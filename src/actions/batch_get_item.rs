@@ -55,18 +55,15 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // Validate each table entry has at least one key
+    // Validate each table entry has at least one key. Checked ahead of the table
+    // names and reported alone, even beside an unknown capacity mode (captured
+    // in twelve regions, 2026-10-09).
     for (table_name, ka) in &request.request_items {
         if ka.keys.is_empty() {
             return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value at 'requestItems.{table_name}.member.keys' failed to satisfy constraint: Member must have length greater than or equal to 1"
+                "1 validation error detected: Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1"
             )));
         }
-    }
-
-    // Validate table name format for all tables before checking existence
-    for table_name in request.request_items.keys() {
-        crate::validation::validate_table_name(table_name)?;
     }
 
     // Validate total key count.
@@ -87,6 +84,32 @@ pub async fn execute<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: Member must have length less than or equal to 100"
         )));
+    }
+
+    // A table name that breaks its constraints is a constraint on the
+    // RequestItems map's keys, reported once for the map with the map echoed,
+    // and together with a ReturnConsumedCapacity outside the enum, before
+    // anything is read (captured us-east-1, eu-west-2 and ten more regions,
+    // 2026-10-08 and 2026-10-09).
+    let mut member_errors = Vec::new();
+    if !request
+        .request_items
+        .keys()
+        .all(|name| crate::validation::member_table_name_is_valid(name))
+    {
+        member_errors.push(format!(
+            "Value '{}' at 'requestItems' failed to satisfy constraint: {}",
+            request_items_echo(&request.request_items),
+            crate::validation::REQUEST_ITEMS_KEY_CONSTRAINT
+        ));
+    }
+    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ) {
+        member_errors.push(msg);
+    }
+    if let Some(msg) = crate::validation::format_validation_errors(&member_errors) {
+        return Err(DynoxideError::ValidationException(msg));
     }
 
     // --- Pre-table validations ---
@@ -326,4 +349,68 @@ pub async fn execute<S: StorageBackend>(
         unprocessed_keys,
         consumed_capacity,
     })
+}
+
+/// The `RequestItems` map as DynamoDB echoes it in a constraint message: JSON,
+/// with the tables, each table's members and every attribute map in order of
+/// name. Two tables came back in name order in half the regions captured and
+/// in the other order in the rest, so the order is DynamoDB's own map order;
+/// name order is the deterministic choice.
+fn request_items_echo(request_items: &HashMap<String, KeysAndAttributes>) -> String {
+    let mut tables: Vec<(&String, &KeysAndAttributes)> = request_items.iter().collect();
+    tables.sort_by(|a, b| a.0.cmp(b.0));
+    let mut echo = serde_json::Map::new();
+    for (table_name, ka) in tables {
+        let mut members = serde_json::Map::new();
+        if let Some(ref attributes) = ka.attributes_to_get {
+            members.insert("AttributesToGet".to_string(), serde_json::json!(attributes));
+        }
+        if let Some(consistent_read) = ka.consistent_read {
+            members.insert(
+                "ConsistentRead".to_string(),
+                serde_json::json!(consistent_read),
+            );
+        }
+        if let Some(ref names) = ka.expression_attribute_names {
+            members.insert(
+                "ExpressionAttributeNames".to_string(),
+                sorted_json(serde_json::json!(names)),
+            );
+        }
+        let keys = ka
+            .keys
+            .iter()
+            .map(|key| sorted_json(serde_json::to_value(key).unwrap_or_default()))
+            .collect();
+        members.insert("Keys".to_string(), serde_json::Value::Array(keys));
+        if let Some(ref projection) = ka.projection_expression {
+            members.insert(
+                "ProjectionExpression".to_string(),
+                serde_json::json!(projection),
+            );
+        }
+        echo.insert(table_name.clone(), serde_json::Value::Object(members));
+    }
+    serde_json::Value::Object(echo).to_string()
+}
+
+/// Rebuild every JSON object with its keys in order of name, so the echo does
+/// not depend on hash-map iteration order.
+fn sorted_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, sorted_json(v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted_json).collect())
+        }
+        other => other,
+    }
 }

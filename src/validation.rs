@@ -8,9 +8,13 @@ use crate::types::{
 ///
 /// AWS DynamoDB applies different constraints to `tableName` depending on the
 /// operation. CreateTable enforces a minimum of 3 characters and a regex
-/// pattern. Read/write operations (PutItem, GetItem, Query, Scan, UpdateItem,
-/// DeleteItem, BatchGet/Write, TransactGet/Write) only enforce a minimum of 1
-/// character; the regex pattern only fires on a non-empty invalid name.
+/// pattern. `ReadWrite` enforces a minimum of 1 character, with the regex
+/// pattern only firing on a non-empty invalid name. PutItem, GetItem,
+/// UpdateItem, DeleteItem, Query and Scan add a minimum of 3 for a non-empty
+/// name on top of it (see `item_table_name_errors`); the batch and transaction
+/// operations check their table names as members of the request body (see
+/// `member_table_name_errors`). SearchVectors keeps `ReadWrite` as it is: its
+/// short-name answer is uncaptured.
 #[derive(Copy, Clone, Debug)]
 pub enum TableNameContext {
     /// CreateTable: regex pattern + minimum length 3.
@@ -116,6 +120,181 @@ pub fn table_name_constraint_errors(
     errors
 }
 
+/// The newer validation layer's answer for an empty table name: no value echo,
+/// the member spelled `TableName`, reported on its own. PutItem, UpdateItem,
+/// DeleteItem, GetItem, Query and SearchVectors give it (captured on
+/// 2026-10-09 in at least five of seven regions for each); Scan, still on the
+/// older layer in most regions, gives the `ReadWrite` form instead.
+pub(crate) const EMPTY_TABLE_NAME_REJECTION: &str = "Value at 'TableName' failed to satisfy \
+     constraint: Member must have length greater than or equal to 1";
+
+fn short_table_name_error(name: &str) -> String {
+    format!(
+        "Value '{name}' at 'tableName' failed to satisfy constraint: \
+         Member must have length greater than or equal to 3"
+    )
+}
+
+fn long_table_name_error(name: &str) -> String {
+    format!(
+        "Value '{name}' at 'tableName' failed to satisfy constraint: \
+         Member must have length less than or equal to 255"
+    )
+}
+
+fn table_name_pattern_error(name: &str) -> String {
+    format!(
+        "Value '{name}' at 'tableName' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+    )
+}
+
+/// The first constraint a non-empty table name breaks, as the newer layer
+/// reports it: one error per name, the length (3 to 255) before the pattern.
+/// A name both short and malformed (`a!`) gets the length error alone
+/// (captured 2026-10-09 on PutItem, DeleteItem, GetItem, Query and
+/// SearchVectors).
+pub(crate) fn first_table_name_error(name: &str) -> Option<String> {
+    if name.len() < 3 {
+        Some(short_table_name_error(name))
+    } else if name.len() > 255 {
+        Some(long_table_name_error(name))
+    } else if !table_name_pattern_holds(name) {
+        Some(table_name_pattern_error(name))
+    } else {
+        None
+    }
+}
+
+/// The table-name errors for PutItem, DeleteItem, GetItem and Query: a missing
+/// name as `ReadWrite` reports it, an empty one in the newer wording, and
+/// otherwise [`first_table_name_error`]. Callers report the empty name on its
+/// own before anything else; the other errors join the request's member
+/// errors.
+pub(crate) fn item_table_name_errors(table_name: Option<&str>) -> Vec<String> {
+    match table_name {
+        None => table_name_constraint_errors(None, TableNameContext::ReadWrite),
+        Some("") => vec![EMPTY_TABLE_NAME_REJECTION.to_string()],
+        Some(name) => first_table_name_error(name).into_iter().collect(),
+    }
+}
+
+/// [`validate_table_name`] for the operations that take
+/// [`item_table_name_errors`], so a request built in Rust gets the same answer
+/// as one decoded from a body.
+pub(crate) fn validate_item_table_name(name: &str) -> Result<()> {
+    match format_validation_errors(&item_table_name_errors(Some(name))) {
+        Some(msg) => Err(DynoxideError::ValidationException(msg)),
+        None => Ok(()),
+    }
+}
+
+/// UpdateItem's table-name errors in the newer layer: every constraint the
+/// name breaks, the pattern listed before the length, where the other
+/// single-item operations stop at the length (captured 2026-10-09, five of
+/// seven regions).
+pub(crate) fn update_item_table_name_errors(table_name: Option<&str>) -> Vec<String> {
+    let name = match table_name {
+        None => return table_name_constraint_errors(None, TableNameContext::ReadWrite),
+        Some("") => return vec![EMPTY_TABLE_NAME_REJECTION.to_string()],
+        Some(name) => name,
+    };
+    let mut errors = Vec::new();
+    if !table_name_pattern_holds(name) {
+        errors.push(table_name_pattern_error(name));
+    }
+    if name.len() < 3 {
+        errors.push(short_table_name_error(name));
+    } else if name.len() > 255 {
+        errors.push(long_table_name_error(name));
+    }
+    errors
+}
+
+/// Scan's table-name errors in the older layer most regions still run it on:
+/// an empty name in the `ReadWrite` form, and otherwise every constraint the
+/// name breaks, the length before the pattern (captured 2026-10-09, six of
+/// seven regions).
+pub(crate) fn scan_table_name_errors(name: &str) -> Vec<String> {
+    if name.is_empty() {
+        return table_name_constraint_errors(Some(name), TableNameContext::ReadWrite);
+    }
+    let mut errors = Vec::new();
+    if name.len() < 3 {
+        errors.push(short_table_name_error(name));
+    } else if name.len() > 255 {
+        errors.push(long_table_name_error(name));
+    }
+    if !table_name_pattern_holds(name) {
+        errors.push(table_name_pattern_error(name));
+    }
+    errors
+}
+
+/// [`validate_table_name`] for Scan, so a request built in Rust gets the same
+/// answer as one decoded from a body.
+pub(crate) fn validate_scan_table_name(name: &str) -> Result<()> {
+    match format_validation_errors(&scan_table_name_errors(name)) {
+        Some(msg) => Err(DynoxideError::ValidationException(msg)),
+        None => Ok(()),
+    }
+}
+
+/// The rejection for a `ReturnValuesOnConditionCheckFailure` outside
+/// `[ALL_OLD, NONE]`, at `path`: `returnValuesOnConditionCheckFailure` on the
+/// single-item operations, `transactItems.N.member.<action>.` before it in a
+/// transaction. Captured in all seven regions tried, 2026-10-09.
+pub(crate) fn return_values_on_condition_check_failure_rejection(
+    value: Option<&str>,
+    path: &str,
+) -> Option<String> {
+    let value = value?;
+    if ["ALL_OLD", "NONE"].contains(&value) {
+        return None;
+    }
+    Some(format!(
+        "Value '{value}' at '{path}' failed to satisfy constraint: \
+         Member must satisfy enum value set: [ALL_OLD, NONE]"
+    ))
+}
+
+/// What DynamoDB says about a `ConditionalOperator` once the request's members
+/// are valid. It only joins legacy conditions, so it is refused when there are
+/// none and when there is only one; `conditions` is the number of entries in
+/// `Expected`, `QueryFilter` or `ScanFilter`. The newer layer checks nothing
+/// else about it, so an unknown value is refused here too (captured
+/// 2026-10-09: PutItem, UpdateItem, DeleteItem and Query in at least five of
+/// seven regions, Scan in all seven for a valid value).
+pub(crate) fn conditional_operator_misuse(
+    operator: Option<&str>,
+    conditions: usize,
+) -> Option<&'static str> {
+    let operator = operator?;
+    match conditions {
+        0 => Some("ConditionalOperator cannot be used without Filter or Expected"),
+        1 => Some(
+            "ConditionalOperator can only be used when Filter or Expected has two or more \
+             elements",
+        ),
+        // With conditions to join, a value other than AND or OR gets the
+        // generic enum message, DynamoDB's own `[ALL, OR]` list included
+        // (captured 2026-10-09: PutItem, UpdateItem and DeleteItem in five of
+        // seven regions, Query in six).
+        _ if !["AND", "OR"].contains(&operator) => {
+            Some("Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]")
+        }
+        _ => None,
+    }
+}
+
+/// How many legacy conditions an `Expected`, `QueryFilter` or `ScanFilter`
+/// carries.
+pub(crate) fn legacy_condition_count(conditions: Option<&serde_json::Value>) -> usize {
+    conditions
+        .and_then(|value| value.as_object())
+        .map_or(0, |object| object.len())
+}
+
 /// Format a list of constraint validation errors into the DynamoDB multi-error format.
 ///
 /// Returns `Some(message)` if there are errors, `None` if empty.
@@ -148,7 +327,11 @@ pub(crate) fn envelope_message(msg: &str) -> String {
 /// instead, so they had nowhere to put it and accepted anything. That was
 /// invisible while the value only chose whether a figure was reported; it
 /// stopped being invisible once an unrecognised value also meant the write path
-/// skipped sizing its indexes. All nine now ask here.
+/// skipped sizing its indexes. Every operation that takes the parameter now
+/// asks here: those six, `SearchVectors`, the three PartiQL operations, and
+/// `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and
+/// `TransactWriteItems`, which check it in their `execute` once their own
+/// request-level constraints have passed.
 ///
 /// Callers that collect several failures push the message onto their own errors
 /// vec, so the multi-error envelope they report is unchanged.
@@ -172,6 +355,107 @@ pub(crate) fn reject_bad_capacity_mode(mode: Option<&str>) -> Result<()> {
         None => Ok(()),
     }
 }
+/// The rejection for a `ReturnValues` outside the enum on PutItem, UpdateItem
+/// and DeleteItem: the validation framework's generic form, which names
+/// neither the value nor the member and lists the enum in DynamoDB's own
+/// order, its `UPDATE_NEW` typo included. Captured in eu-west-2, us-east-1 and
+/// two more regions on 2026-10-08; 31 of 33 regions answer this way, and
+/// eu-south-2 and me-central-1 still give the older per-value wording. Which
+/// values are accepted is unchanged: `UPDATED_NEW` is valid, `UPDATE_NEW` is
+/// only the message's spelling.
+pub(crate) const RETURN_VALUES_REJECTION: &str = "Failed to satisfy constraint: Member must \
+     satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]";
+
+/// The older validation layer's rejection for a `ReturnValues` outside the
+/// enum, naming the value and the member. UpdateItem still gives it when the
+/// request has no key, in all seven regions captured on 2026-10-09.
+pub(crate) fn return_values_value_rejection(value: &str) -> String {
+    format!(
+        "Value '{value}' at 'returnValues' failed to satisfy constraint: \
+         Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]"
+    )
+}
+
+/// The rejection for a `ConditionalOperator` outside `[OR, AND]`, or `None`
+/// when the value is one DynamoDB accepts. Only Scan checks it as an enum
+/// member: it is still on the older validation layer in most regions (six of
+/// seven, 2026-10-09). The newer layer, which the other operations run on in
+/// most regions, never reports the enum; see [`conditional_operator_misuse`].
+pub(crate) fn conditional_operator_rejection(operator: Option<&str>) -> Option<String> {
+    let operator = operator?;
+    if ["OR", "AND"].contains(&operator) {
+        return None;
+    }
+    Some(format!(
+        "Value '{operator}' at 'conditionalOperator' failed to satisfy constraint: \
+         Member must satisfy enum value set: [OR, AND]"
+    ))
+}
+
+/// The rejection for a `ReturnItemCollectionMetrics` outside the enum, or
+/// `None` when the value is one DynamoDB accepts. `BatchWriteItem` and
+/// `TransactWriteItems` ask here; PutItem, UpdateItem and DeleteItem spell the
+/// same check out in their own deserialisation.
+pub(crate) fn return_item_collection_metrics_rejection(mode: Option<&str>) -> Option<String> {
+    let mode = mode?;
+    if ["SIZE", "NONE"].contains(&mode) {
+        return None;
+    }
+    Some(format!(
+        "Value '{mode}' at 'returnItemCollectionMetrics' failed to satisfy constraint: \
+         Member must satisfy enum value set: [SIZE, NONE]"
+    ))
+}
+
+fn table_name_pattern_holds(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// Whether a table name meets the constraints on a `TableName` member of a
+/// request body: 3 to 255 characters from `[a-zA-Z0-9_.-]`. The single-item
+/// operations validate a top-level `tableName` more loosely (see
+/// [`TableNameContext::ReadWrite`]); the batch and transaction operations carry
+/// their table names inside the body and apply the full constraint.
+pub(crate) fn member_table_name_is_valid(name: &str) -> bool {
+    (3..=255).contains(&name.len()) && table_name_pattern_holds(name)
+}
+
+/// The constraint errors for a table name carried at `path` inside a
+/// transaction, such as `transactItems.2.member.update.tableName`: the length
+/// first, then the pattern, which is the order DynamoDB lists them in when a
+/// name breaks both (captured us-east-1 and three more regions, 2026-10-09;
+/// eu-west-2 lists the pattern first).
+pub(crate) fn member_table_name_errors(name: &str, path: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    if name.len() < 3 {
+        errors.push(format!(
+            "Value '{name}' at '{path}' failed to satisfy constraint: \
+             Member must have length greater than or equal to 3"
+        ));
+    } else if name.len() > 255 {
+        errors.push(format!(
+            "Value '{name}' at '{path}' failed to satisfy constraint: \
+             Member must have length less than or equal to 255"
+        ));
+    }
+    if !table_name_pattern_holds(name) {
+        errors.push(format!(
+            "Value '{name}' at '{path}' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        ));
+    }
+    errors
+}
+
+/// The constraint a batch request's `RequestItems` map puts on its keys, the
+/// table names. DynamoDB reports it once for the whole map, echoing the map,
+/// whichever name broke it.
+pub(crate) const REQUEST_ITEMS_KEY_CONSTRAINT: &str = "Map keys must satisfy constraint: \
+     [Member must have length less than or equal to 255, Member must have length greater \
+     than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]";
 
 /// Wrap an `EnvelopedValidation` error in the `1 validation error detected: `
 /// envelope, converting it to a plain `ValidationException`. Every other error

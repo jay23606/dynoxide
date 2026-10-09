@@ -571,7 +571,12 @@ fn test_update_item_invalid_return_values() {
 
     match result {
         Err(DynoxideError::ValidationException(msg)) => {
-            assert!(msg.contains("returnValues"));
+            // The generic form, which names neither the value nor the member
+            // (captured 2026-10-08).
+            assert!(
+                msg.contains("[ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]"),
+                "got: {msg}"
+            );
         }
         other => panic!("Expected ValidationException, got: {other:?}"),
     }

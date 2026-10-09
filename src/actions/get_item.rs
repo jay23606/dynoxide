@@ -40,9 +40,16 @@ impl<'de> serde::Deserialize<'de> for GetItemRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = GetItemRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        use crate::validation::format_validation_errors;
+
+        // An empty name is the newer validation layer's own check and is
+        // reported on its own (captured 2026-10-09, six of seven regions).
+        if raw.table_name.as_deref() == Some("") {
+            return Err(serde::de::Error::custom(format!(
+                "VALIDATION:{}",
+                crate::validation::envelope_message(crate::validation::EMPTY_TABLE_NAME_REJECTION)
+            )));
+        }
 
         let mut errors = Vec::new();
 
@@ -56,9 +63,8 @@ impl<'de> serde::Deserialize<'de> for GetItemRequest {
         }
 
         // Table name constraints
-        errors.extend(table_name_constraint_errors(
+        errors.extend(crate::validation::item_table_name_errors(
             raw.table_name.as_deref(),
-            TableNameContext::ReadWrite,
         ));
         let table_name = raw.table_name.unwrap_or_default();
 
@@ -109,7 +115,7 @@ pub async fn execute<S: StorageBackend>(
     request: GetItemRequest,
 ) -> Result<GetItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    crate::validation::validate_item_table_name(&request.table_name)?;
 
     // Validate expression/non-expression parameter conflicts
     {

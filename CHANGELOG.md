@@ -285,6 +285,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A PartiQL INSERT of a key that already exists is reported as a duplicate
   before an item nested to the limit is.
 
+### Fixed
+
+- `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and
+  `TransactWriteItems` refuse a `ReturnConsumedCapacity` other than `INDEXES`,
+  `TOTAL` or `NONE` with the ValidationException the single-item operations
+  already return, before anything is read or written. They used to accept any
+  value and treat it as `NONE`, and the two writes went ahead.
+  `TransactWriteItems` now checks its `TransactItems` length, the length of
+  its `ClientRequestToken` and then `ReturnConsumedCapacity` before looking the
+  token up, so a replayed token is checked too. `BatchWriteItem` checks the
+  capacity mode ahead of a table name that fails its pattern, as DynamoDB does.
+- `BatchWriteItem` and `TransactWriteItems` refuse a
+  `ReturnItemCollectionMetrics` other than `SIZE` or `NONE` before writing
+  anything. They used to accept any value. A request with more than one of
+  these member errors, such as both enums, or an overlong
+  `ClientRequestToken` beside either, now gets them in one
+  `N validation errors detected:` message, as DynamoDB gives them.
+- A malformed table name in a transaction is a top-level ValidationException
+  naming the action's position and type, such as
+  `transactItems.2.member.update.tableName`, checked before any action runs.
+  `TransactGetItems` used to report it as a cancellation reason, and both
+  reported the path as `tableName`. The name must now be 3 to 255 characters,
+  as DynamoDB requires inside a request body.
+- `BatchGetItem` and `BatchWriteItem` report a malformed table name as a
+  constraint on the `RequestItems` map's keys, echoing the map as DynamoDB
+  does, and `BatchGetItem` reports it together with an unknown
+  `ReturnConsumedCapacity`. An empty request list in `BatchWriteItem`, and an
+  empty `Keys` list in `BatchGetItem`, use DynamoDB's messages too.
+- A `BatchWriteItem` put whose item has no partition key is refused with "The
+  provided key element does not match the schema", as DynamoDB does, where it
+  named the missing key.
+- A `TransactWriteItems` item with no action is refused with DynamoDB's
+  "Invalid Request" message, and one with two actions with "TransactItems can
+  only contain one of Check, Put, Update or Delete". An item carrying both a
+  `Put` and a `Delete` used to run the `Put` and drop the `Delete`.
+- A `TransactGetItems` item without its `Get` is refused with DynamoDB's
+  "Value null at 'transactItems.N.member.get' failed to satisfy constraint:
+  Member must not be null", together with an unknown
+  `ReturnConsumedCapacity`. It used to come back as serde's own "missing
+  field" text.
+- The single-item operations, `Query`, `Scan` and `SearchVectors` follow the
+  member validation most regions now run. DynamoDB is moving each operation to
+  a newer validation layer region by region; these match the majority of seven
+  regions captured on 2026-10-09, which is the newer layer everywhere except
+  `Scan`.
+  - A table name of one or two characters is refused for its length before
+    the table is looked up, where it used to answer
+    `ResourceNotFoundException`. A name that breaks more than one constraint
+    gets one error on most operations, both on `UpdateItem` and `Scan`.
+  - An empty table name gets the newer "Value at 'TableName'" wording on its
+    own, except on `Scan`.
+  - `PutItem` and `DeleteItem` report a table-name error together with the
+    other member errors; `UpdateItem` reports it alone; `Scan` reports it only
+    when nothing else is wrong.
+  - `UpdateItem` without its key reports every invalid enum, in the older
+    per-value wording, followed by the missing key, as all seven regions do.
+  - An unknown `ReturnValues` gets the newer layer's message, which names
+    neither the value nor the member.
+  - An unknown `ReturnValuesOnConditionCheckFailure` is refused, on the
+    single-item operations and on every `TransactWriteItems` action. It used to
+    be accepted.
+  - `UpdateItem` reports one invalid enum, in DynamoDB's order, without the
+    envelope for `ReturnValuesOnConditionCheckFailure` and
+    `ReturnConsumedCapacity`.
+  - `Query` reports a `Limit` of 0 and an empty name together, ahead of
+    everything else, and checks `Select` after mixing `ConditionalOperator`
+    with an expression. `Scan`
+    reports its member errors in DynamoDB's order.
+  - A `ConditionalOperator` is refused unless it joins two or more legacy
+    `Expected`, `QueryFilter` or `ScanFilter` conditions, with DynamoDB's
+    messages, and joining two or more with a value other than `AND` or `OR`
+    gets DynamoDB's generic enum message. Beside an expression it gets the
+    mixing message, which `DeleteItem` now wraps in the envelope as `PutItem`
+    and `UpdateItem` do. It used to be accepted with nothing to join. `Scan`
+    still checks its value as an enum.
+  - `SearchVectors` refuses a short or malformed table name without the
+    envelope once its other members pass, a `TopK` below 1 in the newer
+    wording, and a missing `IndexName`, `SearchVector` or `TopK` with
+    DynamoDB's own "missing field" message.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security

@@ -6,12 +6,72 @@ use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 pub struct TransactGetItemsRequest {
-    #[serde(rename = "TransactItems")]
     pub transact_items: Vec<TransactGetItem>,
-    #[serde(rename = "ReturnConsumedCapacity", default)]
     pub return_consumed_capacity: Option<String>,
+}
+
+/// The request as it arrives, before an item's `Get` is known to be there.
+#[derive(Deserialize)]
+struct TransactGetItemsRequestRaw {
+    #[serde(rename = "TransactItems")]
+    transact_items: Vec<TransactGetItemRaw>,
+    #[serde(rename = "ReturnConsumedCapacity", default)]
+    return_consumed_capacity: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TransactGetItemRaw {
+    #[serde(rename = "Get", default)]
+    get: Option<TransactGet>,
+}
+
+impl<'de> Deserialize<'de> for TransactGetItemsRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let raw = TransactGetItemsRequestRaw::deserialize(deserializer)?;
+
+        // An item without its `Get` (absent or null) is a member constraint,
+        // reported together with a `ReturnConsumedCapacity` outside the enum
+        // and ahead of every other check (captured in five regions,
+        // 2026-10-09). Only a request body can leave it out: the public type
+        // requires it.
+        let mut errors: Vec<String> = raw
+            .transact_items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.get.is_none())
+            .map(|(position, _)| {
+                format!(
+                    "Value null at 'transactItems.{}.member.get' failed to satisfy \
+                     constraint: Member must not be null",
+                    position + 1
+                )
+            })
+            .collect();
+        if !errors.is_empty() {
+            if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+                raw.return_consumed_capacity.as_deref(),
+            ) {
+                errors.push(msg);
+            }
+            if let Some(msg) = crate::validation::format_validation_errors(&errors) {
+                return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
+            }
+        }
+
+        Ok(TransactGetItemsRequest {
+            transact_items: raw
+                .transact_items
+                .into_iter()
+                .filter_map(|item| item.get)
+                .map(|get| TransactGetItem { get })
+                .collect(),
+            return_consumed_capacity: raw.return_consumed_capacity,
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -67,6 +127,33 @@ pub async fn execute<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '[{dump}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
         )));
+    }
+
+    // ReturnConsumedCapacity outside the enum: refused with the message the
+    // single-item operations give, after the TransactItems constraints and before
+    // anything is read or written (captured eu-west-2, 2026-10-08).
+    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        ));
+    }
+
+    // Every Get's table name, reported together as a top-level error under its
+    // position, such as `transactItems.2.member.get.tableName`, never as a
+    // cancellation reason. Checked after the capacity mode, as us-east-1 and
+    // nine more regions do (captured 2026-10-09); eu-west-2 and eu-north-1
+    // report the two together.
+    let mut name_errors = Vec::new();
+    for (position, transact_item) in request.transact_items.iter().enumerate() {
+        name_errors.extend(crate::validation::member_table_name_errors(
+            &transact_item.get.table_name,
+            &format!("transactItems.{}.member.get.tableName", position + 1),
+        ));
+    }
+    if let Some(msg) = crate::validation::format_validation_errors(&name_errors) {
+        return Err(DynoxideError::ValidationException(msg));
     }
 
     // Per-action validation pass.

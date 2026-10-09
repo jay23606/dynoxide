@@ -77,23 +77,14 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = ScanRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        use crate::validation::format_validation_errors;
 
+        // Scan still runs on the older validation layer in most regions (six
+        // of seven, 2026-10-09). Its member errors come back together in the
+        // order Select, ReturnConsumedCapacity, ConditionalOperator, Limit,
+        // Segment, with a missing or empty table name last. Any other table
+        // name error is reported only when none of those fired.
         let mut errors = Vec::new();
-        errors.extend(table_name_constraint_errors(
-            raw.table_name.as_deref(),
-            TableNameContext::ReadWrite,
-        ));
-        let table_name = raw.table_name.unwrap_or_default();
-
-        // ReturnConsumedCapacity enum
-        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-            raw.return_consumed_capacity.as_deref(),
-        ) {
-            errors.push(msg);
-        }
 
         // Select enum
         if let Some(ref sel) = raw.select
@@ -106,10 +97,24 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             .contains(&sel.as_str())
         {
             errors.push(format!(
-                    "Value '{}' at 'select' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
-                    sel
-                ));
+                "Value '{}' at 'select' failed to satisfy constraint: \
+                 Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
+                sel
+            ));
+        }
+
+        // ReturnConsumedCapacity enum
+        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+            raw.return_consumed_capacity.as_deref(),
+        ) {
+            errors.push(msg);
+        }
+
+        // ConditionalOperator enum, which only this layer checks.
+        if let Some(msg) =
+            crate::validation::conditional_operator_rejection(raw.conditional_operator.as_deref())
+        {
+            errors.push(msg);
         }
 
         // Limit must be >= 1.
@@ -138,9 +143,25 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             ));
         }
 
+        match raw.table_name.as_deref() {
+            None | Some("") => errors.extend(crate::validation::table_name_constraint_errors(
+                raw.table_name.as_deref(),
+                crate::validation::TableNameContext::ReadWrite,
+            )),
+            Some(_) => {}
+        }
+
         if let Some(msg) = format_validation_errors(&errors) {
             return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
         }
+
+        if let Some(name) = raw.table_name.as_deref()
+            && let Some(msg) =
+                format_validation_errors(&crate::validation::scan_table_name_errors(name))
+        {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+        }
+        let table_name = raw.table_name.unwrap_or_default();
 
         Ok(ScanRequest {
             table_name,
@@ -183,7 +204,7 @@ pub async fn execute<S: StorageBackend>(
     mut request: ScanRequest,
 ) -> Result<ScanResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    crate::validation::validate_scan_table_name(&request.table_name)?;
 
     // ---- Expression vs non-expression mixing validation ----
     {
@@ -216,6 +237,23 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_values_raw: &no_raw_eav,
         };
         helpers::validate_expression_params(&ctx)?;
+    }
+
+    // ---- ConditionalOperator only joins legacy ScanFilter conditions, so a
+    // valid one is refused without two of them; Scan reports it without the
+    // envelope (captured 2026-10-09, all seven regions). ----
+    if let Some(msg) =
+        crate::validation::conditional_operator_rejection(request.conditional_operator.as_deref())
+    {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        ));
+    }
+    if let Some(msg) = crate::validation::conditional_operator_misuse(
+        request.conditional_operator.as_deref(),
+        crate::validation::legacy_condition_count(request.scan_filter.as_ref()),
+    ) {
+        return Err(DynoxideError::ValidationException(msg.to_string()));
     }
 
     // ---- Validate ScanFilter attribute values (before argument counts, matching DynamoDB) ----

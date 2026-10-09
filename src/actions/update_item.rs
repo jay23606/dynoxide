@@ -65,36 +65,39 @@ pub struct UpdateItemRequest {
     pub conditional_operator: Option<String>,
 }
 
-/// First invalid `Return*` enum for UpdateItem, ReturnValues first, or `None` if
-/// all valid. UpdateItem stops at the first; PutItem aggregates.
-fn first_invalid_return_enum(
+/// UpdateItem's first invalid enum member, or `None` if all are valid, and
+/// whether DynamoDB wraps it in the `1 validation error detected: ` envelope.
+/// UpdateItem reports one, where PutItem reports them all. In the newer
+/// validation layer (five of seven regions, 2026-10-09) the order is
+/// ReturnValues, ReturnValuesOnConditionCheckFailure,
+/// ReturnItemCollectionMetrics, ReturnConsumedCapacity, and the second and
+/// fourth come back without the envelope.
+fn first_invalid_member_enum(
     return_values: Option<&str>,
-    return_consumed_capacity: Option<&str>,
+    return_values_on_condition_check_failure: Option<&str>,
     return_item_collection_metrics: Option<&str>,
-) -> Option<String> {
+    return_consumed_capacity: Option<&str>,
+) -> Option<(String, bool)> {
     if let Some(rv) = return_values
         && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv)
     {
-        return Some(format!(
-            "Value '{}' at 'returnValues' failed to satisfy constraint: \
-                 Member must satisfy enum value set: \
-                 [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]",
-            rv
-        ));
+        return Some((crate::validation::RETURN_VALUES_REJECTION.to_string(), true));
+    }
+    if let Some(msg) = crate::validation::return_values_on_condition_check_failure_rejection(
+        return_values_on_condition_check_failure,
+        "returnValuesOnConditionCheckFailure",
+    ) {
+        return Some((msg, false));
+    }
+    if let Some(msg) =
+        crate::validation::return_item_collection_metrics_rejection(return_item_collection_metrics)
+    {
+        return Some((msg, true));
     }
     if let Some(msg) =
         crate::validation::return_consumed_capacity_rejection(return_consumed_capacity)
     {
-        return Some(msg);
-    }
-    if let Some(ricm) = return_item_collection_metrics
-        && !["SIZE", "NONE"].contains(&ricm)
-    {
-        return Some(format!(
-            "Value '{}' at 'returnItemCollectionMetrics' failed to satisfy constraint: \
-                 Member must satisfy enum value set: [SIZE, NONE]",
-            ricm
-        ));
+        return Some((msg, false));
     }
     None
 }
@@ -104,14 +107,50 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = UpdateItemRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        use crate::validation::format_validation_errors;
 
-        // AWS reports an invalid table name on its own, before the key and
-        // Return* enum checks (eu-west-2).
+        // Without its key, UpdateItem falls back to the older layer in all seven
+        // regions captured on 2026-10-09: every enum error in the older
+        // per-value wording, then the key, and no table name error beside
+        // them. The enums' order is the older layer's (ReturnConsumedCapacity,
+        // ReturnValues, ReturnValuesOnConditionCheckFailure,
+        // ReturnItemCollectionMetrics). An empty name is still checked first.
+        if raw.key.is_none() && raw.table_name.as_deref() != Some("") {
+            let mut errors: Vec<String> = Vec::new();
+            if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+                raw.return_consumed_capacity.as_deref(),
+            ) {
+                errors.push(msg);
+            }
+            if let Some(rv) = raw.return_values.as_deref()
+                && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv)
+            {
+                errors.push(crate::validation::return_values_value_rejection(rv));
+            }
+            if let Some(msg) = crate::validation::return_values_on_condition_check_failure_rejection(
+                raw.return_values_on_condition_check_failure.as_deref(),
+                "returnValuesOnConditionCheckFailure",
+            ) {
+                errors.push(msg);
+            }
+            if let Some(msg) = crate::validation::return_item_collection_metrics_rejection(
+                raw.return_item_collection_metrics.as_deref(),
+            ) {
+                errors.push(msg);
+            }
+            errors.push(
+                "Value null at 'key' failed to satisfy constraint: Member must not be null"
+                    .to_string(),
+            );
+            if let Some(msg) = format_validation_errors(&errors) {
+                return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+            }
+        }
+
+        // UpdateItem reports a table name error on its own, before the key and
+        // the enums (captured 2026-10-09, five of seven regions).
         let table_name_errors =
-            table_name_constraint_errors(raw.table_name.as_deref(), TableNameContext::ReadWrite);
+            crate::validation::update_item_table_name_errors(raw.table_name.as_deref());
         if let Some(msg) = format_validation_errors(&table_name_errors) {
             return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
         }
@@ -128,14 +167,21 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             );
         }
 
-        // UpdateItem stops at the first invalid enum (ReturnValues first) and
-        // reports one error, where PutItem aggregates all of them. Keep separate.
-        if let Some(enum_err) = first_invalid_return_enum(
+        // UpdateItem stops at the first invalid enum and reports one error,
+        // where PutItem aggregates all of them. One reported without the
+        // envelope stands alone; beside a missing key it is left for later,
+        // since that pairing is uncaptured.
+        match first_invalid_member_enum(
             raw.return_values.as_deref(),
-            raw.return_consumed_capacity.as_deref(),
+            raw.return_values_on_condition_check_failure.as_deref(),
             raw.return_item_collection_metrics.as_deref(),
+            raw.return_consumed_capacity.as_deref(),
         ) {
-            errors.push(enum_err);
+            Some((msg, true)) => errors.push(msg),
+            Some((msg, false)) if errors.is_empty() => {
+                return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
+            }
+            _ => {}
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -218,7 +264,11 @@ async fn execute_inner<S: StorageBackend>(
     mut request: UpdateItemRequest,
 ) -> Result<UpdateItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    if let Some(msg) = crate::validation::format_validation_errors(
+        &crate::validation::update_item_table_name_errors(Some(&request.table_name)),
+    ) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
 
     // Reject {NULL: false} up front. The HTTP path rejects it during request
     // deserialisation; this keeps the in-process API in agreement (eu-west-2).
@@ -244,6 +294,9 @@ async fn execute_inner<S: StorageBackend>(
         if request.expected.is_some() {
             non_expr.push("Expected");
         }
+        if request.conditional_operator.is_some() {
+            non_expr.push("ConditionalOperator");
+        }
         if request.update_expression.is_some() {
             expr_params.push("UpdateExpression");
         }
@@ -262,6 +315,15 @@ async fn execute_inner<S: StorageBackend>(
         // Enveloped families are tagged for the request-validation envelope.
         helpers::validate_expression_params(&ctx)
             .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
+    }
+
+    // ConditionalOperator only joins legacy Expected conditions, so it is
+    // refused without two of them, whatever its value (captured 2026-10-09).
+    if let Some(msg) = crate::validation::conditional_operator_misuse(
+        request.conditional_operator.as_deref(),
+        crate::validation::legacy_condition_count(request.expected.as_ref()),
+    ) {
+        return Err(DynoxideError::EnvelopedValidation(msg.to_string()));
     }
 
     // Validate key attribute values (unsupported datatypes, invalid numbers)
@@ -443,18 +505,16 @@ async fn execute_inner<S: StorageBackend>(
 
     // Validate ReturnValues parameter. The constraint text is tagged without
     // the envelope prefix; the operation boundary applies it, so the prefix
-    // has a single producer. The enum list mirrors first_invalid_return_enum's
-    // ordering so the in-process message matches the request deserialiser.
+    // has a single producer. It is the same text first_invalid_return_enum
+    // gives, so the in-process message matches the request deserialiser.
     if let Some(ref rv) = request.return_values {
         let rv_upper = rv.to_uppercase();
         if !["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"]
             .contains(&rv_upper.as_str())
         {
-            return Err(DynoxideError::EnvelopedValidation(format!(
-                "Value '{rv}' at 'returnValues' failed to satisfy constraint: \
-                 Member must satisfy enum value set: \
-                 [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]"
-            )));
+            return Err(DynoxideError::EnvelopedValidation(
+                crate::validation::RETURN_VALUES_REJECTION.to_string(),
+            ));
         }
     }
 
@@ -1012,7 +1072,12 @@ mod tests {
         .to_string();
         assert!(err.contains("1 validation error detected"), "got: {err}");
         assert!(err.contains("enum value set"), "got: {err}");
-        assert!(err.contains("returnValues"), "got: {err}");
+        // The generic form names neither the value nor the member (captured
+        // 2026-10-08): the enum list is what identifies ReturnValues.
+        assert!(
+            err.contains("[ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]"),
+            "got: {err}"
+        );
         assert!(!err.contains("returnConsumedCapacity"), "got: {err}");
     }
 

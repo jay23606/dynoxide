@@ -135,10 +135,24 @@ pub async fn execute<S: StorageBackend>(
     Ok(execute_cached(storage, request).await?.response)
 }
 
-pub(crate) async fn execute_cached<S: StorageBackend>(
-    storage: &S,
-    request: TransactWriteItemsRequest,
-) -> Result<CachedWrite> {
+/// The request-level checks, in the order DynamoDB reports them: the
+/// `TransactItems` length; then the request's own members, `ClientRequestToken`,
+/// `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`, reported together
+/// in one message; then whether each item carries exactly one action; then
+/// every action's table name, again in one message.
+///
+/// That is what us-east-1 and nine more regions answered on 2026-10-09.
+/// eu-west-2 and eu-north-1 have moved transactions to a newer validation
+/// layer, which reports a table name or an empty action together with the
+/// enums, words the empty action and the token differently, and reports an
+/// overlong token alone.
+///
+/// Called at the entry point ahead of the idempotency cache as well as at the
+/// start of `execute_cached`. A same-token replay never reaches
+/// `execute_cached`, and the token is keyed on the items alone, so a second
+/// call may carry a capacity mode the first one never did. Running the same
+/// checks in both places keeps their order the same whichever path answers.
+pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
     let items = &request.transact_items;
 
     // Validate: at least 1 action
@@ -160,9 +174,137 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         )));
     }
 
+    // The request's own members, reported together before anything is read or
+    // written: every action's ReturnValuesOnConditionCheckFailure in request
+    // order, then the token and the two enums (captured 2026-10-09, six of
+    // seven regions). The idempotency layer checks the token again, for the
+    // operations that reach it without coming through here.
+    let mut member_errors: Vec<String> = Vec::new();
+    for (position, item) in items.iter().enumerate() {
+        let actions = [
+            (
+                "put",
+                item.put
+                    .as_ref()
+                    .map(|a| &a.return_values_on_condition_check_failure),
+            ),
+            (
+                "update",
+                item.update
+                    .as_ref()
+                    .map(|a| &a.return_values_on_condition_check_failure),
+            ),
+            (
+                "delete",
+                item.delete
+                    .as_ref()
+                    .map(|a| &a.return_values_on_condition_check_failure),
+            ),
+            (
+                "conditionCheck",
+                item.condition_check
+                    .as_ref()
+                    .map(|a| &a.return_values_on_condition_check_failure),
+            ),
+        ];
+        for (action, value) in actions {
+            if let Some(msg) = value.and_then(|value| {
+                crate::validation::return_values_on_condition_check_failure_rejection(
+                    value.as_deref(),
+                    &format!(
+                        "transactItems.{}.member.{action}.returnValuesOnConditionCheckFailure",
+                        position + 1
+                    ),
+                )
+            }) {
+                member_errors.push(msg);
+            }
+        }
+    }
+    member_errors.extend(
+        [
+            crate::token_constraint_error(request.client_request_token.as_deref()),
+            crate::validation::return_consumed_capacity_rejection(
+                request.return_consumed_capacity.as_deref(),
+            ),
+            crate::validation::return_item_collection_metrics_rejection(
+                request.return_item_collection_metrics.as_deref(),
+            ),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    if let Some(msg) = crate::validation::format_validation_errors(&member_errors) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
+    // Each item carries exactly one action, checked for every item before any
+    // table name is.
+    for item in items {
+        let actions = [
+            item.put.is_some(),
+            item.update.is_some(),
+            item.delete.is_some(),
+            item.condition_check.is_some(),
+        ]
+        .into_iter()
+        .filter(|&present| present)
+        .count();
+        match actions {
+            0 => {
+                return Err(DynoxideError::ValidationException(
+                    "Invalid Request: TransactWriteRequest should contain Delete or Put or Update request"
+                        .to_string(),
+                ));
+            }
+            1 => {}
+            _ => {
+                return Err(DynoxideError::ValidationException(
+                    "TransactItems can only contain one of Check, Put, Update or Delete"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    // Every action's table name, reported together under its position and
+    // action type, such as `transactItems.2.member.update.tableName`.
+    let mut name_errors = Vec::new();
+    for (position, item) in items.iter().enumerate() {
+        let (action, table_name) = if let Some(ref put) = item.put {
+            ("put", &put.table_name)
+        } else if let Some(ref update) = item.update {
+            ("update", &update.table_name)
+        } else if let Some(ref delete) = item.delete {
+            ("delete", &delete.table_name)
+        } else if let Some(ref check) = item.condition_check {
+            ("conditionCheck", &check.table_name)
+        } else {
+            continue;
+        };
+        name_errors.extend(crate::validation::member_table_name_errors(
+            table_name,
+            &format!("transactItems.{}.member.{action}.tableName", position + 1),
+        ));
+    }
+    if let Some(msg) = crate::validation::format_validation_errors(&name_errors) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn execute_cached<S: StorageBackend>(
+    storage: &S,
+    request: TransactWriteItemsRequest,
+) -> Result<CachedWrite> {
+    check_request(&request)?;
+    let items = &request.transact_items;
+
     // Validate: each action's request-only checks (value depth, Put item,
     // expression sizes and condition syntax), in request order, before any
-    // table is looked up (#223).
+    // table is looked up (#223). The request's own members come first, as
+    // DynamoDB reports them (captured 2026-10-09).
     for item in items {
         validate_action_request(item)?;
     }

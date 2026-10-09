@@ -53,22 +53,19 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
     ) -> std::result::Result<Self, D::Error> {
         let raw = PutItemRequestRaw::deserialize(deserializer)?;
 
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        use crate::validation::format_validation_errors;
 
-        // AWS reports an invalid table name on its own, before the item and
-        // Return* enum checks (eu-west-2). A valid name lets the rest aggregate.
-        let table_name_opt = raw.table_name.as_deref();
-        let table_name_errors =
-            table_name_constraint_errors(table_name_opt, TableNameContext::ReadWrite);
-        if let Some(msg) = format_validation_errors(&table_name_errors) {
-            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+        // An empty name is the newer validation layer's own check and is
+        // reported on its own. Any other name error joins the member errors
+        // below, one per name (captured 2026-10-09, five of seven regions).
+        if raw.table_name.as_deref() == Some("") {
+            return Err(serde::de::Error::custom(format!(
+                "VALIDATION:{}",
+                crate::validation::envelope_message(crate::validation::EMPTY_TABLE_NAME_REJECTION)
+            )));
         }
+        let mut errors = crate::validation::item_table_name_errors(raw.table_name.as_deref());
         let table_name = raw.table_name.unwrap_or_default();
-
-        // Collect remaining constraint validation errors (DynamoDB aggregates these)
-        let mut errors = Vec::new();
 
         // Item constraint validation
         if raw.item.is_none() {
@@ -90,12 +87,7 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
         if let Some(ref rv) = raw.return_values
             && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv.as_str())
         {
-            errors.push(format!(
-                "Value '{}' at 'returnValues' failed to satisfy constraint: \
-                     Member must satisfy enum value set: \
-                     [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]",
-                rv
-            ));
+            errors.push(crate::validation::RETURN_VALUES_REJECTION.to_string());
         }
 
         // ReturnItemCollectionMetrics enum validation
@@ -107,6 +99,15 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
                      Member must satisfy enum value set: [SIZE, NONE]",
                 ricm
             ));
+        }
+
+        // ReturnValuesOnConditionCheckFailure enum, after the others
+        // (captured 2026-10-09).
+        if let Some(msg) = crate::validation::return_values_on_condition_check_failure_rejection(
+            raw.return_values_on_condition_check_failure.as_deref(),
+            "returnValuesOnConditionCheckFailure",
+        ) {
+            errors.push(msg);
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -159,7 +160,7 @@ async fn execute_inner<S: StorageBackend>(
     mut request: PutItemRequest,
 ) -> Result<PutItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    crate::validation::validate_item_table_name(&request.table_name)?;
 
     // Reject {NULL: false} up front. The HTTP path rejects it during request
     // deserialisation; this keeps the in-process API in agreement (eu-west-2).
@@ -181,6 +182,9 @@ async fn execute_inner<S: StorageBackend>(
         if request.expected.is_some() {
             non_expr.push("Expected");
         }
+        if request.conditional_operator.is_some() {
+            non_expr.push("ConditionalOperator");
+        }
         if request.condition_expression.is_some() {
             expr_params.push("ConditionExpression");
         }
@@ -196,6 +200,15 @@ async fn execute_inner<S: StorageBackend>(
         // tagged for the request-validation envelope.
         helpers::validate_expression_params(&ctx)
             .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
+    }
+
+    // ConditionalOperator only joins legacy Expected conditions, so it is
+    // refused without two of them, whatever its value.
+    if let Some(msg) = crate::validation::conditional_operator_misuse(
+        request.conditional_operator.as_deref(),
+        crate::validation::legacy_condition_count(request.expected.as_ref()),
+    ) {
+        return Err(DynoxideError::EnvelopedValidation(msg.to_string()));
     }
 
     // Validate empty ConditionExpression
@@ -561,7 +574,12 @@ mod tests {
             err.to_lowercase().contains("returnitemcollectionmetrics"),
             "got: {err}"
         );
-        assert!(err.to_lowercase().contains("returnvalues"), "got: {err}");
+        // ReturnValues in the generic form, which names neither the value nor
+        // the member (captured 2026-10-08).
+        assert!(
+            err.contains("[ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]"),
+            "got: {err}"
+        );
     }
 
     #[test]

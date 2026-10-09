@@ -223,13 +223,23 @@ const TOKEN_EXPIRY_SECS: u64 = 600;
 
 /// Reject a token longer than DynamoDB accepts, with its exact message.
 fn validate_token(token: Option<&str>) -> Result<()> {
+    match token_constraint_error(token) {
+        Some(msg) => Err(DynoxideError::ValidationException(
+            validation::envelope_message(&msg),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The constraint error for a token longer than DynamoDB accepts, without the
+/// envelope, so a caller can report it alongside the request's other member
+/// errors.
+pub(crate) fn token_constraint_error(token: Option<&str>) -> Option<String> {
     match token {
-        Some(token) if token.len() > MAX_TOKEN_LEN => {
-            Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {MAX_TOKEN_LEN}"
-            )))
-        }
-        _ => Ok(()),
+        Some(token) if token.len() > MAX_TOKEN_LEN => Some(format!(
+            "Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {MAX_TOKEN_LEN}"
+        )),
+        _ => None,
     }
 }
 
@@ -953,6 +963,10 @@ impl Database<RusqliteBackend> {
         &self,
         request: actions::transact_write_items::TransactWriteItemsRequest,
     ) -> Result<actions::transact_write_items::TransactWriteItemsResponse> {
+        // Ahead of the cache, not only inside the work: a replayed token skips
+        // the work entirely, and the token is keyed on the items alone, so a
+        // replay may carry a capacity mode the first call never did.
+        actions::transact_write_items::check_request(&request)?;
         run_idempotent(
             &self.tokens.transact_write,
             request.client_request_token.as_deref(),

@@ -518,13 +518,15 @@ async fn top_k_one_returns_the_best_match() {
 
 #[test]
 fn top_k_zero_rejects_at_the_request_model_layer_enveloped() {
+    // The newer validation layer's wording, with no value echo (captured
+    // 2026-10-09, six of six regions; it echoed '0' at 'topK' in August).
     let err = request_model_error(serde_json::from_value(json!({
         "TableName": "T", "IndexName": "vix",
         "SearchVector": [{"N": "1"}], "TopK": 0
     })));
     assert_eq!(
         err,
-        "1 validation error detected: Value '0' at 'topK' failed to satisfy constraint: \
+        "1 validation error detected: Value at 'TopK' failed to satisfy constraint: \
          Member must have value greater than or equal to 1"
     );
 }
@@ -533,8 +535,9 @@ fn top_k_zero_rejects_at_the_request_model_layer_enveloped() {
 fn unrecognised_return_consumed_capacity_rejects_at_the_request_model_layer() {
     // SearchVectors asks the shared enum helper rather than carrying its own
     // copy, so the wording here is the same one Query, Scan and PutItem give.
+    // The table name has to be valid: a short one is reported first.
     let err = request_model_error(serde_json::from_value(json!({
-        "TableName": "T", "IndexName": "vix",
+        "TableName": "AnyTable", "IndexName": "vix",
         "SearchVector": [{"N": "1"}], "TopK": 1,
         "ReturnConsumedCapacity": "INDEX"
     })));

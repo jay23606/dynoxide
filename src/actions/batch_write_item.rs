@@ -85,43 +85,48 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // Validate each table entry has at least one write request
-    for (table_name, wrs) in &request.request_items {
-        if wrs.is_empty() {
-            return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value at 'requestItems.{table_name}.member' failed to satisfy constraint: Member must have length greater than or equal to 1"
-            )));
-        }
-    }
-
-    // Validate table name format for all tables before checking existence
-    for table_name in request.request_items.keys() {
-        crate::validation::validate_table_name(table_name)?;
-    }
-
-    // Validate total request count.
-    // AWS surfaces this as the standard "1 validation error detected" envelope
-    // and echoes the WriteRequest list inside `Value '{<table>=[<dump>]}'`. The
-    // conformance suite anchors a regex around the envelope and the constraint
-    // phrase but leaves the dump body unconstrained (because the AWS SDK's
-    // Java-toString shape adds new AttributeValue fields over time). We emit
-    // the table name verbatim and a Rust Debug dump of the WriteRequests so
-    // the envelope matches without coupling to a specific SDK version. If a
-    // future suite tightens the regex to pin the dump exactly, this site
-    // will need a follow-up change.
+    // The request's member constraints, reported together before anything is
+    // read or written: a table's request list that is empty or pushes the
+    // request past 25, then ReturnConsumedCapacity and
+    // ReturnItemCollectionMetrics outside their enums (captured us-east-1,
+    // eu-west-2 and ten more regions, 2026-10-08 and 2026-10-09).
+    let mut member_errors = Vec::new();
     let total_requests: usize = request.request_items.values().map(|v| v.len()).sum();
-    if total_requests > 25 {
-        let empty: Vec<WriteRequest> = Vec::new();
-        let (table_name, requests) = request
-            .request_items
-            .iter()
-            .max_by_key(|(_, v)| v.len())
-            .map(|(name, v)| (name.as_str(), v))
-            .unwrap_or(("", &empty));
-        let dump = format!("{requests:?}");
-        return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{{{table_name}=[{dump}]}}' at 'requestItems' failed to satisfy constraint: Map value must satisfy constraint: [Member must have length less than or equal to 25, Member must have length greater than or equal to 1]"
-        )));
+    if total_requests > 25 || request.request_items.values().any(|wrs| wrs.is_empty()) {
+        member_errors.push(format!(
+            "Value '{}' at 'requestItems' failed to satisfy constraint: Map value must satisfy constraint: [Member must have length less than or equal to 25, Member must have length greater than or equal to 1]",
+            request_items_echo(&request.request_items)
+        ));
+    }
+    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ) {
+        member_errors.push(msg);
+    }
+    if let Some(msg) = crate::validation::return_item_collection_metrics_rejection(
+        request.return_item_collection_metrics.as_deref(),
+    ) {
+        member_errors.push(msg);
+    }
+    if let Some(msg) = crate::validation::format_validation_errors(&member_errors) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
+    // A table name that breaks its constraints comes after those, and alone:
+    // it is a constraint on the RequestItems map's keys, reported once for the
+    // map with the map echoed.
+    if !request
+        .request_items
+        .keys()
+        .all(|name| crate::validation::member_table_name_is_valid(name))
+    {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&format!(
+                "Value '{}' at 'requestItems' failed to satisfy constraint: {}",
+                request_items_echo(&request.request_items),
+                crate::validation::REQUEST_ITEMS_KEY_CONSTRAINT
+            )),
+        ));
     }
 
     // --- Pre-table validations ---
@@ -187,6 +192,7 @@ pub async fn execute<S: StorageBackend>(
                 // a 400 ValidationException. Mirrors put_item.rs, which validates
                 // before extracting.
                 let key_item = if let Some(ref put) = wr.put_request {
+                    require_key_attributes(&put.item, &key_schema)?;
                     helpers::validate_item_keys_for_batch(&put.item, &key_schema, &meta)?;
                     &put.item
                 } else if let Some(ref del) = wr.delete_request {
@@ -494,6 +500,136 @@ pub async fn execute<S: StorageBackend>(
         consumed_capacity,
         item_collection_metrics,
     })
+}
+
+/// A put whose item lacks a key attribute is refused with the schema message,
+/// where PutItem names the missing key (captured us-east-1 and eu-west-2,
+/// 2026-10-09).
+fn require_key_attributes(item: &Item, schema: &helpers::KeySchema) -> Result<()> {
+    let missing = !item.contains_key(&schema.partition_key)
+        || schema
+            .sort_key
+            .as_ref()
+            .is_some_and(|sk| !item.contains_key(sk));
+    if missing {
+        return Err(DynoxideError::ValidationException(
+            "The provided key element does not match the schema".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The `RequestItems` map as DynamoDB echoes it in a constraint message: the
+/// request object's Java `toString`, which names every field of every value.
+/// Eleven of twelve regions printed it this way on 2026-10-09; the other, and
+/// eu-west-2 on other days, print each attribute value as an object hash, so no
+/// echo matches every region byte for byte. Tables and attributes are in order
+/// of name, where DynamoDB's own order is its map's.
+fn request_items_echo(request_items: &HashMap<String, Vec<WriteRequest>>) -> String {
+    let mut tables: Vec<(&String, &Vec<WriteRequest>)> = request_items.iter().collect();
+    tables.sort_by(|a, b| a.0.cmp(b.0));
+    let tables: Vec<String> = tables
+        .into_iter()
+        .map(|(table_name, requests)| {
+            let requests: Vec<String> = requests.iter().map(java_write_request).collect();
+            format!("{table_name}=[{}]", requests.join(", "))
+        })
+        .collect();
+    format!("{{{}}}", tables.join(", "))
+}
+
+fn java_write_request(request: &WriteRequest) -> String {
+    let put = match request.put_request {
+        Some(ref put) => format!(
+            "PutRequest(item={}, workloadProfileName=null)",
+            java_item(&put.item)
+        ),
+        None => "null".to_string(),
+    };
+    let delete = match request.delete_request {
+        Some(ref delete) => format!(
+            "DeleteRequest(key={}, workloadProfileName=null)",
+            java_item(&delete.key)
+        ),
+        None => "null".to_string(),
+    };
+    format!("WriteRequest(putRequest={put}, deleteRequest={delete})")
+}
+
+fn java_item(item: &HashMap<String, AttributeValue>) -> String {
+    let mut attributes: Vec<(&String, &AttributeValue)> = item.iter().collect();
+    attributes.sort_by(|a, b| a.0.cmp(b.0));
+    let attributes: Vec<String> = attributes
+        .into_iter()
+        .map(|(name, value)| format!("{name}={}", java_attribute_value(value)))
+        .collect();
+    format!("{{{}}}", attributes.join(", "))
+}
+
+/// One attribute value with all sixteen of the Java model's fields, the one in
+/// use filled in. Only the string form has been captured; the others follow the
+/// same model, with binary shown as Java prints a `ByteBuffer`.
+fn java_attribute_value(value: &AttributeValue) -> String {
+    let byte_buffer = |bytes: &[u8]| {
+        format!(
+            "java.nio.HeapByteBuffer[pos=0 lim={len} cap={len}]",
+            len = bytes.len()
+        )
+    };
+    let mut fields: [(&str, Option<String>); 16] = [
+        ("s", None),
+        ("n", None),
+        ("b", None),
+        ("iNT", None),
+        ("dECIMAL", None),
+        ("dOUBLE", None),
+        ("sS", None),
+        ("nS", None),
+        ("bS", None),
+        ("iNTSET", None),
+        ("dECIMALSET", None),
+        ("dOUBLESET", None),
+        ("m", None),
+        ("l", None),
+        ("nULL", None),
+        ("bOOL", None),
+    ];
+    let (slot, shown) = match value {
+        AttributeValue::S(s) => (0, s.clone()),
+        AttributeValue::N(n) => (1, n.clone()),
+        AttributeValue::B(b) => (2, byte_buffer(b)),
+        AttributeValue::SS(set) => (6, format!("[{}]", set.join(", "))),
+        AttributeValue::NS(set) => (7, format!("[{}]", set.join(", "))),
+        AttributeValue::BS(set) => (
+            8,
+            format!(
+                "[{}]",
+                set.iter()
+                    .map(|b| byte_buffer(b))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
+        AttributeValue::M(map) => (12, java_item(map)),
+        AttributeValue::L(list) => (
+            13,
+            format!(
+                "[{}]",
+                list.iter()
+                    .map(java_attribute_value)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
+        AttributeValue::NULL(null) => (14, null.to_string()),
+        AttributeValue::BOOL(b) => (15, b.to_string()),
+    };
+    fields[slot].1 = Some(shown);
+    let fields: Vec<String> = fields
+        .iter()
+        .map(|(name, shown)| format!("{name}={}", shown.as_deref().unwrap_or("null")))
+        .collect();
+    format!("AttributeValue({})", fields.join(", "))
 }
 
 #[cfg(test)]
