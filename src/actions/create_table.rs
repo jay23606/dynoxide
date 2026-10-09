@@ -736,8 +736,11 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
     collect_pt_errors(&raw.provisioned_throughput, &mut errors);
     collect_ks_errors(&raw.key_schema, &mut errors);
     collect_ad_errors(&raw.attribute_definitions, &mut errors);
-    collect_lsi_errors(&raw.local_secondary_indexes, &mut errors);
+    // The GSIs' member errors come before the LSIs': with a too-short name on
+    // both, DynamoDB lists the GSI's first, whichever order the request gives
+    // them in (captured eu-west-2 and us-east-1, 2026-10-09).
     collect_gsi_errors(&raw.global_secondary_indexes, &mut errors);
+    collect_lsi_errors(&raw.local_secondary_indexes, &mut errors);
     collect_vix_errors(&raw.vector_indexes, &mut errors);
 
     // DynamoDB caps multi-field constraint errors at 10

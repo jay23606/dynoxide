@@ -477,6 +477,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameter, and as an ExpressionAttributeNames value. It used to be stored,
   or ignored. PutItem, UpdateItem and DeleteItem report it inside the
   validation envelope, as DynamoDB does.
+- CreateTable lists a GSI's member errors before an LSI's, so two too-short
+  index names come back in DynamoDB's order.
 
 ## [1.2.1] - 2026-09-20
 

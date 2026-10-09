@@ -412,3 +412,52 @@ fn test_delete_table_protected_returns_exact_aws_message() {
          Disable deletion protection first."
     );
 }
+
+/// With a too-short name on both a GSI and an LSI, DynamoDB lists the GSI's
+/// error first, whichever order the request gives them in and whatever the
+/// names sort to (captured eu-west-2 and us-east-1, 2026-10-09).
+#[test]
+fn test_create_table_lists_gsi_index_name_error_before_lsi() {
+    let short = |name: &str, member: &str| {
+        format!(
+            "Value '{name}' at '{member}.1.member.indexName' failed to satisfy constraint: \
+             Member must have length greater than or equal to 3"
+        )
+    };
+    for (lsi, gsi) in [("l1", "g1"), ("aa", "zz")] {
+        let request = serde_json::json!({
+            "TableName": "IndexNames",
+            "BillingMode": "PAY_PER_REQUEST",
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"}
+            ],
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "LocalSecondaryIndexes": [{
+                "IndexName": lsi,
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lr", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "GlobalSecondaryIndexes": [{
+                "IndexName": gsi,
+                "KeySchema": [{"AttributeName": "gh", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        });
+        let err = serde_json::from_value::<CreateTableRequest>(request)
+            .unwrap_err()
+            .to_string();
+        let expected = format!(
+            "2 validation errors detected: {}; {}",
+            short(gsi, "globalSecondaryIndexes"),
+            short(lsi, "localSecondaryIndexes")
+        );
+        assert!(err.contains(&expected), "got: {err}");
+    }
+}
