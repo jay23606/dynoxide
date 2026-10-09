@@ -105,11 +105,48 @@ pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
         return DeepBody::Run(rewritten);
     }
     if let Err(e) = check_members(operation, &rewritten) {
+        let e = older_return_values_wording(operation, &rewritten, e);
         return DeepBody::Refuse(crate::validation::resolve_request_validation_tag(
             operation, e,
         ));
     }
     DeepBody::Refuse(DynoxideError::ValidationException(refusal(first, body)))
+}
+
+/// A body too deep to decode is checked by DynamoDB's older validation layer,
+/// which names the value and the member when it refuses a `ReturnValues`,
+/// where a shallow request now gets the generic form. Captured on PutItem and
+/// UpdateItem with a value nested 100 levels, eu-west-2 and us-east-1,
+/// 2026-10-09.
+fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) -> DynoxideError {
+    if !matches!(operation, "PutItem" | "UpdateItem") {
+        return err;
+    }
+    let generic = crate::validation::RETURN_VALUES_REJECTION;
+    let reword = |message: String| {
+        if !message.contains(generic) {
+            return message;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|request| request.get("ReturnValues")?.as_str().map(str::to_string));
+        match value {
+            Some(value) => message.replace(
+                generic,
+                &crate::validation::return_values_value_rejection(&value),
+            ),
+            None => message,
+        }
+    };
+    match err {
+        DynoxideError::ValidationException(message) => {
+            DynoxideError::ValidationException(reword(message))
+        }
+        DynoxideError::EnvelopedValidation(message) => {
+            DynoxideError::EnvelopedValidation(reword(message))
+        }
+        other => other,
+    }
 }
 
 /// A value wrapped in one more map than DynamoDB accepts in a PartiQL
