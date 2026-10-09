@@ -496,6 +496,18 @@ pub fn count_items(table_name: &str) -> (String, Vec<SqlParam<'static>>) {
     )
 }
 
+/// Count all items in a data table and total their stored `item_size`, in one
+/// pass. Returns two integer columns: the count, then the byte total.
+pub fn item_count_and_size(table_name: &str) -> (String, Vec<SqlParam<'static>>) {
+    (
+        format!(
+            "SELECT COUNT(*), COALESCE(SUM(item_size), 0) FROM \"{}\"",
+            escape_table_name(table_name)
+        ),
+        Vec::new(),
+    )
+}
+
 // --- Secondary index tables (GSI/LSI) -----------------------------------
 
 /// Create a GSI table plus its base-key index (a two-statement batch).
@@ -788,6 +800,81 @@ pub fn drop_vector_table(table_name: &str, index_name: &str) -> (String, Vec<Sql
     let vix = format!("{table_name}::vector::{index_name}");
     (
         format!("DROP TABLE IF EXISTS \"{}\"", escape_table_name(&vix)),
+        Vec::new(),
+    )
+}
+
+/// Count a GSI's entries and total their sizes, for a GSI that projects ALL.
+/// Each entry is then the whole base item, whose DynamoDB size the base row
+/// already stores, so this joins to the base table rather than reading every
+/// entry's JSON. Returns two integer columns: the count, then the byte total.
+pub fn gsi_count_and_size_from_base(
+    table_name: &str,
+    index_name: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    index_count_and_size_from_base(
+        table_name,
+        &format!("{table_name}::gsi::{index_name}"),
+        "table_pk",
+        "table_sk",
+    )
+}
+
+/// [`gsi_count_and_size_from_base`] for an LSI that projects ALL.
+pub fn lsi_count_and_size_from_base(
+    table_name: &str,
+    index_name: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    index_count_and_size_from_base(
+        table_name,
+        &format!("{table_name}::lsi::{index_name}"),
+        "base_pk",
+        "base_sk",
+    )
+}
+
+fn index_count_and_size_from_base(
+    table_name: &str,
+    index_table: &str,
+    base_pk_col: &str,
+    base_sk_col: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    (
+        format!(
+            "SELECT COUNT(*), COALESCE(SUM(b.item_size), 0) FROM \"{}\" i \
+             JOIN \"{}\" b ON b.pk = i.{base_pk_col} AND b.sk = i.{base_sk_col}",
+            escape_table_name(index_table),
+            escape_table_name(table_name)
+        ),
+        Vec::new(),
+    )
+}
+
+/// The projected item JSON of every entry in a GSI, for sizing an index whose
+/// entries are not whole items.
+pub fn gsi_entries_item_json(
+    table_name: &str,
+    index_name: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    (
+        format!(
+            "SELECT item_json FROM \"{}\"",
+            escape_table_name(&format!("{table_name}::gsi::{index_name}"))
+        ),
+        Vec::new(),
+    )
+}
+
+/// [`gsi_entries_item_json`] for an LSI.
+pub fn lsi_entries_item_json(
+    table_name: &str,
+    index_name: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    (
+        format!(
+            "SELECT item_json FROM \"{}\"",
+            escape_table_name(&format!("{table_name}::lsi::{index_name}"))
+        ),
         Vec::new(),
     )
 }

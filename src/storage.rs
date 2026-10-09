@@ -1511,6 +1511,78 @@ impl Storage {
         Ok(count)
     }
 
+    /// Count items in a table and total their stored sizes, in one query.
+    pub fn item_count_and_size(&self, table_name: &str) -> Result<(i64, i64)> {
+        let (sql, params) = sql_builders::item_count_and_size(table_name);
+        let stats: (i64, i64) =
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+        Ok(stats)
+    }
+
+    /// Count a GSI's entries and total their projected sizes. See
+    /// [`StorageBackend::gsi_item_count_and_size`].
+    pub fn gsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64)> {
+        if whole_items {
+            self.count_and_size(sql_builders::gsi_count_and_size_from_base(
+                table_name, index_name,
+            ))
+        } else {
+            self.count_and_size_entries(sql_builders::gsi_entries_item_json(table_name, index_name))
+        }
+    }
+
+    /// Count an LSI's entries and total their projected sizes. See
+    /// [`StorageBackend::lsi_item_count_and_size`].
+    pub fn lsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64)> {
+        if whole_items {
+            self.count_and_size(sql_builders::lsi_count_and_size_from_base(
+                table_name, index_name,
+            ))
+        } else {
+            self.count_and_size_entries(sql_builders::lsi_entries_item_json(table_name, index_name))
+        }
+    }
+
+    fn count_and_size(
+        &self,
+        (sql, params): (String, Vec<sql_builders::SqlParam<'static>>),
+    ) -> Result<(i64, i64)> {
+        Ok(self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?)
+    }
+
+    fn count_and_size_entries(
+        &self,
+        (sql, params): (String, Vec<sql_builders::SqlParam<'static>>),
+    ) -> Result<(i64, i64)> {
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+        let (mut count, mut bytes) = (0i64, 0i64);
+        while let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            count += 1;
+            bytes += crate::storage_backend::projected_entry_size(&json)
+                .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+        }
+        Ok((count, bytes))
+    }
+
     // -----------------------------------------------------------------------
     // Introspection
     // -----------------------------------------------------------------------

@@ -272,6 +272,37 @@ impl WasmBridgeBackend {
         Ok(rows.unchecked_into())
     }
 
+    /// Read a `(count, bytes)` pair from a two-column statement.
+    async fn count_and_size(
+        &self,
+        sql: &str,
+        params: Vec<SqlParam<'_>>,
+    ) -> Result<(i64, i64), BackendError> {
+        let rows = self.query(sql, params).await?;
+        if rows.length() == 0 {
+            return Ok((0, 0));
+        }
+        let row: js_sys::Array = rows.get(0).unchecked_into();
+        Ok((col_i64(&row, 0), col_i64(&row, 1)))
+    }
+
+    /// Count the rows of an `item_json` statement and total each entry's
+    /// projected size.
+    async fn count_and_size_entries(
+        &self,
+        sql: &str,
+        params: Vec<SqlParam<'_>>,
+    ) -> Result<(i64, i64), BackendError> {
+        let rows = self.query(sql, params).await?;
+        let mut bytes = 0i64;
+        for i in 0..rows.length() {
+            let row: js_sys::Array = rows.get(i).unchecked_into();
+            let json = col_text(&row, 0).unwrap_or_default();
+            bytes += super::projected_entry_size(&json)?;
+        }
+        Ok((rows.length() as i64, bytes))
+    }
+
     /// Shared put path: capture the prior value, then insert-or-replace.
     async fn put(
         &self,
@@ -1119,6 +1150,46 @@ impl StorageBackend for WasmBridgeBackend {
         }
         let row: js_sys::Array = rows.get(0).unchecked_into();
         Ok(col_i64(&row, 0))
+    }
+
+    async fn item_count_and_size(&self, table_name: &str) -> Result<(i64, i64), BackendError> {
+        let (sql, params) = sql_builders::item_count_and_size(table_name);
+        let rows = self.query(&sql, params).await?;
+        if rows.length() == 0 {
+            return Ok((0, 0));
+        }
+        let row: js_sys::Array = rows.get(0).unchecked_into();
+        Ok((col_i64(&row, 0), col_i64(&row, 1)))
+    }
+
+    async fn gsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError> {
+        if whole_items {
+            let (sql, params) = sql_builders::gsi_count_and_size_from_base(table_name, index_name);
+            self.count_and_size(&sql, params).await
+        } else {
+            let (sql, params) = sql_builders::gsi_entries_item_json(table_name, index_name);
+            self.count_and_size_entries(&sql, params).await
+        }
+    }
+
+    async fn lsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError> {
+        if whole_items {
+            let (sql, params) = sql_builders::lsi_count_and_size_from_base(table_name, index_name);
+            self.count_and_size(&sql, params).await
+        } else {
+            let (sql, params) = sql_builders::lsi_entries_item_json(table_name, index_name);
+            self.count_and_size_entries(&sql, params).await
+        }
     }
 
     // --- Introspection ---------------------------------------------------

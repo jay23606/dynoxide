@@ -451,6 +451,30 @@ impl StorageBackend for Storage {
         Storage::count_items(self, table_name).map_err(dyno_to_backend)
     }
 
+    async fn item_count_and_size(&self, table_name: &str) -> Result<(i64, i64), BackendError> {
+        Storage::item_count_and_size(self, table_name).map_err(dyno_to_backend)
+    }
+
+    async fn gsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError> {
+        Storage::gsi_item_count_and_size(self, table_name, index_name, whole_items)
+            .map_err(dyno_to_backend)
+    }
+
+    async fn lsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError> {
+        Storage::lsi_item_count_and_size(self, table_name, index_name, whole_items)
+            .map_err(dyno_to_backend)
+    }
+
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {
         Storage::db_size_bytes(self).map_err(dyno_to_backend)
     }

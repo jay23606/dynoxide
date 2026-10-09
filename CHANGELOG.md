@@ -125,6 +125,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A list index written with a leading zero, such as `l[00]` or `l[01]`, is a
   syntax error in every expression (`token: "0", near: "00]"`), as DynamoDB
   reads it. It used to be accepted as the index its digits spell.
+- `DescribeTable` reports `TableSizeBytes` as the total size of the table's
+  items, where it was always 0, so the MCP server's `size_bytes` is right too.
+  `UpdateTable`'s response carries the same `ItemCount` and `TableSizeBytes`,
+  where both were 0. DynamoDB refreshes these figures about every six hours;
+  Dynoxide reports them live.
+- `DescribeTable` and `UpdateTable` report each GSI's and LSI's `ItemCount` and
+  `IndexSizeBytes`: the number of items the index holds and the total size of
+  what it projects for them, where both were always 0. Vector indexes still
+  report 0.
 
 ## [1.2.1] - 2026-09-20
 
