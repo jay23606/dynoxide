@@ -328,7 +328,10 @@ async fn execute_inner<S: StorageBackend>(
         let ctx = helpers::ExpressionParamContext {
             non_expression_params: non_expr,
             expression_params: expr_params,
-            all_expression_param_names: vec!["UpdateExpression", "ConditionExpression"],
+            // DynamoDB names no expression after its "can only be specified
+            // when using expressions" message on the single-item writes
+            // (eu-west-2 and us-east-1, 2026-10-09).
+            all_expression_param_names: vec![],
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
@@ -419,20 +422,18 @@ async fn execute_inner<S: StorageBackend>(
     // no UpdateExpression, conversion does not, so that guard stays on the
     // validation rather than moving up here.
     let expected: Option<HashMap<String, helpers::ExpectedCondition>> =
-        if request.condition_expression.is_none() {
-            request
-                .expected
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-        } else {
-            None
+        match request.expected.as_ref() {
+            Some(v) if request.condition_expression.is_none() => helpers::read_expected(v)?,
+            _ => None,
         };
 
-    // Validate legacy Expected parameter
+    // Validate legacy Expected parameter. Every family comes back in the
+    // envelope (eu-west-2 and us-east-1, 2026-10-09).
     if request.update_expression.is_none()
         && let Some(ref expected) = expected
     {
-        helpers::validate_expected_conditions(expected)?;
+        helpers::validate_expected_conditions(expected)
+            .map_err(crate::validation::tag_for_envelope)?;
     }
 
     // Validate empty UpdateExpression
@@ -444,11 +445,12 @@ async fn execute_inner<S: StorageBackend>(
         ));
     }
 
-    // Validate empty ConditionExpression
+    // Validate empty ConditionExpression, inside the envelope (eu-west-2 and
+    // us-east-1, 2026-10-09).
     if let Some(ref ce) = request.condition_expression
         && ce.is_empty()
     {
-        return Err(DynoxideError::ValidationException(
+        return Err(DynoxideError::EnvelopedValidation(
             "Invalid ConditionExpression: The expression can not be empty;".to_string(),
         ));
     }

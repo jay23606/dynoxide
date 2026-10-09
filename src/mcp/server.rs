@@ -1709,7 +1709,7 @@ impl McpServer {
         let key = match parse_dynamo_map(
             params.key,
             "key",
-            crate::validation::strip_request_validation_tag,
+            crate::validation::envelope_request_validation,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -1717,7 +1717,7 @@ impl McpServer {
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
-            crate::validation::strip_request_validation_tag,
+            crate::validation::envelope_request_validation,
         ) {
             Ok(v) => v,
             Err(err) => return Ok(err),

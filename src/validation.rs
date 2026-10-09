@@ -504,24 +504,25 @@ pub(crate) fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError 
 }
 
 /// Resolve the wire-invisible `EnvelopedValidation` tag for a named operation:
-/// PutItem and UpdateItem wrap the request-validation family in the
+/// PutItem, UpdateItem and DeleteItem wrap the request-validation family in the
 /// `1 validation error detected: ` envelope, every other operation reports it
 /// bare. Either way the tag never reaches the wire. Enveloping is idempotent
 /// for untagged errors, so applying this to an already-enveloped action error
 /// is safe.
 ///
 /// Owner of the operation split for the HTTP and wasm dispatch seams, which
-/// both route through here. The same PutItem/UpdateItem membership is encoded
-/// at the action boundaries (`put_item::execute` / `update_item::execute`
-/// apply the envelope for the in-process API) and in the MCP tools' choice of
-/// resolver, so a future enveloped operation must update all three places.
+/// both route through here. The same PutItem/UpdateItem/DeleteItem membership
+/// is encoded at the action boundaries (`put_item::execute`,
+/// `update_item::execute` and `delete_item::execute` apply the envelope for the
+/// in-process API) and in the MCP tools' choice of resolver, so a future
+/// enveloped operation must update all three places.
 ///
 /// Compiled only for the dispatch seams that consume it: the HTTP server, the
 /// wasm engine API, and the unit tests.
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 pub(crate) fn resolve_request_validation_tag(operation: &str, err: DynoxideError) -> DynoxideError {
     match operation {
-        "PutItem" | "UpdateItem" => envelope_request_validation(err),
+        "PutItem" | "UpdateItem" | "DeleteItem" => envelope_request_validation(err),
         _ => strip_request_validation_tag(err),
     }
 }

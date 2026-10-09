@@ -668,11 +668,12 @@ pub struct ExpressionParamContext<'a> {
 /// and successfully parsed, so the caller can store it on the request.
 ///
 /// The error is classified: the families DynamoDB wraps in the
-/// request-validation envelope on PutItem and UpdateItem (mixing expression
-/// and non-expression parameters, ExpressionAttributeValues without an
-/// expression, and empty or duplicate sets inside ExpressionAttributeValues)
-/// are marked as enveloped. Callers other than those two operations propagate
-/// with `?`, which converts back to the plain error unchanged.
+/// request-validation envelope on PutItem, UpdateItem and DeleteItem (mixing
+/// expression and non-expression parameters, ExpressionAttributeValues or
+/// ExpressionAttributeNames without an expression, either map empty, and empty
+/// or duplicate sets inside ExpressionAttributeValues) are marked as
+/// enveloped. Callers other than those three operations propagate with `?`,
+/// which converts back to the plain error unchanged.
 pub fn validate_expression_params(
     ctx: &ExpressionParamContext<'_>,
 ) -> std::result::Result<Option<HashMap<String, AttributeValue>>, ClassifiedValidationError> {
@@ -695,7 +696,7 @@ pub fn validate_expression_params(
 
     // ExpressionAttributeNames without any expression
     if has_names && !has_expressions {
-        return Err(ClassifiedValidationError::bare(
+        return Err(ClassifiedValidationError::enveloped(
             "ExpressionAttributeNames can only be specified when using expressions",
         ));
     }
@@ -720,7 +721,7 @@ pub fn validate_expression_params(
     // Empty ExpressionAttributeNames
     if let Some(names) = ctx.expression_attribute_names {
         if names.is_empty() {
-            return Err(ClassifiedValidationError::bare(
+            return Err(ClassifiedValidationError::enveloped(
                 "ExpressionAttributeNames must not be empty",
             ));
         }
@@ -738,7 +739,7 @@ pub fn validate_expression_params(
     if let Some(raw_val) = ctx.expression_attribute_values_raw {
         if let Some(obj) = raw_val.as_object() {
             if obj.is_empty() {
-                return Err(ClassifiedValidationError::bare(
+                return Err(ClassifiedValidationError::enveloped(
                     "ExpressionAttributeValues must not be empty",
                 ));
             }
@@ -751,7 +752,12 @@ pub fn validate_expression_params(
                 }
             }
             // Parse and validate values with key context
-            let parsed = parse_expression_attribute_values_raw(raw_val)?;
+            let parsed = parse_expression_attribute_values_raw(raw_val).map_err(|e| match e {
+                DynoxideError::EnvelopedValidation(msg) => {
+                    ClassifiedValidationError::enveloped(msg)
+                }
+                other => other.into(),
+            })?;
             // Validate parsed values (NULL:false, empty sets, duplicates, numbers)
             for (key, value) in &parsed {
                 validate_expression_attribute_value(key, value)?;
@@ -761,7 +767,7 @@ pub fn validate_expression_params(
     } else if let Some(values) = ctx.expression_attribute_values {
         // Pre-parsed EAV (e.g. from MCP/library usage)
         if values.is_empty() {
-            return Err(ClassifiedValidationError::bare(
+            return Err(ClassifiedValidationError::enveloped(
                 "ExpressionAttributeValues must not be empty",
             ));
         }
@@ -1006,8 +1012,11 @@ pub fn parse_expression_attribute_values_raw(
                     // value" wrapper it uses for empty or malformed values, so surface
                     // the cleaned inner message directly rather than leaking a
                     // SerializationException with the raw prefix. Confirmed against
-                    // real DynamoDB (eu-west-2).
-                    return Err(DynoxideError::ValidationException(inner.to_string()));
+                    // real DynamoDB (eu-west-2). It is the request-validation
+                    // family DeleteItem wraps in the envelope (eu-west-2 and
+                    // us-east-1, 2026-10-09), so it is tagged; a read that
+                    // reports it bare strips the tag.
+                    return Err(DynoxideError::EnvelopedValidation(inner.to_string()));
                 } else {
                     return Err(DynoxideError::SerializationException(msg));
                 }
@@ -1015,6 +1024,33 @@ pub fn parse_expression_attribute_values_raw(
         }
     }
     Ok(result)
+}
+
+/// Read the legacy `Expected` map of PutItem, UpdateItem or DeleteItem.
+///
+/// A value in it that DynamoDB refuses (`{"NULL": false}`, a number it can't
+/// read or store) is refused here, tagged for the request-validation envelope,
+/// as DynamoDB refuses it (eu-west-2 and us-east-1, 2026-10-09). A map whose
+/// shape doesn't read as conditions yields `None`; the request-model checks
+/// report those.
+pub(crate) fn read_expected(
+    expected: &serde_json::Value,
+) -> Result<Option<HashMap<String, ExpectedCondition>>> {
+    match serde_json::from_value::<HashMap<String, ExpectedCondition>>(expected.clone()) {
+        Ok(map) => Ok(Some(map)),
+        Err(e) => {
+            let msg = e.to_string();
+            let marked = msg.starts_with(crate::serde_errors::REQUEST_VALIDATION_MARKER)
+                || msg.starts_with(crate::serde_errors::VALIDATION_MARKER);
+            if marked {
+                Err(DynoxideError::EnvelopedValidation(
+                    crate::serde_errors::clean_serde_message(&msg).to_string(),
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Validate that AttributesToGet has no duplicate values.

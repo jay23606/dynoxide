@@ -2376,10 +2376,12 @@ fn test_put_eav_without_expression_enveloped() {
         })
         .unwrap_err();
 
+    // No expression is named after the message (eu-west-2 and us-east-1,
+    // 2026-10-09).
     assert_eq!(
         err.to_string(),
         "1 validation error detected: ExpressionAttributeValues can only be specified when \
-         using expressions: ConditionExpression is null"
+         using expressions"
     );
 }
 
@@ -2407,9 +2409,9 @@ fn test_put_mixing_expected_and_condition_expression_enveloped() {
 }
 
 #[test]
-fn test_put_ean_without_expression_stays_bare() {
-    // ExpressionAttributeNames misuse is not a captured enveloped family and
-    // keeps the bare message.
+fn test_put_ean_without_expression_enveloped() {
+    // ExpressionAttributeNames without an expression comes back in the
+    // envelope (eu-west-2 and us-east-1, 2026-10-09).
     let db = make_db();
     create_table(&db, "Tbl");
 
@@ -2426,7 +2428,8 @@ fn test_put_ean_without_expression_stays_bare() {
 
     assert_eq!(
         err.to_string(),
-        "ExpressionAttributeNames can only be specified when using expressions"
+        "1 validation error detected: ExpressionAttributeNames can only be specified when \
+         using expressions"
     );
 }
 
@@ -2562,10 +2565,12 @@ fn test_update_eav_without_expression_enveloped() {
         })
         .unwrap_err();
 
+    // No expression is named after the message (eu-west-2 and us-east-1,
+    // 2026-10-09).
     assert_eq!(
         err.to_string(),
         "1 validation error detected: ExpressionAttributeValues can only be specified when \
-         using expressions: UpdateExpression is null and ConditionExpression is null"
+         using expressions"
     );
 }
 

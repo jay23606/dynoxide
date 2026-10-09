@@ -133,10 +133,14 @@ fn test_delete_item_invalid_return_values() {
         ..Default::default()
     });
 
+    // DeleteItem honours only ALL_OLD and NONE, and says so in the envelope
+    // (eu-west-2 and us-east-1, 2026-10-09).
     match result {
         Err(DynoxideError::ValidationException(msg)) => {
-            assert!(msg.contains("returnValues"));
-            assert!(msg.contains("ALL_OLD, NONE"));
+            assert_eq!(
+                msg,
+                "1 validation error detected: ReturnValues can only be ALL_OLD or NONE"
+            );
         }
         other => panic!("Expected ValidationException, got: {other:?}"),
     }

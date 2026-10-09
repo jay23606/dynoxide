@@ -484,6 +484,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ItemCollectionMetrics` reports `SizeEstimateRangeGB` as DynamoDB does: a
   lower and an upper bound in whole gigabytes, so a small item collection
   reads `[0.0, 1.0]`. It used to give the collection's exact size twice.
+- PutItem, UpdateItem and DeleteItem report more of their request-validation
+  errors inside the `1 validation error detected: ` envelope, as DynamoDB does:
+  `ExpressionAttributeNames` or `ExpressionAttributeValues` without an
+  expression, either map empty, an empty `ConditionExpression`, and every
+  malformed legacy `Expected` condition. The values message no longer names
+  the missing expressions after it. DeleteItem now envelopes the same families
+  PutItem does, including `{"NULL": false}` wherever it sits, and refuses a
+  `ReturnValues` other than `ALL_OLD` or `NONE` with DynamoDB's
+  `ReturnValues can only be ALL_OLD or NONE`, before the table is looked up.
+- A legacy `Expected` value DynamoDB refuses, such as `{"NULL": false}` or a
+  number it can't store, is refused on PutItem, UpdateItem and DeleteItem.
+  The condition used to be dropped and the write went ahead.
 
 ## [1.2.1] - 2026-09-20
 

@@ -147,6 +147,18 @@ pub struct DeleteItemResponse {
 
 pub async fn execute<S: StorageBackend>(
     storage: &S,
+    request: DeleteItemRequest,
+) -> Result<DeleteItemResponse> {
+    // Apply the request-validation envelope exactly once at the operation
+    // boundary, as PutItem and UpdateItem do, so every early return inside is
+    // covered and the tagged variant never escapes.
+    execute_inner(storage, request)
+        .await
+        .map_err(crate::validation::envelope_request_validation)
+}
+
+async fn execute_inner<S: StorageBackend>(
+    storage: &S,
     mut request: DeleteItemRequest,
 ) -> Result<DeleteItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
@@ -180,28 +192,22 @@ pub async fn execute<S: StorageBackend>(
         let ctx = helpers::ExpressionParamContext {
             non_expression_params: non_expr,
             expression_params: expr_params,
-            all_expression_param_names: vec!["ConditionExpression"],
+            // DynamoDB names no expression after its "can only be specified
+            // when using expressions" message on the single-item writes
+            // (eu-west-2 and us-east-1, 2026-10-09).
+            all_expression_param_names: vec![],
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &request.expression_attribute_values_raw,
         };
-        // DeleteItem wraps two request-validation families in the envelope, as
-        // PutItem and UpdateItem do: the nesting rejection (us-east-1 and
-        // eu-west-2, 2026-10-09) and mixing expression and non-expression
-        // parameters (2026-10-09, five of seven regions). The other families
-        // keep their bare form, which is all that was captured here.
-        match helpers::validate_expression_params(&ctx) {
-            Ok(Some(parsed_eav)) => request.expression_attribute_values = Some(parsed_eav),
-            Ok(None) => {}
-            Err(crate::validation::ClassifiedValidationError::Enveloped(msg))
-                if msg == crate::validation::NESTING_LIMIT_MESSAGE
-                    || msg.starts_with("Can not use both expression and non-expression") =>
-            {
-                return Err(DynoxideError::ValidationException(
-                    crate::validation::envelope_message(&msg),
-                ));
-            }
-            Err(e) => return Err(e.into()),
+        // DeleteItem wraps the request-validation families in the envelope, as
+        // PutItem and UpdateItem do: the nesting rejection, mixing expression
+        // and non-expression parameters, either map without an expression and
+        // either map empty (us-east-1 and eu-west-2, 2026-10-09).
+        if let Some(parsed_eav) = helpers::validate_expression_params(&ctx)
+            .map_err(crate::validation::ClassifiedValidationError::into_tagged)?
+        {
+            request.expression_attribute_values = Some(parsed_eav);
         }
     }
 
@@ -225,11 +231,12 @@ pub async fn execute<S: StorageBackend>(
 
     crate::validation::validate_key_attribute_values(&request.key)?;
 
-    // Validate empty ConditionExpression
+    // Validate empty ConditionExpression, inside the envelope and before the
+    // table lookup (eu-west-2 and us-east-1, 2026-10-09).
     if let Some(ref ce) = request.condition_expression
         && ce.is_empty()
     {
-        return Err(DynoxideError::ValidationException(
+        return Err(DynoxideError::EnvelopedValidation(
             "Invalid ConditionExpression: The expression can not be empty;".to_string(),
         ));
     }
@@ -283,13 +290,15 @@ pub async fn execute<S: StorageBackend>(
     // Validate the legacy Expected parameter BEFORE checking table existence,
     // then convert it to a ConditionExpression. Both steps read the same map,
     // so it is deserialised once rather than once per step.
-    if request.condition_expression.is_none()
-        && let Some(ref expected_val) = request.expected
-        && let Ok(expected) = serde_json::from_value::<HashMap<String, helpers::ExpectedCondition>>(
-            expected_val.clone(),
-        )
-    {
-        helpers::validate_expected_conditions(&expected)?;
+    let expected = match request.expected.as_ref() {
+        Some(v) if request.condition_expression.is_none() => helpers::read_expected(v)?,
+        _ => None,
+    };
+    if let Some(expected) = expected {
+        // Every family comes back in the envelope, before the table lookup
+        // (eu-west-2 and us-east-1, 2026-10-09).
+        helpers::validate_expected_conditions(&expected)
+            .map_err(crate::validation::tag_for_envelope)?;
 
         if !expected.is_empty() {
             let (cond_expr, values) = helpers::convert_expected_to_condition(
@@ -311,19 +320,21 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
-    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
-    let key_schema = helpers::parse_key_schema(&meta)?;
-
-    // Validate ReturnValues parameter (DeleteItem only supports NONE and ALL_OLD)
+    // DeleteItem honours only NONE and ALL_OLD. Another value the enum allows
+    // is refused in the envelope, before the table is looked up, as PutItem
+    // refuses it (eu-west-2 and us-east-1, 2026-10-09, for ALL_NEW,
+    // UPDATED_NEW and UPDATED_OLD, and for ALL_NEW on a missing table).
     if let Some(ref rv) = request.return_values {
         let rv_upper = rv.to_uppercase();
         if rv_upper != "NONE" && rv_upper != "ALL_OLD" {
-            return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value '{rv}' at 'returnValues' failed to satisfy constraint: \
-                 Member must satisfy enum value set: [ALL_OLD, NONE]"
-            )));
+            return Err(DynoxideError::EnvelopedValidation(
+                "ReturnValues can only be ALL_OLD or NONE".to_string(),
+            ));
         }
     }
+
+    let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
+    let key_schema = helpers::parse_key_schema(&meta)?;
 
     // Validate key
     helpers::validate_key_only(&request.key, &key_schema)?;

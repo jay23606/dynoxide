@@ -934,7 +934,7 @@ async fn test_put_item_eav_without_expression_enveloped() {
     assert_validation_error(
         resp,
         "1 validation error detected: ExpressionAttributeValues can only be specified \
-         when using expressions: ConditionExpression is null",
+         when using expressions",
     )
     .await;
 }
