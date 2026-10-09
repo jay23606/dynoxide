@@ -1138,3 +1138,35 @@ async fn partiql_refuses_a_parameter_holding_an_empty_name() {
         .collect();
     assert_eq!(pks.len(), 2, "only a and b2 exist: {pks:?}");
 }
+
+// A Scan's ConditionalOperator outside its enum is a member check, reported
+// ahead of an empty attribute name. The wire path checks it as the request is
+// read; a request an embedded caller builds skips that, so `scan` checks it
+// before the empty name too.
+#[test]
+fn an_embedded_scan_reports_a_bad_conditional_operator_ahead_of_an_empty_name() {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(json!({
+            "TableName": "Things",
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let err = db
+        .scan(dynoxide::actions::scan::ScanRequest {
+            table_name: "Things".to_string(),
+            attributes_to_get: Some(vec![String::new()]),
+            conditional_operator: Some("XOR".to_string()),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "1 validation error detected: Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]"
+    );
+}

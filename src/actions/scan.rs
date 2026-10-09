@@ -210,6 +210,18 @@ pub async fn execute<S: StorageBackend>(
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_scan_table_name(&request.table_name)?;
 
+    // ConditionalOperator outside its enum is a member check, reported ahead of
+    // the value checks. The wire path refuses it as the request is read; this
+    // covers a request an embedded caller builds (captured 2026-10-09, six of
+    // seven regions).
+    if let Some(msg) =
+        crate::validation::conditional_operator_rejection(request.conditional_operator.as_deref())
+    {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        ));
+    }
+
     // An empty attribute name is refused ahead of the table lookup and the
     // expressions (captured in ten regions). AttributesToGet and a ScanFilter
     // value answer bare; the ExclusiveStartKey and the expression values name
@@ -285,13 +297,6 @@ pub async fn execute<S: StorageBackend>(
     // ---- ConditionalOperator only joins legacy ScanFilter conditions, so a
     // valid one is refused without two of them; Scan reports it without the
     // envelope (captured 2026-10-09, all seven regions). ----
-    if let Some(msg) =
-        crate::validation::conditional_operator_rejection(request.conditional_operator.as_deref())
-    {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&msg),
-        ));
-    }
     if let Some(msg) = crate::validation::conditional_operator_misuse(
         request.conditional_operator.as_deref(),
         crate::validation::legacy_condition_count(request.scan_filter.as_ref()),
