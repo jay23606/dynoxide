@@ -165,7 +165,18 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &request.expression_attribute_values_raw,
         };
-        if let Some(parsed_eav) = helpers::validate_expression_params(&ctx)? {
+        // DeleteItem wraps the nesting rejection in the envelope, like PutItem
+        // and UpdateItem (us-east-1 and eu-west-2, 2026-10-09). The other
+        // families keep their bare form, which is all that was captured here.
+        let parsed = helpers::validate_expression_params(&ctx).map_err(|e| match e {
+            crate::validation::ClassifiedValidationError::Enveloped(msg)
+                if msg == crate::validation::NESTING_LIMIT_MESSAGE =>
+            {
+                DynoxideError::ValidationException(crate::validation::envelope_message(&msg))
+            }
+            other => other.into(),
+        })?;
+        if let Some(parsed_eav) = parsed {
             request.expression_attribute_values = Some(parsed_eav);
         }
     }
@@ -182,23 +193,49 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.) before table lookup
+    // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.)
+    // before table lookup. Every error here comes back in the request-validation
+    // envelope, as on PutItem and UpdateItem: syntax, size, redundant
+    // parentheses, reserved words, BETWEEN bounds, operand types, undefined and
+    // unused names and values (us-east-1 and eu-west-2, 2026-10-09).
     if let Some(ref ce) = request.condition_expression {
         let parsed = crate::expressions::condition::parse(ce).map_err(|e| {
-            DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+            DynoxideError::ValidationException(crate::validation::envelope_message(&format!(
+                "Invalid ConditionExpression: {e}"
+            )))
         })?;
         crate::expressions::condition::validate_static(
             &parsed,
             &request.expression_attribute_values,
         )
-        .map_err(DynoxideError::ValidationException)?;
+        .map_err(|e| DynoxideError::ValidationException(crate::validation::envelope_message(&e)))?;
         crate::expressions::condition::validate_operand_semantics(
             &parsed,
             &request.expression_attribute_names,
             &request.expression_attribute_values,
         )
         .map_err(|e| {
-            DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+            DynoxideError::ValidationException(crate::validation::envelope_message(&format!(
+                "Invalid ConditionExpression: {e}"
+            )))
+        })?;
+
+        // The condition's names and values, from the request alone: one it
+        // names but the request doesn't define, then any it doesn't use.
+        let tracker = crate::expressions::TrackedExpressionAttributes::new(
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+        );
+        crate::expressions::condition::track_references(&parsed, &tracker).map_err(|e| {
+            DynoxideError::ValidationException(crate::validation::envelope_message(&format!(
+                "Invalid ConditionExpression: {e}"
+            )))
+        })?;
+        tracker.check_unused().map_err(|e| match e {
+            DynoxideError::ValidationException(msg) => {
+                DynoxideError::ValidationException(crate::validation::envelope_message(&msg))
+            }
+            other => other,
         })?;
     }
 

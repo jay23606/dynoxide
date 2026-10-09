@@ -786,8 +786,22 @@ fn validate_expression_attribute_value(
     value: &AttributeValue,
 ) -> std::result::Result<(), ClassifiedValidationError> {
     // Over-deep expression values are rejected up front, before evaluation, with the
-    // bare nesting message real DynamoDB uses (no "contains invalid value" wrapper).
-    crate::validation::validate_nesting_depth(value)?;
+    // nesting message real DynamoDB uses (no "contains invalid value" wrapper).
+    // PutItem, UpdateItem and DeleteItem wrap it in the envelope (us-east-1 and
+    // eu-west-2, 2026-10-09); the reads send it bare.
+    // From 63 levels a second check refuses the value naming its key, bare
+    // (us-east-1 and eu-west-2, 2026-10-09).
+    if crate::validation::validate_nesting_depth(value).is_err() {
+        if crate::validation::nesting_depth(value) > crate::validation::SECOND_NESTING_LIMIT {
+            return Err(ClassifiedValidationError::bare(format!(
+                "ExpressionAttributeValues contains invalid value: {} for key {key}",
+                crate::validation::NESTING_LIMIT_MESSAGE
+            )));
+        }
+        return Err(ClassifiedValidationError::enveloped(
+            crate::validation::NESTING_LIMIT_MESSAGE,
+        ));
+    }
     // Check for empty/unsupported datatypes
     match value {
         // Unreachable from PutItem and UpdateItem, whose execute paths reject

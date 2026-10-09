@@ -26,7 +26,23 @@ pub(crate) const MAX_EXPRESSION_BYTES: usize = 4096;
 /// whitespace is not normalised before counting. Called at each expression
 /// parser's entry so every surface (Update/Condition/Filter/KeyCondition/
 /// Projection) is guarded.
+///
+/// The message ends at `size;`, with no figure: so it read on every surface
+/// captured in us-east-1 and eu-west-2 on 2026-10-09 except the two that
+/// [`check_expression_size_with_figure`] covers.
 pub(crate) fn check_expression_size(expr: &str) -> Result<(), String> {
+    if expr.len() > MAX_EXPRESSION_BYTES {
+        return Err("Expression size has exceeded the maximum allowed size;".to_string());
+    }
+    Ok(())
+}
+
+/// The size check for the two surfaces where the message still carries the
+/// figure in us-east-1, a Scan's FilterExpression and a transaction's
+/// ConditionExpression: `...size; expression size: 4097`. eu-west-2 has
+/// dropped the figure on both (captured 2026-10-09); Dynoxide follows
+/// us-east-1 until the regions agree.
+pub(crate) fn check_expression_size_with_figure(expr: &str) -> Result<(), String> {
     if expr.len() > MAX_EXPRESSION_BYTES {
         return Err(format!(
             "Expression size has exceeded the maximum allowed size; expression size: {}",

@@ -3,7 +3,7 @@
 //! Parses comma-separated attribute paths, supports dot notation and bracket indexing.
 //! Always includes key attributes in the result.
 
-use crate::expressions::tokenizer::{Token, TokenStream, near_window_tokenizer, tokenize};
+use crate::expressions::tokenizer::{Token, TokenStream, tokenize, tokenizer_syntax_error};
 use crate::expressions::{
     PathElement, TrackedExpressionAttributes, format_path_for_error, resolve_path,
     resolve_path_elements,
@@ -24,18 +24,13 @@ pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
     // exceeded the maximum allowed size". Confirmed against real DynamoDB
     // (eu-west-2).
     super::check_expression_size(expr).map_err(|e| format!("Invalid ProjectionExpression: {e}"))?;
-    let tokens = match tokenize(expr) {
-        Ok(t) => t,
-        Err(err) => {
-            // Tokenizer-level syntax error (e.g. stray `!`): build the
-            // AWS-style `near: "..."` window from the offending byte position.
-            let bad = &expr[err.position..err.position + err.bad_len];
-            let near = near_window_tokenizer(expr, err.position);
-            return Err(format!(
-                r#"Invalid ProjectionExpression: Syntax error; token: "{bad}", near: "{near}""#
-            ));
-        }
-    };
+    let tokens = tokenize(expr).map_err(|err| {
+        // A character the tokenizer can't read (e.g. a stray `!`).
+        format!(
+            "Invalid ProjectionExpression: {}",
+            tokenizer_syntax_error(expr, &err)
+        )
+    })?;
     let mut stream = TokenStream::new(tokens);
 
     let mut paths = Vec::new();

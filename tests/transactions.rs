@@ -1811,3 +1811,862 @@ fn test_transact_update_empty_binary_sort_key_is_top_level_validation() {
         "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: sk"
     );
 }
+
+// ---- expression size and Put item nesting are checked before any action runs ----
+//
+// An expression over 4096 bytes on any action, or a Put item nested past 32
+// levels, is a top-level ValidationException rather than a cancellation reason.
+// DynamoDB checks the actions in request order, each for its expressions and its
+// Put item, before it looks up a table, checks for duplicate targets or reads a
+// key. Captured in us-east-1, us-east-2, us-west-2, sa-east-1, eu-west-1,
+// eu-central-1, ap-northeast-1 and ap-southeast-2, 2026-10-08.
+
+const NESTING_MSG: &str = "Nesting Levels have exceeded supported limits: \
+                           Attributes in the item have nested levels beyond supported limit";
+const ITEM_SIZE_MSG: &str = "Item size has exceeded the maximum allowed size";
+
+fn condition_size_msg(len: usize) -> String {
+    format!(
+        "Invalid ConditionExpression: Expression size has exceeded the maximum allowed size; \
+         expression size: {len}"
+    )
+}
+
+/// `attribute_not_exists(c0000) AND attribute_not_exists(c0001) ...`, padded to
+/// exactly `len` bytes. True against any item that has none of the names.
+fn condition_of_len(len: usize) -> String {
+    let mut expr = String::new();
+    for i in 0.. {
+        let clause = format!("attribute_not_exists(c{i:04})");
+        let next = if expr.is_empty() {
+            clause
+        } else {
+            format!("{expr} AND {clause}")
+        };
+        if next.len() > len {
+            break;
+        }
+        expr = next;
+    }
+    let short = len - expr.len();
+    expr.insert_str(expr.len() - 1, &"z".repeat(short));
+    assert_eq!(expr.len(), len);
+    expr
+}
+
+/// `SET u0000 = :v, u0001 = :v ...`, padded to exactly `len` bytes.
+fn update_of_len(len: usize) -> String {
+    let mut expr = String::from("SET ");
+    for i in 0.. {
+        let clause = format!("u{i:04} = :v");
+        let next = if i == 0 {
+            format!("{expr}{clause}")
+        } else {
+            format!("{expr}, {clause}")
+        };
+        if next.len() > len {
+            break;
+        }
+        expr = next;
+    }
+    let short = len - expr.len();
+    expr.insert_str(expr.len() - " = :v".len(), &"z".repeat(short));
+    assert_eq!(expr.len(), len);
+    expr
+}
+
+/// A value wrapped in `depth` single-key maps; 32 wraps is one level too deep.
+fn deep_value(depth: usize) -> serde_json::Value {
+    let mut v = json!({"S": "leaf"});
+    for _ in 0..depth {
+        v = json!({"M": {"n": v}});
+    }
+    v
+}
+
+fn transact(db: &Database, items: serde_json::Value) -> Result<(), DynoxideError> {
+    let req = json!({ "TransactItems": items });
+    db.transact_write_items(serde_json::from_value(req).unwrap())
+        .map(|_| ())
+}
+
+fn assert_top_level_validation(err: DynoxideError, expected: &str) {
+    assert!(
+        !matches!(err, DynoxideError::TransactionCanceledException(..)),
+        "expected a top-level ValidationException, got a cancellation: {err:?}"
+    );
+    assert_eq!(
+        err.error_type(),
+        "com.amazon.coral.validate#ValidationException",
+        "{err:?}"
+    );
+    assert_eq!(err.to_string(), expected);
+}
+
+fn cancellation_codes(err: DynoxideError) -> Vec<String> {
+    match err {
+        DynoxideError::TransactionCanceledException(_, reasons) => {
+            reasons.into_iter().map(|r| r.code).collect()
+        }
+        other => panic!("expected a cancellation, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_transact_oversized_condition_check_is_top_level_validation() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let err = transact(
+        &db,
+        json!([{"ConditionCheck": {
+            "TableName": "Table1",
+            "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": condition_of_len(4495)
+        }}]),
+    )
+    .unwrap_err();
+    assert_top_level_validation(err, &condition_size_msg(4495));
+}
+
+#[test]
+fn test_transact_oversized_expression_on_each_action_is_top_level_validation() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let over = condition_of_len(4097);
+    let cases = [
+        (
+            json!({"Put": {"TableName": "Table1", "Item": {"pk": {"S": "p"}},
+                "ConditionExpression": over}}),
+            condition_size_msg(4097),
+        ),
+        (
+            // The UpdateExpression form carries no size figure, in every region.
+            json!({"Update": {"TableName": "Table1", "Key": {"pk": {"S": "u"}},
+                "UpdateExpression": update_of_len(4097),
+                "ExpressionAttributeValues": {":v": {"S": "x"}}}}),
+            "Invalid UpdateExpression: Expression size has exceeded the maximum allowed size;"
+                .to_string(),
+        ),
+        (
+            json!({"Update": {"TableName": "Table1", "Key": {"pk": {"S": "u"}},
+                "UpdateExpression": "SET x = :v", "ConditionExpression": over,
+                "ExpressionAttributeValues": {":v": {"S": "x"}}}}),
+            condition_size_msg(4097),
+        ),
+        (
+            json!({"Delete": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+                "ConditionExpression": over}}),
+            condition_size_msg(4097),
+        ),
+    ];
+    for (action, expected) in cases {
+        let err = transact(&db, json!([action])).unwrap_err();
+        assert_top_level_validation(err, &expected);
+    }
+    assert_eq!(get_val(&db, "Table1", "a"), Some("v".to_string()));
+}
+
+#[test]
+fn test_transact_oversized_second_action_writes_nothing() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let err = transact(
+        &db,
+        json!([
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"S": "first"}, "val": {"S": "1"}}}},
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"S": "second"}},
+                "ConditionExpression": condition_of_len(4097)}}
+        ]),
+    )
+    .unwrap_err();
+    assert_top_level_validation(err, &condition_size_msg(4097));
+    assert_eq!(get_val(&db, "Table1", "first"), None);
+}
+
+#[test]
+fn test_transact_expressions_at_size_limit_run() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    put_item(&db, "Table1", "d", "v");
+    let at_limit = condition_of_len(4096);
+    transact(
+        &db,
+        json!([
+            {"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+                "ConditionExpression": at_limit}},
+            {"Update": {"TableName": "Table1", "Key": {"pk": {"S": "b"}},
+                "UpdateExpression": update_of_len(4096),
+                "ExpressionAttributeValues": {":v": {"S": "x"}}}},
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"S": "c"}, "val": {"S": "put"}},
+                "ConditionExpression": at_limit}},
+            {"Delete": {"TableName": "Table1", "Key": {"pk": {"S": "d"}},
+                "ConditionExpression": at_limit}}
+        ]),
+    )
+    .unwrap();
+    // The conditions ran and held, so the Put and the Delete both applied.
+    assert_eq!(get_val(&db, "Table1", "c"), Some("put".to_string()));
+    assert_eq!(get_val(&db, "Table1", "d"), None);
+}
+
+#[test]
+fn test_transact_expression_size_is_measured_per_expression() {
+    // 3000 bytes of UpdateExpression and 3000 of ConditionExpression on one action
+    // is accepted: the cap is per expression, not per action.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    transact(
+        &db,
+        json!([{"Update": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": update_of_len(3000),
+            "ConditionExpression": condition_of_len(3000),
+            "ExpressionAttributeValues": {":v": {"S": "x"}}}}]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_transact_oversized_expression_is_checked_before_tables_and_keys() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let oversized_check = |pk: &str, table: &str| {
+        json!({"ConditionCheck": {"TableName": table, "Key": {"pk": {"S": pk}},
+            "ConditionExpression": condition_of_len(4097)}})
+    };
+    let cases = [
+        // A missing table, on the oversized action or an earlier one.
+        json!([oversized_check("a", "Missing")]),
+        json!([{"Put": {"TableName": "Missing", "Item": {"pk": {"S": "x"}}}},
+            oversized_check("a", "Table1")]),
+        // An empty key value, either side of the oversized action.
+        json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": ""}}}},
+            oversized_check("a", "Table1")]),
+        json!([oversized_check("a", "Table1"),
+            {"Put": {"TableName": "Table1", "Item": {"pk": {"S": ""}}}}]),
+        // Two actions on one item.
+        json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "a2"}}}},
+            oversized_check("a2", "Table1")]),
+    ];
+    for items in cases {
+        let err = transact(&db, items).unwrap_err();
+        assert_top_level_validation(err, &condition_size_msg(4097));
+    }
+}
+
+#[test]
+fn test_transact_put_nested_32_levels_is_top_level_validation() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let err = transact(
+        &db,
+        json!([{"Put": {"TableName": "Table1",
+            "Item": {"pk": {"S": "deep"}, "data": deep_value(32)}}}]),
+    )
+    .unwrap_err();
+    assert_top_level_validation(err, NESTING_MSG);
+    assert_eq!(get_val(&db, "Table1", "deep"), None);
+
+    // One level shallower is stored.
+    transact(
+        &db,
+        json!([{"Put": {"TableName": "Table1",
+            "Item": {"pk": {"S": "ok"}, "data": deep_value(31)}}}]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_transact_put_nesting_is_checked_before_tables_and_keys() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let deep_put = |pk: &str| {
+        json!({"Put": {"TableName": "Table1",
+            "Item": {"pk": {"S": pk}, "data": deep_value(32)}}})
+    };
+    let cases = [
+        json!([deep_put("d1"), {"Put": {"TableName": "Missing", "Item": {"pk": {"S": "x"}}}}]),
+        json!([{"Put": {"TableName": "Missing", "Item": {"pk": {"S": "x"}}}}, deep_put("d2")]),
+        json!([deep_put("d3"), {"Put": {"TableName": "Table1", "Item": {"pk": {"S": "d3"}}}}]),
+        json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"N": "1"}}}}, deep_put("d4")]),
+        json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": ""}}}}, deep_put("d5")]),
+        // The too-deep attribute can be the key itself.
+        json!([{"Put": {"TableName": "Table1", "Item": {"pk": deep_value(32)}}}]),
+    ];
+    for items in cases {
+        let err = transact(&db, items).unwrap_err();
+        assert_top_level_validation(err, NESTING_MSG);
+    }
+}
+
+#[test]
+fn test_transact_up_front_checks_take_actions_in_request_order() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let oversized = json!({"ConditionCheck": {"TableName": "Table1",
+        "Key": {"pk": {"S": "a"}}, "ConditionExpression": condition_of_len(4097)}});
+    let deep = json!({"Put": {"TableName": "Table1",
+        "Item": {"pk": {"S": "deep"}, "data": deep_value(32)}}});
+    let big = json!({"Put": {"TableName": "Table1",
+        "Item": {"pk": {"S": "big"}, "pad": {"S": "x".repeat(400 * 1024)}}}});
+    let cases = [
+        (json!([oversized, deep]), condition_size_msg(4097)),
+        (json!([deep, oversized]), NESTING_MSG.to_string()),
+        (json!([big, deep]), ITEM_SIZE_MSG.to_string()),
+        (json!([deep, big]), NESTING_MSG.to_string()),
+        (json!([oversized, big]), condition_size_msg(4097)),
+    ];
+    for (items, expected) in cases {
+        let err = transact(&db, items).unwrap_err();
+        assert_top_level_validation(err, &expected);
+    }
+}
+
+// Within one action, us-east-1 reports a Put's condition size ahead of its item
+// depth and eu-west-2 the reverse (2026-10-09). These pin the order the
+// single-item operations use: PutItem checks the item's depth before it parses
+// the condition, and UpdateItem parses the UpdateExpression first.
+
+#[test]
+fn test_transact_put_checks_item_depth_before_condition_size() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let err = transact(
+        &db,
+        json!([{"Put": {"TableName": "Table1",
+            "Item": {"pk": {"S": "both"}, "data": deep_value(32)},
+            "ConditionExpression": condition_of_len(4097)}}]),
+    )
+    .unwrap_err();
+    assert_top_level_validation(err, NESTING_MSG);
+}
+
+#[test]
+fn test_transact_update_checks_update_expression_size_first() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let err = transact(
+        &db,
+        json!([{"Update": {"TableName": "Table1", "Key": {"pk": {"S": "u"}},
+            "UpdateExpression": update_of_len(4097),
+            "ConditionExpression": condition_of_len(4097),
+            "ExpressionAttributeValues": {":v": {"S": "x"}}}}]),
+    )
+    .unwrap_err();
+    assert_top_level_validation(
+        err,
+        "Invalid UpdateExpression: Expression size has exceeded the maximum allowed size;",
+    );
+}
+
+#[test]
+fn test_transact_item_size_is_checked_before_tables_and_keys() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let big = |pk: &str| {
+        json!({"Put": {"TableName": "Table1",
+            "Item": {"pk": {"S": pk}, "pad": {"S": "x".repeat(400 * 1024)}}}})
+    };
+    let cases = [
+        json!([{"Put": {"TableName": "Missing", "Item": {"pk": {"S": "x"}}}}, big("b1")]),
+        json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "b2"}}}}, big("b2")]),
+    ];
+    for items in cases {
+        let err = transact(&db, items).unwrap_err();
+        assert_top_level_validation(err, ITEM_SIZE_MSG);
+    }
+}
+
+#[test]
+fn test_transact_deep_condition_value_is_evaluated_not_rejected() {
+    // A 32-level ExpressionAttributeValues entry that is only compared is not
+    // depth-checked inside a transaction, on any action: the condition runs.
+    // From 33 levels it is refused up front (see below).
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let names = json!({"#d": "data"});
+    let values = json!({":deep": deep_value(32)});
+    let actions = [
+        json!({"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "#d = :deep",
+            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}}),
+        json!({"Put": {"TableName": "Table1", "Item": {"pk": {"S": "p"}},
+            "ConditionExpression": "#d = :deep",
+            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}}),
+        json!({"Delete": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "#d = :deep",
+            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}}),
+        json!({"Update": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET t = :t", "ConditionExpression": "#d = :deep",
+            "ExpressionAttributeNames": names,
+            "ExpressionAttributeValues": {":t": {"S": "y"}, ":deep": deep_value(32)}}}),
+    ];
+    for action in actions {
+        let err = transact(&db, json!([action])).unwrap_err();
+        assert_eq!(cancellation_codes(err), vec!["ConditionalCheckFailed"]);
+    }
+
+    // And when the condition holds, the transaction goes through.
+    transact(
+        &db,
+        json!([{"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "attribute_not_exists(zz) OR #d = :deep",
+            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}}]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_transact_update_writing_too_deep_value_still_cancels() {
+    // The value reaches the item, so the stored-item cap applies to the finished
+    // item and the action cancels with a ValidationError reason.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let err = transact(
+        &db,
+        json!([{"Update": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET dd = :deep",
+            "ExpressionAttributeValues": {":deep": deep_value(32)}}}]),
+    )
+    .unwrap_err();
+    let DynoxideError::TransactionCanceledException(_, reasons) = err else {
+        panic!("expected a cancellation, got {err:?}");
+    };
+    assert_eq!(reasons.len(), 1);
+    assert_eq!(reasons[0].code, "ValidationError");
+    // The reason stops after "limits", without the clause about the item's
+    // attributes that the stored-item message carries. Captured us-east-1,
+    // 2026-10-09.
+    assert_eq!(
+        reasons[0].message.as_deref(),
+        Some("Nesting Levels have exceeded supported limits")
+    );
+}
+
+fn deep_value_msg(key: &str) -> String {
+    format!("ExpressionAttributeValues contains invalid value: {NESTING_MSG} for key {key}")
+}
+
+#[test]
+fn test_transact_condition_value_nested_33_levels_is_top_level_validation() {
+    // One level past the stored-item limit, an ExpressionAttributeValues entry is
+    // refused up front on every action, compared, written or unused. Before, a
+    // Put whose condition compared such a value went on to write its item.
+    // Captured us-east-1, 2026-10-09.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let names = json!({"#d": "data"});
+    let values = json!({":deep": deep_value(33)});
+    let actions = [
+        json!({"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "#d = :deep",
+            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}}),
+        json!({"Put": {"TableName": "Table1", "Item": {"pk": {"S": "p"}},
+            "ConditionExpression": "attribute_not_exists(pk) OR #d = :deep",
+            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}}),
+        json!({"Delete": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "#d = :deep",
+            "ExpressionAttributeNames": names, "ExpressionAttributeValues": values}}),
+        json!({"Update": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET dd = :deep", "ExpressionAttributeValues": values}}),
+        json!({"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "attribute_exists(pk)", "ExpressionAttributeValues": values}}),
+    ];
+    for action in actions {
+        let err = transact(&db, json!([action])).unwrap_err();
+        assert_top_level_validation(err, &deep_value_msg(":deep"));
+    }
+    assert_eq!(get_val(&db, "Table1", "p"), None, "the Put must not write");
+    assert_eq!(get_val(&db, "Table1", "a"), Some("v".to_string()));
+}
+
+#[test]
+fn test_transact_deep_condition_value_is_checked_first() {
+    // Within an action the value check comes ahead of the Put item's depth,
+    // both expression sizes and anything about tables or keys; across actions,
+    // the first failing action wins. Captured us-east-1, 2026-10-09.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let values = json!({":deep": deep_value(33)});
+    let cc_deep = json!({"ConditionCheck": {"TableName": "Table1",
+        "Key": {"pk": {"S": "a"}}, "ConditionExpression": "attribute_exists(pk)",
+        "ExpressionAttributeValues": values}});
+    let deep_put = json!({"Put": {"TableName": "Table1",
+        "Item": {"pk": {"S": "deep"}, "data": deep_value(32)}}});
+    let cases = [
+        // A Put with a 32-level item and a 33-level value in its condition.
+        (
+            json!([{"Put": {"TableName": "Table1",
+                "Item": {"pk": {"S": "x1"}, "data": deep_value(32)},
+                "ConditionExpression": "attribute_not_exists(pk) OR data = :deep",
+                "ExpressionAttributeValues": values}}]),
+            deep_value_msg(":deep"),
+        ),
+        // A Put with an oversized condition and a 33-level value.
+        (
+            json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "x2"}},
+                "ConditionExpression": condition_of_len(4097),
+                "ExpressionAttributeValues": values}}]),
+            deep_value_msg(":deep"),
+        ),
+        // An Update writing a 33-level value with an oversized UpdateExpression.
+        (
+            json!([{"Update": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": update_of_len(4097),
+                "ExpressionAttributeValues": {":v": deep_value(33)}}}]),
+            deep_value_msg(":v"),
+        ),
+        // An Update writing a 33-level value with an oversized condition.
+        (
+            json!([{"Update": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET dd = :deep",
+                "ConditionExpression": condition_of_len(4097),
+                "ExpressionAttributeValues": values}}]),
+            deep_value_msg(":deep"),
+        ),
+        (json!([cc_deep, deep_put]), deep_value_msg(":deep")),
+        (json!([deep_put, cc_deep]), NESTING_MSG.to_string()),
+        // Ahead of a missing table, a duplicate target and an empty key value
+        // on an earlier action.
+        (
+            json!([{"Put": {"TableName": "Missing", "Item": {"pk": {"S": "m"}}}}, cc_deep]),
+            deep_value_msg(":deep"),
+        ),
+        (
+            json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "a"}}}}, cc_deep]),
+            deep_value_msg(":deep"),
+        ),
+        (
+            json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": ""}}}}, cc_deep]),
+            deep_value_msg(":deep"),
+        ),
+    ];
+    for (items, expected) in cases {
+        let err = transact(&db, items).unwrap_err();
+        assert_top_level_validation(err, &expected);
+    }
+}
+
+#[test]
+fn test_transact_condition_syntax_is_checked_up_front() {
+    // A ConditionExpression that doesn't parse is a top-level error, reported in
+    // request order ahead of a later action's checks and of any table lookup.
+    // Captured us-east-1 and eu-west-2, 2026-10-09.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let bad = json!({"ConditionCheck": {"TableName": "Table1",
+        "Key": {"pk": {"S": "a"}}, "ConditionExpression": "attribute_not_exists("}});
+    let deep_put = json!({"Put": {"TableName": "Table1",
+        "Item": {"pk": {"S": "deep"}, "data": deep_value(32)}}});
+    let missing = json!({"Put": {"TableName": "Missing", "Item": {"pk": {"S": "m"}}}});
+
+    for items in [json!([bad, deep_put]), json!([missing, bad])] {
+        let err = transact(&db, items).unwrap_err();
+        assert!(
+            !matches!(err, DynoxideError::TransactionCanceledException(..)),
+            "expected a top-level ValidationException, got a cancellation: {err:?}"
+        );
+        assert_eq!(
+            err.error_type(),
+            "com.amazon.coral.validate#ValidationException",
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            r#"Invalid ConditionExpression: Syntax error; token: "<EOF>", near: "(""#
+        );
+    }
+
+    let err = transact(&db, json!([deep_put, bad])).unwrap_err();
+    assert_top_level_validation(err, NESTING_MSG);
+}
+
+#[test]
+fn test_transact_empty_condition_expression_is_top_level_validation() {
+    // Captured us-east-1 and eu-west-2, 2026-10-09.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let err = transact(
+        &db,
+        json!([{"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": ""}}]),
+    )
+    .unwrap_err();
+    assert_top_level_validation(
+        err,
+        "Invalid ConditionExpression: The expression can not be empty;",
+    );
+}
+
+fn unused_values_msg(keys: &str) -> String {
+    format!("Value provided in ExpressionAttributeValues unused in expressions: keys: {{{keys}}}")
+}
+
+fn unused_check(pk: &str) -> serde_json::Value {
+    json!({"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": pk}},
+        "ConditionExpression": "attribute_exists(pk)",
+        "ExpressionAttributeValues": {":v": {"S": "x"}}}})
+}
+
+#[test]
+fn test_transact_unused_expression_value_is_top_level_validation() {
+    // An ExpressionAttributeValues entry no expression uses is refused before
+    // the transaction runs, on every action type, so an earlier valid Put writes
+    // nothing either way but the error is a ValidationException rather than a
+    // cancellation. Captured us-east-1 and eu-west-2, 2026-10-09.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let cases = [
+        (json!([unused_check("a")]), unused_values_msg(":v")),
+        (
+            json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "u2"}, "val": {"S": "w"}}}},
+                unused_check("a")]),
+            unused_values_msg(":v"),
+        ),
+        (
+            json!([{"Update": {"TableName": "Table1", "Key": {"pk": {"S": "u20"}},
+                "UpdateExpression": "SET a = :a",
+                "ExpressionAttributeValues": {":a": {"S": "x"}, ":b": {"S": "y"}}}}]),
+            unused_values_msg(":b"),
+        ),
+        (
+            json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "u22"}},
+                "ConditionExpression": "attribute_not_exists(pk)",
+                "ExpressionAttributeValues": {":v": {"S": "x"}}}}]),
+            unused_values_msg(":v"),
+        ),
+        (
+            json!([{"Delete": {"TableName": "Table1", "Key": {"pk": {"S": "u23"}},
+                "ConditionExpression": "attribute_not_exists(pk)",
+                "ExpressionAttributeValues": {":v": {"S": "x"}}}}]),
+            unused_values_msg(":v"),
+        ),
+    ];
+    for (items, expected) in cases {
+        let err = transact(&db, items).unwrap_err();
+        assert_top_level_validation(err, &expected);
+    }
+    assert_eq!(get_val(&db, "Table1", "u2"), None, "the Put must not write");
+}
+
+#[test]
+fn test_transact_unused_value_is_reported_ahead_of_tables_keys_and_duplicates() {
+    // The unused check is one of the request-only checks, so it wins over a
+    // missing table, a duplicate target, an empty key value and a key that
+    // doesn't match the schema, wherever they sit in the request. Captured
+    // us-east-1 and eu-west-2, 2026-10-09.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    put_item(&db, "Table1", "b", "v");
+    let missing = json!({"Put": {"TableName": "Missing", "Item": {"pk": {"S": "x"}}}});
+    let empty_key = json!({"Put": {"TableName": "Table1", "Item": {"pk": {"S": ""}}}});
+    let wrong_key = json!({"ConditionCheck": {"TableName": "Table1",
+        "Key": {"zz": {"S": "b"}}, "ConditionExpression": "attribute_exists(pk)"}});
+    let cases = [
+        json!([missing, unused_check("a")]),
+        json!([unused_check("a"), missing]),
+        json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "u6"}}}}, unused_check("u6")]),
+        json!([unused_check("u7"), {"Put": {"TableName": "Table1", "Item": {"pk": {"S": "u7"}}}}]),
+        json!([empty_key, unused_check("a")]),
+        json!([unused_check("a"), empty_key]),
+        json!([wrong_key, unused_check("b")]),
+        json!([unused_check("a"), wrong_key]),
+    ];
+    for items in cases {
+        let err = transact(&db, items.clone()).unwrap_err();
+        assert_top_level_validation(err, &unused_values_msg(":v"));
+    }
+}
+
+#[test]
+fn test_transact_unused_value_takes_its_place_in_request_order() {
+    // Across actions the first failing action wins; within one action the
+    // expression size and syntax come first. Captured us-east-1 and eu-west-2,
+    // 2026-10-09 (the size message's figure is the us-east-1 form).
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    put_item(&db, "Table1", "b", "v");
+    let deep_put = json!({"Put": {"TableName": "Table1",
+        "Item": {"pk": {"S": "deep"}, "data": deep_value(32)}}});
+    let oversized = json!({"ConditionCheck": {"TableName": "Table1",
+        "Key": {"pk": {"S": "b"}}, "ConditionExpression": condition_of_len(4097)}});
+    let size_msg = "Invalid ConditionExpression: Expression size has exceeded the maximum \
+                    allowed size; expression size: 4097";
+    let syntax_msg = r#"Invalid ConditionExpression: Syntax error; token: "<EOF>", near: "(""#;
+    let cases = [
+        (
+            json!([unused_check("a"), deep_put]),
+            unused_values_msg(":v"),
+        ),
+        (
+            json!([deep_put, unused_check("a")]),
+            NESTING_MSG.to_string(),
+        ),
+        (
+            json!([unused_check("a"), oversized]),
+            unused_values_msg(":v"),
+        ),
+        (json!([oversized, unused_check("a")]), size_msg.to_string()),
+        (
+            json!([{"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+                "ConditionExpression": condition_of_len(4097),
+                "ExpressionAttributeValues": {":v": {"S": "x"}}}}]),
+            size_msg.to_string(),
+        ),
+        (
+            json!([{"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+                "ConditionExpression": "attribute_not_exists(",
+                "ExpressionAttributeValues": {":v": {"S": "x"}}}}]),
+            syntax_msg.to_string(),
+        ),
+    ];
+    for (items, expected) in cases {
+        let err = transact(&db, items).unwrap_err();
+        assert_top_level_validation(err, &expected);
+    }
+}
+
+#[test]
+fn test_transact_unused_names_come_before_values_and_keys_are_sorted() {
+    // Captured us-east-1 and eu-west-2, 2026-10-09. DynamoDB lists several
+    // unused values in an order that follows the request's own key order (the
+    // two regions disagree on which way round), which a parsed request no
+    // longer carries, so Dynoxide sorts them.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    let err = transact(
+        &db,
+        json!([{"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "attribute_exists(pk)",
+            "ExpressionAttributeNames": {"#n": "x"},
+            "ExpressionAttributeValues": {":v": {"S": "x"}}}}]),
+    )
+    .unwrap_err();
+    assert_top_level_validation(
+        err,
+        "Value provided in ExpressionAttributeNames unused in expressions: keys: {#n}",
+    );
+    let err = transact(
+        &db,
+        json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "u26"}, "val": {"S": "w"}}}},
+            {"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "attribute_exists(pk)",
+            "ExpressionAttributeNames": {"#n": "x"}}}]),
+    )
+    .unwrap_err();
+    assert_top_level_validation(
+        err,
+        "Value provided in ExpressionAttributeNames unused in expressions: keys: {#n}",
+    );
+    assert_eq!(
+        get_val(&db, "Table1", "u26"),
+        None,
+        "the Put must not write"
+    );
+    let err = transact(
+        &db,
+        json!([{"ConditionCheck": {"TableName": "Table1", "Key": {"pk": {"S": "a"}},
+            "ConditionExpression": "attribute_exists(pk)",
+            "ExpressionAttributeValues": {":w": {"S": "y"}, ":v": {"S": "x"}}}}]),
+    )
+    .unwrap_err();
+    assert_top_level_validation(err, &unused_values_msg(":v, :w"));
+}
+
+#[test]
+fn test_transact_undefined_value_is_top_level_validation() {
+    // A condition naming a value the request doesn't define is refused up front
+    // too, ahead of a missing table, and takes its place in request order
+    // against an unused value. Captured us-east-1 and eu-west-2, 2026-10-09.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    put_item(&db, "Table1", "a", "v");
+    put_item(&db, "Table1", "b", "v");
+    let undefined = json!({"ConditionCheck": {"TableName": "Table1",
+        "Key": {"pk": {"S": "b"}}, "ConditionExpression": "a = :nope"}});
+    let undefined_msg = "Invalid ConditionExpression: An expression attribute value used in \
+                         expression is not defined; attribute value: :nope";
+    let cases = [
+        (
+            json!([{"Put": {"TableName": "Missing", "Item": {"pk": {"S": "x"}}}}, undefined]),
+            undefined_msg.to_string(),
+        ),
+        (
+            json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "u30"}, "val": {"S": "w"}}}}, undefined]),
+            undefined_msg.to_string(),
+        ),
+        (
+            json!([unused_check("a"), undefined]),
+            unused_values_msg(":v"),
+        ),
+        (
+            json!([undefined, unused_check("a")]),
+            undefined_msg.to_string(),
+        ),
+    ];
+    for (items, expected) in cases {
+        let err = transact(&db, items).unwrap_err();
+        assert_top_level_validation(err, &expected);
+    }
+    assert_eq!(
+        get_val(&db, "Table1", "u30"),
+        None,
+        "the Put must not write"
+    );
+}
+
+#[test]
+fn test_transact_update_expression_syntax_is_top_level_validation() {
+    // An UpdateExpression that doesn't parse is refused up front, ahead of a
+    // missing table and of an earlier valid Put. Captured us-east-1 and
+    // eu-west-2, 2026-10-09.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    let bad = json!({"Update": {"TableName": "Table1", "Key": {"pk": {"S": "u33"}},
+        "UpdateExpression": "SET a ="}});
+    let msg = r#"Invalid UpdateExpression: Syntax error; token: "<EOF>", near: "=""#;
+    for items in [
+        json!([bad]),
+        json!([{"Put": {"TableName": "Missing", "Item": {"pk": {"S": "x"}}}}, bad]),
+        json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "u35"}, "val": {"S": "w"}}}}, bad]),
+    ] {
+        let err = transact(&db, items).unwrap_err();
+        assert_top_level_validation(err, msg);
+    }
+    assert_eq!(
+        get_val(&db, "Table1", "u35"),
+        None,
+        "the Put must not write"
+    );
+}
+
+#[test]
+fn test_transact_put_with_values_and_no_condition_is_accepted() {
+    // us-east-1 accepts a transactional Put carrying ExpressionAttributeValues
+    // and no ConditionExpression, and writes the item; eu-west-2 refuses it with
+    // "ExpressionAttributeValues can only be specified when using expressions".
+    // Dynoxide follows us-east-1. Captured 2026-10-09.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Table1");
+    transact(
+        &db,
+        json!([{"Put": {"TableName": "Table1", "Item": {"pk": {"S": "u24"}, "val": {"S": "w"}},
+            "ExpressionAttributeValues": {":v": {"S": "x"}}}}]),
+    )
+    .unwrap();
+    assert_eq!(get_val(&db, "Table1", "u24"), Some("w".to_string()));
+}

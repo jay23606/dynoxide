@@ -299,6 +299,11 @@ pub async fn execute<S: StorageBackend>(
                 ));
             }
         } else {
+            // A Scan is the one FilterExpression whose size message still
+            // carries the figure in us-east-1, so it is checked here first.
+            expressions::check_expression_size_with_figure(filter_expr_str).map_err(|e| {
+                DynoxideError::ValidationException(format!("Invalid FilterExpression: {e}"))
+            })?;
             // Try parsing the expression to catch syntax errors early
             let parsed_fe = expressions::condition::parse(filter_expr_str).map_err(|e| {
                 DynoxideError::ValidationException(format!("Invalid FilterExpression: {e}"))

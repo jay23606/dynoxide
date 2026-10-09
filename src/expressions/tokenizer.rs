@@ -222,10 +222,17 @@ pub fn tokenize(input: &str) -> Result<Vec<(Token, TokenSpan)>, TokenizeError> {
             '[' => {
                 i += 1;
                 tokens.push((Token::LBracket, TokenSpan::new(start, 1)));
-                // Try to read a number inside brackets
+                // Try to read a number inside brackets. A number starting with
+                // 0 is the 0 alone, as DynamoDB reads it, so `l[00]` leaves a
+                // second digit the tokenizer then refuses (`token: "0", near:
+                // "00]"`, eu-west-2, 2026-10-09).
                 let num_start = i;
-                while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                if i < bytes.len() && bytes[i] == b'0' {
                     i += 1;
+                } else {
+                    while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                        i += 1;
+                    }
                 }
                 if i > num_start {
                     let num = input[num_start..i].to_string();
@@ -326,12 +333,30 @@ impl TokenStream {
         token
     }
 
+    /// Consume the next token if it is `expected`. On a mismatch the token is
+    /// left in place, so the stream still points at it when the caller turns
+    /// the failure into a `token: ..., near: ...` message.
     pub fn expect(&mut self, expected: &Token) -> Result<(), String> {
-        match self.next() {
-            Some(t) if t == expected => Ok(()),
+        match self.peek() {
+            Some(t) if t == expected => {
+                self.pos += 1;
+                Ok(())
+            }
             Some(t) => Err(format!("Expected {expected}, got {t}")),
             None => Err(format!("Expected {expected}, got end of expression")),
         }
+    }
+
+    /// The token `offset` places after the current one, without consuming.
+    pub fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + offset).map(|(t, _)| t)
+    }
+
+    /// DynamoDB's syntax error for the token the stream is stopped at, or for
+    /// the end of the expression when it has run out. See [`syntax_error_at`].
+    pub fn syntax_error(&self, source: &str) -> String {
+        let spans: Vec<TokenSpan> = self.tokens.iter().map(|(_, s)| *s).collect();
+        syntax_error_at(source, &spans, self.pos)
     }
 
     pub fn at_end(&self) -> bool {
@@ -353,34 +378,71 @@ impl TokenStream {
     }
 }
 
-/// Build the AWS-style `near: "..."` window for a parser-level syntax error
-/// (such as UpdateExpression's "unexpected leading token"), where the offending
-/// token has a known span and the window extends to include the next token if
-/// one is present. The returned window is the original source slice from the
-/// offending token's start to the next token's end (or the offending token's
-/// end if no following token exists).
-pub fn near_window_parser(source: &str, offending: TokenSpan, next: Option<TokenSpan>) -> &str {
-    let end = match next {
-        Some(span) => span.end(),
-        None => offending.end(),
+/// DynamoDB's syntax error naming the token at `index` in `spans` (or the end
+/// of the expression when `index` is past the last token):
+/// `Syntax error; token: "x", near: ") x y"`.
+///
+/// `near` is the source from the start of the token before the offending one
+/// to the end of the token after it, so it holds up to three tokens with their
+/// original spacing. At the end of the expression the token is `<EOF>` and
+/// `near` is the last token read. Captured in us-east-1 and eu-west-2,
+/// 2026-10-09, across ConditionExpression, FilterExpression,
+/// KeyConditionExpression and UpdateExpression.
+pub fn syntax_error_at(source: &str, spans: &[TokenSpan], index: usize) -> String {
+    let Some(offending) = spans.get(index) else {
+        let near = spans
+            .last()
+            .map(|last| &source[last.start..last.end()])
+            .unwrap_or("");
+        return format!(r#"Syntax error; token: "<EOF>", near: "{near}""#);
     };
-    let end = end.min(source.len());
-    &source[offending.start..end]
+    let start = if index > 0 {
+        spans[index - 1].start
+    } else {
+        offending.start
+    };
+    let end = spans
+        .get(index + 1)
+        .map_or(offending.end(), |next| next.end());
+    format!(
+        r#"Syntax error; token: "{}", near: "{}""#,
+        &source[offending.start..offending.end()],
+        &source[start..end]
+    )
 }
 
-/// Build the AWS-style `near: "..."` window for a tokenizer-level error (such
-/// as ProjectionExpression's stray `!`), where the failure point is a single
-/// byte position in the source. The window captures the offending byte plus
-/// at most one more contiguous non-whitespace byte, capped at the original
-/// AWS-observed shape (e.g. `!!!` -> `!!`).
-pub fn near_window_tokenizer(source: &str, position: usize) -> &str {
-    let bytes = source.as_bytes();
-    let mut end = position + 1;
-    if end <= bytes.len() && end < bytes.len() && !(bytes[end] as char).is_whitespace() {
-        end += 1;
+/// DynamoDB's syntax error for a character the tokenizer can't read, such as a
+/// stray `!`. The character counts as a token of its own, so `near` takes in
+/// the token before it and the next token or unreadable character after it.
+pub fn tokenizer_syntax_error(source: &str, err: &TokenizeError) -> String {
+    let bad = TokenSpan::new(err.position, err.bad_len);
+    // Everything before the first unreadable character tokenizes.
+    let mut spans: Vec<TokenSpan> = tokenize(&source[..err.position])
+        .map(|tokens| tokens.into_iter().map(|(_, s)| s).collect())
+        .unwrap_or_default();
+    let index = spans.len();
+    spans.push(bad);
+    if let Some(next) = next_lexeme(source, bad.end()) {
+        spans.push(next);
     }
-    let end = end.min(bytes.len());
-    &source[position..end]
+    syntax_error_at(source, &spans, index)
+}
+
+/// The span of the first token, or unreadable character, at or after `from`.
+fn next_lexeme(source: &str, from: usize) -> Option<TokenSpan> {
+    let rest = &source[from..];
+    let start = from + (rest.len() - rest.trim_start().len());
+    if start >= source.len() {
+        return None;
+    }
+    let offset = |s: TokenSpan| TokenSpan::new(start + s.start, s.len);
+    match tokenize(&source[start..]) {
+        Ok(tokens) => tokens.first().map(|(_, s)| offset(*s)),
+        Err(e) if e.position == 0 => Some(TokenSpan::new(start, e.bad_len)),
+        Err(e) => tokenize(&source[start..start + e.position])
+            .ok()
+            .and_then(|tokens| tokens.first().map(|(_, s)| offset(*s))),
+    }
 }
 
 /// Detect redundant parentheses, matching DynamoDB's rule: a parenthesised
@@ -551,32 +613,50 @@ mod tests {
         assert_eq!(err.position, 0);
     }
 
+    fn syntax_error_for(source: &str, index: usize) -> String {
+        let spans: Vec<TokenSpan> = tokenize(source)
+            .unwrap()
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        syntax_error_at(source, &spans, index)
+    }
+
     #[test]
-    fn test_near_window_parser_uses_next_token() {
-        let source = "INVALID SYNTAX HERE";
-        let offending = TokenSpan::new(0, 7);
-        let next = Some(TokenSpan::new(8, 6));
+    fn test_syntax_error_near_takes_the_tokens_either_side() {
         assert_eq!(
-            near_window_parser(source, offending, next),
-            "INVALID SYNTAX"
+            syntax_error_for("INVALID SYNTAX HERE", 0),
+            r#"Syntax error; token: "INVALID", near: "INVALID SYNTAX""#
+        );
+        assert_eq!(
+            syntax_error_for("attribute_exists(pk) x y", 4),
+            r#"Syntax error; token: "x", near: ") x y""#
+        );
+        assert_eq!(
+            syntax_error_for("a = :v)", 3),
+            r#"Syntax error; token: ")", near: ":v)""#
         );
     }
 
     #[test]
-    fn test_near_window_parser_falls_back_to_offending_when_no_next() {
-        let source = "BARE";
-        let offending = TokenSpan::new(0, 4);
-        assert_eq!(near_window_parser(source, offending, None), "BARE");
+    fn test_syntax_error_at_the_end_names_the_last_token() {
+        assert_eq!(
+            syntax_error_for("attribute_not_exists(", 2),
+            r#"Syntax error; token: "<EOF>", near: "(""#
+        );
     }
 
     #[test]
-    fn test_near_window_tokenizer_extends_one_char() {
-        assert_eq!(near_window_tokenizer("!!! INVALID !!!", 0), "!!");
-    }
-
-    #[test]
-    fn test_near_window_tokenizer_stops_at_whitespace() {
-        // Only one offending char before whitespace; window stays single-char.
-        assert_eq!(near_window_tokenizer("! foo", 0), "!");
+    fn test_tokenizer_syntax_error_treats_the_character_as_a_token() {
+        let near = |source: &str| {
+            let err = tokenize(source).unwrap_err();
+            tokenizer_syntax_error(source, &err)
+        };
+        assert_eq!(near("!!!"), r#"Syntax error; token: "!", near: "!!""#);
+        assert_eq!(
+            near("a = :v !"),
+            r#"Syntax error; token: "!", near: ":v !""#
+        );
+        assert_eq!(near("a ! b"), r#"Syntax error; token: "!", near: "a ! b""#);
     }
 }

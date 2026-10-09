@@ -74,6 +74,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both give `Invalid KeySchema: Some index key attribute have no definition`.
   A GSI key schema of more than eight elements is refused as the request is
   read.
+- `TransactWriteItems` rejects an expression over 4096 bytes on any action, and
+  a `Put` item nested past 32 levels, with a top-level `ValidationException`
+  before any action runs, as DynamoDB does. Both used to come back as a
+  `TransactionCanceledException` with a `ValidationError` reason. The `Put`
+  item-size check moves forward with them, so all three now win over a missing
+  table, a duplicate target or an empty key value elsewhere in the request.
+- An `ExpressionAttributeValues` entry nested 32 levels deep that a transaction
+  action only compares is no longer refused: the condition is evaluated, as
+  DynamoDB does. An `Update` that writes one into the item still cancels on the
+  item's nesting limit, now with DynamoDB's shorter reason message. From 33
+  levels an entry is refused up front with a top-level `ValidationException`
+  naming its key, used or not, where a `Put` whose condition compared one used
+  to write its item.
+- `TransactWriteItems` rejects an empty or unparseable `ConditionExpression` on
+  any action with a top-level `ValidationException` before any action runs,
+  where it used to cancel the transaction. An unparseable `UpdateExpression`,
+  an `ExpressionAttributeNames` or `ExpressionAttributeValues` entry no
+  expression uses, and a value a condition names but the request doesn't
+  define are refused the same way, ahead of a missing table, a duplicate
+  target or a key that doesn't match the schema. A `Put` that carries
+  `ExpressionAttributeValues` and no `ConditionExpression` is accepted, as in
+  us-east-1, where it used to cancel.
+- Expression syntax errors name the token the parse stopped at and the text
+  around it, as DynamoDB does: `Syntax error; token: "x", near: ") x y"`, or
+  `token: "<EOF>"` for an expression that ends early. This covers condition,
+  filter, key condition and update expressions, which used to say things like
+  `Expected operand, got end of expression`. A malformed key condition also
+  gains its `Invalid KeyConditionExpression:` prefix.
+- An expression over 4096 bytes is refused without the trailing
+  `expression size: <n>`, as DynamoDB now sends it. A Scan's `FilterExpression`
+  and a transaction's `ConditionExpression` keep the figure, which us-east-1
+  still sends there.
+- PutItem, UpdateItem and DeleteItem wrap the nesting error for a value past
+  32 levels in `1 validation error detected: `, and DeleteItem wraps its
+  `ConditionExpression` syntax and size errors the same way. From 63 levels a
+  stored item's error drops the wrapper and an expression value is refused
+  naming its key. An `UpdateExpression` that leaves the item nested too deep
+  gets DynamoDB's short `Nesting Levels have exceeded supported limits`.
+- UpdateItem reports a `ConditionExpression` syntax error ahead of an unused
+  expression attribute value.
+- PutItem, UpdateItem and DeleteItem wrap an unused `ExpressionAttributeNames`
+  or `ExpressionAttributeValues` entry in `1 validation error detected: `, and
+  report it, along with a value or name the condition uses but doesn't define,
+  before looking up the table. GetItem, Query and Scan send it bare, as
+  before. DeleteItem now envelopes all its `ConditionExpression` errors,
+  including reversed or mixed-type BETWEEN bounds and operand types, and an
+  undefined value in UpdateItem's condition gains its
+  `Invalid ConditionExpression:` prefix.
+- A list index written with a leading zero, such as `l[00]` or `l[01]`, is a
+  syntax error in every expression (`token: "0", near: "00]"`), as DynamoDB
+  reads it. It used to be accepted as the index its digits spell.
 
 ## [1.2.1] - 2026-09-20
 

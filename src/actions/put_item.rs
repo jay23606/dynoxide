@@ -270,6 +270,26 @@ async fn execute_inner<S: StorageBackend>(
         ));
     }
 
+    // The condition's names and values, from the request alone: one it names
+    // but the request doesn't define, then any the condition doesn't use. Both
+    // come back in the envelope, ahead of the table lookup (us-east-1 and
+    // eu-west-2, 2026-10-09).
+    if let Some(ref ce) = request.condition_expression {
+        let parsed = crate::expressions::condition::parse(ce).map_err(|e| {
+            DynoxideError::EnvelopedValidation(format!("Invalid ConditionExpression: {e}"))
+        })?;
+        let tracker = crate::expressions::TrackedExpressionAttributes::new(
+            &request.expression_attribute_names,
+            &request.expression_attribute_values,
+        );
+        crate::expressions::condition::track_references(&parsed, &tracker).map_err(|e| {
+            DynoxideError::EnvelopedValidation(format!("Invalid ConditionExpression: {e}"))
+        })?;
+        tracker
+            .check_unused()
+            .map_err(crate::validation::tag_for_envelope)?;
+    }
+
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
     let key_schema = helpers::parse_key_schema(&meta)?;
 

@@ -3,9 +3,7 @@
 //! Supports SET, REMOVE, ADD, DELETE clauses.
 
 use crate::expressions::condition::parse_raw_path;
-use crate::expressions::tokenizer::{
-    Token, TokenStream, near_window_parser, near_window_tokenizer, tokenize,
-};
+use crate::expressions::tokenizer::{Token, TokenStream, tokenize, tokenizer_syntax_error};
 use crate::expressions::{
     PathElement, TrackedExpressionAttributes, format_path_for_error, remove_path, resolve_path,
     resolve_path_elements, set_path,
@@ -98,19 +96,14 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
     // DynamoDB returns "Invalid UpdateExpression: Expression size has exceeded
     // the maximum allowed size". Confirmed against real DynamoDB (eu-west-2).
     super::check_expression_size(expr).map_err(|e| format!("Invalid UpdateExpression: {e}"))?;
-    let tokens = match tokenize(expr) {
-        Ok(t) => t,
-        Err(err) => {
-            // Tokenizer-level syntax error (e.g. stray `!` mid-expression):
-            // emit the same shape as parser-level errors, with a tokenizer-style
-            // near: window (offending byte plus at most one more non-whitespace byte).
-            let bad = &expr[err.position..err.position + err.bad_len];
-            let near = near_window_tokenizer(expr, err.position);
-            return Err(format!(
-                r#"Invalid UpdateExpression: Syntax error; token: "{bad}", near: "{near}""#
-            ));
-        }
-    };
+    let tokens = tokenize(expr).map_err(|err| {
+        // A character the tokenizer can't read (e.g. a stray `!`) is reported
+        // in the same shape as a parser-level syntax error.
+        format!(
+            "Invalid UpdateExpression: {}",
+            tokenizer_syntax_error(expr, &err)
+        )
+    })?;
     let mut stream = TokenStream::new(tokens);
 
     let mut set_actions = Vec::new();
@@ -131,7 +124,8 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
                 }
                 seen_set = true;
                 stream.next();
-                parse_set_clause(&mut stream, &mut set_actions).map_err(wrap_syntax_error)?;
+                parse_set_clause(&mut stream, &mut set_actions)
+                    .map_err(|e| clause_error(expr, &stream, e))?;
             }
             Some(Token::Remove) => {
                 if seen_remove {
@@ -139,7 +133,8 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
                 }
                 seen_remove = true;
                 stream.next();
-                parse_remove_clause(&mut stream, &mut remove_actions).map_err(wrap_syntax_error)?;
+                parse_remove_clause(&mut stream, &mut remove_actions)
+                    .map_err(|e| clause_error(expr, &stream, e))?;
             }
             Some(Token::Add) => {
                 if seen_add {
@@ -147,7 +142,8 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
                 }
                 seen_add = true;
                 stream.next();
-                parse_add_clause(&mut stream, &mut add_actions).map_err(wrap_syntax_error)?;
+                parse_add_clause(&mut stream, &mut add_actions)
+                    .map_err(|e| clause_error(expr, &stream, e))?;
             }
             Some(Token::Delete) => {
                 if seen_delete {
@@ -155,21 +151,15 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
                 }
                 seen_delete = true;
                 stream.next();
-                parse_delete_clause(&mut stream, &mut delete_actions).map_err(wrap_syntax_error)?;
+                parse_delete_clause(&mut stream, &mut delete_actions)
+                    .map_err(|e| clause_error(expr, &stream, e))?;
             }
             Some(_) => {
-                // Unexpected leading token where SET/REMOVE/ADD/DELETE was required.
-                // Build the AWS-style "token: \"X\", near: \"X Y\"" window from the
-                // offending token's span and the next token's span (if any).
-                let offending_span = stream
-                    .peek_span()
-                    .expect("peek_span must yield when peek did");
-                let bad = &expr[offending_span.start..offending_span.end()];
-                stream.next();
-                let next_span = stream.peek_span();
-                let near = near_window_parser(expr, offending_span, next_span);
+                // A token where SET, REMOVE, ADD or DELETE was required, at the
+                // start or after a complete clause.
                 return Err(format!(
-                    r#"Invalid UpdateExpression: Syntax error; token: "{bad}", near: "{near}""#
+                    "Invalid UpdateExpression: {}",
+                    stream.syntax_error(expr)
                 ));
             }
             None => break,
@@ -182,6 +172,17 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
         add_actions,
         delete_actions,
     })
+}
+
+/// A clause parser's error as DynamoDB reports it. A grammar failure ("Expected
+/// ...") leaves the stream on the offending token and becomes the
+/// `token: ..., near: ...` form; anything else keeps its own wording.
+fn clause_error(expr: &str, stream: &TokenStream, err: String) -> String {
+    if err.starts_with("Expected ") {
+        format!("Invalid UpdateExpression: {}", stream.syntax_error(expr))
+    } else {
+        wrap_syntax_error(err)
+    }
 }
 
 /// Wrap a sub-parser error with the standard syntax error prefix,
@@ -923,14 +924,13 @@ fn parse_add_clause(stream: &mut TokenStream, actions: &mut Vec<AddAction>) -> R
 
 fn parse_add_action(stream: &mut TokenStream) -> Result<AddAction, String> {
     let path = parse_raw_path(stream)?;
-    match stream.next() {
-        Some(Token::ValueRef(name)) => Ok(AddAction {
-            path,
-            value_ref: name.clone(),
-        }),
-        Some(t) => Err(format!("Expected value reference in ADD, got {t}")),
-        None => Err("Expected value reference in ADD, got end of expression".to_string()),
-    }
+    let value_ref = match stream.peek() {
+        Some(Token::ValueRef(name)) => name.clone(),
+        Some(t) => return Err(format!("Expected value reference in ADD, got {t}")),
+        None => return Err("Expected value reference in ADD, got end of expression".to_string()),
+    };
+    stream.next();
+    Ok(AddAction { path, value_ref })
 }
 
 fn parse_delete_clause(
@@ -947,14 +947,13 @@ fn parse_delete_clause(
 
 fn parse_delete_action(stream: &mut TokenStream) -> Result<DeleteAction, String> {
     let path = parse_raw_path(stream)?;
-    match stream.next() {
-        Some(Token::ValueRef(name)) => Ok(DeleteAction {
-            path,
-            value_ref: name.clone(),
-        }),
-        Some(t) => Err(format!("Expected value reference in DELETE, got {t}")),
-        None => Err("Expected value reference in DELETE, got end of expression".to_string()),
-    }
+    let value_ref = match stream.peek() {
+        Some(Token::ValueRef(name)) => name.clone(),
+        Some(t) => return Err(format!("Expected value reference in DELETE, got {t}")),
+        None => return Err("Expected value reference in DELETE, got end of expression".to_string()),
+    };
+    stream.next();
+    Ok(DeleteAction { path, value_ref })
 }
 
 /// Format a BigDecimal number, stripping unnecessary trailing zeros.

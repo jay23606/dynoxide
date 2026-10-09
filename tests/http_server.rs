@@ -794,7 +794,7 @@ async fn test_put_item_condition_expression_syntax_error_enveloped() {
     .await;
     assert_validation_error(
         resp,
-        "1 validation error detected: Invalid ConditionExpression: Expected operand, got =",
+        r#"1 validation error detected: Invalid ConditionExpression: Syntax error; token: "=", near: "==""#,
     )
     .await;
 }
@@ -817,7 +817,7 @@ async fn test_put_item_condition_expression_oversize_enveloped() {
     assert_validation_error(
         resp,
         "1 validation error detected: Invalid ConditionExpression: \
-         Expression size has exceeded the maximum allowed size; expression size: 4200",
+         Expression size has exceeded the maximum allowed size;",
     )
     .await;
 }
@@ -839,8 +839,7 @@ async fn test_update_item_update_expression_syntax_error_enveloped() {
     .await;
     assert_validation_error(
         resp,
-        "1 validation error detected: Invalid UpdateExpression: Syntax error; \
-         Expected attribute name, got end of expression",
+        r#"1 validation error detected: Invalid UpdateExpression: Syntax error; token: "<EOF>", near: "SET""#,
     )
     .await;
 }
@@ -863,7 +862,7 @@ async fn test_update_item_update_expression_oversize_enveloped() {
     assert_validation_error(
         resp,
         "1 validation error detected: Invalid UpdateExpression: \
-         Expression size has exceeded the maximum allowed size; expression size: 4200",
+         Expression size has exceeded the maximum allowed size;",
     )
     .await;
 }
@@ -1247,7 +1246,7 @@ async fn test_get_item_projection_expression_oversize_bare() {
     assert_validation_error(
         resp,
         "Invalid ProjectionExpression: \
-         Expression size has exceeded the maximum allowed size; expression size: 4200",
+         Expression size has exceeded the maximum allowed size;",
     )
     .await;
 }
@@ -1269,7 +1268,7 @@ async fn test_query_key_condition_expression_oversize_bare() {
     assert_validation_error(
         resp,
         "Invalid KeyConditionExpression: \
-         Expression size has exceeded the maximum allowed size; expression size: 4200",
+         Expression size has exceeded the maximum allowed size;",
     )
     .await;
 }
@@ -1293,7 +1292,7 @@ async fn test_query_filter_expression_oversize_bare() {
     assert_validation_error(
         resp,
         "Invalid FilterExpression: \
-         Expression size has exceeded the maximum allowed size; expression size: 4200",
+         Expression size has exceeded the maximum allowed size;",
     )
     .await;
 }

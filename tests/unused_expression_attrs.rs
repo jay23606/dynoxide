@@ -117,9 +117,11 @@ fn test_put_item_with_unused_value_rejected() {
 }
 
 #[test]
-fn test_put_item_unused_name_message_is_bare() {
-    // The unused-attribute rejection carries no
-    // "1 validation error detected: " envelope on PutItem.
+fn test_put_item_unused_name_message_is_enveloped() {
+    // PutItem, UpdateItem and DeleteItem wrap the unused-attribute rejection in
+    // the "1 validation error detected: " envelope, for names and values alike.
+    // Captured us-east-1 and eu-west-2, 2026-10-09; it was bare when this test
+    // was first written.
     let db = make_db();
     create_table(&db, "TestTable");
 
@@ -140,15 +142,13 @@ fn test_put_item_unused_name_message_is_bare() {
         .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Value provided in ExpressionAttributeNames unused in expressions: keys: {#unused}"
+        "1 validation error detected: \
+         Value provided in ExpressionAttributeNames unused in expressions: keys: {#unused}"
     );
 }
 
 #[test]
-fn test_update_item_unused_name_message_is_bare() {
-    // The unused-attribute rejection carries no
-    // "1 validation error detected: " envelope on UpdateItem either,
-    // matching PutItem.
+fn test_update_item_unused_name_message_is_enveloped() {
     let db = make_db();
     create_table(&db, "TestTable");
 
@@ -173,8 +173,140 @@ fn test_update_item_unused_name_message_is_bare() {
         .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Value provided in ExpressionAttributeNames unused in expressions: keys: {#unused}"
+        "1 validation error detected: \
+         Value provided in ExpressionAttributeNames unused in expressions: keys: {#unused}"
     );
+}
+
+fn json_request<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn test_unused_values_are_enveloped_on_writes_and_bare_on_reads() {
+    // Captured us-east-1 and eu-west-2, 2026-10-09.
+    let db = make_db();
+    create_table(&db, "TestTable");
+    put_item(&db, "TestTable", "k1", "s1");
+    let key = serde_json::json!({"pk": {"S": "k1"}, "sk": {"S": "s1"}});
+    let item = serde_json::json!({"pk": {"S": "k2"}, "sk": {"S": "s2"}});
+    let enveloped = |keys: &str| {
+        format!(
+            "1 validation error detected: \
+             Value provided in ExpressionAttributeValues unused in expressions: keys: {{{keys}}}"
+        )
+    };
+    let bare = |keys: &str| {
+        format!(
+            "Value provided in ExpressionAttributeValues unused in expressions: keys: {{{keys}}}"
+        )
+    };
+
+    let err = db
+        .put_item(json_request(
+            serde_json::json!({"TableName": "TestTable", "Item": item,
+            "ConditionExpression": "attribute_not_exists(pk)",
+            "ExpressionAttributeValues": {":v": {"S": "x"}}}),
+        ))
+        .unwrap_err();
+    assert_eq!(err.to_string(), enveloped(":v"), "PutItem");
+
+    let err = db
+        .update_item(json_request(
+            serde_json::json!({"TableName": "TestTable", "Key": key,
+            "UpdateExpression": "SET b = :b",
+            "ExpressionAttributeValues": {":b": {"S": "x"}, ":unused": {"S": "y"}}}),
+        ))
+        .unwrap_err();
+    assert_eq!(err.to_string(), enveloped(":unused"), "UpdateItem");
+
+    let err = db
+        .update_item(json_request(
+            serde_json::json!({"TableName": "TestTable", "Key": key,
+            "UpdateExpression": "SET b = :b", "ConditionExpression": "attribute_exists(pk)",
+            "ExpressionAttributeValues": {":b": {"S": "x"}, ":c": {"S": "y"}}}),
+        ))
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        enveloped(":c"),
+        "UpdateItem with a condition"
+    );
+
+    let err = db
+        .delete_item(json_request(
+            serde_json::json!({"TableName": "TestTable", "Key": key,
+            "ConditionExpression": "attribute_exists(pk)",
+            "ExpressionAttributeValues": {":v": {"S": "x"}}}),
+        ))
+        .unwrap_err();
+    assert_eq!(err.to_string(), enveloped(":v"), "DeleteItem");
+
+    let err = db
+        .delete_item(json_request(
+            serde_json::json!({"TableName": "TestTable", "Key": key,
+            "ConditionExpression": "attribute_exists(pk)",
+            "ExpressionAttributeNames": {"#n": "x"}}),
+        ))
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "1 validation error detected: \
+         Value provided in ExpressionAttributeNames unused in expressions: keys: {#n}",
+        "DeleteItem name"
+    );
+
+    let err = db
+        .query(json_request(serde_json::json!({"TableName": "TestTable",
+            "KeyConditionExpression": "pk = :pk",
+            "ExpressionAttributeValues": {":pk": {"S": "k1"}, ":v": {"S": "x"}}})))
+        .unwrap_err();
+    assert_eq!(err.to_string(), bare(":v"), "Query");
+
+    let err = db
+        .scan(json_request(serde_json::json!({"TableName": "TestTable",
+            "FilterExpression": "a = :a",
+            "ExpressionAttributeValues": {":a": {"S": "v"}, ":v": {"S": "x"}}})))
+        .unwrap_err();
+    assert_eq!(err.to_string(), bare(":v"), "Scan");
+}
+
+#[test]
+fn test_unused_value_is_reported_ahead_of_a_missing_table() {
+    // On PutItem, UpdateItem and DeleteItem alike. Captured us-east-1 and
+    // eu-west-2, 2026-10-09.
+    let db = make_db();
+    let msg = |keys: &str| {
+        format!(
+            "1 validation error detected: \
+             Value provided in ExpressionAttributeValues unused in expressions: keys: {{{keys}}}"
+        )
+    };
+    let key = serde_json::json!({"pk": {"S": "k1"}, "sk": {"S": "s1"}});
+    let err = db
+        .put_item(json_request(
+            serde_json::json!({"TableName": "Missing", "Item": key,
+            "ConditionExpression": "attribute_not_exists(pk)",
+            "ExpressionAttributeValues": {":v": {"S": "x"}}}),
+        ))
+        .unwrap_err();
+    assert_eq!(err.to_string(), msg(":v"), "PutItem");
+    let err = db
+        .update_item(json_request(
+            serde_json::json!({"TableName": "Missing", "Key": key,
+            "UpdateExpression": "SET b = :b",
+            "ExpressionAttributeValues": {":b": {"S": "x"}, ":unused": {"S": "y"}}}),
+        ))
+        .unwrap_err();
+    assert_eq!(err.to_string(), msg(":unused"), "UpdateItem");
+    let err = db
+        .delete_item(json_request(
+            serde_json::json!({"TableName": "Missing", "Key": key,
+            "ConditionExpression": "attribute_not_exists(pk)",
+            "ExpressionAttributeValues": {":v": {"S": "x"}}}),
+        ))
+        .unwrap_err();
+    assert_eq!(err.to_string(), msg(":v"), "DeleteItem");
 }
 
 #[test]
