@@ -14,6 +14,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `server::ServerOptions` and `server::start_with_options` give embedded Rust
   callers the same switch.
 
+### Fixed
+
+- Set members come back in DynamoDB's order instead of the order they were
+  written in. String and binary sets are sorted by their bytes everywhere.
+  Number sets are sorted by value from GetItem, BatchGetItem, Query and the
+  ReturnValues of PutItem, UpdateItem and DeleteItem, and come back in the
+  order of a Java hash set from Scan, TransactGetItems, the PartiQL
+  operations, stream records and transaction cancellation reasons, as
+  DynamoDB returns them. Sets are now stored sorted, and a row stored before
+  this change is sorted as it is read.
+- An empty attribute name is refused with DynamoDB's `Empty attribute name`
+  before the table is looked up: in an item or a key, as a map key at any
+  depth inside a value, in AttributesToGet, in the legacy Expected,
+  AttributeUpdates, QueryFilter and ScanFilter values, in a PartiQL
+  parameter, and as an ExpressionAttributeNames value. It used to be stored,
+  or ignored. PutItem, UpdateItem and DeleteItem report it inside the
+  validation envelope, as DynamoDB does.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security

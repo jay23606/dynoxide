@@ -152,10 +152,20 @@ impl Serialize for AttributeValue {
             }
             AttributeValue::BOOL(b) => map.serialize_entry("BOOL", b)?,
             AttributeValue::NULL(n) => map.serialize_entry("NULL", n)?,
-            AttributeValue::SS(ss) => map.serialize_entry("SS", ss)?,
-            AttributeValue::NS(ns) => map.serialize_entry("NS", ns)?,
+            // DynamoDB returns set members sorted: strings and binaries by their
+            // bytes, numbers by value. Sorting here as well as on write keeps a
+            // row stored before sets were sorted in the same order on the way out.
+            AttributeValue::SS(ss) => {
+                map.serialize_entry("SS", &crate::set_order::sorted_strings(ss))?
+            }
+            AttributeValue::NS(ns) => {
+                map.serialize_entry("NS", &crate::set_order::sorted_numbers(ns))?
+            }
             AttributeValue::BS(bs) => {
-                let encoded: Vec<String> = bs.iter().map(|b| BASE64.encode(b)).collect();
+                let encoded: Vec<String> = crate::set_order::sorted_binaries(bs)
+                    .into_iter()
+                    .map(|b| BASE64.encode(b))
+                    .collect();
                 map.serialize_entry("BS", &encoded)?;
             }
             AttributeValue::L(items) => map.serialize_entry("L", items)?,

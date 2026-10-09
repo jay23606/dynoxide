@@ -124,20 +124,52 @@ fn arb_attribute_value(depth: u32) -> impl Strategy<Value = AttributeValue> {
     }
 }
 
-/// Any AttributeValue should survive a serialize → deserialize round-trip.
+/// The value with every set's members in the order DynamoDB returns them:
+/// strings and binaries by their bytes, numbers by value. Sets are unordered,
+/// so a round trip keeps their members but not the order they were written in.
+fn with_sets_sorted(val: &AttributeValue) -> AttributeValue {
+    match val {
+        AttributeValue::SS(set) => {
+            let mut set = set.clone();
+            set.sort();
+            AttributeValue::SS(set)
+        }
+        AttributeValue::BS(set) => {
+            let mut set = set.clone();
+            set.sort();
+            AttributeValue::BS(set)
+        }
+        AttributeValue::NS(set) => {
+            let mut set = set.clone();
+            set.sort_by_cached_key(|n| normalize_number_for_sort(n));
+            AttributeValue::NS(set)
+        }
+        AttributeValue::L(list) => AttributeValue::L(list.iter().map(with_sets_sorted).collect()),
+        AttributeValue::M(map) => AttributeValue::M(
+            map.iter()
+                .map(|(k, v)| (k.clone(), with_sets_sorted(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Any AttributeValue should survive a serialize → deserialize round-trip,
+/// with its sets' members in DynamoDB's order.
 #[test]
 fn prop_attribute_value_serde_roundtrip() {
     proptest!(|(val in arb_attribute_value(2))| {
         let json = serde_json::to_value(&val).unwrap();
         let deserialized: AttributeValue = serde_json::from_value(json.clone()).unwrap();
         prop_assert_eq!(
-            &val, &deserialized,
+            &with_sets_sorted(&val), &deserialized,
             "Round-trip failed for {:?}", json
         );
     });
 }
 
-/// Items (HashMap<String, AttributeValue>) should survive a round-trip.
+/// Items (HashMap<String, AttributeValue>) should survive a round-trip, with
+/// their sets' members in DynamoDB's order.
 #[test]
 fn prop_item_serde_roundtrip() {
     let arb_item =
@@ -147,8 +179,12 @@ fn prop_item_serde_roundtrip() {
         let json = serde_json::to_value(&item).unwrap();
         let deserialized: HashMap<String, AttributeValue> =
             serde_json::from_value(json.clone()).unwrap();
+        let expected: HashMap<String, AttributeValue> = item
+            .iter()
+            .map(|(k, v)| (k.clone(), with_sets_sorted(v)))
+            .collect();
         prop_assert_eq!(
-            &item, &deserialized,
+            &expected, &deserialized,
             "Item round-trip failed"
         );
     });

@@ -135,6 +135,54 @@ pub async fn execute<S: StorageBackend>(
     Ok(execute_cached(storage, request).await?.response)
 }
 
+/// Refuse an empty attribute name in one action: in the item or key (bare),
+/// in its expression names, or in its expression values. The values are
+/// reported naming their key, as eight of ten regions do; eu-west-2 and
+/// eu-north-1 answer the bare message.
+fn empty_name_in_write_action(item: &TransactWriteItem) -> Result<()> {
+    let (attributes, names, values) = if let Some(ref put) = item.put {
+        (
+            &put.item,
+            put.expression_attribute_names.as_ref(),
+            put.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(ref update) = item.update {
+        (
+            &update.key,
+            update.expression_attribute_names.as_ref(),
+            update.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(ref delete) = item.delete {
+        (
+            &delete.key,
+            delete.expression_attribute_names.as_ref(),
+            delete.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(ref check) = item.condition_check {
+        (
+            &check.key,
+            check.expression_attribute_names.as_ref(),
+            check.expression_attribute_values.as_ref(),
+        )
+    } else {
+        return Ok(());
+    };
+    if crate::empty_names::map_has_empty_name(attributes) {
+        return Err(crate::empty_names::bare());
+    }
+    if let Some(placeholder) = crate::empty_names::empty_placeholder(names) {
+        return Err(DynoxideError::ValidationException(
+            crate::empty_names::placeholder_message(placeholder),
+        ));
+    }
+    if let Some(key) = crate::empty_names::value_placeholder(values, None) {
+        return Err(DynoxideError::ValidationException(
+            crate::empty_names::value_placeholder_message(key),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn execute_cached<S: StorageBackend>(
     storage: &S,
     request: TransactWriteItemsRequest,
@@ -158,6 +206,12 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '[{dump}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
         )));
+    }
+
+    // An empty attribute name anywhere in an action is a top-level rejection,
+    // ahead of the table lookups and the transaction (captured in ten regions).
+    for item in items {
+        empty_name_in_write_action(item)?;
     }
 
     // Validate: no duplicate item targets. A key that can't be stringified (non-scalar

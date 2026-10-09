@@ -42,7 +42,11 @@ pub struct TransactGetItemsResponse {
 
 #[derive(Debug, Default, Serialize)]
 pub struct TransactGetResponse {
-    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Item",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::item_in_hash_order"
+    )]
     pub item: Option<Item>,
 }
 
@@ -67,6 +71,23 @@ pub async fn execute<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(format!(
             "1 validation error detected: Value '[{dump}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
         )));
+    }
+
+    // An empty attribute name in a key or the expression names is a top-level
+    // rejection, not a cancellation reason, ahead of the table lookups
+    // (captured in ten regions).
+    for transact_item in &request.transact_items {
+        let get = &transact_item.get;
+        if crate::empty_names::map_has_empty_name(&get.key) {
+            return Err(crate::empty_names::bare());
+        }
+        if let Some(placeholder) =
+            crate::empty_names::empty_placeholder(get.expression_attribute_names.as_ref())
+        {
+            return Err(DynoxideError::ValidationException(
+                crate::empty_names::placeholder_message(placeholder),
+            ));
+        }
     }
 
     // Per-action validation pass.

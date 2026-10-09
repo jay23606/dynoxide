@@ -220,6 +220,27 @@ async fn execute_inner<S: StorageBackend>(
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
+    // An empty attribute name is refused as the request is read, ahead of every
+    // other value check, the expressions and the table lookup (captured in ten
+    // regions).
+    let updates_empty = request.attribute_updates.as_ref().is_some_and(|updates| {
+        updates.iter().any(|(name, update)| {
+            name.is_empty()
+                || update
+                    .value
+                    .as_ref()
+                    .is_some_and(crate::empty_names::value_has_empty_name)
+        })
+    });
+    crate::empty_names::check_single_item_write(
+        &request.key,
+        updates_empty,
+        request.expected.as_ref(),
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+        None,
+    )?;
+
     // Reject {NULL: false} up front. The HTTP path rejects it during request
     // deserialisation; this keeps the in-process API in agreement (eu-west-2).
     helpers::validate_no_null_false(&request.key)?;

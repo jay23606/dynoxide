@@ -26,7 +26,11 @@ pub struct ExecuteStatementRequest {
 
 #[derive(Debug, Default, Serialize)]
 pub struct ExecuteStatementResponse {
-    #[serde(rename = "Items", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Items",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::items_in_hash_order"
+    )]
     pub items: Option<Vec<Item>>,
     #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
@@ -58,6 +62,12 @@ pub async fn execute<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(
             crate::validation::envelope_message(&msg),
         ));
+    }
+
+    // A parameter holding an empty attribute name is refused bare, before the
+    // statement is parsed or its table looked up (captured in ten regions).
+    if crate::empty_names::parameters_have_empty_name(request.parameters.as_deref()) {
+        return Err(crate::empty_names::bare());
     }
 
     // A COUNT projection is rejected before parsing, with DynamoDB's bare

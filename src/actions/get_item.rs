@@ -111,6 +111,21 @@ pub async fn execute<S: StorageBackend>(
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
+    // An empty attribute name in the key, AttributesToGet or the expression
+    // names is refused bare, ahead of the table lookup (captured in ten regions).
+    if crate::empty_names::map_has_empty_name(&request.key)
+        || crate::empty_names::names_include_empty(request.attributes_to_get.as_ref())
+    {
+        return Err(crate::empty_names::bare());
+    }
+    if let Some(placeholder) =
+        crate::empty_names::empty_placeholder(request.expression_attribute_names.as_ref())
+    {
+        return Err(DynoxideError::ValidationException(
+            crate::empty_names::placeholder_message(placeholder),
+        ));
+    }
+
     // Validate expression/non-expression parameter conflicts
     {
         let mut non_expr = Vec::new();

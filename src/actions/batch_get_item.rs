@@ -93,6 +93,26 @@ pub async fn execute<S: StorageBackend>(
     // DynamoDB validates expression attributes, key values, projections, and duplicates
     // BEFORE checking table existence. Perform these checks first.
 
+    // An empty attribute name in a key, AttributesToGet or the expression names
+    // is refused bare, before anything else here (captured in ten regions).
+    let mut tables: Vec<&String> = request.request_items.keys().collect();
+    tables.sort_unstable();
+    for table in tables {
+        let ka = &request.request_items[table];
+        if ka.keys.iter().any(crate::empty_names::map_has_empty_name)
+            || crate::empty_names::names_include_empty(ka.attributes_to_get.as_ref())
+        {
+            return Err(crate::empty_names::bare());
+        }
+        if let Some(placeholder) =
+            crate::empty_names::empty_placeholder(ka.expression_attribute_names.as_ref())
+        {
+            return Err(DynoxideError::ValidationException(
+                crate::empty_names::placeholder_message(placeholder),
+            ));
+        }
+    }
+
     // Reject a request that pairs an expression projection with a non-expression
     // AttributesToGet, whether in the same block or across blocks. AWS rejects the
     // request as a whole even when each block is internally consistent.

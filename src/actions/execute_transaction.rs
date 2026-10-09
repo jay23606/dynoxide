@@ -56,7 +56,11 @@ pub(crate) struct CachedTransaction {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ItemResponse {
-    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Item",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::item_in_hash_order"
+    )]
     pub item: Option<Item>,
 }
 
@@ -106,6 +110,15 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(
             "Member must have length less than or equal to 100".to_string(),
         ));
+    }
+
+    // A parameter holding an empty attribute name is a top-level rejection,
+    // before any statement is parsed (captured in ten regions).
+    if statements
+        .iter()
+        .any(|s| crate::empty_names::parameters_have_empty_name(s.parameters.as_deref()))
+    {
+        return Err(crate::empty_names::bare());
     }
 
     // Parse all statements before executing any, to fail fast on syntax errors

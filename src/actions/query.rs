@@ -180,6 +180,36 @@ pub async fn execute<S: StorageBackend>(
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_table_name(&request.table_name)?;
 
+    // An empty attribute name is refused bare, ahead of the table lookup and the
+    // expressions, wherever the request carries one: AttributesToGet, a
+    // QueryFilter value, the ExclusiveStartKey, the expression names and values
+    // (captured in ten regions). An empty name in QueryFilter itself is accepted.
+    if crate::empty_names::names_include_empty(request.attributes_to_get.as_ref())
+        || crate::empty_names::filter_values_have_empty_name(request.query_filter.as_ref())
+        || request
+            .exclusive_start_key
+            .as_ref()
+            .is_some_and(crate::empty_names::map_has_empty_name)
+        || request
+            .exclusive_start_key_raw
+            .as_ref()
+            .is_some_and(crate::empty_names::json_map_has_empty_name)
+    {
+        return Err(crate::empty_names::bare());
+    }
+    if let Some(placeholder) =
+        crate::empty_names::empty_placeholder(request.expression_attribute_names.as_ref())
+    {
+        return Err(DynoxideError::ValidationException(
+            crate::empty_names::placeholder_message(placeholder),
+        ));
+    }
+    if crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
+        .is_some()
+    {
+        return Err(crate::empty_names::bare());
+    }
+
     // ---- Expression vs non-expression mixing validation ----
     // DynamoDB checks this before anything else (except table name format and ESK values).
     {

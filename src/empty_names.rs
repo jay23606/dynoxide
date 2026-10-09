@@ -1,0 +1,263 @@
+//! Empty attribute names.
+//!
+//! DynamoDB refuses an attribute name that is the empty string wherever a
+//! request carries one: an item's top-level attribute, a map key at any depth
+//! inside a value, a key, an ExclusiveStartKey, an ExpressionAttributeNames
+//! value, AttributesToGet, the legacy Expected, AttributeUpdates, QueryFilter
+//! and ScanFilter values, and PartiQL parameters. It answers before it looks the
+//! table up, before it reads or parses an expression, and before it checks a key
+//! against the schema. Only a ReturnValues outside its enum is reported first.
+//!
+//! The message is "Empty attribute name" everywhere; what changes by operation
+//! is the wrapping. PutItem, UpdateItem and DeleteItem put it inside the
+//! validation envelope. An ExpressionAttributeNames entry is reported as
+//! "ExpressionAttributeNames contains invalid value: Empty attribute name for key
+//! #n". Scan and the condition values of a TransactWriteItems action name the
+//! ExpressionAttributeValues key, and Scan's ExclusiveStartKey carries the
+//! starting-key prefix.
+//!
+//! Captured in eu-west-2 and us-east-1 on 9 October 2026, and in ten regions for
+//! the shapes the two disagreed on. Where they split, Dynoxide follows the
+//! majority: for Scan's ExpressionAttributeValues (7 of 10) and ExclusiveStartKey
+//! (7 of 10), and for a transaction's condition values (8 of 10). eu-west-2 is
+//! in the minority each time and answers the bare message.
+//!
+//! An empty name in a legacy QueryFilter or ScanFilter is accepted, as DynamoDB
+//! accepts it; only the values inside those filters are checked.
+
+use crate::errors::{DynoxideError, Result};
+use crate::types::AttributeValue;
+use std::collections::HashMap;
+
+/// DynamoDB's message for an empty attribute name.
+pub(crate) const MESSAGE: &str = "Empty attribute name";
+
+/// Whether a value holds a map with an empty key, at any depth.
+pub(crate) fn value_has_empty_name(value: &AttributeValue) -> bool {
+    match value {
+        AttributeValue::M(map) => map_has_empty_name(map),
+        AttributeValue::L(list) => list.iter().any(value_has_empty_name),
+        _ => false,
+    }
+}
+
+/// Whether a map of attributes (an item, a key, a document) names an empty
+/// attribute, at the top level or inside any value.
+pub(crate) fn map_has_empty_name(map: &HashMap<String, AttributeValue>) -> bool {
+    map.iter()
+        .any(|(name, value)| name.is_empty() || value_has_empty_name(value))
+}
+
+/// The same check over attribute values that have not been parsed yet: an
+/// `{"M": {...}}` with an empty key at any depth.
+pub(crate) fn json_value_has_empty_name(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if let Some(map) = object.get("M").and_then(|m| m.as_object()) {
+        return map
+            .iter()
+            .any(|(name, inner)| name.is_empty() || json_value_has_empty_name(inner));
+    }
+    if let Some(list) = object.get("L").and_then(|l| l.as_array()) {
+        return list.iter().any(json_value_has_empty_name);
+    }
+    false
+}
+
+/// The same check over an unparsed map of attributes.
+pub(crate) fn json_map_has_empty_name(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|map| {
+        map.iter()
+            .any(|(name, inner)| name.is_empty() || json_value_has_empty_name(inner))
+    })
+}
+
+/// The first ExpressionAttributeNames placeholder, in placeholder order, whose
+/// name is empty.
+pub(crate) fn empty_placeholder(names: Option<&HashMap<String, String>>) -> Option<&str> {
+    let names = names?;
+    let mut empty: Vec<&str> = names
+        .iter()
+        .filter(|(_, name)| name.is_empty())
+        .map(|(placeholder, _)| placeholder.as_str())
+        .collect();
+    empty.sort_unstable();
+    empty.first().copied()
+}
+
+/// The message for an empty ExpressionAttributeNames value.
+pub(crate) fn placeholder_message(placeholder: &str) -> String {
+    format!("ExpressionAttributeNames contains invalid value: {MESSAGE} for key {placeholder}")
+}
+
+/// The first ExpressionAttributeValues key, in key order, whose value holds an
+/// empty name. Reads the parsed values when the request has them, otherwise the
+/// raw JSON some operations keep until later.
+pub(crate) fn value_placeholder<'a>(
+    values: Option<&'a HashMap<String, AttributeValue>>,
+    raw: Option<&'a serde_json::Value>,
+) -> Option<&'a str> {
+    let mut found: Vec<&str> = match (values, raw) {
+        (Some(values), _) => values
+            .iter()
+            .filter(|(_, value)| value_has_empty_name(value))
+            .map(|(key, _)| key.as_str())
+            .collect(),
+        (None, Some(raw)) => raw
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter(|(_, value)| json_value_has_empty_name(value))
+                    .map(|(key, _)| key.as_str())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        (None, None) => Vec::new(),
+    };
+    found.sort_unstable();
+    found.first().copied()
+}
+
+/// The message Scan and a transaction's condition values use for an
+/// ExpressionAttributeValues entry holding an empty name.
+pub(crate) fn value_placeholder_message(key: &str) -> String {
+    format!("ExpressionAttributeValues contains invalid value: {MESSAGE} for key {key}")
+}
+
+/// Whether AttributesToGet names the empty attribute.
+pub(crate) fn names_include_empty(names: Option<&Vec<String>>) -> bool {
+    names.is_some_and(|names| names.iter().any(String::is_empty))
+}
+
+/// Whether the legacy Expected parameter names an empty attribute or compares
+/// against a value holding one.
+pub(crate) fn expected_has_empty_name(expected: Option<&serde_json::Value>) -> bool {
+    let Some(map) = expected.and_then(|e| e.as_object()) else {
+        return false;
+    };
+    map.iter()
+        .any(|(name, condition)| name.is_empty() || condition_values_have_empty_name(condition))
+}
+
+/// Whether a legacy QueryFilter or ScanFilter compares against a value holding
+/// an empty name. An empty attribute name in the filter itself is accepted.
+pub(crate) fn filter_values_have_empty_name(filter: Option<&serde_json::Value>) -> bool {
+    filter
+        .and_then(|f| f.as_object())
+        .is_some_and(|map| map.values().any(condition_values_have_empty_name))
+}
+
+/// The `Value` and `AttributeValueList` of one legacy condition.
+fn condition_values_have_empty_name(condition: &serde_json::Value) -> bool {
+    let Some(condition) = condition.as_object() else {
+        return false;
+    };
+    condition
+        .get("Value")
+        .is_some_and(json_value_has_empty_name)
+        || condition
+            .get("AttributeValueList")
+            .and_then(|l| l.as_array())
+            .is_some_and(|list| list.iter().any(json_value_has_empty_name))
+}
+
+/// Whether any PartiQL parameter holds an empty name.
+pub(crate) fn parameters_have_empty_name(parameters: Option<&[AttributeValue]>) -> bool {
+    parameters.is_some_and(|params| params.iter().any(value_has_empty_name))
+}
+
+/// The bare rejection.
+pub(crate) fn bare() -> DynoxideError {
+    DynoxideError::ValidationException(MESSAGE.to_string())
+}
+
+/// The rejection inside the validation envelope, for PutItem, UpdateItem and
+/// DeleteItem. Built enveloped rather than tagged, because DeleteItem wraps it
+/// too and the tag only resolves to the envelope for PutItem and UpdateItem.
+pub(crate) fn enveloped() -> DynoxideError {
+    DynoxideError::ValidationException(crate::validation::envelope_message(MESSAGE))
+}
+
+/// Check the parts a single-item write shares, in the order its request lists
+/// them: the item or key, the legacy Expected, then the expression names and
+/// values. Every rejection goes inside the validation envelope.
+///
+/// `updates_empty` is whether UpdateItem's AttributeUpdates names an empty
+/// attribute or carries a value holding one; it sits between the key and
+/// Expected in UpdateItem's request.
+pub(crate) fn check_single_item_write(
+    attributes: &HashMap<String, AttributeValue>,
+    updates_empty: bool,
+    expected: Option<&serde_json::Value>,
+    names: Option<&HashMap<String, String>>,
+    values: Option<&HashMap<String, AttributeValue>>,
+    raw_values: Option<&serde_json::Value>,
+) -> Result<()> {
+    if map_has_empty_name(attributes) || updates_empty || expected_has_empty_name(expected) {
+        return Err(enveloped());
+    }
+    if let Some(placeholder) = empty_placeholder(names) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&placeholder_message(placeholder)),
+        ));
+    }
+    if value_placeholder(values, raw_values).is_some() {
+        return Err(enveloped());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn map(entries: &[(&str, AttributeValue)]) -> HashMap<String, AttributeValue> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn finds_an_empty_name_at_any_depth() {
+        let leaf = AttributeValue::S("x".into());
+        assert!(map_has_empty_name(&map(&[("", leaf.clone())])));
+        let nested =
+            AttributeValue::M(map(&[("a", AttributeValue::M(map(&[("", leaf.clone())])))]));
+        assert!(map_has_empty_name(&map(&[("m", nested)])));
+        let in_list = AttributeValue::L(vec![AttributeValue::M(map(&[("", leaf.clone())]))]);
+        assert!(map_has_empty_name(&map(&[("l", in_list)])));
+        // A space is a name.
+        assert!(!map_has_empty_name(&map(&[(" ", leaf.clone())])));
+        // An empty string value is not an empty name.
+        assert!(!map_has_empty_name(&map(&[(
+            "s",
+            AttributeValue::S(String::new())
+        )])));
+    }
+
+    #[test]
+    fn reads_unparsed_values_the_same_way() {
+        assert!(json_value_has_empty_name(
+            &json!({"M": {"a": {"L": [{"M": {"": {"N": "1"}}}]}}})
+        ));
+        assert!(!json_value_has_empty_name(&json!({"M": {" ": {"S": ""}}})));
+        assert!(json_map_has_empty_name(
+            &json!({"pk": {"S": "a"}, "": {"S": "x"}})
+        ));
+    }
+
+    #[test]
+    fn legacy_filters_check_values_but_accept_an_empty_name() {
+        let named = json!({"": {"ComparisonOperator": "NOT_NULL"}});
+        assert!(!filter_values_have_empty_name(Some(&named)));
+        let valued = json!({"m": {"ComparisonOperator": "EQ", "AttributeValueList": [{"M": {"": {"S": "x"}}}]}});
+        assert!(filter_values_have_empty_name(Some(&valued)));
+        let expected_name = json!({"": {"Exists": false}});
+        assert!(expected_has_empty_name(Some(&expected_name)));
+        let expected_value = json!({"x": {"Value": {"M": {"": {"S": "x"}}}}});
+        assert!(expected_has_empty_name(Some(&expected_value)));
+    }
+}
