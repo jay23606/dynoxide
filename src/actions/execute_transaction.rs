@@ -27,7 +27,11 @@ pub struct ExecuteTransactionRequest {
 pub struct ParameterizedStatement {
     #[serde(rename = "Statement")]
     pub statement: String,
-    #[serde(rename = "Parameters", default)]
+    #[serde(
+        rename = "Parameters",
+        default,
+        deserialize_with = "crate::types::deserialize_parameters"
+    )]
     pub parameters: Option<Vec<AttributeValue>>,
 }
 

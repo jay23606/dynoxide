@@ -77,7 +77,9 @@ impl<'de> Deserialize<'de> for BatchStatementRequest {
                         parameter_rejection.get_or_insert_with(|| EMPTY.to_string());
                         continue;
                     }
-                    match serde_json::from_value::<AttributeValue>(value) {
+                    match crate::types::reading_parameters(|| {
+                        serde_json::from_value::<AttributeValue>(value)
+                    }) {
                         Ok(parameter) => parameters.push(parameter),
                         // A value refusal belongs to this statement, an empty
                         // value among them; anything else, a malformed value,

@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 pub struct ExecuteStatementRequest {
     #[serde(rename = "Statement")]
     pub statement: String,
-    #[serde(rename = "Parameters", default)]
+    #[serde(
+        rename = "Parameters",
+        default,
+        deserialize_with = "crate::types::deserialize_parameters"
+    )]
     pub parameters: Option<Vec<AttributeValue>>,
     #[serde(rename = "Limit", default)]
     pub limit: Option<usize>,

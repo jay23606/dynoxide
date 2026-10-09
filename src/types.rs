@@ -363,8 +363,14 @@ impl<'de> Deserialize<'de> for AttributeValue {
 /// message content (see `crate::serde_errors::deserialize`).
 fn validate_number_in_deser(n: &str) -> Result<(), String> {
     // validate_dynamo_number is the single source of truth for number format
-    // and precision/range; the deser path only reshapes the error message.
-    match validate_dynamo_number(n) {
+    // and precision/range; the deser path only reshapes the error message. A
+    // PartiQL parameter is read by its own rule, on top of that one.
+    let checked = if READING_PARAMETERS.with(std::cell::Cell::get) {
+        validate_parameter_number(n)
+    } else {
+        validate_dynamo_number(n)
+    };
+    match checked {
         Ok(()) => Ok(()),
         Err(crate::errors::DynoxideError::ValidationException(m)) => Err(format!("VALIDATION:{m}")),
         Err(e) => Err(format!("VALIDATION:{e}")),
@@ -406,6 +412,84 @@ pub fn normalize_number_for_sort(num_str: &str) -> String {
     } else {
         encode_positive(&mantissa_digits, exponent)
     }
+}
+
+thread_local! {
+    /// Whether the values being decoded are PartiQL parameters, whose numbers
+    /// [`validate_parameter_number`] reads rather than the stored-number rule.
+    static READING_PARAMETERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `read` with numbers read as PartiQL parameters are, restoring the rule
+/// in force before, however `read` ends.
+pub(crate) fn reading_parameters<T>(read: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READING_PARAMETERS.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(READING_PARAMETERS.with(|flag| flag.replace(true)));
+    read()
+}
+
+/// Deserialise a statement's `Parameters`, reading their numbers as PartiQL
+/// parameters.
+pub(crate) fn deserialize_parameters<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<AttributeValue>>, D::Error> {
+    reading_parameters(|| Option::<Vec<AttributeValue>>::deserialize(deserializer))
+}
+
+/// Validate a PartiQL parameter's number. DynamoDB reads it as Java's
+/// `BigDecimal(String)` does, so an exponent outside an `int`, or a scale (the
+/// digits after the point less the exponent) outside one, is a value it cannot
+/// convert. Within those, a precision less scale at an `int`'s limit is an
+/// underflow, as for a PartiQL literal, and otherwise the stored-number rule
+/// applies: `1e2147483647` is an underflow here and an overflow in an item
+/// (captured eu-west-2 and us-east-1, 2026-10-09).
+pub(crate) fn validate_parameter_number(
+    num_str: &str,
+) -> std::result::Result<(), crate::errors::DynoxideError> {
+    if num_str.is_empty() || !is_well_formed_dynamo_number(num_str) {
+        return validate_dynamo_number(num_str);
+    }
+    let unconvertible = || {
+        crate::errors::DynoxideError::ValidationException(format!(
+            "The parameter cannot be converted to a numeric value: {num_str}"
+        ))
+    };
+    let unsigned = num_str.trim_start_matches(['+', '-']);
+    let (coefficient, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (
+            &unsigned[..at],
+            unsigned[at + 1..]
+                .parse::<i32>()
+                .map_err(|_| unconvertible())?,
+        ),
+        None => (unsigned, 0),
+    };
+    let fraction_digits = coefficient
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let scale = i64::try_from(fraction_digits).unwrap_or(i64::MAX) - i64::from(exponent);
+    if i32::try_from(scale).is_err() {
+        return Err(unconvertible());
+    }
+    let significant = coefficient
+        .chars()
+        .filter(char::is_ascii_digit)
+        .skip_while(|&d| d == '0')
+        .count()
+        .max(1);
+    if i64::try_from(significant).unwrap_or(i64::MAX) - scale >= i64::from(i32::MAX) {
+        return Err(crate::errors::DynoxideError::ValidationException(
+            "Number underflow. Attempting to store a number with magnitude smaller than \
+             supported range"
+                .to_string(),
+        ));
+    }
+    validate_dynamo_number(num_str)
 }
 
 /// Validate a DynamoDB number string against DynamoDB's constraints:

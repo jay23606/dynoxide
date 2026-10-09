@@ -1129,20 +1129,31 @@ pub(crate) fn nesting_depth(value: &AttributeValue) -> usize {
 /// (unreadable numbers, empty and duplicated sets), leaving its depth to the
 /// statement it fills in.
 pub(crate) fn validate_parameter_value(value: &AttributeValue) -> crate::Result<()> {
-    validate_attribute_value_within(value, 0, None).map_err(Into::into)
+    validate_attribute_value_within(value, 0, None, crate::types::validate_parameter_number)
+        .map_err(Into::into)
 }
 
 fn validate_attribute_value(
     value: &AttributeValue,
     depth: usize,
 ) -> std::result::Result<(), ClassifiedValidationError> {
-    validate_attribute_value_within(value, depth, Some(MAX_NESTING_DEPTH))
+    validate_attribute_value_within(
+        value,
+        depth,
+        Some(MAX_NESTING_DEPTH),
+        crate::types::validate_dynamo_number,
+    )
 }
+
+/// The rule a number is read by: the stored-number rule, or the PartiQL
+/// parameter rule.
+type NumberRule = fn(&str) -> crate::Result<()>;
 
 fn validate_attribute_value_within(
     value: &AttributeValue,
     depth: usize,
     nesting_limit: Option<usize>,
+    number: NumberRule,
 ) -> std::result::Result<(), ClassifiedValidationError> {
     // PutItem wraps the nesting rejection in the envelope (us-east-1 and
     // eu-west-2, 2026-10-09); BatchWriteItem and a transaction's Put send it
@@ -1192,7 +1203,7 @@ fn validate_attribute_value_within(
         }
         AttributeValue::NS(set) if !set.is_empty() => {
             for n in set {
-                crate::types::validate_dynamo_number(n)?;
+                number(n)?;
             }
             // Check for numeric duplicates
             let mut seen = std::collections::HashSet::new();
@@ -1207,18 +1218,18 @@ fn validate_attribute_value_within(
             Ok(())
         }
         AttributeValue::N(n) => {
-            crate::types::validate_dynamo_number(n)?;
+            number(n)?;
             Ok(())
         }
         AttributeValue::L(list) => {
             for v in list {
-                validate_attribute_value_within(v, depth + 1, nesting_limit)?;
+                validate_attribute_value_within(v, depth + 1, nesting_limit, number)?;
             }
             Ok(())
         }
         AttributeValue::M(map) => {
             for v in map.values() {
-                validate_attribute_value_within(v, depth + 1, nesting_limit)?;
+                validate_attribute_value_within(v, depth + 1, nesting_limit, number)?;
             }
             Ok(())
         }

@@ -312,6 +312,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table is looked up, members of the wrong type with its incorrect data type
   message, and `<<>>` anywhere with `Empty bags are not supported`. A function
   call in an INSERT value is refused as an unsupported data type.
+- A PartiQL number parameter is read the way DynamoDB reads it: an exponent or
+  a scale outside a 32-bit integer is `The parameter cannot be converted to a
+  numeric value: <text>`, and `1e2147483647` is an underflow, in every position
+  and on every PartiQL operation. They used to be range-checked as an item's
+  numbers are, as an overflow or underflow by the exponent's sign.
 - PartiQL refuses a `begins_with` operand that isn't a string or binary, and
   BETWEEN bounds of different types or with the lower above the upper, with
   DynamoDB's messages, `NOT` or not, before the table is looked up.
