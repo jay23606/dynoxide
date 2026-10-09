@@ -311,8 +311,15 @@ pub async fn execute<S: StorageBackend>(
                 };
                 let refusal = match resolved_table {
                     Some(resolved) if matches!(stmt, partiql::parser::Statement::Select { .. }) => {
-                        if partiql::parser::index_name(&stmt).is_some() {
-                            Some(unkeyed())
+                        if let Some(index) = partiql::parser::index_name(&stmt) {
+                            // A multi-attribute index is refused in its own
+                            // words first (captured eu-west-2 and us-east-1,
+                            // 2026-10-09).
+                            Some(
+                                partiql::executor::reject_multi_attribute_index(resolved, index)
+                                    .err()
+                                    .map_or_else(unkeyed, |e| e.to_string()),
+                            )
                         } else if let Err(e) =
                             partiql::executor::reject_overlapping_select(&stmt, params, resolved)
                         {

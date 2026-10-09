@@ -829,18 +829,236 @@ fn update_table_can_add_a_multi_attribute_index_and_backfills_it() {
     );
 }
 
+/// DynamoDB refuses a PartiQL `SELECT` on an index with more than one
+/// partition key or sort key attribute, whichever kind of statement it is, but
+/// not one on the table itself or on its other indexes (captured eu-west-2 and
+/// us-east-1, 2026-10-09).
+const MULTI_ATTRIBUTE_REFUSAL: &str = "PartiQL statements cannot be executed on tables with \
+multi-attribute HASH keys or multi-attribute RANGE keys.";
+
+/// A table with a GSI of each multi-attribute shape, a single-attribute GSI and
+/// an LSI, holding one item that every index carries.
+fn mixed_indexes_table(db: &Database) {
+    let gsi = |name: &str, hash: &[&str], range: &[&str]| {
+        let mut schema: Vec<serde_json::Value> = hash
+            .iter()
+            .map(|a| serde_json::json!({"AttributeName": a, "KeyType": "HASH"}))
+            .collect();
+        schema.extend(
+            range
+                .iter()
+                .map(|a| serde_json::json!({"AttributeName": a, "KeyType": "RANGE"})),
+        );
+        serde_json::json!({
+            "IndexName": name,
+            "KeySchema": schema,
+            "Projection": {"ProjectionType": "ALL"}
+        })
+    };
+    let attrs: Vec<serde_json::Value> = ["id", "sk", "g", "h1", "h2", "r1", "r2", "l"]
+        .iter()
+        .map(|a| serde_json::json!({"AttributeName": a, "AttributeType": "S"}))
+        .collect();
+    db.create_table(json(serde_json::json!({
+        "TableName": "Mixed",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": attrs,
+        "KeySchema": [
+            {"AttributeName": "id", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "GlobalSecondaryIndexes": [
+            gsi("single", &["g"], &["r1"]),
+            gsi("hh_rr", &["h1", "h2"], &["r1", "r2"]),
+            gsi("hh_r", &["h1", "h2"], &["r1"]),
+            gsi("h_rr", &["h1"], &["r1", "r2"]),
+            gsi("hh_only", &["h1", "h2"], &[])
+        ],
+        "LocalSecondaryIndexes": [{
+            "IndexName": "local",
+            "KeySchema": [
+                {"AttributeName": "id", "KeyType": "HASH"},
+                {"AttributeName": "l", "KeyType": "RANGE"}
+            ],
+            "Projection": {"ProjectionType": "ALL"}
+        }]
+    })))
+    .unwrap();
+    db.put_item(json(serde_json::json!({
+        "TableName": "Mixed",
+        "Item": {
+            "id": {"S": "i1"}, "sk": {"S": "s"}, "g": {"S": "g1"}, "h1": {"S": "a"},
+            "h2": {"S": "x"}, "r1": {"S": "m"}, "r2": {"S": "n"}, "l": {"S": "l1"}
+        }
+    })))
+    .unwrap();
+}
+
+fn statement(db: &Database, request: serde_json::Value) -> Result<usize, String> {
+    db.execute_statement(json(request))
+        .map(|response| response.items.map_or(0, |items| items.len()))
+        .map_err(|e| e.to_string())
+}
+
 #[test]
-fn a_partiql_read_of_a_multi_attribute_index_returns_the_matching_items() {
+fn a_partiql_select_on_a_multi_attribute_index_is_refused_and_nothing_else_is() {
     let db = Database::memory().unwrap();
-    orders_table(&db);
+    mixed_indexes_table(&db);
+    for index in ["hh_rr", "hh_r", "h_rr", "hh_only"] {
+        assert_eq!(
+            statement(
+                &db,
+                serde_json::json!({
+                    "Statement": format!("SELECT * FROM \"Mixed\".\"{index}\" WHERE h1 = 'a' AND h2 = 'x'")
+                })
+            ),
+            Err(MULTI_ATTRIBUTE_REFUSAL.to_string()),
+            "{index}"
+        );
+    }
+    // The table's other indexes, and the table itself, read and write as usual.
+    for (read, rows) in [
+        ("SELECT * FROM \"Mixed\".\"single\" WHERE g = 'g1'", 1),
+        ("SELECT * FROM \"Mixed\".\"local\" WHERE id = 'i1'", 1),
+        ("SELECT * FROM \"Mixed\" WHERE id = 'i1'", 1),
+        ("SELECT * FROM \"Mixed\"", 1),
+        (
+            "SELECT * FROM \"Mixed\".\"single\" WHERE g = 'g1' ORDER BY g",
+            1,
+        ),
+        ("INSERT INTO \"Mixed\" VALUE {'id': 'n1', 'sk': 's'}", 0),
+        ("UPDATE \"Mixed\" SET a = 1 WHERE id = 'i1' AND sk = 's'", 0),
+        ("DELETE FROM \"Mixed\" WHERE id = 'n1' AND sk = 's'", 0),
+    ] {
+        assert_eq!(
+            statement(&db, serde_json::json!({"Statement": read})),
+            Ok(rows),
+            "{read}"
+        );
+    }
+}
+
+#[test]
+fn the_multi_attribute_refusal_comes_after_parsing_and_before_every_other_check() {
+    let db = Database::memory().unwrap();
+    mixed_indexes_table(&db);
+    let q = "\"Mixed\".\"hh_rr\"";
+    // A literal is checked first, and a missing index or table, or a write
+    // naming an index, keeps its own answer.
+    for (request, expected) in [
+        (
+            serde_json::json!({"Statement": format!("SELECT * FROM {q} WHERE h1 = 1e99999999999")}),
+            "Statement wasn't well formed, can't be processed: ",
+        ),
+        (
+            serde_json::json!({"Statement": "SELECT * FROM \"Mixed\".\"nosuch\" WHERE h1 = 'a'"}),
+            "The table does not have the specified index",
+        ),
+        (
+            serde_json::json!({"Statement": "SELECT * FROM \"Mixed\".\"HH_RR\" WHERE h1 = 'a'"}),
+            "The table does not have the specified index",
+        ),
+        (
+            serde_json::json!({"Statement": "SELECT * FROM \"Absent\".\"hh_rr\" WHERE h1 = 'a'"}),
+            "Requested resource not found",
+        ),
+        (
+            serde_json::json!({"Statement": format!("UPDATE {q} SET a = 1 WHERE id = 'i1'")}),
+            "This operation is not supported on an index",
+        ),
+        (
+            serde_json::json!({"Statement": format!("DELETE FROM {q} WHERE id = 'i1'")}),
+            "This operation is not supported on an index",
+        ),
+    ] {
+        assert_eq!(
+            statement(&db, request.clone()),
+            Err(expected.to_string()),
+            "{request}"
+        );
+    }
+    // Everything else about the read waits for the refusal, ORDER BY included.
+    for request in [
+        serde_json::json!({"Statement": format!("SELECT * FROM {q} WHERE h1 = 5")}),
+        serde_json::json!({"Statement": format!("SELECT * FROM {q} WHERE h1 = {{'a': 1}}")}),
+        serde_json::json!({"Statement": format!("SELECT * FROM {q} WHERE id = 'i1'")}),
+        serde_json::json!({"Statement": format!("SELECT * FROM {q}")}),
+        serde_json::json!({"Statement": format!("SELECT COUNT(*) FROM {q}")}),
+        serde_json::json!({"Statement": format!("SELECT * FROM {q} WHERE begins_with(h1, 5)")}),
+        serde_json::json!({
+            "Statement": format!("SELECT * FROM {q} WHERE h1 = 'a'"),
+            "ConsistentRead": true
+        }),
+        serde_json::json!({
+            "Statement": format!("SELECT * FROM {q} WHERE h1 = 'a'"),
+            "NextToken": "garbage"
+        }),
+        serde_json::json!({"Statement": format!("SELECT * FROM {q} WHERE h1 = 'a'"), "Limit": 1}),
+        serde_json::json!({
+            "Statement": format!("SELECT * FROM {q} WHERE h1 = 'a' AND h2 = 'x' ORDER BY r1 DESC")
+        }),
+        serde_json::json!({
+            "Statement": format!("SELECT * FROM {q} WHERE h1 = 'a' AND h2 IN ['x', 'y'] ORDER BY r1")
+        }),
+        serde_json::json!({"Statement": format!("SELECT * FROM {q} WHERE h1 = 'a' ORDER BY extra")}),
+        serde_json::json!({"Statement": format!("SELECT * FROM {q} ORDER BY r1")}),
+    ] {
+        assert_eq!(
+            statement(&db, request.clone()),
+            Err(MULTI_ATTRIBUTE_REFUSAL.to_string()),
+            "{request}"
+        );
+    }
+    // A transaction refuses any index read before it looks at the index.
+    let err = db
+        .execute_transaction(json(serde_json::json!({
+            "TransactStatements": [{"Statement": format!("SELECT * FROM {q} WHERE h1 = 'a' AND h2 = 'x'")}]
+        })))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "Validation failed in TransactStatements[0]: Reads on indices are not supported within transactions."
+    );
+}
+
+#[test]
+fn a_batch_select_on_a_multi_attribute_index_fails_only_that_statement() {
+    let db = Database::memory().unwrap();
+    mixed_indexes_table(&db);
     let response = db
-        .execute_statement(json(serde_json::json!({
-            "Statement": "SELECT * FROM \"Orders\".\"gsi\" WHERE h = 'o1' AND a = 'T' AND b = 'live'"
+        .batch_execute_statement(json(serde_json::json!({
+            "Statements": [
+                {"Statement": "SELECT * FROM \"Mixed\".\"single\" WHERE g = 'g1' AND r1 = 'm'"},
+                {"Statement": "SELECT * FROM \"Mixed\".\"hh_rr\" WHERE h1 = 'a' AND h2 = 'x' AND r1 = 'm'"},
+                {"Statement": "SELECT * FROM \"Mixed\" WHERE id = 'i1' AND sk = 's'"}
+            ]
         })))
         .unwrap();
-    let mut got = pks(&response.items.unwrap());
-    got.sort_unstable();
-    assert_eq!(got, ["p1", "p2", "p3"]);
+    let outcomes: Vec<Result<bool, (String, String)>> = response
+        .responses
+        .iter()
+        .map(|r| match &r.error {
+            Some(e) => Err((e.code.clone(), e.message.clone())),
+            None => Ok(r.item.is_some()),
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            Err((
+                "ValidationError".to_string(),
+                "Select statements within BatchExecuteStatement must specify the primary key \
+                 in the where clause."
+                    .to_string()
+            )),
+            Err((
+                "ValidationError".to_string(),
+                MULTI_ATTRIBUTE_REFUSAL.to_string()
+            )),
+            Ok(true),
+        ]
+    );
 }
 
 #[test]

@@ -188,6 +188,22 @@ pub fn returning_variant(stmt: &Statement) -> Option<ReturningVariant> {
     }
 }
 
+/// The table and index a `SELECT`'s `FROM` clause names, read without parsing
+/// the rest of the statement. A statement refused before it is parsed, such as
+/// one with a `COUNT` projection, still has its index checked first when that
+/// index is one DynamoDB refuses every read of.
+pub(crate) fn select_target(input: &str) -> Option<(String, Option<String>)> {
+    let mut t = Tokenizer::new(input).ok()?;
+    if !is_keyword(&t.next_token().ok()??, "SELECT") {
+        return None;
+    }
+    // A quoted identifier comes back with its quotes, so only the keyword
+    // matches here.
+    while !is_keyword(&t.next_token().ok()??, "FROM") {}
+    let target = parse_table_name(&mut t).ok()?;
+    Some((target.name, target.index))
+}
+
 /// DynamoDB's rejection message for a `COUNT` projection, if the statement
 /// carries one.
 ///

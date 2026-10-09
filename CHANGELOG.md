@@ -57,7 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index is rebuilt the first time the database is opened. `UpdateTable` can now add one. CreateTable and UpdateTable
   check such a key as DynamoDB does: at most four partition key and four sort
   key attributes, partition key attributes first, no name twice. A local
-  secondary index still takes one sort key attribute.
+  secondary index still takes one sort key attribute. A PartiQL `SELECT` on such
+  an index is refused, as DynamoDB refuses it, with `PartiQL statements cannot
+  be executed on tables with multi-attribute HASH keys or multi-attribute RANGE
+  keys.`; the table itself and its other indexes stay readable and writable.
 - A `KeyConditionExpression` with more clauses than the key has attributes is
   refused with DynamoDB's message, `The number of query conditions (3) exceeds
   the number of key attributes defined in the schema (2)`, rather than

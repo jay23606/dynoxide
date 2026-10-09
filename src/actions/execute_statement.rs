@@ -89,7 +89,13 @@ pub async fn execute<S: StorageBackend>(
     // A COUNT projection is rejected before parsing, with DynamoDB's bare
     // message rather than the wasn't-well-formed wrapper the parse errors
     // below carry. ExecuteStatement is the captured surface for this shape.
+    // A read of a multi-attribute index is refused ahead of it (captured
+    // eu-west-2 and us-east-1, 2026-10-09).
     if let Some(msg) = partiql::parser::count_projection_rejection(&request.statement) {
+        if let Some((table, Some(index))) = partiql::parser::select_target(&request.statement) {
+            partiql::executor::reject_multi_attribute_index_by_name(storage, &table, &index)
+                .await?;
+        }
         return Err(DynoxideError::ValidationException(msg));
     }
 

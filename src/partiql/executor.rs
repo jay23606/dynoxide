@@ -1044,6 +1044,40 @@ pub async fn execute_page<S: StorageBackend>(
             "NextToken is only valid on a SELECT statement".to_string(),
         ));
     }
+    // A read of an index whose key has more than one attribute on either side
+    // is refused before anything else about the read is checked, its operands
+    // included. The table is loaded for it here and passed on, so the read
+    // resolves it once; a table that cannot be loaded is left to the checks
+    // that report it, in their usual order (captured eu-west-2 and us-east-1,
+    // 2026-10-09).
+    let loaded;
+    let resolved = match (stmt, resolved) {
+        (
+            Statement::Select {
+                table_name,
+                index_name: Some(_),
+                ..
+            },
+            None,
+        ) => {
+            loaded = ResolvedTable::load(storage, table_name).await.ok();
+            loaded.as_ref()
+        }
+        (_, resolved) => resolved,
+    };
+    if let (
+        Statement::Select {
+            table_name,
+            index_name: Some(index_name),
+            ..
+        },
+        Some(table),
+    ) = (stmt, resolved)
+        && table.table_name == *table_name
+    {
+        reject_multi_attribute_index(table, index_name)?;
+    }
+
     validate_operand_types(statement_where_clause(stmt), parameters)?;
 
     // DynamoDB rejects an index qualifier on a write statement before it
@@ -1762,6 +1796,45 @@ struct Cursor {
     sk: String,
     base_pk: Option<String>,
     base_sk: Option<String>,
+}
+
+/// DynamoDB's refusal of a PartiQL read of a global secondary index whose key
+/// has more than one partition key or sort key attribute. It names the table,
+/// but only a read qualified with such an index is refused: the table itself
+/// and its other indexes stay readable and writable (captured eu-west-2 and
+/// us-east-1, 2026-10-09).
+pub(crate) const MULTI_ATTRIBUTE_INDEX_REFUSAL: &str = "PartiQL statements cannot be executed \
+on tables with multi-attribute HASH keys or multi-attribute RANGE keys.";
+
+/// Refuse a read of `index_name` when that index's key has more than one
+/// attribute on either side.
+pub(crate) fn reject_multi_attribute_index(
+    resolved: &ResolvedTable,
+    index_name: &str,
+) -> Result<()> {
+    let multi_attribute = crate::actions::gsi::parse_gsi_defs(&resolved.meta)?
+        .iter()
+        .any(|g| g.index_name == index_name && (g.hash_attrs.len() > 1 || g.range_attrs.len() > 1));
+    if multi_attribute {
+        return Err(DynoxideError::ValidationException(
+            MULTI_ATTRIBUTE_INDEX_REFUSAL.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// [`reject_multi_attribute_index`] for a statement refused before it is
+/// parsed. A table that cannot be loaded is left to the statement's own
+/// rejection.
+pub(crate) async fn reject_multi_attribute_index_by_name<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    index_name: &str,
+) -> Result<()> {
+    match ResolvedTable::load(storage, table_name).await {
+        Ok(resolved) => reject_multi_attribute_index(&resolved, index_name),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Which index a qualified `SELECT` resolved to, and the keys to read it by.
