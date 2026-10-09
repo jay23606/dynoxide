@@ -14,6 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `server::ServerOptions` and `server::start_with_options` give embedded Rust
   callers the same switch.
 
+### Fixed
+
+- A number whose exponent is too large for a 32-bit integer is range-checked
+  rather than read with an exponent of 0. `1e99999999999` was stored as 1; it
+  is now refused as an overflow, and `1e-99999999999` as an underflow, as
+  DynamoDB does. An exponent too large for a 64-bit integer is refused as a
+  value that cannot be converted, which is DynamoDB's message for it.
+- Zero is held to the number range as well, as if its last written digit were
+  a 1, so `0e126` is refused as an overflow and `0e-131` as an underflow, where
+  both used to be stored as 0.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security

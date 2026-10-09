@@ -87,6 +87,24 @@ fn test_underflow_rejected() {
 }
 
 #[test]
+fn test_exponent_too_large_for_i32_is_range_checked() {
+    // These were read with an exponent of 0 and stored as 1. Real DynamoDB
+    // refuses each one (captured eu-west-2, 2026-10-08).
+    let db = make_db();
+    for (input, expected) in [
+        ("1e99999999999", "magnitude larger than supported range"),
+        ("1e-99999999999", "magnitude smaller than supported range"),
+        ("0e99999999999", "magnitude larger than supported range"),
+    ] {
+        let err = put_number(&db, input).expect_err(&format!("{input} should be rejected"));
+        assert!(
+            err.contains(expected),
+            "unexpected error for {input}: {err}"
+        );
+    }
+}
+
+#[test]
 fn test_min_positive_accepted() {
     let db = make_db();
     put_number(&db, "1E-130").unwrap();
