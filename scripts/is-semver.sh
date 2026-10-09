@@ -24,7 +24,9 @@ NUM='(0|[1-9][0-9]*)'
 IDENT='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
 SEMVER="^${NUM}\\.${NUM}\\.${NUM}(-${IDENT}(\\.${IDENT})*)?$"
 
-if printf '%s' "$VERSION" | grep -qE "$SEMVER"; then
+# Matched against the whole string. grep matches line by line, so a value
+# holding a newline passed whenever any one of its lines was a version.
+if [[ $VERSION =~ $SEMVER ]]; then
   exit 0
 fi
 

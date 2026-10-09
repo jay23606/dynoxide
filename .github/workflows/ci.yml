@@ -171,8 +171,9 @@ jobs:
       - name: Check the version check can still fail
         run: scripts/check-versions.test.sh
 
-      # The release workflows share four small scripts (version shape, crate
-      # probe, binary probe, npm dist-tag) that only otherwise run at tag time.
+      # The release workflows share six small scripts (version shape,
+      # prerelease rule, npm dist-tag, crate probe, crate publish decision,
+      # binary probe) that only otherwise run at tag time.
       # Exercised here so a change to one fails on a PR rather than mid-release.
       - name: Check the release helper scripts can still fail
         run: scripts/release-helpers.test.sh

@@ -38,6 +38,14 @@ jobs:
             echo "::error::Invalid tag format: $TAG (expected vX.Y.Z or vX.Y.Z-pre.N)"
             exit 1
           fi
+          # The release skips the tap for a prerelease, so recovery does too.
+          # The tap holds one formula, and an rc there reaches everyone on
+          # their next `brew upgrade`.
+          PRERELEASE=$(scripts/is-prerelease.sh "$VERSION")
+          if [ "$PRERELEASE" = true ]; then
+            echo "::error::$TAG is a prerelease. The Homebrew tap only carries stable releases."
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 

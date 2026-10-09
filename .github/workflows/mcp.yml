@@ -47,11 +47,21 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           TAG="$INPUT_TAG"
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+          VERSION="${TAG#v}"
+          # Same shape rule as release.yml, homebrew.yml and npm.yml, from the
+          # same script.
+          if [ "$VERSION" = "$TAG" ] || ! scripts/is-semver.sh "$VERSION"; then
             echo "::error::Invalid tag format: $TAG (expected vX.Y.Z)"
             exit 1
           fi
-          VERSION="${TAG#v}"
+          # The release skips the registry for a prerelease, so recovery does
+          # too. The registry marks whichever version is highest by semver as
+          # latest, and 1.3.0-rc.1 sorts above 1.2.1.
+          PRERELEASE=$(scripts/is-prerelease.sh "$VERSION")
+          if [ "$PRERELEASE" = true ]; then
+            echo "::error::$TAG is a prerelease. The MCP registry only carries stable releases."
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version: $VERSION (tag: $TAG)"
 

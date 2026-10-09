@@ -165,6 +165,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   set. It still names the variable. The MCP auth types' debug output no
   longer shows the token either.
 
+### Fixed
+
+- A prerelease tag such as `v1.3.0-rc.1` no longer ships as if it were the
+  latest release. Its GitHub Release is flagged as a prerelease, so the GitHub
+  Action's default `version: latest` stays on the last stable release, and the
+  Homebrew tap, the MCP registry and dynoxide.dev are left alone. A stable
+  crate version is not published to crates.io from a prerelease tag. npm still
+  publishes a prerelease to `next`, and containers still get the exact tag
+  only. `docs/versioning.md` has the full list.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security
