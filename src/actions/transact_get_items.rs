@@ -183,6 +183,22 @@ pub async fn execute<S: StorageBackend>(
         crate::value_nesting::check_key(&transact_item.get.key)?;
     }
 
+    // So does a key set that is empty or repeats a member, in the older
+    // layer's words (us-east-1, eu-west-1 and us-west-2, 2026-10-09;
+    // eu-west-2 uses the current layer's).
+    for transact_item in &request.transact_items {
+        let key = &transact_item.get.key;
+        let mut names: Vec<&String> = key.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(message) =
+                crate::validation::find_set_error(&key[name], crate::validation::ValueLayer::Older)
+            {
+                return Err(DynoxideError::ValidationException(message));
+            }
+        }
+    }
+
     // Per-action validation pass.
     //
     // AWS surfaces per-action validation failures (empty Key, schema mismatch,

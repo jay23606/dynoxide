@@ -2011,10 +2011,11 @@ const NULL_FALSE_BARE: &str = "One or more parameter values were invalid: \
 
 /// The enveloped rejection UpdateItem returns for a duplicate string set in
 /// ExpressionAttributeValues, shared verbatim with tests/http_server.rs.
+// UpdateItem refuses it in the current layer's words, with no
+// ExpressionAttributeValues wrapper (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
 const DUPLICATE_SET_IN_EAV_ENVELOPED: &str = "1 validation error detected: \
-     ExpressionAttributeValues contains invalid value: \
      One or more parameter values were invalid: \
-     Input collection [a, b, a] contains duplicates. for key :t";
+     Input collection [\"a\", \"b\", \"a\"] contains duplicates.";
 
 /// The bare rejection UpdateItem returns for a SET on a key attribute, shared
 /// verbatim with tests/http_server.rs.

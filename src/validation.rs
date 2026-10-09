@@ -1083,19 +1083,21 @@ pub(crate) fn validate_updated_item_nesting(item: &Item) -> Result<()> {
 /// **Important:** This must only be called on items being persisted, NOT on
 /// `ExpressionAttributeValues` (which may legitimately contain empty strings for comparisons).
 pub fn validate_item_attribute_values(item: &Item) -> crate::Result<()> {
-    validate_item_attribute_values_classified(item).map_err(Into::into)
+    validate_item_attribute_values_classified(item, ValueLayer::Older).map_err(Into::into)
 }
 
-/// Classified form of [`validate_item_attribute_values`]: the set families
-/// (empty and duplicate SS/NS/BS) are marked as enveloped so PutItem and
-/// UpdateItem can wrap them in the request-validation envelope; number and
-/// nesting errors stay bare. Every other caller uses the public wrapper,
-/// which converts back to the plain error unchanged.
+/// Classified form of [`validate_item_attribute_values`], read by `layer`'s
+/// rules: the set families (empty and duplicate SS/NS/BS) are marked as
+/// enveloped so PutItem and UpdateItem can wrap them in the request-validation
+/// envelope, and so are the current layer's number errors; the older layer's
+/// numbers and the second nesting check stay bare. Every other caller converts
+/// back to the plain error unchanged.
 pub(crate) fn validate_item_attribute_values_classified(
     item: &Item,
+    layer: ValueLayer,
 ) -> std::result::Result<(), ClassifiedValidationError> {
     for value in item.values() {
-        validate_attribute_value(value, 0).map_err(|e| match e {
+        validate_attribute_value(value, 0, layer).map_err(|e| match e {
             // From 63 levels a second check answers first, with the same
             // message outside the envelope.
             ClassifiedValidationError::Enveloped(msg)
@@ -1107,6 +1109,45 @@ pub(crate) fn validate_item_attribute_values_classified(
         })?;
     }
     Ok(())
+}
+
+/// [`validate_item_attribute_values_classified`] for one value outside an
+/// item, such as a legacy `Expected` condition's.
+pub(crate) fn validate_value_classified(
+    value: &AttributeValue,
+    layer: ValueLayer,
+) -> std::result::Result<(), ClassifiedValidationError> {
+    validate_attribute_value(value, 0, layer)
+}
+
+/// The first empty set, or set with a repeated member, anywhere in `value`,
+/// lists and maps included, worded by `layer`; `None` when every set is sound.
+pub(crate) fn find_set_error(value: &AttributeValue, layer: ValueLayer) -> Option<String> {
+    const INVALID: &str = "One or more parameter values were invalid: ";
+    match value {
+        AttributeValue::SS(set) if set.is_empty() => {
+            Some(format!("{INVALID}An string set  may not be empty"))
+        }
+        AttributeValue::NS(set) if set.is_empty() => {
+            Some(format!("{INVALID}An number set  may not be empty"))
+        }
+        AttributeValue::BS(set) if set.is_empty() => {
+            Some(format!("{INVALID}Binary sets should not be empty"))
+        }
+        AttributeValue::L(list) => list.iter().find_map(|v| find_set_error(v, layer)),
+        AttributeValue::M(map) => map.values().find_map(|v| find_set_error(v, layer)),
+        _ => duplicate_set_message(value, layer),
+    }
+}
+
+/// The first set with a repeated member anywhere in `value`, lists and maps
+/// included, worded by `layer`; `None` when there is none.
+pub(crate) fn find_duplicate_set(value: &AttributeValue, layer: ValueLayer) -> Option<String> {
+    match value {
+        AttributeValue::L(list) => list.iter().find_map(|v| find_duplicate_set(v, layer)),
+        AttributeValue::M(map) => map.values().find_map(|v| find_duplicate_set(v, layer)),
+        _ => duplicate_set_message(value, layer),
+    }
 }
 
 /// The depth past which a single-item request's nesting is refused by a
@@ -1130,32 +1171,28 @@ pub(crate) fn nesting_depth(value: &AttributeValue) -> usize {
 /// (unreadable numbers, empty and duplicated sets), leaving its depth to the
 /// statement it fills in.
 pub(crate) fn validate_parameter_value(value: &AttributeValue) -> crate::Result<()> {
-    validate_attribute_value_within(value, 0, None, crate::types::validate_parameter_number)
-        .map_err(Into::into)
+    validate_attribute_value_within(value, 0, None, ValueLayer::Older).map_err(Into::into)
 }
 
 fn validate_attribute_value(
     value: &AttributeValue,
     depth: usize,
+    layer: ValueLayer,
 ) -> std::result::Result<(), ClassifiedValidationError> {
-    validate_attribute_value_within(
-        value,
-        depth,
-        Some(MAX_NESTING_DEPTH),
-        crate::types::validate_dynamo_number,
-    )
+    validate_attribute_value_within(value, depth, Some(MAX_NESTING_DEPTH), layer)
 }
-
-/// The rule a number is read by: the stored-number rule, or the PartiQL
-/// parameter rule.
-type NumberRule = fn(&str) -> crate::Result<()>;
 
 fn validate_attribute_value_within(
     value: &AttributeValue,
     depth: usize,
     nesting_limit: Option<usize>,
-    number: NumberRule,
+    layer: ValueLayer,
 ) -> std::result::Result<(), ClassifiedValidationError> {
+    let number = |n: &str| {
+        layer
+            .check_number(n)
+            .map_err(|e| layer.classify_number_error(e))
+    };
     // PutItem wraps the nesting rejection in the envelope (us-east-1 and
     // eu-west-2, 2026-10-09); BatchWriteItem and a transaction's Put send it
     // bare, which the untagged callers keep.
@@ -1172,51 +1209,20 @@ fn validate_attribute_value_within(
         AttributeValue::BS(set) if set.is_empty() => Err(ClassifiedValidationError::enveloped(
             "One or more parameter values were invalid: Binary sets should not be empty",
         )),
-        AttributeValue::SS(set) if !set.is_empty() => {
-            let mut seen = std::collections::HashSet::new();
-            for s in set {
-                if !seen.insert(s.clone()) {
-                    let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                    return Err(ClassifiedValidationError::enveloped(format!(
-                        "One or more parameter values were invalid: Input collection [{}] contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
+        AttributeValue::SS(_) | AttributeValue::BS(_) => {
+            match duplicate_set_message(value, layer) {
+                Some(message) => Err(ClassifiedValidationError::enveloped(message)),
+                None => Ok(()),
             }
-            Ok(())
         }
-        AttributeValue::BS(set) if !set.is_empty() => {
-            let mut seen = std::collections::HashSet::new();
-            for b in set {
-                if !seen.insert(b.clone()) {
-                    use base64::Engine;
-                    let display: Vec<String> = set
-                        .iter()
-                        .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
-                        .collect();
-                    return Err(ClassifiedValidationError::enveloped(format!(
-                        "One or more parameter values were invalid: Input collection [{}]of type BS contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
-            }
-            Ok(())
-        }
-        AttributeValue::NS(set) if !set.is_empty() => {
+        AttributeValue::NS(set) => {
             for n in set {
                 number(n)?;
             }
-            // Check for numeric duplicates
-            let mut seen = std::collections::HashSet::new();
-            for n in set {
-                let normalized = crate::types::normalize_dynamo_number(n);
-                if !seen.insert(normalized) {
-                    return Err(ClassifiedValidationError::enveloped(
-                        "Input collection contains duplicates",
-                    ));
-                }
+            match duplicate_set_message(value, layer) {
+                Some(message) => Err(ClassifiedValidationError::enveloped(message)),
+                None => Ok(()),
             }
-            Ok(())
         }
         AttributeValue::N(n) => {
             number(n)?;
@@ -1224,13 +1230,13 @@ fn validate_attribute_value_within(
         }
         AttributeValue::L(list) => {
             for v in list {
-                validate_attribute_value_within(v, depth + 1, nesting_limit, number)?;
+                validate_attribute_value_within(v, depth + 1, nesting_limit, layer)?;
             }
             Ok(())
         }
         AttributeValue::M(map) => {
             for v in map.values() {
-                validate_attribute_value_within(v, depth + 1, nesting_limit, number)?;
+                validate_attribute_value_within(v, depth + 1, nesting_limit, layer)?;
             }
             Ok(())
         }
@@ -1276,85 +1282,201 @@ fn check_nesting_depth(value: &AttributeValue, depth: usize) -> Result<()> {
 ///
 /// These errors are returned with "One or more parameter values were invalid: " prefix.
 pub fn validate_key_attribute_values(key: &Item) -> Result<()> {
+    validate_key_values(key, ValueLayer::Older).map_err(Into::into)
+}
+
+/// Check a key's values by `layer`'s rules. A duplicated set member, and on
+/// the current layer a number it can't store, are marked enveloped so
+/// UpdateItem and DeleteItem can wrap them in the request-validation envelope;
+/// the empty-set families stay bare.
+pub(crate) fn validate_key_values(
+    key: &Item,
+    layer: ValueLayer,
+) -> std::result::Result<(), ClassifiedValidationError> {
     for value in key.values() {
-        validate_key_attr_value(value)?;
+        validate_key_attr_value(value, layer)?;
     }
     Ok(())
 }
 
-fn validate_key_attr_value(value: &AttributeValue) -> Result<()> {
+fn validate_key_attr_value(
+    value: &AttributeValue,
+    layer: ValueLayer,
+) -> std::result::Result<(), ClassifiedValidationError> {
     match value {
         AttributeValue::SS(set) if set.is_empty() => {
-            return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: An string set  may not be empty"
-                    .to_string(),
+            return Err(ClassifiedValidationError::bare(
+                "One or more parameter values were invalid: An string set  may not be empty",
             ));
         }
         AttributeValue::NS(set) if set.is_empty() => {
-            return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: An number set  may not be empty"
-                    .to_string(),
+            return Err(ClassifiedValidationError::bare(
+                "One or more parameter values were invalid: An number set  may not be empty",
             ));
         }
         AttributeValue::BS(set) if set.is_empty() => {
-            return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: Binary sets should not be empty"
-                    .to_string(),
+            return Err(ClassifiedValidationError::bare(
+                "One or more parameter values were invalid: Binary sets should not be empty",
             ));
         }
-        AttributeValue::SS(set) => {
-            // Check for duplicates
-            let mut seen = std::collections::HashSet::new();
-            for s in set {
-                if !seen.insert(s.clone()) {
-                    let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                    return Err(DynoxideError::ValidationException(format!(
-                        "One or more parameter values were invalid: \
-                         Input collection [{}] contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
+        AttributeValue::SS(_) | AttributeValue::BS(_) => {
+            if let Some(message) = duplicate_set_message(value, layer) {
+                return Err(ClassifiedValidationError::enveloped(message));
             }
         }
-        AttributeValue::NS(set) if !set.is_empty() => {
-            // Validate numbers and check for duplicates
+        AttributeValue::NS(set) => {
             for n in set {
-                crate::types::validate_dynamo_number(n)?;
+                layer
+                    .check_number(n)
+                    .map_err(|e| layer.classify_number_error(e))?;
             }
-            let mut seen = std::collections::HashSet::new();
-            for n in set {
-                let normalized = crate::types::normalize_dynamo_number(n);
-                if !seen.insert(normalized) {
-                    return Err(DynoxideError::ValidationException(
-                        "Input collection contains duplicates".to_string(),
-                    ));
-                }
-            }
-        }
-        AttributeValue::BS(set) => {
-            // Check for duplicates
-            let mut seen = std::collections::HashSet::new();
-            for b in set {
-                if !seen.insert(b.clone()) {
-                    use base64::Engine;
-                    let display: Vec<String> = set
-                        .iter()
-                        .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
-                        .collect();
-                    return Err(DynoxideError::ValidationException(format!(
-                        "One or more parameter values were invalid: \
-                         Input collection [{}]of type BS contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
+            if let Some(message) = duplicate_set_message(value, layer) {
+                return Err(ClassifiedValidationError::enveloped(message));
             }
         }
         AttributeValue::N(n) => {
-            crate::types::validate_dynamo_number(n)?;
+            layer
+                .check_number(n)
+                .map_err(|e| layer.classify_number_error(e))?;
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Which of DynamoDB's two attribute-value validation layers an operation
+/// runs. They word a number they can't read, and a set with a repeated member,
+/// differently. Captured in eu-west-2, us-east-1, eu-west-1 and us-west-2,
+/// 2026-10-09; where the regions split (transactions and Scan, which eu-west-2
+/// already runs on the current layer), the majority's layer is used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ValueLayer {
+    /// PutItem, UpdateItem and DeleteItem (inside the envelope), and GetItem,
+    /// BatchGetItem and Query (bare). Numbers by the stored-number rule, an
+    /// empty one ending `: `; duplicates quoted, in the order described at
+    /// [`duplicate_set_message`]; expression values with no
+    /// `ExpressionAttributeValues contains invalid value` wrapper.
+    Current,
+    /// BatchWriteItem, TransactWriteItems, TransactGetItems, Scan and the
+    /// PartiQL operations. Numbers as Java's `BigDecimal` reads them, an empty
+    /// one with no colon; duplicates unquoted, as sent; expression values
+    /// inside the wrapper.
+    Older,
+}
+
+impl ValueLayer {
+    /// The layer DynamoDB runs `operation` on, for the dispatch seams that
+    /// read a request knowing only the operation's name.
+    #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+    pub(crate) fn for_operation(operation: &str) -> Self {
+        match operation {
+            "BatchWriteItem"
+            | "TransactWriteItems"
+            | "TransactGetItems"
+            | "Scan"
+            | "ExecuteStatement"
+            | "BatchExecuteStatement"
+            | "ExecuteTransaction" => Self::Older,
+            _ => Self::Current,
+        }
+    }
+
+    /// Check a number by this layer's rule.
+    pub(crate) fn check_number(self, n: &str) -> Result<()> {
+        match self {
+            Self::Current => crate::types::validate_current_number(n),
+            Self::Older => crate::types::validate_parameter_number(n),
+        }
+    }
+
+    /// Classify a number this layer refuses: the current layer's go in the
+    /// envelope on the single-item writes, the older layer's stay bare.
+    pub(crate) fn classify_number_error(self, e: DynoxideError) -> ClassifiedValidationError {
+        match (self, e) {
+            (Self::Current, DynoxideError::ValidationException(m)) => {
+                ClassifiedValidationError::enveloped(m)
+            }
+            (_, e) => ClassifiedValidationError::Bare(e),
+        }
+    }
+}
+
+/// The message DynamoDB refuses a string, number or binary set with a repeated
+/// member in, by `layer`'s wording, or `None` when every member is distinct.
+///
+/// The current layer quotes the members and lists them in an odd order: they
+/// are read into a byte-ordered set until the first repeat, and the message
+/// prints that set, the repeated member, then the members not yet read, as
+/// sent. `["b", "a", "b", "C"]` reads `["a", "b", "b", "C"]`. Binary members
+/// are base64, joined with no space. A number set names no members. The older
+/// layer prints every member as sent, unquoted, and words a number set
+/// without the prefix or the full stop. Captured in eu-west-2, us-east-1,
+/// eu-west-1 and us-west-2, 2026-10-09.
+pub(crate) fn duplicate_set_message(value: &AttributeValue, layer: ValueLayer) -> Option<String> {
+    const INVALID: &str = "One or more parameter values were invalid: ";
+    /// The current layer's order: the sorted members read before the first
+    /// repeat, the repeat, then the rest as sent. `None` without a repeat.
+    fn current_order<T: Ord + Clone>(members: &[T]) -> Option<Vec<T>> {
+        let mut read = std::collections::BTreeSet::new();
+        for (i, member) in members.iter().enumerate() {
+            if !read.insert(member.clone()) {
+                let mut out: Vec<T> = read.into_iter().collect();
+                out.push(member.clone());
+                out.extend(members[i + 1..].iter().cloned());
+                return Some(out);
+            }
+        }
+        None
+    }
+    fn has_repeat<T: std::hash::Hash + Eq>(members: impl IntoIterator<Item = T>) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        members.into_iter().any(|m| !seen.insert(m))
+    }
+    use base64::Engine;
+    let b64 = |b: &Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
+    match (value, layer) {
+        (AttributeValue::SS(set), ValueLayer::Current) => current_order(set).map(|ordered| {
+            let quoted: Vec<String> = ordered
+                .iter()
+                .map(|s| serde_json::to_string(s).unwrap_or_default())
+                .collect();
+            format!(
+                "{INVALID}Input collection [{}] contains duplicates.",
+                quoted.join(", ")
+            )
+        }),
+        (AttributeValue::SS(set), ValueLayer::Older) => has_repeat(set.iter()).then(|| {
+            format!(
+                "{INVALID}Input collection [{}] contains duplicates.",
+                set.join(", ")
+            )
+        }),
+        (AttributeValue::BS(set), ValueLayer::Current) => current_order(set).map(|ordered| {
+            let quoted: Vec<String> = ordered.iter().map(|b| format!("\"{}\"", b64(b))).collect();
+            format!(
+                "{INVALID}Input collection [{}]of type BS contains duplicates.",
+                quoted.join(",")
+            )
+        }),
+        (AttributeValue::BS(set), ValueLayer::Older) => has_repeat(set.iter()).then(|| {
+            let shown: Vec<String> = set.iter().map(b64).collect();
+            format!(
+                "{INVALID}Input collection [{}]of type BS contains duplicates.",
+                shown.join(", ")
+            )
+        }),
+        (AttributeValue::NS(set), _) => {
+            has_repeat(set.iter().map(|n| crate::types::normalize_dynamo_number(n))).then(|| {
+                match layer {
+                    ValueLayer::Current => {
+                        format!("{INVALID}Input collection contains duplicates.")
+                    }
+                    ValueLayer::Older => "Input collection contains duplicates".to_string(),
+                }
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Normalize sets within an item by deduplicating and sorting them in-place.

@@ -656,6 +656,9 @@ pub struct ExpressionParamContext<'a> {
     /// Raw JSON for ExpressionAttributeValues: when present, used for key
     /// validation and parsed with key-specific error messages.
     pub expression_attribute_values_raw: &'a Option<serde_json::Value>,
+    /// The validation layer the operation runs on, which decides how a bad
+    /// number or a duplicated set member in a value is worded.
+    pub layer: crate::validation::ValueLayer,
 }
 
 /// Validate expression vs non-expression parameter conflicts and basic
@@ -752,15 +755,16 @@ pub fn validate_expression_params(
                 }
             }
             // Parse and validate values with key context
-            let parsed = parse_expression_attribute_values_raw(raw_val).map_err(|e| match e {
-                DynoxideError::EnvelopedValidation(msg) => {
-                    ClassifiedValidationError::enveloped(msg)
-                }
-                other => other.into(),
-            })?;
+            let parsed =
+                parse_expression_attribute_values_raw(raw_val, ctx.layer).map_err(|e| match e {
+                    DynoxideError::EnvelopedValidation(msg) => {
+                        ClassifiedValidationError::enveloped(msg)
+                    }
+                    other => other.into(),
+                })?;
             // Validate parsed values (NULL:false, empty sets, duplicates, numbers)
             for (key, value) in &parsed {
-                validate_expression_attribute_value(key, value)?;
+                validate_expression_attribute_value(key, value, ctx.layer)?;
             }
             return Ok(Some(parsed));
         }
@@ -779,7 +783,7 @@ pub fn validate_expression_params(
             }
         }
         for (key, value) in values {
-            validate_expression_attribute_value(key, value)?;
+            validate_expression_attribute_value(key, value, ctx.layer)?;
         }
     }
 
@@ -787,10 +791,18 @@ pub fn validate_expression_params(
 }
 
 /// Validate a single ExpressionAttributeValues entry.
+///
+/// On the current layer a duplicated set member or a number it can't store is
+/// refused in that layer's words with no `ExpressionAttributeValues contains
+/// invalid value` wrapper, marked for the envelope; the older layer keeps the
+/// wrapper naming the key (eu-west-2, us-east-1, eu-west-1 and us-west-2,
+/// 2026-10-09).
 fn validate_expression_attribute_value(
     key: &str,
     value: &AttributeValue,
+    layer: crate::validation::ValueLayer,
 ) -> std::result::Result<(), ClassifiedValidationError> {
+    use crate::validation::ValueLayer;
     // Over-deep expression values are rejected up front, before evaluation, with the
     // nesting message real DynamoDB uses (no "contains invalid value" wrapper).
     // PutItem, UpdateItem and DeleteItem wrap it in the envelope (us-east-1 and
@@ -842,71 +854,43 @@ fn validate_expression_attribute_value(
                  Binary sets should not be empty for key {key}"
             )));
         }
-        AttributeValue::SS(set) => {
-            let mut seen = std::collections::HashSet::new();
-            for s in set {
-                if !seen.insert(s.clone()) {
-                    let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                    return Err(ClassifiedValidationError::enveloped(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         One or more parameter values were invalid: \
-                         Input collection [{}] contains duplicates. for key {key}",
-                        display.join(", ")
-                    )));
-                }
+        AttributeValue::SS(_) | AttributeValue::BS(_) => {
+            if let Some(message) = crate::validation::duplicate_set_message(value, layer) {
+                return Err(ClassifiedValidationError::enveloped(match layer {
+                    ValueLayer::Current => message,
+                    ValueLayer::Older => format!(
+                        "ExpressionAttributeValues contains invalid value: {message} for key {key}"
+                    ),
+                }));
             }
         }
-        AttributeValue::BS(set) => {
-            let mut seen = std::collections::HashSet::new();
-            for b in set {
-                if !seen.insert(b.clone()) {
-                    use base64::Engine;
-                    let display: Vec<String> = set
-                        .iter()
-                        .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
-                        .collect();
-                    return Err(ClassifiedValidationError::enveloped(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         One or more parameter values were invalid: \
-                         Input collection [{}]of type BS contains duplicates. for key {key}",
-                        display.join(", ")
-                    )));
-                }
-            }
-        }
-        AttributeValue::N(n) => {
-            crate::types::validate_dynamo_number(n).map_err(|e| {
-                let inner = match &e {
-                    DynoxideError::ValidationException(m) => m.clone(),
-                    _ => e.to_string(),
-                };
-                DynoxideError::ValidationException(format!(
-                    "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
-                ))
-            })?;
-        }
-        AttributeValue::NS(set) if !set.is_empty() => {
-            for n in set {
-                crate::types::validate_dynamo_number(n).map_err(|e| {
-                    let inner = match &e {
-                        DynoxideError::ValidationException(m) => m.clone(),
-                        _ => e.to_string(),
-                    };
-                    DynoxideError::ValidationException(format!(
-                        "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
-                    ))
+        AttributeValue::N(_) | AttributeValue::NS(_) => {
+            let numbers: Vec<&String> = match value {
+                AttributeValue::N(n) => vec![n],
+                AttributeValue::NS(set) => set.iter().collect(),
+                _ => Vec::new(),
+            };
+            for n in numbers {
+                layer.check_number(n).map_err(|e| match layer {
+                    ValueLayer::Current => layer.classify_number_error(e),
+                    ValueLayer::Older => {
+                        let inner = match &e {
+                            DynoxideError::ValidationException(m) => m.clone(),
+                            _ => e.to_string(),
+                        };
+                        ClassifiedValidationError::bare(format!(
+                            "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
+                        ))
+                    }
                 })?;
             }
-            // Check for duplicates
-            let mut seen = std::collections::HashSet::new();
-            for n in set {
-                let normalized = crate::types::normalize_dynamo_number(n);
-                if !seen.insert(normalized) {
-                    return Err(ClassifiedValidationError::enveloped(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         Input collection contains duplicates for key {key}"
-                    )));
-                }
+            if let Some(message) = crate::validation::duplicate_set_message(value, layer) {
+                return Err(ClassifiedValidationError::enveloped(match layer {
+                    ValueLayer::Current => message,
+                    ValueLayer::Older => format!(
+                        "ExpressionAttributeValues contains invalid value: {message} for key {key}"
+                    ),
+                }));
             }
         }
         _ => {}
@@ -964,6 +948,7 @@ pub(crate) fn validate_no_null_false_value(value: &AttributeValue) -> Result<()>
 /// format that DynamoDB uses.
 pub fn parse_expression_attribute_values_raw(
     raw: &serde_json::Value,
+    layer: crate::validation::ValueLayer,
 ) -> Result<HashMap<String, AttributeValue>> {
     let obj = raw.as_object().ok_or_else(|| {
         DynoxideError::SerializationException(
@@ -973,7 +958,9 @@ pub fn parse_expression_attribute_values_raw(
 
     let mut result = HashMap::new();
     for (key, value) in obj {
-        match serde_json::from_value::<AttributeValue>(value.clone()) {
+        match crate::types::with_value_layer(layer, || {
+            serde_json::from_value::<AttributeValue>(value.clone())
+        }) {
             Ok(av) => {
                 result.insert(key.clone(), av);
             }
@@ -1001,10 +988,19 @@ pub fn parse_expression_attribute_values_raw(
                     || inner.contains("Number overflow")
                     || inner.contains("Number underflow")
                 {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         {inner} for key {key}"
-                    )));
+                    // The current layer refuses it with no wrapper, in the
+                    // envelope on DeleteItem; the older layer names the key.
+                    return Err(match layer {
+                        crate::validation::ValueLayer::Current => {
+                            DynoxideError::EnvelopedValidation(inner.to_string())
+                        }
+                        crate::validation::ValueLayer::Older => {
+                            DynoxideError::ValidationException(format!(
+                                "ExpressionAttributeValues contains invalid value: \
+                                 {inner} for key {key}"
+                            ))
+                        }
+                    });
                 } else if inner.contains("Null attribute value types must have the value of true") {
                     // A rejected {"NULL": false} fails to deserialise here with a
                     // marker-prefixed message. Real DynamoDB rejects it with the
@@ -1037,7 +1033,28 @@ pub(crate) fn read_expected(
     expected: &serde_json::Value,
 ) -> Result<Option<HashMap<String, ExpectedCondition>>> {
     match serde_json::from_value::<HashMap<String, ExpectedCondition>>(expected.clone()) {
-        Ok(map) => Ok(Some(map)),
+        Ok(map) => {
+            // Each value is checked as an item's would be: empty and duplicated
+            // sets and numbers, in the envelope (eu-west-2, us-east-1,
+            // eu-west-1 and us-west-2, 2026-10-09).
+            let mut names: Vec<&String> = map.keys().collect();
+            names.sort();
+            for name in names {
+                let condition = &map[name];
+                let values = condition
+                    .value
+                    .iter()
+                    .chain(condition.attribute_value_list.iter().flatten());
+                for value in values {
+                    crate::validation::validate_value_classified(
+                        value,
+                        crate::validation::ValueLayer::Current,
+                    )
+                    .map_err(ClassifiedValidationError::into_tagged)?;
+                }
+            }
+            Ok(Some(map))
+        }
         Err(e) => {
             let msg = e.to_string();
             let marked = msg.starts_with(crate::serde_errors::REQUEST_VALIDATION_MARKER)
@@ -1914,9 +1931,12 @@ pub fn extract_key_strings(
 /// - Number errors: raw error (no prefix)
 pub fn parse_exclusive_start_key(
     value: &serde_json::Value,
+    layer: crate::validation::ValueLayer,
 ) -> Result<HashMap<String, AttributeValue>> {
     // First, try to deserialise: this catches multi-type and number errors
-    let parsed = match serde_json::from_value::<HashMap<String, AttributeValue>>(value.clone()) {
+    let parsed = match crate::types::with_value_layer(layer, || {
+        serde_json::from_value::<HashMap<String, AttributeValue>>(value.clone())
+    }) {
         Ok(map) => map,
         Err(e) => {
             let msg = e.to_string();
@@ -1989,51 +2009,20 @@ pub fn parse_exclusive_start_key(
                         .to_string(),
                 ));
             }
-            AttributeValue::SS(set) => {
-                let mut seen = std::collections::HashSet::new();
-                for s in set {
-                    if !seen.insert(s.clone()) {
-                        let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                        return Err(DynoxideError::ValidationException(format!(
-                            "One or more parameter values were invalid: \
-                             Input collection [{}] contains duplicates.",
-                            display.join(", ")
-                        )));
-                    }
-                }
-            }
-            AttributeValue::BS(set) => {
-                let mut seen = std::collections::HashSet::new();
-                for b in set {
-                    if !seen.insert(b.clone()) {
-                        use base64::Engine;
-                        let display: Vec<String> = set
-                            .iter()
-                            .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
-                            .collect();
-                        return Err(DynoxideError::ValidationException(format!(
-                            "One or more parameter values were invalid: \
-                             Input collection [{}]of type BS contains duplicates.",
-                            display.join(", ")
-                        )));
-                    }
+            AttributeValue::SS(_) | AttributeValue::BS(_) => {
+                if let Some(message) = crate::validation::duplicate_set_message(av, layer) {
+                    return Err(DynoxideError::ValidationException(message));
                 }
             }
             AttributeValue::N(n) => {
-                crate::types::validate_dynamo_number(n)?;
+                layer.check_number(n)?;
             }
-            AttributeValue::NS(set) if !set.is_empty() => {
+            AttributeValue::NS(set) => {
                 for n in set {
-                    crate::types::validate_dynamo_number(n)?;
+                    layer.check_number(n)?;
                 }
-                let mut seen = std::collections::HashSet::new();
-                for n in set {
-                    let normalized = crate::types::normalize_dynamo_number(n);
-                    if !seen.insert(normalized) {
-                        return Err(DynoxideError::ValidationException(
-                            "Input collection contains duplicates".to_string(),
-                        ));
-                    }
+                if let Some(message) = crate::validation::duplicate_set_message(av, layer) {
+                    return Err(DynoxideError::ValidationException(message));
                 }
             }
             _ => {}
@@ -2305,6 +2294,8 @@ fn validate_comparison_type_compat(comp_op: &str, type_name: &str) -> Result<()>
 pub fn validate_filter_conditions_raw(
     value: Option<&serde_json::Value>,
     _param_name: &str,
+
+    layer: crate::validation::ValueLayer,
 ) -> Result<()> {
     let val = match value {
         Some(v) if v.is_object() => v,
@@ -2324,7 +2315,9 @@ pub fn validate_filter_conditions_raw(
         {
             for av_val in arr {
                 // Try to deserialize each AttributeValue to trigger validation
-                match serde_json::from_value::<AttributeValue>(av_val.clone()) {
+                match crate::types::with_value_layer(layer, || {
+                    serde_json::from_value::<AttributeValue>(av_val.clone())
+                }) {
                     Err(e) => {
                         let msg = e.to_string();
                         // Strip the serde position suffix and any internal marker
@@ -2354,7 +2347,7 @@ pub fn validate_filter_conditions_raw(
                     }
                     Ok(av) => {
                         // Validate parsed value (NULL:false, empty sets, duplicates, numbers)
-                        validate_filter_attribute_value(&av)?;
+                        validate_filter_attribute_value(&av, layer)?;
                     }
                 }
             }
@@ -2367,7 +2360,10 @@ pub fn validate_filter_conditions_raw(
 /// Validate a single attribute value inside a filter condition (QueryFilter,
 /// ScanFilter, KeyConditions). Error messages use the
 /// "One or more parameter values were invalid: " prefix.
-fn validate_filter_attribute_value(value: &AttributeValue) -> Result<()> {
+fn validate_filter_attribute_value(
+    value: &AttributeValue,
+    layer: crate::validation::ValueLayer,
+) -> Result<()> {
     match value {
         AttributeValue::NULL(b) if !b => Err(DynoxideError::ValidationException(
             "One or more parameter values were invalid: \
@@ -2386,56 +2382,21 @@ fn validate_filter_attribute_value(value: &AttributeValue) -> Result<()> {
             "One or more parameter values were invalid: Binary sets should not be empty"
                 .to_string(),
         )),
-        AttributeValue::SS(set) => {
-            let mut seen = std::collections::HashSet::new();
-            for s in set {
-                if !seen.insert(s.clone()) {
-                    let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                    return Err(DynoxideError::ValidationException(format!(
-                        "One or more parameter values were invalid: \
-                         Input collection [{}] contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
+        AttributeValue::SS(_) | AttributeValue::BS(_) => {
+            match crate::validation::duplicate_set_message(value, layer) {
+                Some(message) => Err(DynoxideError::ValidationException(message)),
+                None => Ok(()),
             }
-            Ok(())
         }
-        AttributeValue::BS(set) => {
-            let mut seen = std::collections::HashSet::new();
-            for b in set {
-                if !seen.insert(b.clone()) {
-                    use base64::Engine;
-                    let display: Vec<String> = set
-                        .iter()
-                        .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
-                        .collect();
-                    return Err(DynoxideError::ValidationException(format!(
-                        "One or more parameter values were invalid: \
-                         Input collection [{}]of type BS contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
-            }
-            Ok(())
-        }
-        AttributeValue::N(n) => {
-            crate::types::validate_dynamo_number(n)?;
-            Ok(())
-        }
-        AttributeValue::NS(set) if !set.is_empty() => {
+        AttributeValue::N(n) => layer.check_number(n),
+        AttributeValue::NS(set) => {
             for n in set {
-                crate::types::validate_dynamo_number(n)?;
+                layer.check_number(n)?;
             }
-            let mut seen = std::collections::HashSet::new();
-            for n in set {
-                let normalized = crate::types::normalize_dynamo_number(n);
-                if !seen.insert(normalized) {
-                    return Err(DynoxideError::ValidationException(
-                        "Input collection contains duplicates".to_string(),
-                    ));
-                }
+            match crate::validation::duplicate_set_message(value, layer) {
+                Some(message) => Err(DynoxideError::ValidationException(message)),
+                None => Ok(()),
             }
-            Ok(())
         }
         _ => Ok(()),
     }

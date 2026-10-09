@@ -239,6 +239,7 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
+            layer: crate::validation::ValueLayer::Current,
         };
         helpers::validate_expression_params(&ctx)?;
     }
@@ -276,8 +277,16 @@ pub async fn execute<S: StorageBackend>(
     // A QueryFilter or KeyConditions value nested too deep is refused first.
     crate::value_nesting::check_query_conditions(request.query_filter.as_ref())?;
     crate::value_nesting::check_query_conditions(request.key_conditions.as_ref())?;
-    helpers::validate_filter_conditions_raw(request.query_filter.as_ref(), "QueryFilter")?;
-    helpers::validate_filter_conditions_raw(request.key_conditions.as_ref(), "KeyConditions")?;
+    helpers::validate_filter_conditions_raw(
+        request.query_filter.as_ref(),
+        "QueryFilter",
+        crate::validation::ValueLayer::Current,
+    )?;
+    helpers::validate_filter_conditions_raw(
+        request.key_conditions.as_ref(),
+        "KeyConditions",
+        crate::validation::ValueLayer::Current,
+    )?;
 
     // ---- Validate filter argument counts and type compatibility ----
     helpers::validate_filter_condition_args(request.query_filter.as_ref())?;
@@ -290,7 +299,10 @@ pub async fn execute<S: StorageBackend>(
 
     // ---- Parse ExclusiveStartKey from JSON value ----
     let exclusive_start_key = if let Some(ref esk_val) = request.exclusive_start_key_raw {
-        Some(helpers::parse_exclusive_start_key(esk_val).map_err(start_key_value_error)?)
+        Some(
+            helpers::parse_exclusive_start_key(esk_val, crate::validation::ValueLayer::Current)
+                .map_err(start_key_value_error)?,
+        )
     } else {
         request.exclusive_start_key.clone()
     };

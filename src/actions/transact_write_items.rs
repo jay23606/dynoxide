@@ -40,7 +40,11 @@ pub struct TransactPut {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_older_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -58,7 +62,11 @@ pub struct TransactUpdate {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_older_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -74,7 +82,11 @@ pub struct TransactDelete {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_older_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -90,7 +102,11 @@ pub struct TransactConditionCheck {
     pub condition_expression: String,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_older_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -596,6 +612,12 @@ async fn execute_single_action<S: StorageBackend>(
 /// condition size, where us-east-1 reports the size first. Dynoxide follows
 /// the majority except on that last point, which keeps PutItem's order.
 fn validate_action_request(item: &TransactWriteItem) -> Result<()> {
+    // Every action's sets are checked first, empty or with a repeated member,
+    // in its item or key and its expression values: ahead of a missing table
+    // and a condition's syntax error, as a top-level refusal (us-east-1,
+    // eu-west-1 and us-west-2, 2026-10-09, in the older layer's words;
+    // eu-west-2 uses the current layer's).
+    validate_action_sets(item)?;
     if let Some(ref put) = item.put {
         validate_expression_value_depth(&put.expression_attribute_values)?;
         for value in put.item.values() {
@@ -656,6 +678,42 @@ fn validate_action_request(item: &TransactWriteItem) -> Result<()> {
             Some(&check.condition_expression),
             None,
         )?;
+    }
+    Ok(())
+}
+
+/// The empty or duplicated sets in one action, item or key first and then its
+/// expression values (named by key, in key order), in the older layer's words.
+fn validate_action_sets(item: &TransactWriteItem) -> Result<()> {
+    use crate::validation::{ValueLayer, find_set_error};
+    let (values, values_map) = if let Some(ref put) = item.put {
+        (&put.item, &put.expression_attribute_values)
+    } else if let Some(ref update) = item.update {
+        (&update.key, &update.expression_attribute_values)
+    } else if let Some(ref delete) = item.delete {
+        (&delete.key, &delete.expression_attribute_values)
+    } else if let Some(ref check) = item.condition_check {
+        (&check.key, &check.expression_attribute_values)
+    } else {
+        return Ok(());
+    };
+    let mut names: Vec<&String> = values.keys().collect();
+    names.sort();
+    for name in names {
+        if let Some(message) = find_set_error(&values[name], ValueLayer::Older) {
+            return Err(DynoxideError::ValidationException(message));
+        }
+    }
+    if let Some(eav) = values_map {
+        let mut keys: Vec<&String> = eav.keys().collect();
+        keys.sort();
+        for key in keys {
+            if let Some(message) = find_set_error(&eav[key], ValueLayer::Older) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "ExpressionAttributeValues contains invalid value: {message} for key {key}"
+                )));
+            }
+        }
     }
     Ok(())
 }

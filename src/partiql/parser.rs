@@ -2783,7 +2783,11 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
             t.note_empty_bag();
             return Ok(PartiqlValue::Literal(AttributeValue::SS(Vec::new())));
         }
-        return set_literal_to_value(elements);
+        let set = set_literal_to_value(elements)?;
+        if let PartiqlValue::Literal(ref value) = set {
+            t.note_set_literal(value);
+        }
+        return Ok(set);
     }
 
     // List literal: [val1, val2]
@@ -3134,7 +3138,9 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
             t.note_empty_bag();
             return Ok(AttributeValue::SS(Vec::new()));
         }
-        return item_value_set_literal(elements);
+        let set = item_value_set_literal(elements)?;
+        t.note_set_literal(&set);
+        return Ok(set);
     }
 
     // Scalar value
@@ -3438,6 +3444,38 @@ impl Tokenizer {
     fn note_empty_bag(&mut self) {
         self.literal_errors
             .push((self.clause, "Empty bags are not supported".to_string()));
+    }
+
+    /// Note a set literal once it is read. A number set with a repeated value
+    /// is refused naming its members as written and its path, `under root`
+    /// being the value it was written as part of; a string set in the older
+    /// validation layer's words, with no path (captured eu-west-2, us-east-1,
+    /// eu-west-1 and us-west-2, 2026-10-09).
+    fn note_set_literal(&mut self, value: &AttributeValue) {
+        let message = match value {
+            AttributeValue::NS(members) => {
+                let mut seen = std::collections::HashSet::new();
+                let repeated = members
+                    .iter()
+                    .any(|n| !seen.insert(crate::types::normalize_dynamo_number(n)));
+                repeated.then(|| {
+                    let path: String = self.value_path.concat();
+                    format!(
+                        "One or more parameter values were invalid: Input collection [{}] \
+                         contains duplicates! under root{path}",
+                        members.join(", ")
+                    )
+                })
+            }
+            AttributeValue::SS(_) => crate::validation::duplicate_set_message(
+                value,
+                crate::validation::ValueLayer::Older,
+            ),
+            _ => None,
+        };
+        if let Some(message) = message {
+            self.literal_errors.push((self.clause, message));
+        }
     }
 
     /// Note an operand a condition function can't take.

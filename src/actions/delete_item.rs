@@ -199,6 +199,7 @@ async fn execute_inner<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &request.expression_attribute_values_raw,
+            layer: crate::validation::ValueLayer::Current,
         };
         // DeleteItem wraps the request-validation families in the envelope, as
         // PutItem and UpdateItem do: the nesting rejection, mixing expression
@@ -229,7 +230,10 @@ async fn execute_inner<S: StorageBackend>(
     crate::value_nesting::check_key_enveloped(&request.key)?;
     crate::value_nesting::check_expected(request.expected.as_ref())?;
 
-    crate::validation::validate_key_attribute_values(&request.key)?;
+    // A duplicated set member or a number it can't store comes back in the
+    // envelope (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+    crate::validation::validate_key_values(&request.key, crate::validation::ValueLayer::Current)
+        .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
 
     // Validate empty ConditionExpression, inside the envelope and before the
     // table lookup (eu-west-2 and us-east-1, 2026-10-09).

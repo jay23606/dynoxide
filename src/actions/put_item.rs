@@ -183,8 +183,11 @@ async fn execute_inner<S: StorageBackend>(
     // Validate attribute values (empty strings, empty sets, number precision)
     // DynamoDB validates item values before expression parameter checks for PutItem.
     // The set families are tagged for the request-validation envelope.
-    crate::validation::validate_item_attribute_values_classified(&request.item)
-        .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
+    crate::validation::validate_item_attribute_values_classified(
+        &request.item,
+        crate::validation::ValueLayer::Current,
+    )
+    .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
 
     // Validate expression/non-expression parameter conflicts
     {
@@ -209,6 +212,7 @@ async fn execute_inner<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &None,
+            layer: crate::validation::ValueLayer::Current,
         };
         // Raw EAV not used for PutItem HTTP path. Enveloped families are
         // tagged for the request-validation envelope.

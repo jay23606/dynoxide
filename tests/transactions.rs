@@ -1368,9 +1368,10 @@ fn test_transact_put_non_scalar_table_key_is_cancellation_reason() {
 }
 
 #[test]
-fn test_transact_put_duplicate_ss_stays_bare_cancellation_reason() {
-    // Only PutItem envelopes the duplicate-set families; a transactional Put
-    // keeps the bare message as a ValidationError cancellation reason.
+fn test_transact_put_duplicate_ss_is_refused_up_front() {
+    // A transaction checks every action's sets before it runs any: a repeated
+    // member is a top-level refusal in the older layer's words, not a
+    // cancellation reason (us-east-1, eu-west-1 and us-west-2, 2026-10-09).
     let db = Database::memory().unwrap();
     create_test_table(&db, "Table1");
     let req: serde_json::Value = json!({
@@ -1382,14 +1383,13 @@ fn test_transact_put_duplicate_ss_stays_bare_cancellation_reason() {
         .transact_write_items(serde_json::from_value(req).unwrap())
         .unwrap_err();
     match err {
-        DynoxideError::TransactionCanceledException(_, reasons) => {
-            assert_eq!(reasons[0].code, "ValidationError");
+        DynoxideError::ValidationException(message) => {
             assert_eq!(
-                reasons[0].message.as_deref().unwrap_or_default(),
+                message,
                 "One or more parameter values were invalid: Input collection [a, a] contains duplicates."
             );
         }
-        other => panic!("duplicate SS must stay a bare cancellation reason, got {other:?}"),
+        other => panic!("duplicate SS must be refused up front, got {other:?}"),
     }
 }
 

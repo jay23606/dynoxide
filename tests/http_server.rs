@@ -596,10 +596,11 @@ async fn test_put_item_multi_datatype_attribute_value_bare() {
 
 /// The enveloped rejection UpdateItem returns for a duplicate string set in
 /// ExpressionAttributeValues.
+// UpdateItem refuses it in the current layer's words, with no
+// ExpressionAttributeValues wrapper (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
 const DUPLICATE_SET_IN_EAV_ENVELOPED: &str = "1 validation error detected: \
-     ExpressionAttributeValues contains invalid value: \
      One or more parameter values were invalid: \
-     Input collection [a, b, a] contains duplicates. for key :t";
+     Input collection [\"a\", \"b\", \"a\"] contains duplicates.";
 
 /// The bare rejection UpdateItem returns for a SET on a key attribute,
 /// captured against real DynamoDB (eu-west-2).
@@ -772,7 +773,7 @@ async fn test_put_item_duplicate_string_set_in_item_enveloped() {
     assert_validation_error(
         resp,
         "1 validation error detected: One or more parameter values were invalid: \
-         Input collection [x, x] contains duplicates.",
+         Input collection [\"x\", \"x\"] contains duplicates.",
     )
     .await;
 }
@@ -1188,8 +1189,8 @@ async fn test_put_item_duplicate_set_matching_bare_wording_still_enveloped() {
     assert_validation_error(
         resp,
         "1 validation error detected: One or more parameter values were invalid: \
-         Input collection [This attribute is part of the key, \
-         This attribute is part of the key] contains duplicates.",
+         Input collection [\"This attribute is part of the key\", \
+         \"This attribute is part of the key\"] contains duplicates.",
     )
     .await;
 }

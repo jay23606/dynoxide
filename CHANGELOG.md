@@ -496,6 +496,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A legacy `Expected` value DynamoDB refuses, such as `{"NULL": false}` or a
   number it can't store, is refused on PutItem, UpdateItem and DeleteItem.
   The condition used to be dropped and the write went ahead.
+- A number DynamoDB can't store, and a set with a repeated member, are
+  refused in the words of the validation layer each operation runs on, as
+  DynamoDB refuses them. PutItem, UpdateItem and DeleteItem report them inside
+  the validation envelope wherever the value sits, and GetItem, BatchGetItem
+  and Query report them bare; an empty number ends `numeric value: `, a
+  duplicated string or binary set lists its members quoted, and expression
+  values carry no `ExpressionAttributeValues contains invalid value` wrapper.
+  BatchWriteItem, the transactions, Scan and PartiQL keep the older wording,
+  read numbers as DynamoDB's older layer does (`1e2147483647` is an underflow
+  there) and name the key of a bad expression value. The transactions refuse
+  an empty or duplicated set in any action up front, before a missing table or
+  a condition's syntax error, rather than cancelling. A legacy `Expected`
+  value and an `AttributeUpdates` value are checked as an item's are. A
+  PartiQL number set literal with a repeated value is refused naming its
+  members and path, in a WHERE clause too.
 
 ## [1.2.1] - 2026-09-20
 

@@ -20,7 +20,11 @@ struct ScanRequestRaw {
     projection_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_older_expression_values"
+    )]
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "Limit", default)]
     limit: Option<usize>,
@@ -290,6 +294,7 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
+            layer: crate::validation::ValueLayer::Older,
         };
         helpers::validate_expression_params(&ctx)?;
     }
@@ -307,7 +312,11 @@ pub async fn execute<S: StorageBackend>(
     crate::value_nesting::check_scan_filter(request.scan_filter.as_ref())?;
 
     // ---- Validate ScanFilter attribute values (before argument counts, matching DynamoDB) ----
-    helpers::validate_filter_conditions_raw(request.scan_filter.as_ref(), "ScanFilter")?;
+    helpers::validate_filter_conditions_raw(
+        request.scan_filter.as_ref(),
+        "ScanFilter",
+        crate::validation::ValueLayer::Older,
+    )?;
 
     // ---- Validate filter argument counts and type compatibility ----
     helpers::validate_filter_condition_args(request.scan_filter.as_ref())?;
@@ -319,7 +328,10 @@ pub async fn execute<S: StorageBackend>(
 
     // ---- Parse ExclusiveStartKey from JSON value ----
     let exclusive_start_key = if let Some(ref esk_val) = request.exclusive_start_key_raw {
-        Some(helpers::parse_exclusive_start_key(esk_val)?)
+        Some(helpers::parse_exclusive_start_key(
+            esk_val,
+            crate::validation::ValueLayer::Older,
+        )?)
     } else {
         request.exclusive_start_key.clone()
     };

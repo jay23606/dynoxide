@@ -196,14 +196,14 @@ fn test_malformed_numbers_rejected_end_to_end() {
 }
 
 #[test]
-fn test_malformed_number_message_stays_bare() {
-    // Number-format errors on PutItem are not a captured enveloped family and
-    // keep the bare message, byte for byte.
+fn test_malformed_number_message_is_enveloped() {
+    // PutItem refuses every number it can't read or store inside the
+    // request-validation envelope (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
     let db = make_db();
     let err = put_number(&db, "1.2.3").unwrap_err();
     assert_eq!(
         err,
-        "The parameter cannot be converted to a numeric value: 1.2.3"
+        "1 validation error detected: The parameter cannot be converted to a numeric value: 1.2.3"
     );
 }
 

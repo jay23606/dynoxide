@@ -355,7 +355,12 @@ fn unknown_operation_response(content_type: &str) -> Response {
 }
 
 fn dispatch(db: &Database, operation: &str, body: &str) -> crate::Result<String> {
-    let result = dispatch_operation(db, operation, body);
+    // The request's values are read under the validation layer the operation
+    // runs on, which decides how a number it can't store is worded. The
+    // operation runs to completion on this thread (the database blocks on it),
+    // so the layer holds for the whole call.
+    let layer = crate::validation::ValueLayer::for_operation(operation);
+    let result = crate::types::with_value_layer(layer, || dispatch_operation(db, operation, body));
 
     // DynamoDB wraps the request-validation family in the
     // "1 validation error detected: " envelope on PutItem and UpdateItem and

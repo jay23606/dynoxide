@@ -480,6 +480,7 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
+            layer: crate::validation::ValueLayer::Older,
         };
         helpers::validate_expression_params(&ctx)?;
     }

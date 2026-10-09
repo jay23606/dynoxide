@@ -362,19 +362,34 @@ impl<'de> Deserialize<'de> for AttributeValue {
 /// bypass the normal validation flow; the server routes them based on
 /// message content (see `crate::serde_errors::deserialize`).
 fn validate_number_in_deser(n: &str) -> Result<(), String> {
-    // validate_dynamo_number is the single source of truth for number format
-    // and precision/range; the deser path only reshapes the error message. A
-    // PartiQL parameter is read by its own rule, on top of that one.
-    let checked = if READING_PARAMETERS.with(std::cell::Cell::get) {
-        validate_parameter_number(n)
-    } else {
-        validate_dynamo_number(n)
+    // The layer the request is read under decides the rule: the current
+    // layer's numbers are refused inside the envelope on PutItem, UpdateItem
+    // and DeleteItem, so they carry the request-validation marker, and the
+    // older layer's stay bare.
+    let layer = VALUE_LAYER.with(std::cell::Cell::get);
+    let marker = match layer {
+        crate::validation::ValueLayer::Current => crate::serde_errors::REQUEST_VALIDATION_MARKER,
+        crate::validation::ValueLayer::Older => crate::serde_errors::VALIDATION_MARKER,
     };
-    match checked {
+    match layer.check_number(n) {
         Ok(()) => Ok(()),
-        Err(crate::errors::DynoxideError::ValidationException(m)) => Err(format!("VALIDATION:{m}")),
-        Err(e) => Err(format!("VALIDATION:{e}")),
+        Err(crate::errors::DynoxideError::ValidationException(m)) => Err(format!("{marker}{m}")),
+        Err(e) => Err(format!("{marker}{e}")),
     }
+}
+
+/// Validate a number by the current validation layer's rule: the stored-number
+/// rule, with an empty string refused as `... numeric value: `, colon and
+/// space (captured eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+pub(crate) fn validate_current_number(
+    num_str: &str,
+) -> std::result::Result<(), crate::errors::DynoxideError> {
+    if num_str.is_empty() {
+        return Err(crate::errors::DynoxideError::ValidationException(
+            "The parameter cannot be converted to a numeric value: ".to_string(),
+        ));
+    }
+    validate_dynamo_number(num_str)
 }
 
 // ---------------------------------------------------------------------------
@@ -415,22 +430,77 @@ pub fn normalize_number_for_sort(num_str: &str) -> String {
 }
 
 thread_local! {
-    /// Whether the values being decoded are PartiQL parameters, whose numbers
-    /// [`validate_parameter_number`] reads rather than the stored-number rule.
-    static READING_PARAMETERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The validation layer the values being decoded are read under. Set
+    /// around a request's deserialisation, which runs synchronously; outside
+    /// one it is the current layer.
+    static VALUE_LAYER: std::cell::Cell<crate::validation::ValueLayer> =
+        const { std::cell::Cell::new(crate::validation::ValueLayer::Current) };
 }
 
-/// Run `read` with numbers read as PartiQL parameters are, restoring the rule
-/// in force before, however `read` ends.
-pub(crate) fn reading_parameters<T>(read: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
+/// Run `read` with values decoded under `layer`, restoring the layer in force
+/// before, however `read` ends. `read` must not await: the layer belongs to
+/// the thread.
+pub(crate) fn with_value_layer<T>(
+    layer: crate::validation::ValueLayer,
+    read: impl FnOnce() -> T,
+) -> T {
+    struct Restore(crate::validation::ValueLayer);
     impl Drop for Restore {
         fn drop(&mut self) {
-            READING_PARAMETERS.with(|flag| flag.set(self.0));
+            VALUE_LAYER.with(|cell| cell.set(self.0));
         }
     }
-    let _restore = Restore(READING_PARAMETERS.with(|flag| flag.replace(true)));
+    let _restore = Restore(VALUE_LAYER.with(|cell| cell.replace(layer)));
     read()
+}
+
+/// Run `read` with numbers read as PartiQL parameters are: the older layer's
+/// rule, which [`validate_parameter_number`] holds.
+pub(crate) fn reading_parameters<T>(read: impl FnOnce() -> T) -> T {
+    with_value_layer(crate::validation::ValueLayer::Older, read)
+}
+
+/// Deserialise an operation's `ExpressionAttributeValues` on the older
+/// validation layer, which refuses a number it can't store inside the
+/// `ExpressionAttributeValues contains invalid value: ... for key :k` wrapper
+/// (TransactWriteItems in three of four regions, Scan in seven of ten;
+/// 2026-10-09). Every other value error passes through as it is.
+pub(crate) fn deserialize_older_expression_values<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
+    let Some(raw) =
+        Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    let mut values = HashMap::with_capacity(raw.len());
+    for (key, value) in raw {
+        let read = with_value_layer(crate::validation::ValueLayer::Older, || {
+            serde_json::from_value::<AttributeValue>(value)
+        });
+        match read {
+            Ok(av) => {
+                values.insert(key, av);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let inner = crate::serde_errors::clean_serde_message(&msg);
+                let number = inner.contains("cannot be converted to a numeric value")
+                    || inner.contains("significant digits")
+                    || inner.contains("Number overflow")
+                    || inner.contains("Number underflow");
+                return Err(de::Error::custom(if number {
+                    format!(
+                        "{}ExpressionAttributeValues contains invalid value: {inner} for key {key}",
+                        crate::serde_errors::VALIDATION_MARKER
+                    )
+                } else {
+                    msg
+                }));
+            }
+        }
+    }
+    Ok(Some(values))
 }
 
 /// Deserialise a statement's `Parameters`, reading their numbers as PartiQL

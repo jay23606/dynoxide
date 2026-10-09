@@ -205,7 +205,12 @@ pub async fn execute<S: StorageBackend>(
 
         // Validate key attribute values (empty attrs, invalid numbers, etc.)
         for key in &keys_and_attrs.keys {
-            crate::validation::validate_item_attribute_values(key)?;
+            // A key's values are checked as an item's are (depth included),
+            // in the current layer's words (2026-10-09).
+            crate::validation::validate_item_attribute_values_classified(
+                key,
+                crate::validation::ValueLayer::Current,
+            )?;
         }
 
         // Duplicate keys check

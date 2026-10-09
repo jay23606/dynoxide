@@ -299,10 +299,19 @@ async fn route<S: StorageBackend>(
 ) -> crate::Result<String> {
     // Each arm: deserialise the request through the shared decoder (so a parse
     // failure classifies exactly as it does over HTTP), run the shared handler,
-    // then serialise the response.
+    // then serialise the response. The request's values are read under the
+    // validation layer the operation runs on; deserialising doesn't await, so
+    // the layer is set around it alone.
+    let layer = crate::validation::ValueLayer::for_operation(op);
+    fn read<T: serde::de::DeserializeOwned>(
+        layer: crate::validation::ValueLayer,
+        json: &str,
+    ) -> crate::Result<T> {
+        crate::types::with_value_layer(layer, || crate::serde_errors::deserialize(json))
+    }
     macro_rules! run {
         ($module:ident) => {{
-            match crate::serde_errors::deserialize(request_json) {
+            match read(layer, request_json) {
                 Ok(request) => match actions::$module::execute(backend, request).await {
                     Ok(response) => serde_json::to_string(&response)
                         .map_err(|e| DynoxideError::InternalServerError(e.to_string())),
@@ -318,7 +327,7 @@ async fn route<S: StorageBackend>(
     // window a wire client does.
     macro_rules! run_lifecycle {
         ($module:ident) => {{
-            match crate::serde_errors::deserialize(request_json) {
+            match read(layer, request_json) {
                 Ok(request) => {
                     match actions::$module::execute(backend, request, ctx.vector_lifecycle).await {
                         Ok(response) => serde_json::to_string(&response)

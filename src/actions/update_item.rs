@@ -335,6 +335,7 @@ async fn execute_inner<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
+            layer: crate::validation::ValueLayer::Current,
         };
         // Enveloped families are tagged for the request-validation envelope.
         helpers::validate_expression_params(&ctx)
@@ -362,8 +363,28 @@ async fn execute_inner<S: StorageBackend>(
     )?;
     crate::value_nesting::check_expected(request.expected.as_ref())?;
 
-    // Validate key attribute values (unsupported datatypes, invalid numbers)
-    crate::validation::validate_key_attribute_values(&request.key)?;
+    // Validate key attribute values (unsupported datatypes, invalid numbers).
+    // A duplicated set member or a number it can't store comes back in the
+    // envelope (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+    crate::validation::validate_key_values(&request.key, crate::validation::ValueLayer::Current)
+        .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
+
+    // A legacy AttributeUpdates value with a repeated set member is refused in
+    // the envelope, in the current layer's wording (same capture).
+    if let Some(ref updates) = request.attribute_updates {
+        let mut names: Vec<&String> = updates.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(value) = updates[name].value.as_ref()
+                && let Some(message) = crate::validation::find_duplicate_set(
+                    value,
+                    crate::validation::ValueLayer::Current,
+                )
+            {
+                return Err(DynoxideError::EnvelopedValidation(message));
+            }
+        }
+    }
 
     // Validate legacy AttributeUpdates parameters
     if request.update_expression.is_none()

@@ -149,6 +149,7 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &None,
             expression_attribute_values_raw: &None,
+            layer: crate::validation::ValueLayer::Current,
         };
         helpers::validate_expression_params(&ctx)?;
     }
@@ -157,7 +158,7 @@ pub async fn execute<S: StorageBackend>(
     crate::value_nesting::check_key(&request.key)?;
 
     // Validate key attribute values (unsupported datatypes, invalid numbers)
-    crate::validation::validate_key_attribute_values(&request.key)?;
+    crate::validation::validate_key_values(&request.key, crate::validation::ValueLayer::Current)?;
 
     // Validate duplicate AttributesToGet
     if let Some(ref attrs) = request.attributes_to_get {
