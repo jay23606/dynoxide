@@ -153,19 +153,49 @@ impl WasmBridgeBackend {
             .await
             .map_err(js_err)?;
         }
+        // The version an earlier build recorded, read before this open stamps
+        // its own. None for a database this open is creating.
+        let recorded = bridge_query(
+            &handle,
+            sql_builders::GET_SCHEMA_VERSION,
+            js_sys::Array::new(),
+        )
+        .await
+        .map_err(js_err)?;
+        let recorded_version: Option<u32> = js_sys::Array::from(&recorded)
+            .iter()
+            .next()
+            .and_then(|row| col_text(&js_sys::Array::from(&row), 0))
+            .and_then(|v| v.parse().ok());
+        let backend = Self {
+            handle,
+            persistence_mode,
+            clock: SystemClock::arc(),
+        };
+        // A database an earlier build wrote may hold a multi-attribute GSI keyed
+        // on its first attributes only. Rebuild those through the path the
+        // native migration takes, then record the version so it runs once.
+        if recorded_version
+            .is_some_and(|v| v < crate::actions::gsi::MULTI_ATTRIBUTE_KEY_SCHEMA_VERSION)
+        {
+            crate::actions::gsi::rebuild_multi_attribute_gsis(&backend)
+                .await
+                .map_err(|e| {
+                    BackendError::Io(format!("rebuilding multi-attribute indexes: {e}"))
+                })?;
+            backend
+                .record_schema_version(sql_builders::SCHEMA_VERSION)
+                .await?;
+        }
         // Record the schema version (if none is recorded yet) so future wasm
         // schema changes can migrate versioned, as the native backend does,
         // instead of accreting one unconditional ALTER per column.
         let (version_sql, version_params) =
             sql_builders::init_schema_version(sql_builders::SCHEMA_VERSION);
-        bridge_exec(&handle, &version_sql, params_to_js(&version_params))
+        bridge_exec(&backend.handle, &version_sql, params_to_js(&version_params))
             .await
             .map_err(js_err)?;
-        Ok(Self {
-            handle,
-            persistence_mode,
-            clock: SystemClock::arc(),
-        })
+        Ok(backend)
     }
 
     /// The active persistence mode: `"opfs"`, `"memory"`, or `"unknown"`.
@@ -176,6 +206,16 @@ impl WasmBridgeBackend {
     /// Close the underlying SQLite connection. The wasm engine calls this
     /// before a re-open swaps in a new database, so the old connection (and the
     /// OPFS handles behind it) is released rather than leaked.
+    /// Record `version` as the database's schema version, replacing any
+    /// recorded one.
+    pub(crate) async fn record_schema_version(&self, version: &str) -> Result<(), BackendError> {
+        let (sql, params) = sql_builders::set_schema_version(version);
+        bridge_exec(&self.handle, &sql, params_to_js(&params))
+            .await
+            .map_err(js_err)?;
+        Ok(())
+    }
+
     pub async fn close(&self) -> Result<(), BackendError> {
         bridge_close(&self.handle).await.map_err(js_err)?;
         Ok(())

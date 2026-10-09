@@ -1470,7 +1470,7 @@ fn parse_stored_throughput(
 }
 
 /// Backfill existing items into a newly created GSI, processing in batches.
-async fn backfill_gsi<S: StorageBackend>(
+pub(crate) async fn backfill_gsi<S: StorageBackend>(
     storage: &S,
     table_name: &str,
     key_schema: &helpers::KeySchema,

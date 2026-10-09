@@ -283,25 +283,11 @@ impl<'a> TrackedExpressionAttributes<'a> {
 
     /// Pre-register all `#name` and `:value` references in a parsed key condition.
     /// Note: key_condition::parse already resolves names, so we track the original
-    /// value refs that will be resolved later via resolve_values.
+    /// value refs that will be resolved later via key_condition::bind.
     pub fn track_key_condition(&self, cond: &key_condition::KeyCondition) {
-        self.used_values
-            .borrow_mut()
-            .insert(cond.pk_value_ref.clone());
-        if let Some(ref sk) = cond.sk_condition {
-            match sk {
-                key_condition::SortKeyCondition::Eq(_, vr)
-                | key_condition::SortKeyCondition::Lt(_, vr)
-                | key_condition::SortKeyCondition::Le(_, vr)
-                | key_condition::SortKeyCondition::Gt(_, vr)
-                | key_condition::SortKeyCondition::Ge(_, vr)
-                | key_condition::SortKeyCondition::BeginsWith(_, vr) => {
-                    self.used_values.borrow_mut().insert(vr.clone());
-                }
-                key_condition::SortKeyCondition::Between(_, lo, hi) => {
-                    self.used_values.borrow_mut().insert(lo.clone());
-                    self.used_values.borrow_mut().insert(hi.clone());
-                }
+        for clause in &cond.clauses {
+            for value_ref in clause.value_refs() {
+                self.used_values.borrow_mut().insert(value_ref.to_string());
             }
         }
     }

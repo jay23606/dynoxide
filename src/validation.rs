@@ -335,6 +335,87 @@ pub fn validate_attribute_definitions(defs: &[AttributeDefinition]) -> Result<()
     Ok(())
 }
 
+/// Attribute names in the order DynamoDB lists them in its index definition
+/// messages: the iteration order of the Java hash table it collects them in.
+///
+/// That order is deterministic for a given set of names: each name lands in
+/// bucket `(h ^ (h >>> 16)) & (capacity - 1)` of its `String.hashCode()` `h`,
+/// buckets are walked in turn, and names sharing a bucket keep the order they
+/// were added in. `sized_to_count` picks the table: one sized to the number of
+/// names (`new HashMap<>(n)`), or a default one with sixteen buckets
+/// (`new HashSet<>()`). Either grows by doubling once it is more than three
+/// quarters full. Captured eu-west-2 and us-east-1, 2026-10-09, over 24 lists of
+/// one to sixteen names.
+pub(crate) fn java_hash_order<'a>(names: &[&'a str], sized_to_count: bool) -> Vec<&'a str> {
+    let mut unique: Vec<&str> = Vec::new();
+    for name in names {
+        if !unique.contains(name) {
+            unique.push(name);
+        }
+    }
+    let mut capacity: usize = if sized_to_count {
+        unique.len().max(1).next_power_of_two()
+    } else {
+        16
+    };
+    for added in 1..=unique.len() {
+        if added * 4 > capacity * 3 {
+            capacity *= 2;
+        }
+    }
+    let java_hash = |name: &str| {
+        name.encode_utf16().fold(0u32, |h, unit| {
+            h.wrapping_mul(31).wrapping_add(u32::from(unit))
+        })
+    };
+    let bucket = |name: &str| {
+        let h = java_hash(name);
+        ((h ^ (h >> 16)) as usize) & (capacity - 1)
+    };
+    let mut ordered: Vec<(usize, usize, &str)> = unique
+        .iter()
+        .enumerate()
+        .map(|(added, name)| (bucket(name), added, *name))
+        .collect();
+    ordered.sort_unstable();
+    ordered.into_iter().map(|(_, _, name)| name).collect()
+}
+
+/// The error for an index whose key schema names an attribute the request
+/// does not define, or `None` when every key attribute is defined.
+///
+/// The message lists the index's key attributes and the request's definitions
+/// when the request defines at least as many attributes as the index has key
+/// attributes, and is the generic one otherwise. CreateTable asks this of each
+/// index in turn and reports the first; UpdateTable asks it of a new index.
+/// Captured eu-west-2 and us-east-1, 2026-10-09.
+pub(crate) fn undefined_index_key_error(
+    key_schema: &[KeySchemaElement],
+    definitions: &[AttributeDefinition],
+) -> Option<String> {
+    let defined: Vec<&str> = definitions
+        .iter()
+        .map(|d| d.attribute_name.as_str())
+        .collect();
+    let keys: Vec<&str> = key_schema
+        .iter()
+        .map(|k| k.attribute_name.as_str())
+        .collect();
+    if keys.iter().all(|k| defined.contains(k)) {
+        return None;
+    }
+    let key_count = java_hash_order(&keys, true).len();
+    if defined.len() < key_count {
+        return Some("Invalid KeySchema: Some index key attribute have no definition".to_string());
+    }
+    Some(format!(
+        "One or more parameter values were invalid: Some index key attributes are not defined \
+         in AttributeDefinitions. Keys: [{}], AttributeDefinitions: [{}]",
+        java_hash_order(&keys, true).join(", "),
+        java_hash_order(&defined, true).join(", ")
+    ))
+}
+
 /// Validate that all key schema attributes are defined in attribute definitions.
 pub fn validate_key_attributes_in_definitions(
     key_schema: &[KeySchemaElement],
@@ -358,6 +439,57 @@ pub fn validate_key_attributes_in_definitions(
         }
     }
 
+    Ok(())
+}
+
+/// The shape rules for a global secondary index key, which can have up to four
+/// partition key (HASH) and four sort key (RANGE) attributes, HASH first, each
+/// named once. CreateTable and UpdateTable answer alike. `key_schema` must not
+/// be empty. Captured eu-west-2, 2026-10-09.
+pub fn check_gsi_key_schema(key_schema: &[KeySchemaElement]) -> std::result::Result<(), String> {
+    const MAX_PER_KIND: usize = 4;
+    if key_schema[0].key_type != KeyType::HASH {
+        return Err(
+            "Invalid KeySchema: The first KeySchemaElement is not a HASH key type".to_string(),
+        );
+    }
+    if let [hash, range] = key_schema
+        && range.key_type == KeyType::RANGE
+        && hash.attribute_name == range.attribute_name
+    {
+        return Err(
+            "Both the Hash Key and the Range Key element in the KeySchema have the same name"
+                .to_string(),
+        );
+    }
+    for (i, element) in key_schema.iter().enumerate() {
+        if key_schema[..i]
+            .iter()
+            .any(|earlier| earlier.attribute_name == element.attribute_name)
+        {
+            return Err(
+                "The KeySchema contains multiple key attributes with the same name".to_string(),
+            );
+        }
+    }
+    if key_schema
+        .windows(2)
+        .any(|w| w[0].key_type == KeyType::RANGE && w[1].key_type == KeyType::HASH)
+    {
+        return Err(
+            "One or more parameter values were invalid: All HASH key attributes must precede \
+             RANGE key attributes in the KeySchema"
+                .to_string(),
+        );
+    }
+    for (key_type, name) in [(KeyType::HASH, "HASH"), (KeyType::RANGE, "RANGE")] {
+        if key_schema.iter().filter(|k| k.key_type == key_type).count() > MAX_PER_KIND {
+            return Err(format!(
+                "One or more parameter values were invalid: The KeySchema exceeds the maximum \
+                 allowed number of {name} key attributes"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -393,13 +525,18 @@ pub fn validate_gsi(
     }
 
     // Validate key schema
-    validate_key_schema(&gsi.key_schema)?;
+    if gsi.key_schema.is_empty() {
+        validate_key_schema(&gsi.key_schema)?;
+    }
+    check_gsi_key_schema(&gsi.key_schema).map_err(DynoxideError::ValidationException)?;
 
     // Validate projection
     validate_projection(&gsi.projection, &gsi.index_name)?;
 
     // Validate GSI key attributes exist in definitions
-    validate_key_attributes_in_definitions(&gsi.key_schema, request_definitions)?;
+    if let Some(message) = undefined_index_key_error(&gsi.key_schema, request_definitions) {
+        return Err(DynoxideError::ValidationException(message));
+    }
 
     Ok(())
 }
@@ -986,6 +1123,29 @@ pub fn sort_key_name(key_schema: &[KeySchemaElement]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_hash_order_matches_the_captured_lists() {
+        // Definitions as requested, in DynamoDB's message order, eu-west-2 and
+        // us-east-1, 2026-10-09: a table sized to the count, then a default one.
+        assert_eq!(
+            java_hash_order(&["PK", "h", "a", "unused"], true),
+            ["h", "a", "unused", "PK"]
+        );
+        assert_eq!(
+            java_hash_order(&["PK", "a", "b", "c", "d", "u1"], true),
+            ["a", "b", "PK", "c", "d", "u1"]
+        );
+        assert_eq!(java_hash_order(&["h", "a", "zz"], true), ["h", "zz", "a"]);
+        assert_eq!(
+            java_hash_order(&["pk", "sk", "gpk", "gsk"], false),
+            ["gpk", "sk", "pk", "gsk"]
+        );
+        assert_eq!(
+            java_hash_order(&["orderId", "customerId", "createdAt", "status"], false),
+            ["createdAt", "orderId", "customerId", "status"]
+        );
+    }
 
     fn hash_key(name: &str) -> KeySchemaElement {
         KeySchemaElement {

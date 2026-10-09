@@ -104,14 +104,18 @@ fn statement_where_clause(stmt: &Statement) -> Option<&WhereClause> {
     }
 }
 
-/// Reject an ordering comparison whose operand is a type that has no ordering.
+/// Reject an operand of a type its operator does not take.
 ///
 /// DynamoDB orders `S`, `N` and `B` and nothing else, and it rejects the
 /// statement outright rather than declining to match: the check fires before the
 /// table is resolved, so a statement naming a table that does not exist still
 /// reports this. `=` and `<>` are unaffected, being defined for every type.
 /// Captured eu-west-2 2026-08-15.
-fn validate_ordering_operands(
+///
+/// `begins_with` takes a string or binary, on any attribute, negated or not.
+/// An AND chain is checked in the order written, so its first offending operand
+/// is the one reported, as DynamoDB reports it. Captured eu-west-2, 2026-10-08.
+fn validate_operand_types(
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
 ) -> Result<()> {
@@ -158,6 +162,13 @@ fn validate_ordering_operands(
                         }
                     }
                 }
+                WhereCondition::BeginsWith(_, prefix)
+                | WhereCondition::NotBeginsWith(_, prefix) => {
+                    let value = resolve_value(prefix, parameters)?;
+                    if !matches!(value, AttributeValue::S(_) | AttributeValue::B(_)) {
+                        return Err(reject("begins_with", &value));
+                    }
+                }
                 _ => {}
             }
         }
@@ -181,7 +192,7 @@ pub async fn execute_page<S: StorageBackend>(
             "NextToken is only valid on a SELECT statement".to_string(),
         ));
     }
-    validate_ordering_operands(statement_where_clause(stmt), parameters)?;
+    validate_operand_types(statement_where_clause(stmt), parameters)?;
 
     // DynamoDB rejects an index qualifier on a write statement before it
     // resolves the table, so a qualified UPDATE against a table that does not
@@ -436,7 +447,12 @@ async fn execute_select<S: StorageBackend>(
             }
         }
 
-        if keys_index(where_clause, idx.pk_attr()) {
+        if idx
+            .def
+            .hash_attrs
+            .iter()
+            .all(|attr| keys_index(where_clause, attr))
+        {
             let missing: Vec<String> = where_attributes(where_clause)
                 .into_iter()
                 .filter(|attr| !idx.projects(attr, table_key_schema))
@@ -608,12 +624,27 @@ async fn evaluate_window<S: StorageBackend>(
     reach_back: bool,
     consistent_read: bool,
 ) -> Result<Window> {
-    let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, read_pk));
+    // A keyed read needs an equality on every partition key attribute: one for
+    // a table or an LSI, up to four for a GSI with a multi-attribute key.
+    let hash_attrs: Vec<&str> = match index {
+        Some(idx) => idx.def.hash_attrs.iter().map(String::as_str).collect(),
+        None => vec![read_pk],
+    };
+    let pk_conditions: Option<Vec<&crate::partiql::parser::Condition>> =
+        where_clause.and_then(|wc| {
+            hash_attrs
+                .iter()
+                .map(|attr| find_pk_condition(wc, attr))
+                .collect()
+        });
 
-    let rows: Vec<(String, String, String)> = if let Some(pk_cond) = pk_condition {
-        let pk_val = resolve_value(&pk_cond.value, parameters)?;
-        let pk_str = pk_val
-            .to_key_string()
+    let rows: Vec<(String, String, String)> = if let Some(pk_conds) = pk_conditions {
+        let pk_vals = pk_conds
+            .iter()
+            .map(|c| resolve_value(&c.value, parameters))
+            .collect::<Result<Vec<_>>>()?;
+        let pk_refs: Vec<&AttributeValue> = pk_vals.iter().collect();
+        let pk_str = crate::actions::gsi::composite_key_string(&pk_refs)
             .ok_or_else(|| DynoxideError::ValidationException("Invalid key value".to_string()))?;
 
         // Sort-key conditions that a key condition can express are pushed into
@@ -621,8 +652,13 @@ async fn evaluate_window<S: StorageBackend>(
         // than rows in the whole partition, which is how DynamoDB paces a
         // key-bound read. find_pk_condition only fires on a single-OR-group
         // WHERE, so the group holding the sort-key conditions is unambiguous.
+        // A multi-attribute sort key is stored as one composite string, which a
+        // condition on its first attribute cannot bound, so nothing is pushed
+        // down for it: the partition is read whole and the WHERE clause
+        // filters it, which stays correct.
+        let single_sort_key = index.is_none_or(|idx| idx.def.range_attrs.len() <= 1);
         let sk_conditions = match (read_sk, where_clause) {
-            (Some(sk_name), Some(wc)) => {
+            (Some(sk_name), Some(wc)) if single_sort_key => {
                 translate_sk_conditions(&wc.groups[0], sk_name, parameters)
             }
             _ => None,

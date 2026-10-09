@@ -126,10 +126,13 @@ fn test_update_table_create_gsi_requires_key_in_request_attribute_definitions() 
     }))
     .unwrap();
 
+    // With fewer definitions in the request than the index has key
+    // attributes, DynamoDB gives the generic form (captured eu-west-2 and
+    // us-east-1, 2026-10-09, on the same shape).
     let err = db.update_table(req).unwrap_err();
     assert!(
         err.to_string()
-            .contains("Some index key attributes are not defined in AttributeDefinitions"),
+            .contains("Invalid KeySchema: Some index key attribute have no definition"),
         "unexpected error: {err}"
     );
 }

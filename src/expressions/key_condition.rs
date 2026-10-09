@@ -10,33 +10,63 @@ use crate::expressions::tokenizer::{
 use crate::expressions::{PathElement, TrackedExpressionAttributes};
 use crate::types::AttributeValue;
 
-/// Parsed key condition.
+/// Parsed key condition: every clause, in the order written. Which clause
+/// binds to which key attribute is decided against the key schema by [`bind`],
+/// since a global secondary index key can have up to four partition key and
+/// four sort key attributes.
 #[derive(Debug)]
 pub struct KeyCondition {
-    /// Partition key attribute name (resolved).
-    pub pk_name: String,
-    /// Partition key value reference (e.g. `:pk`).
-    pub pk_value_ref: String,
-    /// Optional sort key condition.
-    pub sk_condition: Option<SortKeyCondition>,
+    pub clauses: Vec<SortKeyCondition>,
 }
 
-/// Sort key condition variants.
+/// One clause of a key condition. Each variant names the attribute it
+/// constrains first; on a single-attribute key that is the partition or sort
+/// key.
 #[derive(Debug)]
 pub enum SortKeyCondition {
-    Eq(String, String), // (sk_name, value_ref)
+    Eq(String, String), // (attr_name, value_ref)
     Lt(String, String),
     Le(String, String),
     Gt(String, String),
     Ge(String, String),
-    Between(String, String, String), // (sk_name, lo_ref, hi_ref)
-    BeginsWith(String, String),      // (sk_name, prefix_ref)
+    Between(String, String, String), // (attr_name, lo_ref, hi_ref)
+    BeginsWith(String, String),      // (attr_name, prefix_ref)
+}
+
+impl SortKeyCondition {
+    /// The attribute this clause constrains.
+    pub fn attr_name(&self) -> &str {
+        match self {
+            Self::Eq(n, _)
+            | Self::Lt(n, _)
+            | Self::Le(n, _)
+            | Self::Gt(n, _)
+            | Self::Ge(n, _)
+            | Self::Between(n, _, _)
+            | Self::BeginsWith(n, _) => n,
+        }
+    }
+
+    /// The value references this clause reads, in the order written.
+    pub fn value_refs(&self) -> Vec<&str> {
+        match self {
+            Self::Eq(_, v)
+            | Self::Lt(_, v)
+            | Self::Le(_, v)
+            | Self::Gt(_, v)
+            | Self::Ge(_, v)
+            | Self::BeginsWith(_, v) => vec![v],
+            Self::Between(_, lo, hi) => vec![lo, hi],
+        }
+    }
 }
 
 /// Parse a KeyConditionExpression string, tracking attribute name usage.
 ///
 /// Supports optional parentheses around individual conditions and around
-/// the entire expression, matching DynamoDB behavior.
+/// the entire expression, matching DynamoDB behavior. Everything checked here
+/// needs no key schema, so it runs before the table is looked up; the clause
+/// count and which attributes the clauses name are checked by [`bind`].
 pub fn parse(expr: &str, tracker: &TrackedExpressionAttributes) -> Result<KeyCondition, String> {
     // Prefix the size error like every other KeyConditionExpression error; real
     // DynamoDB checks size before parsing and returns "Invalid
@@ -52,30 +82,13 @@ pub fn parse(expr: &str, tracker: &TrackedExpressionAttributes) -> Result<KeyCon
     let tokens = strip_outer_parens(tokens);
     let mut stream = TokenStream::new(tokens);
 
-    let cond1 = parse_single_condition(&mut stream, tracker)?;
-
-    let (pk_cond, sk_cond) = if matches!(stream.peek(), Some(Token::And)) {
+    // Every AND clause is parsed, however many there are: a multi-attribute
+    // index key takes up to eight.
+    let mut conds = vec![parse_single_condition(&mut stream, tracker)?];
+    while matches!(stream.peek(), Some(Token::And)) {
         stream.next();
-        let cond2 = parse_single_condition(&mut stream, tracker)?;
-        match (cond1, cond2) {
-            (ParsedCond::Eq(n1, v1), c2) => ((n1, v1), Some(c2)),
-            (c1, ParsedCond::Eq(n2, v2)) => ((n2, v2), Some(c1)),
-            _ => {
-                return Err(
-                    "Invalid KeyConditionExpression: partition key must use equality".to_string(),
-                );
-            }
-        }
-    } else {
-        match cond1 {
-            ParsedCond::Eq(name, val_ref) => ((name, val_ref), None),
-            _ => {
-                return Err(
-                    "Invalid KeyConditionExpression: partition key must use equality".to_string(),
-                );
-            }
-        }
-    };
+        conds.push(parse_single_condition(&mut stream, tracker)?);
+    }
 
     if !stream.at_end() {
         return Err(format!(
@@ -84,45 +97,308 @@ pub fn parse(expr: &str, tracker: &TrackedExpressionAttributes) -> Result<KeyCon
         ));
     }
 
-    let (pk_name, pk_value_ref) = pk_cond;
-    let sk_condition = sk_cond.map(|c| c.into_sk_condition()).transpose()?;
+    // Operand types come after the whole expression has parsed and before
+    // anything about which key each condition names.
+    let written: Vec<(&ParsedCond, &str)> = conds.iter().map(|(c, op)| (c, *op)).collect();
+    check_operand_types(&written, tracker)?;
+
+    // A second condition on the same attribute is refused before the clauses
+    // are counted against the key: `pk = :p AND sk > :a AND sk < :b` reports
+    // this rather than three conditions for a two-attribute key (captured
+    // eu-west-2, October 2026).
+    let mut named: Vec<&str> = Vec::new();
+    for (cond, _) in &conds {
+        let name = cond.attr_name();
+        if named.contains(&name) {
+            return Err(
+                "Invalid KeyConditionExpression: KeyConditionExpressions must only contain one condition per key"
+                    .to_string(),
+            );
+        }
+        named.push(name);
+    }
 
     Ok(KeyCondition {
-        pk_name,
-        pk_value_ref,
-        sk_condition,
+        clauses: conds.into_iter().map(|(c, _)| c.into_clause()).collect(),
     })
 }
 
-/// Resolve the actual attribute values from the parsed key condition, tracking usage.
-pub fn resolve_values(
-    condition: &KeyCondition,
-    tracker: &TrackedExpressionAttributes,
-) -> Result<ResolvedKeyCondition, String> {
-    let pk_val = tracker.resolve_value(&condition.pk_value_ref)?.clone();
+/// The key a condition is checked against: its partition key attributes and
+/// its sort key attributes, each in key-schema order. A table or an LSI has one
+/// of each at most; a GSI can have up to four of each.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyAttributes<'a> {
+    pub hash: &'a [String],
+    pub range: &'a [String],
+}
 
-    let sk = if let Some(ref sk_cond) = condition.sk_condition {
-        Some(resolve_sk_condition(sk_cond, tracker)?)
-    } else {
+/// A key condition bound to a key schema, with its values resolved.
+#[derive(Debug)]
+pub struct BoundKeyCondition {
+    /// One value per partition key attribute, in key-schema order.
+    pub hash: Vec<(String, AttributeValue)>,
+    /// Equalities on the leading sort key attributes, in key-schema order.
+    pub range_eq: Vec<(String, AttributeValue)>,
+    /// A non-equality condition on the sort key attribute after `range_eq`.
+    pub range_last: Option<ResolvedSortKeyCondition>,
+}
+
+impl BoundKeyCondition {
+    /// Every attribute the condition compares, with each value it is compared
+    /// against.
+    pub fn compared_values(&self) -> Vec<(&str, &AttributeValue)> {
+        let mut out: Vec<(&str, &AttributeValue)> = self
+            .hash
+            .iter()
+            .chain(&self.range_eq)
+            .map(|(n, v)| (n.as_str(), v))
+            .collect();
+        if let Some(last) = &self.range_last {
+            out.extend(last.values().into_iter().map(|v| (last.sk_name(), v)));
+        }
+        out
+    }
+
+    /// The partition key string the rows are stored under, or `None` when a
+    /// value has no key form.
+    pub fn partition_key_string(&self) -> Option<String> {
+        let values: Vec<&AttributeValue> = self.hash.iter().map(|(_, v)| v).collect();
+        crate::actions::gsi::composite_key_string(&values)
+    }
+
+    /// The sort key conditions as SQL over the `sk` column with their
+    /// parameters, for a key whose sort key has `range_len` attributes.
+    pub fn sort_key_sql(&self, range_len: usize) -> (Option<String>, Vec<String>) {
+        pairs_to_sql(&self.sort_key_bounds(range_len))
+    }
+
+    fn sort_key_bounds(&self, range_len: usize) -> Vec<(String, String)> {
+        if range_len <= 1 {
+            if let Some((_, v)) = self.range_eq.first() {
+                return vec![("=".into(), val_to_key_string(v))];
+            }
+            return self
+                .range_last
+                .as_ref()
+                .map(|c| c.to_sql_conditions())
+                .unwrap_or_default();
+        }
+        multi_attribute_sort_key_bounds(&self.range_eq, self.range_last.as_ref(), range_len)
+    }
+}
+
+/// Bound a multi-attribute sort key.
+///
+/// Rows are stored under [`crate::actions::gsi::composite_key_string`] of their
+/// sort key attributes, so the equality prefix is a run of closed parts, and a
+/// condition on the next attribute becomes a range over the parts that follow
+/// it. Every bound is on whole parts, so a value is never confused with a
+/// longer one it is a prefix of.
+fn multi_attribute_sort_key_bounds(
+    range_eq: &[(String, AttributeValue)],
+    range_last: Option<&ResolvedSortKeyCondition>,
+    range_len: usize,
+) -> Vec<(String, String)> {
+    use crate::actions::gsi::{push_escaped_key, push_key_part};
+
+    let mut prefix = String::new();
+    for (_, v) in range_eq {
+        push_key_part(&mut prefix, &val_to_key_string(v));
+    }
+    let closed = |v: &AttributeValue| {
+        let mut s = prefix.clone();
+        push_key_part(&mut s, &val_to_key_string(v));
+        s
+    };
+    let mut bounds: Vec<(String, String)> = Vec::new();
+    let mut push = |op: &str, value: Option<String>| {
+        if let Some(value) = value {
+            bounds.push((op.to_string(), value));
+        }
+    };
+    let in_group_from = (!range_eq.is_empty()).then(|| prefix.clone());
+    let in_group_to = if range_eq.is_empty() {
         None
+    } else {
+        prefix_upper_bound(&prefix)
     };
 
-    Ok(ResolvedKeyCondition {
-        pk_name: condition.pk_name.clone(),
-        pk_value: pk_val,
-        sk_condition: sk,
+    match range_last {
+        None if range_eq.len() == range_len => push("=", Some(prefix.clone())),
+        None => {
+            push(">=", in_group_from);
+            push("<", in_group_to);
+        }
+        Some(ResolvedSortKeyCondition::Eq(_, v)) => {
+            let part = closed(v);
+            push("<", prefix_upper_bound(&part));
+            push(">=", Some(part));
+        }
+        Some(ResolvedSortKeyCondition::Gt(_, v)) => {
+            push(">=", prefix_upper_bound(&closed(v)));
+            push("<", in_group_to);
+        }
+        Some(ResolvedSortKeyCondition::Ge(_, v)) => {
+            push(">=", Some(closed(v)));
+            push("<", in_group_to);
+        }
+        Some(ResolvedSortKeyCondition::Lt(_, v)) => {
+            push(">=", in_group_from);
+            push("<", Some(closed(v)));
+        }
+        Some(ResolvedSortKeyCondition::Le(_, v)) => {
+            push(">=", in_group_from);
+            push("<", prefix_upper_bound(&closed(v)));
+        }
+        Some(ResolvedSortKeyCondition::Between(_, lo, hi)) => {
+            push(">=", Some(closed(lo)));
+            push("<", prefix_upper_bound(&closed(hi)));
+        }
+        Some(ResolvedSortKeyCondition::BeginsWith(_, p)) => {
+            let mut start = prefix.clone();
+            push_escaped_key(&mut start, &val_to_key_string(p));
+            push("<", prefix_upper_bound(&start));
+            push(">=", Some(start));
+        }
+    }
+    bounds
+}
+
+/// The smallest string greater than every string that starts with `prefix`,
+/// or `None` when no such string exists (a prefix made only of `char::MAX`).
+pub(crate) fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let mut next = last as u32 + 1;
+        if (0xD800..=0xDFFF).contains(&next) {
+            next = 0xE000;
+        }
+        if let Some(next) = char::from_u32(next) {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// Bind a parsed key condition to a key schema and resolve its values.
+///
+/// The checks run in this order: the clause count against the key's attribute
+/// count; an equality on every partition key attribute; the values, in the
+/// order written; a clause on an attribute outside the key; and, on a sort key
+/// with more than one attribute, equalities on every attribute ahead of the
+/// last one constrained. Every message is DynamoDB's: the count captured
+/// eu-west-2, 2026-10-08; the partition key and sort key rules eu-central-1,
+/// us-east-1 and eu-west-2, October 2026, on single- and multi-attribute keys.
+pub fn bind(
+    condition: &KeyCondition,
+    keys: KeyAttributes<'_>,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<BoundKeyCondition, String> {
+    let given = condition.clauses.len();
+    let defined = keys.hash.len() + keys.range.len();
+    if given > defined {
+        return Err(format!(
+            "The number of query conditions ({given}) exceeds the number of key attributes \
+             defined in the schema ({defined})"
+        ));
+    }
+
+    let clause_for = |attr: &str| condition.clauses.iter().find(|c| c.attr_name() == attr);
+    let is_eq = |attr: &str| matches!(clause_for(attr), Some(SortKeyCondition::Eq(..)));
+    if keys.hash.len() > 1 || keys.range.len() > 1 {
+        // A multi-attribute key names every partition key attribute without an
+        // equality, even when its partition key has just one.
+        let missing: Vec<&str> = keys
+            .hash
+            .iter()
+            .filter(|a| !is_eq(a))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "HASH key attributes {} must have equality conditions specified in the query",
+                missing.join(", ")
+            ));
+        }
+    } else {
+        for attr in keys.hash {
+            match clause_for(attr) {
+                Some(SortKeyCondition::Eq(..)) => {}
+                Some(_) => return Err("Query key condition not supported".to_string()),
+                None => return Err(format!("Query condition missed key schema element: {attr}")),
+            }
+        }
+    }
+
+    // Values resolve in the order written, so the first undefined one is the
+    // one reported.
+    let mut resolved = Vec::with_capacity(condition.clauses.len());
+    for clause in &condition.clauses {
+        resolved.push(resolve_sk_condition(clause, tracker)?);
+    }
+    let resolved_for = |attr: &str| resolved.iter().find(|c| c.sk_name() == attr);
+
+    let in_key = |attr: &str| keys.hash.iter().chain(keys.range).any(|k| k == attr);
+    if condition.clauses.iter().any(|c| !in_key(c.attr_name())) {
+        // With every partition key attribute matched and no more clauses than
+        // key attributes, a stray clause leaves a sort key attribute without
+        // one.
+        let unmatched = keys
+            .range
+            .iter()
+            .find(|a| clause_for(a).is_none())
+            .map(String::as_str)
+            .unwrap_or_default();
+        return Err(format!(
+            "Query condition missed key schema element: {unmatched}"
+        ));
+    }
+
+    let mut range_eq = Vec::new();
+    let mut range_last = None;
+    if let Some(last) = keys.range.iter().rposition(|a| clause_for(a).is_some()) {
+        let missing: Vec<&str> = keys.range[..last]
+            .iter()
+            .filter(|a| !matches!(clause_for(a), Some(SortKeyCondition::Eq(..))))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "RANGE key attributes {} must have equality conditions specified in the query \
+                 because a condition is present on key attribute {}",
+                missing.join(", "),
+                keys.range[last]
+            ));
+        }
+        for attr in &keys.range[..=last] {
+            match resolved_for(attr) {
+                Some(ResolvedSortKeyCondition::Eq(_, v)) => {
+                    range_eq.push((attr.clone(), v.clone()))
+                }
+                Some(other) => range_last = Some(other.clone()),
+                None => {}
+            }
+        }
+    }
+
+    let hash = keys
+        .hash
+        .iter()
+        .filter_map(|attr| match resolved_for(attr) {
+            Some(ResolvedSortKeyCondition::Eq(_, v)) => Some((attr.clone(), v.clone())),
+            _ => None,
+        })
+        .collect();
+
+    Ok(BoundKeyCondition {
+        hash,
+        range_eq,
+        range_last,
     })
 }
 
-/// Resolved key condition with actual values.
-#[derive(Debug)]
-pub struct ResolvedKeyCondition {
-    pub pk_name: String,
-    pub pk_value: AttributeValue,
-    pub sk_condition: Option<ResolvedSortKeyCondition>,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ResolvedSortKeyCondition {
     Eq(String, AttributeValue),
     Lt(String, AttributeValue),
@@ -146,6 +422,19 @@ impl ResolvedSortKeyCondition {
         }
     }
 
+    /// The values this condition compares against.
+    pub fn values(&self) -> Vec<&AttributeValue> {
+        match self {
+            Self::Eq(_, v)
+            | Self::Lt(_, v)
+            | Self::Le(_, v)
+            | Self::Gt(_, v)
+            | Self::Ge(_, v)
+            | Self::BeginsWith(_, v) => vec![v],
+            Self::Between(_, lo, hi) => vec![lo, hi],
+        }
+    }
+
     /// Convert to SQL WHERE clause components for sk column.
     /// Returns (operator, value_string) pairs.
     /// For BETWEEN, returns two conditions.
@@ -160,14 +449,17 @@ impl ResolvedSortKeyCondition {
                 (">=".into(), val_to_key_string(lo)),
                 ("<=".into(), val_to_key_string(hi)),
             ],
+            // A range rather than LIKE: SQLite's LIKE folds ASCII case, and
+            // DynamoDB compares key bytes exactly, so `begins_with(sk, "abc")`
+            // must not match "ABCdef".
             Self::BeginsWith(_, prefix) => {
-                let prefix_str = val_to_key_string(prefix);
-                // Escape LIKE wildcards in the prefix value before appending %
-                let escaped = prefix_str
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_");
-                vec![("LIKE".into(), format!("{escaped}%"))]
+                let start = val_to_key_string(prefix);
+                let mut out = Vec::new();
+                if let Some(end) = prefix_upper_bound(&start) {
+                    out.push(("<".into(), end));
+                }
+                out.push((">=".into(), start));
+                out
             }
         }
     }
@@ -180,18 +472,22 @@ impl ResolvedSortKeyCondition {
 pub fn sk_conditions_to_sql(
     conditions: &[ResolvedSortKeyCondition],
 ) -> (Option<String>, Vec<String>) {
+    let pairs: Vec<(String, String)> = conditions
+        .iter()
+        .flat_map(|c| c.to_sql_conditions())
+        .collect();
+    pairs_to_sql(&pairs)
+}
+
+/// Render `(operator, value)` bounds on the sk column as SQL, numbering the
+/// placeholders from ?2 (the partition key is ?1).
+fn pairs_to_sql(pairs: &[(String, String)]) -> (Option<String>, Vec<String>) {
     let mut sql_parts = Vec::new();
     let mut param_values = Vec::new();
-    for cond in conditions {
-        for (op, val) in cond.to_sql_conditions() {
-            let param_idx = param_values.len() + 2;
-            if op == "LIKE" {
-                sql_parts.push(format!("AND sk LIKE ?{param_idx} ESCAPE '\\'"));
-            } else {
-                sql_parts.push(format!("AND sk {op} ?{param_idx}"));
-            }
-            param_values.push(val);
-        }
+    for (op, val) in pairs {
+        let param_idx = param_values.len() + 2;
+        sql_parts.push(format!("AND sk {op} ?{param_idx}"));
+        param_values.push(val.clone());
     }
     let sql = if sql_parts.is_empty() {
         None
@@ -277,16 +573,88 @@ enum ParsedCond {
     BeginsWith(String, String),      // (attr_name, prefix_ref)
 }
 
+/// Reject an operand its operator has no use for: begins_with takes a string or
+/// binary, the ordering comparisons and BETWEEN take a string, number or binary,
+/// and `=` takes anything (a value of the wrong type for the key is a different
+/// error). DynamoDB checks this before it resolves the table, condition by
+/// condition in the order written, naming the operator as written, so `:v < sk`
+/// reports `<` even though it is held as `sk > :v`. The first problem met in
+/// that order wins: a bad operand ahead of an undefined value is reported, and
+/// an undefined value ahead of a bad operand stops the check, leaving the
+/// undefined value to resolution. Captured eu-west-2, 2026-10-08 and 2026-10-09.
+fn check_operand_types(
+    conds: &[(&ParsedCond, &str)],
+    tracker: &TrackedExpressionAttributes,
+) -> Result<(), String> {
+    fn orderable(v: &AttributeValue) -> bool {
+        matches!(
+            v,
+            AttributeValue::S(_) | AttributeValue::N(_) | AttributeValue::B(_)
+        )
+    }
+    fn string_or_binary(v: &AttributeValue) -> bool {
+        matches!(v, AttributeValue::S(_) | AttributeValue::B(_))
+    }
+
+    let value = |value_ref: &str| tracker.values.as_ref().and_then(|m| m.get(value_ref));
+    for (cond, op) in conds {
+        let accepts: Option<fn(&AttributeValue) -> bool> = match cond {
+            ParsedCond::Eq(..) => None,
+            ParsedCond::BeginsWith(..) => Some(string_or_binary),
+            _ => Some(orderable),
+        };
+        for value_ref in cond.value_refs() {
+            let Some(v) = value(value_ref) else {
+                return Ok(());
+            };
+            if let Some(accepts) = accepts
+                && !accepts(v)
+            {
+                return Err(format!(
+                    "Invalid KeyConditionExpression: Incorrect operand type for operator or function; \
+                     operator or function: {op}, operand type: {}",
+                    v.type_name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ParsedCond {
-    fn into_sk_condition(self) -> Result<SortKeyCondition, String> {
+    fn value_refs(&self) -> Vec<&str> {
         match self {
-            ParsedCond::Eq(n, v) => Ok(SortKeyCondition::Eq(n, v)),
-            ParsedCond::Lt(n, v) => Ok(SortKeyCondition::Lt(n, v)),
-            ParsedCond::Le(n, v) => Ok(SortKeyCondition::Le(n, v)),
-            ParsedCond::Gt(n, v) => Ok(SortKeyCondition::Gt(n, v)),
-            ParsedCond::Ge(n, v) => Ok(SortKeyCondition::Ge(n, v)),
-            ParsedCond::Between(n, lo, hi) => Ok(SortKeyCondition::Between(n, lo, hi)),
-            ParsedCond::BeginsWith(n, v) => Ok(SortKeyCondition::BeginsWith(n, v)),
+            ParsedCond::Eq(_, v)
+            | ParsedCond::Lt(_, v)
+            | ParsedCond::Le(_, v)
+            | ParsedCond::Gt(_, v)
+            | ParsedCond::Ge(_, v)
+            | ParsedCond::BeginsWith(_, v) => vec![v],
+            ParsedCond::Between(_, lo, hi) => vec![lo, hi],
+        }
+    }
+
+    fn attr_name(&self) -> &str {
+        match self {
+            ParsedCond::Eq(n, _)
+            | ParsedCond::Lt(n, _)
+            | ParsedCond::Le(n, _)
+            | ParsedCond::Gt(n, _)
+            | ParsedCond::Ge(n, _)
+            | ParsedCond::Between(n, _, _)
+            | ParsedCond::BeginsWith(n, _) => n,
+        }
+    }
+
+    fn into_clause(self) -> SortKeyCondition {
+        match self {
+            ParsedCond::Eq(n, v) => SortKeyCondition::Eq(n, v),
+            ParsedCond::Lt(n, v) => SortKeyCondition::Lt(n, v),
+            ParsedCond::Le(n, v) => SortKeyCondition::Le(n, v),
+            ParsedCond::Gt(n, v) => SortKeyCondition::Gt(n, v),
+            ParsedCond::Ge(n, v) => SortKeyCondition::Ge(n, v),
+            ParsedCond::Between(n, lo, hi) => SortKeyCondition::Between(n, lo, hi),
+            ParsedCond::BeginsWith(n, v) => SortKeyCondition::BeginsWith(n, v),
         }
     }
 }
@@ -331,10 +699,12 @@ fn strip_outer_parens(mut tokens: Vec<(Token, TokenSpan)>) -> Vec<(Token, TokenS
     tokens
 }
 
+/// Parse one condition, returning it with its operator as written, which the
+/// operand type error names.
 fn parse_single_condition(
     stream: &mut TokenStream,
     tracker: &TrackedExpressionAttributes,
-) -> Result<ParsedCond, String> {
+) -> Result<(ParsedCond, &'static str), String> {
     // Count and skip optional wrapping parentheses: `(pk = :pk)`, `((pk = :pk))`
     let mut parens = 0;
     while matches!(stream.peek(), Some(Token::LParen)) {
@@ -354,7 +724,7 @@ fn parse_single_condition(
         let val_ref = expect_value_ref(stream)?;
         stream.expect(&Token::RParen)?;
         consume_close_parens(stream, parens)?;
-        return Ok(ParsedCond::BeginsWith(attr_name, val_ref));
+        return Ok((ParsedCond::BeginsWith(attr_name, val_ref), "begins_with"));
     }
 
     // Reversed operand order (:val op #attr). AWS accepts the value on the left
@@ -363,22 +733,23 @@ fn parse_single_condition(
     if matches!(stream.peek(), Some(Token::ValueRef(_))) {
         let val_ref = expect_value_ref(stream)?;
         // Match here rather than bind, to release the stream borrow before the path parse.
-        let build: Option<fn(String, String) -> ParsedCond> = match stream.next() {
-            Some(Token::Eq) => Some(ParsedCond::Eq),
-            Some(Token::Lt) => Some(ParsedCond::Gt),
-            Some(Token::Le) => Some(ParsedCond::Ge),
-            Some(Token::Gt) => Some(ParsedCond::Lt),
-            Some(Token::Ge) => Some(ParsedCond::Le),
+        type Build = fn(String, String) -> ParsedCond;
+        let build: Option<(Build, &'static str)> = match stream.next() {
+            Some(Token::Eq) => Some((ParsedCond::Eq, "=")),
+            Some(Token::Lt) => Some((ParsedCond::Gt, "<")),
+            Some(Token::Le) => Some((ParsedCond::Ge, "<=")),
+            Some(Token::Gt) => Some((ParsedCond::Lt, ">")),
+            Some(Token::Ge) => Some((ParsedCond::Le, ">=")),
             _ => None,
         };
-        let build = build.ok_or_else(|| {
+        let (build, op) = build.ok_or_else(|| {
             "Invalid KeyConditionExpression: unsupported operator with a value on the left"
                 .to_string()
         })?;
         let path = parse_raw_path(stream)?;
         let attr_name = resolve_path_to_name(&path, tracker)?;
         consume_close_parens(stream, parens)?;
-        return Ok(build(attr_name, val_ref));
+        return Ok((build(attr_name, val_ref), op));
     }
 
     // attr op :val
@@ -388,29 +759,29 @@ fn parse_single_condition(
     let result = match stream.next() {
         Some(Token::Eq) => {
             let val_ref = expect_value_ref(stream)?;
-            Ok(ParsedCond::Eq(attr_name, val_ref))
+            Ok((ParsedCond::Eq(attr_name, val_ref), "="))
         }
         Some(Token::Lt) => {
             let val_ref = expect_value_ref(stream)?;
-            Ok(ParsedCond::Lt(attr_name, val_ref))
+            Ok((ParsedCond::Lt(attr_name, val_ref), "<"))
         }
         Some(Token::Le) => {
             let val_ref = expect_value_ref(stream)?;
-            Ok(ParsedCond::Le(attr_name, val_ref))
+            Ok((ParsedCond::Le(attr_name, val_ref), "<="))
         }
         Some(Token::Gt) => {
             let val_ref = expect_value_ref(stream)?;
-            Ok(ParsedCond::Gt(attr_name, val_ref))
+            Ok((ParsedCond::Gt(attr_name, val_ref), ">"))
         }
         Some(Token::Ge) => {
             let val_ref = expect_value_ref(stream)?;
-            Ok(ParsedCond::Ge(attr_name, val_ref))
+            Ok((ParsedCond::Ge(attr_name, val_ref), ">="))
         }
         Some(Token::Between) => {
             let lo_ref = expect_value_ref(stream)?;
             stream.expect(&Token::And)?;
             let hi_ref = expect_value_ref(stream)?;
-            Ok(ParsedCond::Between(attr_name, lo_ref, hi_ref))
+            Ok((ParsedCond::Between(attr_name, lo_ref, hi_ref), "BETWEEN"))
         }
         Some(t) => Err(format!(
             "Unexpected operator in KeyConditionExpression: {t}"
@@ -518,6 +889,31 @@ mod tests {
         values: &'a Option<HashMap<String, AttributeValue>>,
     ) -> TrackedExpressionAttributes<'a> {
         TrackedExpressionAttributes::new(names, values)
+    }
+
+    /// The two-clause view most of these tests were written against: the first
+    /// equality is the partition key and the other clause the sort key.
+    #[derive(Debug)]
+    struct TwoClause {
+        pk_name: String,
+        pk_value_ref: String,
+        sk_condition: Option<SortKeyCondition>,
+    }
+
+    fn parse(expr: &str, tracker: &TrackedExpressionAttributes) -> Result<TwoClause, String> {
+        let mut clauses = super::parse(expr, tracker)?.clauses;
+        let pk_at = clauses
+            .iter()
+            .position(|c| matches!(c, SortKeyCondition::Eq(..)))
+            .expect("parse requires an equality");
+        let SortKeyCondition::Eq(pk_name, pk_value_ref) = clauses.remove(pk_at) else {
+            unreachable!("position found an equality")
+        };
+        Ok(TwoClause {
+            pk_name,
+            pk_value_ref,
+            sk_condition: clauses.pop(),
+        })
     }
 
     #[test]
@@ -662,16 +1058,24 @@ mod tests {
         let no_names = None;
         let no_values = None;
         let parse_tracker = make_tracker(&no_names, &no_values);
-        let kc = parse("pk = :pk AND sk >= :sk", &parse_tracker).unwrap();
+        let kc = super::parse("pk = :pk AND sk >= :sk", &parse_tracker).unwrap();
         let av = Some(HashMap::from([
             (":pk".to_string(), AttributeValue::S("user#1".into())),
             (":sk".to_string(), AttributeValue::S("2024-01-01".into())),
         ]));
         let resolve_tracker = make_tracker(&no_names, &av);
-        let resolved = resolve_values(&kc, &resolve_tracker).unwrap();
-        assert_eq!(resolved.pk_value, AttributeValue::S("user#1".into()));
+        let (hash, range) = (["pk".to_string()], ["sk".to_string()]);
+        let keys = KeyAttributes {
+            hash: &hash,
+            range: &range,
+        };
+        let resolved = bind(&kc, keys, &resolve_tracker).unwrap();
+        assert_eq!(
+            resolved.hash,
+            vec![("pk".to_string(), AttributeValue::S("user#1".into()))]
+        );
         assert!(matches!(
-            resolved.sk_condition,
+            resolved.range_last,
             Some(ResolvedSortKeyCondition::Ge(_, _))
         ));
     }

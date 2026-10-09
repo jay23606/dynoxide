@@ -115,6 +115,7 @@ the ones worth knowing.
 | GSI add/remove via UpdateTable | Supported (with backfill) |
 | GSI projection ALL / KEYS_ONLY / INCLUDE | Supported |
 | Sparse GSI (items without GSI keys excluded) | Supported |
+| Multi-attribute GSI keys (up to four HASH and four RANGE attributes) | Supported |
 | Per-GSI ConsumedCapacity (INDEXES mode) | Supported |
 | **LSI on CreateTable** | Supported |
 | **LSI projection ALL / KEYS_ONLY / INCLUDE** | Supported |
@@ -391,6 +392,38 @@ DynamoDB Local fails a share of the suite that real DynamoDB passes, clustered i
 - **Single-shard stream model** - DescribeStream returns a single shard; `ExclusiveStartShardId` and `Limit` accepted but ignored
 - **Number arithmetic precision** - uses `rust_decimal` for arbitrary-precision arithmetic, which may have minor differences from DynamoDB's proprietary implementation at extreme edge cases
 - **Transaction contention errors** - `TransactionConflictException` and `TransactionInProgressException` not emulated (concurrent transaction contention doesn't apply to single-process emulator)
+
+### Where AWS answers the same request differently
+
+These three come from inside AWS, so Dynoxide picks one answer and keeps to it.
+Captured in eu-west-2 and us-east-1 on 2026-10-09.
+
+**1. Scan order across partitions.** AWS walks partitions in the order of an
+internal hash of the partition key: the same six items came back with partition
+`b` ahead of `a` in both regions. Dynoxide walks them in key order. Within a
+partition both return sort key order.
+
+*What to do:* never depend on which partition a Scan reaches first.
+
+**2. `LastEvaluatedKey` on a page that ends at the last matching item.** When a
+Query or Scan fills its `Limit` with the last item there is, AWS sometimes
+returns a `LastEvaluatedKey` and sometimes does not. The same request answered
+one way in eu-west-2 and the other in us-east-1, and two requests that differed
+only in direction or `Select` answered differently in one region. Dynoxide
+always returns one when a page fills its `Limit`, so the next request comes back
+empty, which AWS also does.
+
+*What to do:* page until `LastEvaluatedKey` is absent, and treat an empty page
+as the end.
+
+**3. How a refused key schema is printed.** A request-model error that quotes a
+key schema, such as a table key with three attributes, usually lists each
+element as `KeySchemaElement(attributeName=pk, keyType=HASH)`. Some AWS hosts
+print `com.amazonaws.dynamodb.v20120810.KeySchemaElement@ad28e71d` instead; both
+forms came back from eu-west-2 within the same hour. Dynoxide prints the first.
+
+*What to do:* match the constraint text (`Member must have length less than or
+equal to 2`), not the list.
 
 ### Legacy Pre-2015 API Parameters
 

@@ -415,6 +415,16 @@ pub async fn execute<S: StorageBackend>(
         )
     };
 
+    // Every partition key and sort key attribute, in key-schema order. Only a
+    // GSI can have more than one of each.
+    let (key_hash, key_range): (Vec<String>, Vec<String>) = match request.index_name {
+        Some(ref index_name) if !is_lsi => super::gsi::parse_gsi_key_attrs(&meta, index_name)?,
+        _ => (
+            vec![effective_pk.clone()],
+            effective_sk.iter().cloned().collect(),
+        ),
+    };
+
     // ---- Validate ExclusiveStartKey structure against key schema ----
     // Stage 1+2: count check + index key type check
     if let Some(ref esk) = exclusive_start_key {
@@ -458,11 +468,15 @@ pub async fn execute<S: StorageBackend>(
 
     // Extract ExclusiveStartKey pk/sk using effective key names
     let (start_pk, start_sk) = if let Some(ref esk) = exclusive_start_key {
-        let pk = esk.get(&effective_pk).and_then(|v| v.to_key_string());
-        let sk = if let Some(ref sk_name) = effective_sk {
-            esk.get(sk_name).and_then(|v| v.to_key_string())
-        } else {
+        let key_string = |attrs: &[String]| {
+            let values: Option<Vec<&AttributeValue>> = attrs.iter().map(|a| esk.get(a)).collect();
+            values.and_then(|v| super::gsi::composite_key_string(&v))
+        };
+        let pk = key_string(&key_hash);
+        let sk = if key_range.is_empty() {
             Some(String::new())
+        } else {
+            key_string(&key_range)
         };
         (pk, sk)
     } else {
@@ -548,13 +562,10 @@ pub async fn execute<S: StorageBackend>(
         }
         let mut index_key_attrs = Vec::new();
         if request.index_name.is_some() {
-            if !base_key_attrs.contains(&effective_pk) {
-                index_key_attrs.push(effective_pk.clone());
-            }
-            if let Some(ref sk) = effective_sk
-                && !base_key_attrs.contains(sk)
-            {
-                index_key_attrs.push(sk.clone());
+            for attr in key_hash.iter().chain(&key_range) {
+                if !base_key_attrs.contains(attr) {
+                    index_key_attrs.push(attr.clone());
+                }
             }
         }
         if let Some((attr, is_index)) = expressions::condition::check_non_scalar_key_access(
@@ -693,15 +704,11 @@ pub async fn execute<S: StorageBackend>(
     let is_gsi_scan = request.index_name.is_some() && !is_lsi;
     let last_evaluated_key = if has_more {
         last_evaluated_item.map(|item| {
-            let mut key = HashMap::new();
-            if let Some(pk_val) = item.get(&effective_pk) {
-                key.insert(effective_pk.clone(), pk_val.clone());
-            }
-            if let Some(ref sk_name) = effective_sk
-                && let Some(sk_val) = item.get(sk_name)
-            {
-                key.insert(sk_name.clone(), sk_val.clone());
-            }
+            let mut key: HashMap<String, AttributeValue> = key_hash
+                .iter()
+                .chain(&key_range)
+                .filter_map(|name| item.get(name).map(|v| (name.clone(), v.clone())))
+                .collect();
             // For LSI scans, add the table sort key if different from the index sort key
             if is_lsi
                 && let Some(tsk) = table_key_schema.sort_key.as_deref()

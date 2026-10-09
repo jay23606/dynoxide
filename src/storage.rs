@@ -460,6 +460,9 @@ impl Storage {
         if version < 9 {
             self.migrate_v8_to_v9()?;
         }
+        if version < 10 {
+            self.migrate_v9_to_v10()?;
+        }
 
         Ok(())
     }
@@ -669,6 +672,21 @@ impl Storage {
             [],
         )?;
 
+        Ok(())
+    }
+
+    /// Migrate from schema v9 to v10: rebuild every GSI whose key has more than
+    /// one partition key or sort key attribute, through the same path the wasm
+    /// backend takes on open. See
+    /// [`rebuild_multi_attribute_gsis`](crate::actions::gsi::rebuild_multi_attribute_gsis).
+    /// The native backend's futures never suspend, so `block_on` returns as
+    /// soon as the rebuild does.
+    fn migrate_v9_to_v10(&self) -> Result<()> {
+        pollster::block_on(crate::actions::gsi::rebuild_multi_attribute_gsis(self))?;
+        let version = crate::actions::gsi::MULTI_ATTRIBUTE_KEY_SCHEMA_VERSION.to_string();
+        let (sql, params) = sql_builders::set_schema_version(&version);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -2221,6 +2239,104 @@ mod tests {
             )
             .unwrap();
         assert!(col.is_none());
+    }
+
+    #[test]
+    fn test_migrate_v9_to_v10_rebuilds_a_multi_attribute_gsi() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // A table with a one-plus-two-attribute GSI key, written by this build.
+        {
+            let db = crate::Database::new(&path).unwrap();
+            db.create_table(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "Legacy",
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "AttributeDefinitions": [
+                        {"AttributeName": "pk", "AttributeType": "S"},
+                        {"AttributeName": "h", "AttributeType": "S"},
+                        {"AttributeName": "a", "AttributeType": "S"},
+                        {"AttributeName": "b", "AttributeType": "S"}
+                    ],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "GlobalSecondaryIndexes": [{
+                        "IndexName": "byKey",
+                        "KeySchema": [
+                            {"AttributeName": "h", "KeyType": "HASH"},
+                            {"AttributeName": "a", "KeyType": "RANGE"},
+                            {"AttributeName": "b", "KeyType": "RANGE"}
+                        ],
+                        "Projection": {"ProjectionType": "ALL"}
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            for item in [
+                serde_json::json!({"pk": {"S": "1"}, "h": {"S": "x"}, "a": {"S": "m"}, "b": {"S": "2"}}),
+                serde_json::json!({"pk": {"S": "2"}, "h": {"S": "x"}, "a": {"S": "m"}, "b": {"S": "1"}}),
+                serde_json::json!({"pk": {"S": "3"}, "h": {"S": "x"}, "a": {"S": "m"}}),
+            ] {
+                db.put_item(
+                    serde_json::from_value(
+                        serde_json::json!({"TableName": "Legacy", "Item": item}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+        }
+
+        // Put the index back the way a v9 build left it: keyed on the first
+        // sort key attribute alone, and holding the item that lacks `b`.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DELETE FROM \"Legacy::gsi::byKey\";
+                 INSERT INTO \"Legacy::gsi::byKey\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json)
+                    SELECT 'S:x', 'S:m', pk, sk, item_json FROM \"Legacy\";
+                 UPDATE _config SET value = '9' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        }
+
+        let storage = Storage::new(&path).unwrap();
+        let version: String = storage
+            .conn()
+            .query_row(
+                "SELECT value FROM _config WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let rows: Vec<(String, String)> = {
+            let mut stmt = storage
+                .conn()
+                .prepare(
+                    "SELECT table_pk, gsi_sk FROM \"Legacy::gsi::byKey\" ORDER BY gsi_sk, table_pk",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let expected_key = |b: &str| {
+            crate::actions::gsi::composite_key_string(&[
+                &AttributeValue::S("m".into()),
+                &AttributeValue::S(b.into()),
+            ])
+            .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("S:2".to_string(), expected_key("1")),
+                ("S:1".to_string(), expected_key("2")),
+            ]
+        );
     }
 
     #[test]

@@ -14,6 +14,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `server::ServerOptions` and `server::start_with_options` give embedded Rust
   callers the same switch.
 
+### Fixed
+
+- A `KeyConditionExpression` rejects an operand its operator does not take, as
+  DynamoDB does: `begins_with` takes a string or binary, and `<`, `<=`, `>`,
+  `>=` and `BETWEEN` take a string, number or binary
+  ([#220](https://github.com/nubo-db/dynoxide/issues/220)). A number in
+  `begins_with(sk, :v)` used to run as a prefix match on the stored key, and a
+  boolean, null, list, map or set became an empty prefix that matched every
+  item in the partition. The check runs before the table is looked up, so a
+  missing table or index reports the operand rather than itself.
+- PartiQL's `begins_with` rejects an operand that is not a string or binary,
+  on any attribute and under `NOT`, where it used to accept the statement.
+- A global secondary index whose key has more than one partition key or sort
+  key attribute works as DynamoDB's does. Items sort by each sort key attribute
+  in turn, an item missing any key attribute is left out of the index, a Query
+  takes an equality on every partition key attribute and on a leading run of
+  sort key attributes with a range condition allowed only on the last one
+  named, and `LastEvaluatedKey` carries every key attribute. Such an index used
+  to sort and filter on its first sort key attribute alone, index items missing
+  a later one, and refuse any key condition with three clauses. In a database
+  an earlier version wrote, on disk or in the browser's OPFS storage, such an
+  index is rebuilt the first time the database is opened. `UpdateTable` can now add one. CreateTable and UpdateTable
+  check such a key as DynamoDB does: at most four partition key and four sort
+  key attributes, partition key attributes first, no name twice. A local
+  secondary index still takes one sort key attribute.
+- A `KeyConditionExpression` with more clauses than the key has attributes is
+  refused with DynamoDB's message, `The number of query conditions (3) exceeds
+  the number of key attributes defined in the schema (2)`, rather than
+  `Unexpected token in KeyConditionExpression: AND`. Two conditions on one key
+  attribute report that each key takes only one.
+- A key condition value whose type differs from its key attribute's type is
+  refused with `Condition parameter type does not match schema type`, on a
+  table and on any index. That covers a string compared with a number sort
+  key, which used to match nothing, and a map, list, boolean, null or set
+  value, which used to fail with `Cannot convert partition key value to
+  string`.
+- `begins_with` in a key condition is case-sensitive. A lower-case prefix
+  matched upper-case sort keys too.
+- A key condition can name the sort key before the partition key. A range
+  condition on a one-attribute partition key, such as `begins_with(pk, :v)`,
+  is refused with `Query key condition not supported`, and like every key
+  condition problem that needs the key, only once the table and index are
+  found: a missing table or index reports itself first.
+- CreateTable with an index reports an attribute definition no key uses as
+  `Some AttributeDefinitions are not used`, listing the definitions and the keys
+  used, rather than as a count mismatch. An index key attribute with no
+  definition names the first index missing one, and its lists, like the unused
+  ones, come in DynamoDB's own order. When the request defines fewer
+  attributes than that index has key attributes, CreateTable and UpdateTable
+  both give `Invalid KeySchema: Some index key attribute have no definition`.
+  A GSI key schema of more than eight elements is refused as the request is
+  read.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security

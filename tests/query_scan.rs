@@ -1133,6 +1133,580 @@ fn test_query_key_condition_expression_over_size_limit_rejected() {
 }
 
 // =============================================================================
+// Operand types in a KeyConditionExpression
+//
+// begins_with takes a string or binary operand, and the ordering comparisons
+// and BETWEEN take a string, number or binary one. DynamoDB rejects anything
+// else before it resolves the table, reporting the operator as written.
+// Captured eu-west-2, 2026-10-08.
+// =============================================================================
+
+/// Every operand type, as (value, type name).
+fn every_operand_type() -> Vec<(serde_json::Value, &'static str)> {
+    vec![
+        (serde_json::json!({"S": "a"}), "S"),
+        (serde_json::json!({"N": "1"}), "N"),
+        (serde_json::json!({"B": "YQ=="}), "B"),
+        (serde_json::json!({"BOOL": true}), "BOOL"),
+        (serde_json::json!({"NULL": true}), "NULL"),
+        (serde_json::json!({"L": [{"S": "a"}]}), "L"),
+        (serde_json::json!({"M": {"k": {"S": "v"}}}), "M"),
+        (serde_json::json!({"SS": ["a"]}), "SS"),
+        (serde_json::json!({"NS": ["1"]}), "NS"),
+        (serde_json::json!({"BS": ["YQ=="]}), "BS"),
+    ]
+}
+
+fn operand_type_error(op: &str, type_name: &str) -> String {
+    format!(
+        "Invalid KeyConditionExpression: Incorrect operand type for operator or function; \
+         operator or function: {op}, operand type: {type_name}"
+    )
+}
+
+/// A Query on `table` with `pk = :pk AND <sk_condition>`, `:v` bound to `value`.
+fn query_key_condition(
+    db: &Database,
+    table: &str,
+    key_condition: &str,
+    value: serde_json::Value,
+) -> Result<dynoxide::actions::query::QueryResponse, dynoxide::errors::DynoxideError> {
+    db.query(
+        serde_json::from_value(serde_json::json!({
+            "TableName": table,
+            "KeyConditionExpression": key_condition,
+            "ExpressionAttributeValues": {":pk": {"S": "a"}, ":v": value}
+        }))
+        .unwrap(),
+    )
+}
+
+#[test]
+fn begins_with_in_a_key_condition_rejects_an_operand_that_is_not_a_string_or_binary() {
+    // Before the fix a number was run as a prefix match on the stored key, and
+    // a type with no key form became an empty prefix that matched the whole
+    // partition.
+    let db = setup_db();
+    create_test_table(&db, "BwOperand");
+    put(
+        &db,
+        "BwOperand",
+        serde_json::json!({"pk": {"S": "a"}, "sk": {"S": "1x"}}),
+    );
+
+    let mut checked = 0;
+    for (value, type_name) in every_operand_type() {
+        if matches!(type_name, "S" | "B") {
+            continue;
+        }
+        let err = query_key_condition(&db, "BwOperand", "pk = :pk AND begins_with(sk, :v)", value)
+            .expect_err("a begins_with operand that is not S or B is rejected")
+            .to_string();
+        assert!(
+            err.contains(&operand_type_error("begins_with", type_name)),
+            "for {type_name}: got {err}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 8);
+}
+
+#[test]
+fn an_ordering_key_condition_rejects_an_operand_with_no_ordering() {
+    let db = setup_db();
+    create_test_table(&db, "OrdOperand");
+    put(
+        &db,
+        "OrdOperand",
+        serde_json::json!({"pk": {"S": "a"}, "sk": {"S": "m"}}),
+    );
+
+    let mut checked = 0;
+    for (value, type_name) in every_operand_type() {
+        if matches!(type_name, "S" | "N" | "B") {
+            continue;
+        }
+        for op in ["<", "<=", ">", ">="] {
+            let err = query_key_condition(
+                &db,
+                "OrdOperand",
+                &format!("pk = :pk AND sk {op} :v"),
+                value.clone(),
+            )
+            .expect_err("an unorderable operand is rejected")
+            .to_string();
+            assert!(
+                err.contains(&operand_type_error(op, type_name)),
+                "for {op} on {type_name}: got {err}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 28);
+}
+
+#[test]
+fn between_in_a_key_condition_rejects_an_operand_with_no_ordering_on_either_bound() {
+    // The operand check comes before the same-type check, so a BOOL against a
+    // number reports the BOOL rather than the mismatch.
+    let db = setup_db();
+    create_test_table(&db, "BetweenOperand");
+    for (lo, hi) in [
+        (
+            serde_json::json!({"BOOL": true}),
+            serde_json::json!({"BOOL": false}),
+        ),
+        (
+            serde_json::json!({"BOOL": true}),
+            serde_json::json!({"N": "1"}),
+        ),
+        (
+            serde_json::json!({"N": "1"}),
+            serde_json::json!({"BOOL": true}),
+        ),
+    ] {
+        let err = db
+            .query(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "BetweenOperand",
+                    "KeyConditionExpression": "pk = :pk AND sk BETWEEN :lo AND :hi",
+                    "ExpressionAttributeValues": {":pk": {"S": "a"}, ":lo": lo, ":hi": hi}
+                }))
+                .unwrap(),
+            )
+            .expect_err("an unorderable BETWEEN bound is rejected")
+            .to_string();
+        assert!(
+            err.contains(&operand_type_error("BETWEEN", "BOOL")),
+            "got {err}"
+        );
+    }
+}
+
+#[test]
+fn a_reversed_key_comparison_reports_the_operator_as_written() {
+    // `:v < sk` is stored as `sk > :v`, but DynamoDB names the `<` it was given.
+    let db = setup_db();
+    create_test_table(&db, "ReversedOperand");
+    for op in ["<", "<=", ">", ">="] {
+        let err = query_key_condition(
+            &db,
+            "ReversedOperand",
+            &format!("pk = :pk AND :v {op} sk"),
+            serde_json::json!({"BOOL": true}),
+        )
+        .expect_err("an unorderable operand is rejected")
+        .to_string();
+        assert!(
+            err.contains(&operand_type_error(op, "BOOL")),
+            "for {op}: got {err}"
+        );
+    }
+}
+
+#[test]
+fn the_key_condition_operand_check_runs_before_the_table_and_key_schema() {
+    let db = setup_db();
+    create_test_table(&db, "OperandOrder");
+    let n = || serde_json::json!({"N": "1"});
+    let begins_with_n = operand_type_error("begins_with", "N");
+
+    // A table that does not exist.
+    let err = query_key_condition(&db, "NoSuchTable", "pk = :pk AND begins_with(sk, :v)", n())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&begins_with_n), "missing table: got {err}");
+
+    // An attribute that is not the sort key.
+    let err = query_key_condition(&db, "OperandOrder", "pk = :pk AND begins_with(x, :v)", n())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&begins_with_n), "non-key attribute: got {err}");
+
+    // begins_with on the partition key, alone and alongside a sort key clause.
+    for kc in ["begins_with(pk, :v)", "begins_with(pk, :v) AND sk = :pk"] {
+        let err = query_key_condition(&db, "OperandOrder", kc, n())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&begins_with_n), "{kc}: got {err}");
+    }
+
+    // An index the table does not have.
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "OperandOrder",
+                "IndexName": "nope",
+                "KeyConditionExpression": "pk = :pk AND begins_with(sk, :v)",
+                "ExpressionAttributeValues": {":pk": {"S": "a"}, ":v": n()}
+            }))
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&begins_with_n), "missing index: got {err}");
+
+    // An unused value, which DynamoDB reports only once the operands pass.
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "OperandOrder",
+                "KeyConditionExpression": "pk = :pk AND begins_with(sk, :v)",
+                "ExpressionAttributeValues": {":pk": {"S": "a"}, ":v": n(), ":unused": n()}
+            }))
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&begins_with_n), "unused value: got {err}");
+}
+
+#[test]
+fn a_key_condition_syntax_error_wins_over_an_operand_type() {
+    // DynamoDB parses the whole expression before it looks at operand types.
+    let db = setup_db();
+    create_test_table(&db, "OperandSyntax");
+    let err = query_key_condition(
+        &db,
+        "OperandSyntax",
+        "pk = :pk AND begins_with(sk, :v) junk",
+        serde_json::json!({"N": "1"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("Unexpected token in KeyConditionExpression: junk"),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_third_key_condition_clause_still_has_its_operands_checked() {
+    // DynamoDB parses every AND clause and checks the operands before it
+    // objects to the number of clauses, so the bad operand is what it reports.
+    let db = setup_db();
+    create_test_table(&db, "OperandThirdClause");
+    let err = query_key_condition(
+        &db,
+        "OperandThirdClause",
+        "pk = :pk AND begins_with(sk, :v) AND x = :pk",
+        serde_json::json!({"N": "1"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains(&operand_type_error("begins_with", "N")),
+        "got {err}"
+    );
+
+    // With every operand acceptable, the third clause is still refused, counted
+    // against the two attributes of the table's key (captured eu-west-2,
+    // 2026-10-08, for `pk = :p AND sk = :s AND x = :p`).
+    let err = query_key_condition(
+        &db,
+        "OperandThirdClause",
+        "pk = :pk AND begins_with(sk, :v) AND x = :pk",
+        serde_json::json!({"S": "1"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains(
+            "The number of query conditions (3) exceeds the number of key attributes \
+             defined in the schema (2)"
+        ),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_second_key_condition_on_a_hash_only_table_is_counted_against_its_one_key_attribute() {
+    // The same rule as the three-clause case above, applied to a table whose
+    // key has one attribute.
+    let db = setup_db();
+    create_hash_only_table(&db, "OneKeyAttribute");
+    let err = query_key_condition(
+        &db,
+        "OneKeyAttribute",
+        "pk = :pk AND x = :v",
+        serde_json::json!({"S": "1"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains(
+            "The number of query conditions (2) exceeds the number of key attributes \
+             defined in the schema (1)"
+        ),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_key_condition_may_name_the_sort_key_before_the_partition_key() {
+    let db = setup_db();
+    create_test_table(&db, "SortKeyFirst");
+    put(
+        &db,
+        "SortKeyFirst",
+        serde_json::json!({"pk": {"S": "a"}, "sk": {"S": "1"}}),
+    );
+    let response = query_key_condition(
+        &db,
+        "SortKeyFirst",
+        "sk = :v AND pk = :pk",
+        serde_json::json!({"S": "1"}),
+    )
+    .unwrap();
+    assert_eq!(response.count, 1);
+}
+
+#[test]
+fn begins_with_on_a_sort_key_is_case_sensitive() {
+    // DynamoDB compares string keys byte by byte, so a lower-case prefix does
+    // not match an upper-case key. SQLite's LIKE folds ASCII case, and the
+    // key condition was pushed into the read as a LIKE.
+    let db = setup_db();
+    create_test_table(&db, "PrefixCase");
+    for sk in ["ABCdef", "abcdef", "abd"] {
+        put(
+            &db,
+            "PrefixCase",
+            serde_json::json!({"pk": {"S": "a"}, "sk": {"S": sk}}),
+        );
+    }
+    let response = query_key_condition(
+        &db,
+        "PrefixCase",
+        "pk = :pk AND begins_with(sk, :v)",
+        serde_json::json!({"S": "abc"}),
+    )
+    .unwrap();
+    let got: Vec<_> = response
+        .items
+        .unwrap()
+        .into_iter()
+        .map(|i| i.get("sk").cloned())
+        .collect();
+    assert_eq!(got, vec![Some(AttributeValue::S("abcdef".into()))]);
+}
+
+#[test]
+fn a_bad_operand_in_the_third_key_condition_clause_is_reported() {
+    // The operands of every clause are checked before the clause count, so a
+    // bad one in the third clause outranks the extra clause too.
+    let db = setup_db();
+    create_test_table(&db, "OperandInThirdClause");
+    let err = query_key_condition(
+        &db,
+        "OperandInThirdClause",
+        "pk = :pk AND sk > :pk AND begins_with(x, :v)",
+        serde_json::json!({"N": "1"}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains(&operand_type_error("begins_with", "N")),
+        "got {err}"
+    );
+}
+
+#[test]
+fn the_first_bad_key_condition_operand_in_written_order_is_reported() {
+    let db = setup_db();
+    create_test_table(&db, "OperandWrittenOrder");
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "OperandWrittenOrder",
+                "KeyConditionExpression": "begins_with(sk, :n) AND pk < :b",
+                "ExpressionAttributeValues": {":n": {"N": "1"}, ":b": {"BOOL": true}}
+            }))
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&operand_type_error("begins_with", "N")),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_binary_sort_key_takes_a_binary_operand_in_every_key_condition() {
+    // Binary orders and has prefixes, so begins_with, the ordering comparisons
+    // and BETWEEN all accept it. begins_with on a binary sort key is captured
+    // eu-west-2, 2026-10-08.
+    let db = setup_db();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": "BinarySk",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "B"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // "a", "ab" and "b".
+    for sk in ["YQ==", "YWI=", "Yg=="] {
+        put(
+            &db,
+            "BinarySk",
+            serde_json::json!({"pk": {"S": "a"}, "sk": {"B": sk}}),
+        );
+    }
+
+    let count = |kc: &str, values: serde_json::Value| {
+        let mut eav = serde_json::json!({":pk": {"S": "a"}});
+        eav.as_object_mut()
+            .unwrap()
+            .extend(values.as_object().unwrap().clone());
+        db.query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "BinarySk",
+                "KeyConditionExpression": kc,
+                "ExpressionAttributeValues": eav
+            }))
+            .unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{kc} must accept a binary operand, got {e}"))
+        .count
+    };
+    assert_eq!(
+        count(
+            "pk = :pk AND begins_with(sk, :v)",
+            serde_json::json!({":v": {"B": "YQ=="}})
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            "pk = :pk AND sk < :v",
+            serde_json::json!({":v": {"B": "Yg=="}})
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            "pk = :pk AND sk BETWEEN :lo AND :hi",
+            serde_json::json!({":lo": {"B": "YQ=="}, ":hi": {"B": "YWI="}})
+        ),
+        2
+    );
+}
+
+#[test]
+fn an_undefined_key_condition_value_is_reported_ahead_of_an_operand_type() {
+    // The undefined value sits in the partition key clause, ahead of the bad
+    // operand, and DynamoDB reports it rather than the operand type.
+    let db = setup_db();
+    create_test_table(&db, "OperandUndefined");
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "OperandUndefined",
+                "KeyConditionExpression": "pk = :undef AND begins_with(sk, :v)",
+                "ExpressionAttributeValues": {":v": {"N": "1"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(
+            "An expression attribute value used in expression is not defined; \
+             attribute value: :undef"
+        ),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_bad_operand_ahead_of_an_undefined_value_is_reported_first() {
+    // The reverse order: DynamoDB reports whichever problem comes first as it
+    // walks the clauses, so a bad operand ahead of an undefined value wins.
+    // Captured eu-west-2, 2026-10-09.
+    let db = setup_db();
+    create_test_table(&db, "OperandFirst");
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "OperandFirst",
+                "KeyConditionExpression": "begins_with(sk, :n) AND pk = :missing",
+                "ExpressionAttributeValues": {":n": {"N": "1"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(
+            "Invalid KeyConditionExpression: Incorrect operand type for operator or function; \
+             operator or function: begins_with, operand type: N"
+        ),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_bad_operand_in_a_middle_clause_is_reported_ahead_of_a_later_undefined_value() {
+    // Three clauses, with the bad operand in the second and an undefined value
+    // in the third. DynamoDB reports the operand, not the undefined value and
+    // not the third clause. Captured eu-west-2, 2026-10-09.
+    let db = setup_db();
+    create_test_table(&db, "OperandMiddle");
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "OperandMiddle",
+                "KeyConditionExpression": "pk = :pk AND begins_with(sk, :n) AND sk = :missing",
+                "ExpressionAttributeValues": {":pk": {"S": "a"}, ":n": {"N": "1"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(
+            "Invalid KeyConditionExpression: Incorrect operand type for operator or function; \
+             operator or function: begins_with, operand type: N"
+        ),
+        "got {err}"
+    );
+}
+
+#[test]
+fn begins_with_in_a_key_condition_accepts_a_string_operand() {
+    let db = setup_db();
+    create_test_table(&db, "BwString");
+    put(
+        &db,
+        "BwString",
+        serde_json::json!({"pk": {"S": "a"}, "sk": {"S": "1x"}}),
+    );
+    put(
+        &db,
+        "BwString",
+        serde_json::json!({"pk": {"S": "a"}, "sk": {"S": "2x"}}),
+    );
+    let resp = query_key_condition(
+        &db,
+        "BwString",
+        "pk = :pk AND begins_with(sk, :v)",
+        serde_json::json!({"S": "1"}),
+    )
+    .unwrap();
+    assert_eq!(resp.count, 1);
+}
+
+// =============================================================================
 // {"NULL": false} in ExclusiveStartKey and ScanFilter
 // =============================================================================
 
@@ -1203,4 +1777,193 @@ fn test_scan_filter_null_false_no_marker_leak() {
         Ok(resp) => assert_eq!(resp.count, 1),
         Err(err) => panic!("scan unexpectedly failed: {err}"),
     }
+}
+
+/// A table keyed on a string partition key and a number sort key.
+fn create_number_sort_key_table(db: &Database, name: &str) {
+    let req: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "TableName": name,
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "N"}
+        ],
+        "BillingMode": "PAY_PER_REQUEST"
+    }))
+    .unwrap();
+    db.create_table(req).unwrap();
+}
+
+const SCHEMA_TYPE_MISMATCH: &str = "One or more parameter values were invalid: Condition parameter type does not match schema type";
+
+#[test]
+fn a_key_condition_value_of_another_key_type_fails_the_schema_check() {
+    // Captured eu-west-2, October 2026. A string is a fine operand for
+    // begins_with and a boolean for `=`, so neither is an operand error; both
+    // fail once the condition is checked against the number sort key.
+    let db = setup_db();
+    create_number_sort_key_table(&db, "NumberSortKey");
+    for (key_condition, value) in [
+        (
+            "pk = :pk AND begins_with(sk, :v)",
+            serde_json::json!({"S": "a"}),
+        ),
+        ("pk = :pk AND sk = :v", serde_json::json!({"BOOL": true})),
+        ("pk = :pk AND sk > :v", serde_json::json!({"S": "1"})),
+    ] {
+        let err = query_key_condition(&db, "NumberSortKey", key_condition, value)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(SCHEMA_TYPE_MISMATCH),
+            "{key_condition}: got {err}"
+        );
+    }
+}
+
+#[test]
+fn a_partition_key_value_of_another_key_type_fails_the_schema_check() {
+    let db = setup_db();
+    create_number_sort_key_table(&db, "NumberSortKeyPk");
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "NumberSortKeyPk",
+                "KeyConditionExpression": "pk = :pk",
+                "ExpressionAttributeValues": {":pk": {"N": "1"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(SCHEMA_TYPE_MISMATCH), "got {err}");
+}
+
+#[test]
+fn two_conditions_on_one_key_attribute_are_refused() {
+    // Captured eu-west-2, October 2026: reported ahead of the clause count,
+    // although three clauses exceed the two key attributes.
+    let db = setup_db();
+    create_number_sort_key_table(&db, "OneConditionPerKey");
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "OneConditionPerKey",
+                "KeyConditionExpression": "pk = :pk AND sk > :a AND sk < :b",
+                "ExpressionAttributeValues": {
+                    ":pk": {"S": "q"}, ":a": {"N": "1"}, ":b": {"N": "5"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(
+            "Invalid KeyConditionExpression: KeyConditionExpressions must only contain one \
+             condition per key"
+        ),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_range_condition_on_a_one_attribute_partition_key_is_not_supported() {
+    // Captured eu-west-2, 2026-10-08 (`begins_with(pk, :v)`) and 2026-10-09
+    // (`pk > :a AND sk = :b`).
+    let db = setup_db();
+    create_test_table(&db, "RangeOnPartition");
+    for key_condition in ["pk > :pk AND sk = :v", "begins_with(pk, :pk)"] {
+        let err = query_key_condition(
+            &db,
+            "RangeOnPartition",
+            key_condition,
+            serde_json::json!({"S": "1"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Query key condition not supported"),
+            "{key_condition}: got {err}"
+        );
+    }
+}
+
+#[test]
+fn a_key_condition_problem_that_needs_the_key_waits_for_the_table_and_index() {
+    // Captured eu-west-2 and us-east-1, 2026-10-09. A missing table reports
+    // itself, and a missing index names itself, ahead of every key condition
+    // problem that has to be checked against the key. Only a second condition
+    // on one attribute is refused first, since that needs no key.
+    let db = setup_db();
+    create_number_sort_key_table(&db, "OrderingTable");
+    let shapes: [(&str, serde_json::Value); 5] = [
+        ("pk > :a", serde_json::json!({":a": {"S": "a"}})),
+        ("begins_with(pk, :a)", serde_json::json!({":a": {"S": "a"}})),
+        (
+            "pk > :a AND sk = :b",
+            serde_json::json!({":a": {"S": "a"}, ":b": {"N": "1"}}),
+        ),
+        (
+            "pk = :a AND sk > :b AND x = :c",
+            serde_json::json!({":a": {"S": "a"}, ":b": {"N": "1"}, ":c": {"S": "c"}}),
+        ),
+        (
+            "pk = :a AND sk = :b",
+            serde_json::json!({":a": {"S": "a"}, ":b": {"S": "x"}}),
+        ),
+    ];
+    for (key_condition, values) in &shapes {
+        let missing_table = db
+            .query(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "NoSuchTable",
+                    "KeyConditionExpression": key_condition,
+                    "ExpressionAttributeValues": values
+                }))
+                .unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                missing_table,
+                dynoxide::errors::DynoxideError::ResourceNotFoundException(_)
+            ),
+            "{key_condition}: got {missing_table}"
+        );
+        let missing_index = db
+            .query(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "OrderingTable",
+                    "IndexName": "nope",
+                    "KeyConditionExpression": key_condition,
+                    "ExpressionAttributeValues": values
+                }))
+                .unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_index.contains("The table does not have the specified index: nope"),
+            "{key_condition}: got {missing_index}"
+        );
+    }
+    let duplicate = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "NoSuchTable",
+                "KeyConditionExpression": "pk = :a AND pk = :b",
+                "ExpressionAttributeValues": {":a": {"S": "a"}, ":b": {"S": "b"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        duplicate.contains("KeyConditionExpressions must only contain one condition per key"),
+        "got {duplicate}"
+    );
 }

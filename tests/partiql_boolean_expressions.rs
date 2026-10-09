@@ -246,6 +246,126 @@ fn equality_accepts_every_operand_type() {
     }
 }
 
+// --- operand types on begins_with -----------------------------------------
+
+/// The error a statement gets, or a panic naming what came back instead.
+fn statement_error(db: &Database, statement: String, parameters: serde_json::Value) -> String {
+    match db.execute_statement(
+        serde_json::from_value(serde_json::json!({
+            "Statement": statement,
+            "Parameters": parameters
+        }))
+        .unwrap(),
+    ) {
+        Ok(_) => panic!("{statement} must be rejected"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn begins_with_rejects_an_operand_that_is_not_a_string_or_binary() {
+    // As in a condition expression, begins_with takes a string or binary and
+    // nothing else, on a key attribute or any other. DynamoDB rejects it before
+    // the table is resolved, and a negated begins_with on the same terms.
+    // Captured eu-west-2, 2026-10-08.
+    let db = seeded();
+    let mut checked = 0;
+    for (operand, type_name) in [
+        (serde_json::json!({"N": "1"}), "N"),
+        (serde_json::json!({"BOOL": true}), "BOOL"),
+        (serde_json::json!({"NULL": true}), "NULL"),
+        (serde_json::json!({"L": [{"S": "a"}]}), "L"),
+        (serde_json::json!({"M": {"k": {"S": "v"}}}), "M"),
+        (serde_json::json!({"SS": ["a"]}), "SS"),
+        (serde_json::json!({"NS": ["1"]}), "NS"),
+        (serde_json::json!({"BS": ["YQ=="]}), "BS"),
+    ] {
+        for statement in [
+            format!("SELECT pk FROM \"{TABLE}\" WHERE begins_with(a, ?)"),
+            format!("SELECT pk FROM \"{TABLE}\" WHERE NOT begins_with(a, ?)"),
+            format!("SELECT pk FROM \"{TABLE}\" WHERE pk = '1' AND begins_with(pk, ?)"),
+            "SELECT pk FROM \"no_such_table\" WHERE begins_with(a, ?)".to_string(),
+            format!("DELETE FROM \"{TABLE}\" WHERE pk = '1' AND begins_with(a, ?)"),
+        ] {
+            let err = statement_error(&db, statement.clone(), serde_json::json!([operand]));
+            assert!(
+                err.contains(&format!(
+                    "Incorrect operand type for operator or function; \
+                     operator or function: begins_with, operand type: {type_name}"
+                )),
+                "{statement} with {type_name}: got {err}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 40);
+}
+
+#[test]
+fn begins_with_rejects_a_literal_operand_that_is_not_a_string() {
+    let db = seeded();
+    for (literal, type_name) in [("1", "N"), ("true", "BOOL")] {
+        let err = statement_error(
+            &db,
+            format!("SELECT pk FROM \"{TABLE}\" WHERE begins_with(a, {literal})"),
+            serde_json::json!([]),
+        );
+        assert!(
+            err.contains(&format!(
+                "operator or function: begins_with, operand type: {type_name}"
+            )),
+            "begins_with(a, {literal}): got {err}"
+        );
+    }
+}
+
+#[test]
+fn begins_with_accepts_a_string_or_binary_operand() {
+    let db = seeded();
+    for operand in [
+        serde_json::json!({"S": "x"}),
+        serde_json::json!({"B": "YQ=="}),
+    ] {
+        assert!(
+            db.execute_statement(
+                serde_json::from_value(serde_json::json!({
+                    "Statement": format!("SELECT pk FROM \"{TABLE}\" WHERE begins_with(a, ?)"),
+                    "Parameters": [operand]
+                }))
+                .unwrap(),
+            )
+            .is_ok(),
+            "a string or binary begins_with operand must be accepted"
+        );
+    }
+}
+
+#[test]
+fn operand_types_are_checked_in_the_order_written() {
+    // The first offending operand is the one reported, whichever check it
+    // belongs to.
+    let db = seeded();
+    let err = statement_error(
+        &db,
+        format!("SELECT pk FROM \"{TABLE}\" WHERE a < ? AND begins_with(a, ?)"),
+        serde_json::json!([{"BOOL": true}, {"N": "1"}]),
+    );
+    assert!(
+        err.contains("operator or function: <, operand type: BOOL"),
+        "got {err}"
+    );
+
+    let err = statement_error(
+        &db,
+        format!("SELECT pk FROM \"{TABLE}\" WHERE begins_with(a, ?) AND a < ?"),
+        serde_json::json!([{"N": "1"}, {"BOOL": true}]),
+    );
+    assert!(
+        err.contains("operator or function: begins_with, operand type: N"),
+        "got {err}"
+    );
+}
+
 // --- nesting is bounded ---------------------------------------------------
 //
 // Both halves of the parser are recursive descents, and neither had a bound.
