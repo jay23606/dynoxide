@@ -71,19 +71,26 @@ with AWS DynamoDB's observable behaviour is the headline goal.
 
 ## Benchmarks
 
-The benchmark PR check has two layers and they do not carry equal
-weight:
+The benchmark PR check has two layers. Neither blocks a merge, and
+they do not carry equal weight:
 
 - **Criterion (wall-clock micro-benchmarks).** Advisory. These run on
   shared GitHub Actions runners and can vary by up to roughly 3x
   between runs because of noisy neighbours. A red Criterion row on
   your PR is not by itself a blocker; re-run the workflow if the
   result looks noisy.
-- **iai-callgrind (instruction-count benchmarks).** Deterministic and
-  blocking. If iai-callgrind flags a regression it means the code
-  path does measurably more work; investigate before merging.
+- **iai-callgrind (instruction-count benchmarks).** Deterministic, but
+  informational. The PR job reports instruction counts without a
+  stored baseline to compare against, so it never fails on a
+  regression by itself, and CI keeps no counts from `main` to compare
+  with. When you need to know whether a change does more work, run
+  `cargo bench --bench iai_core --features iai-callgrind` in
+  `benchmarks/` on `main` and on your branch, on the same Linux
+  machine or container; a difference there means the code path really
+  does more.
 
-In short: trust iai-callgrind, treat Criterion as a smoke signal.
+In short: trust iai-callgrind's numbers, treat Criterion as a smoke
+signal.
 
 ## Commit style
 

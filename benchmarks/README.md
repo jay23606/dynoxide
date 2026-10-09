@@ -307,15 +307,17 @@ cargo run --release --bin ci_pipeline_bench                    # embedded + HTTP
 cargo run --release --bin ci_pipeline_bench -- --ddb-endpoint http://localhost:8000
 ```
 
-Or run the full CI workflow by pushing to a fork — `.github/workflows/benchmark-comparative.yml` runs everything and stores results in the `benchmark-data` branch.
+Or run the full suite in CI: `.github/workflows/benchmark-refresh.yml` runs everything, stores the results in the `benchmark-data` branch and opens a pull request with the new numbers.
 
 ## CI Workflows
 
-### `benchmark-regression.yml` (on every PR)
-Runs criterion micro-benchmarks (wall-clock, compared against baseline from `benchmark-data` branch, blocks merge if >20% regression) and iai-callgrind instruction-count benchmarks (deterministic, <1% variance, detects algorithmic regressions independent of CI runner load).
+Neither benchmark workflow blocks a merge.
 
-### `benchmark-comparative.yml` (on push to main)
-Runs full comparative benchmarks (Dynoxide vs DynamoDB Local), stores results in the `benchmark-data` branch for historical tracking, and uploads criterion charts as workflow artifacts.
+### `benchmark-regression.yml` (on every PR)
+Runs criterion micro-benchmarks (wall-clock, compared against the median of the last five runs stored on the `benchmark-data` branch; anything over 1.5x that median is flagged in the PR comment, as advice rather than a failure) and iai-callgrind instruction-count benchmarks (deterministic, reported without a stored baseline; CI keeps no counts from `main`, so to see whether a change does more work, run `cargo bench --bench iai_core --features iai-callgrind` here on `main` and on the branch, on the same Linux machine or container, and compare).
+
+### `benchmark-refresh.yml` (run by hand)
+Runs the full comparative benchmarks (Dynoxide vs DynamoDB Local and LocalStack), appends the run to the `benchmark-data` branch for historical tracking, and opens a pull request that updates the benchmark numbers in `README.md` and this file.
 
 To view historical results:
 ```bash

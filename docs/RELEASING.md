@@ -80,7 +80,7 @@ Public workflows a contributor may see when opening a PR:
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
 | `ci.yml` | Pull request, manual | Build, test, and lint. Required for merge. |
-| `benchmark-regression.yml` | Pull request | Runs Criterion and iai-callgrind benchmarks and posts a comparison comment. Wall-clock numbers are advisory because shared runners are noisy; iai-callgrind instruction-count regressions block the PR. |
+| `benchmark-regression.yml` | Pull request | Runs Criterion and iai-callgrind benchmarks and posts a comparison comment. Wall-clock numbers are advisory because shared runners are noisy. iai-callgrind instruction counts are deterministic but informational: the job has no stored baseline, so it does not fail on a regression. |
 | `release.yml` | `v*` tag push | Primary release pipeline. Runs only on releases; contributors should not see it fire on PRs. |
 
 Additional workflows in `.github/workflows/` (`benchmark-refresh.yml`,
