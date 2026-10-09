@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Exercises the small scripts the release workflows share: is-semver.sh,
-# npm-dist-tag.sh, is-crate-published.sh and check-release-binary-version.sh.
+# npm-dist-tag.sh, is-crate-published.sh, check-release-binary-version.sh and
+# install-mcp-publisher.sh.
 #
 # Each of these replaced a copy of the same logic in two or three workflow
 # files, and workflow steps only run at tag time, when a mistake is already
 # public. So every one is shown to fail on a real violation here, and to stay
-# quiet on a clean case, on every PR. The two that talk to the network take a
+# quiet on a clean case, on every PR. The ones that talk to the network take a
 # stand-in through an environment variable rather than being skipped.
 set -euo pipefail
 
@@ -144,6 +145,58 @@ expect 1 "" "a fetched archive whose binary reports another version is caught" \
 
 expect 1 "" "an archive that cannot be fetched fails rather than reading clean" \
   env RELEASE_BASE="file://$FIXTURE/releases/download" "$BINCHECK" 9.9.9
+
+# --- install-mcp-publisher.sh -----------------------------------------------
+#
+# Only the refusals can be shown offline, since an install that passes needs
+# the real release bytes. The stand-in download is a real tarball holding an
+# `mcp-publisher`, so a script that unpacked before checking the digest would
+# leave one behind and fail here even though it still exited non-zero.
+
+INSTALL="$SCRIPTS/install-mcp-publisher.sh"
+PUBLISHER_VERSION=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$INSTALL")
+PUBLISHER_ASSET=$(sed -n 's/^ASSET="\(.*\)"$/\1/p' "$INSTALL")
+
+# install_refuses <stderr must contain this> <case name> <download base>
+install_refuses() {
+  local want=$1 name=$2 base=$3 dir got=0 err
+  checked=$((checked + 1))
+  dir=$(mktemp -d "$FIXTURE/install.XXXXXX")
+  err=$(cd "$dir" && MCP_PUBLISHER_BASE="$base" "$INSTALL" 2>&1 >/dev/null) || got=$?
+  if [ "$got" -eq 0 ]; then
+    echo "FAIL  - $name: wanted a refusal, got exit 0"
+    failures=$((failures + 1))
+  elif [[ "$err" != *"$want"* ]]; then
+    echo "FAIL  - $name: refused, but not because '$want': $err"
+    failures=$((failures + 1))
+  elif [ -e "$dir/mcp-publisher" ]; then
+    echo "FAIL  - $name: refused, but left an mcp-publisher behind"
+    failures=$((failures + 1))
+  else
+    echo "ok    - $name (exit $got)"
+  fi
+}
+
+if [ -z "$PUBLISHER_VERSION" ] || [ -z "$PUBLISHER_ASSET" ]; then
+  echo "FAIL  - could not read VERSION and ASSET from install-mcp-publisher.sh"
+  failures=$((failures + 1)); checked=$((checked + 1))
+elif [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
+  mkdir -p "$FIXTURE/mcp/v$PUBLISHER_VERSION" "$FIXTURE/mcp-pack"
+  printf '#!/bin/sh\necho not the real mcp-publisher\n' > "$FIXTURE/mcp-pack/mcp-publisher"
+  chmod +x "$FIXTURE/mcp-pack/mcp-publisher"
+  tar czf "$FIXTURE/mcp/v$PUBLISHER_VERSION/$PUBLISHER_ASSET" -C "$FIXTURE/mcp-pack" mcp-publisher
+  install_refuses "does not match its pinned SHA-256" \
+    "an mcp-publisher download that does not match the pinned digest is refused" \
+    "file://$FIXTURE/mcp"
+  install_refuses "could not download" \
+    "an mcp-publisher download that cannot be fetched is refused" \
+    "file://$FIXTURE/absent"
+else
+  # The pin is the linux amd64 build, so elsewhere the guard is what refuses.
+  install_refuses "is the linux amd64 build" \
+    "mcp-publisher is refused on a host other than linux amd64" \
+    "file://$FIXTURE/mcp"
+fi
 
 echo "$checked cases checked, $failures failed"
 [ "$failures" -eq 0 ]
