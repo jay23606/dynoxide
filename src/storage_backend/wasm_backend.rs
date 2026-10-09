@@ -465,12 +465,11 @@ fn col_i64(row: &js_sys::Array, i: u32) -> i64 {
     if let Some(f) = v.as_f64() {
         return f as i64;
     }
-    if let Ok(big) = v.dyn_into::<js_sys::BigInt>() {
-        if let Some(s) = big.to_string(10).ok().and_then(|js| js.as_string()) {
-            if let Ok(n) = s.parse::<i64>() {
-                return n;
-            }
-        }
+    if let Ok(big) = v.dyn_into::<js_sys::BigInt>()
+        && let Some(s) = big.to_string(10).ok().and_then(|js| js.as_string())
+        && let Ok(n) = s.parse::<i64>()
+    {
+        return n;
     }
     0
 }
