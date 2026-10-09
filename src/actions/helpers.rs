@@ -1124,15 +1124,22 @@ pub async fn build_item_collection_metrics<S: StorageBackend>(
         }
     }
 
-    let size_gb = partition_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-
     let mut key_map = HashMap::new();
     key_map.insert(pk_attr.to_string(), pk_value.clone());
 
     Ok(Some(crate::types::ItemCollectionMetrics {
         item_collection_key: key_map,
-        size_estimate_range_gb: vec![size_gb, size_gb],
+        size_estimate_range_gb: size_estimate_range_gb(partition_bytes),
     }))
+}
+
+/// The `SizeEstimateRangeGB` DynamoDB reports for an item collection of
+/// `bytes`: a lower and an upper bound in whole gigabytes, the size rounded
+/// down and one more. A small collection reads `[0.0, 1.0]` (captured
+/// eu-west-2 and us-east-1, 2026-10-09).
+fn size_estimate_range_gb(bytes: i64) -> Vec<f64> {
+    let lower = (bytes as f64 / (1024.0 * 1024.0 * 1024.0)).floor();
+    vec![lower, lower + 1.0]
 }
 
 /// Convert legacy `AttributesToGet` list to a `ProjectionExpr`.
@@ -2395,5 +2402,19 @@ fn validate_filter_attribute_value(value: &AttributeValue) -> Result<()> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn size_estimate_range_is_whole_gigabytes_around_the_size() {
+        const GB: i64 = 1024 * 1024 * 1024;
+        assert_eq!(super::size_estimate_range_gb(0), vec![0.0, 1.0]);
+        assert_eq!(super::size_estimate_range_gb(1_000), vec![0.0, 1.0]);
+        assert_eq!(super::size_estimate_range_gb(GB - 1), vec![0.0, 1.0]);
+        assert_eq!(super::size_estimate_range_gb(GB), vec![1.0, 2.0]);
+        assert_eq!(super::size_estimate_range_gb(GB * 3 / 2), vec![1.0, 2.0]);
+        assert_eq!(super::size_estimate_range_gb(10 * GB), vec![10.0, 11.0]);
     }
 }

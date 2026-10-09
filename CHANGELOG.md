@@ -479,6 +479,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation envelope, as DynamoDB does.
 - CreateTable lists a GSI's member errors before an LSI's, so two too-short
   index names come back in DynamoDB's order.
+- `ItemCollectionMetrics` reports `SizeEstimateRangeGB` as DynamoDB does: a
+  lower and an upper bound in whole gigabytes, so a small item collection
+  reads `[0.0, 1.0]`. It used to give the collection's exact size twice.
 
 ## [1.2.1] - 2026-09-20
 
