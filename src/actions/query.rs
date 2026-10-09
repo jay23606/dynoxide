@@ -83,15 +83,34 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = QueryRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        use crate::validation::format_validation_errors;
 
-        let mut errors = Vec::new();
-        errors.extend(table_name_constraint_errors(
-            raw.table_name.as_deref(),
-            TableNameContext::ReadWrite,
-        ));
+        // An empty name and a Limit of 0 are the newer validation layer's own
+        // checks, each reported on its own ahead of everything else. A name
+        // error and ReturnConsumedCapacity follow, together; Select waits
+        // until after the expression-mixing check in `execute` (captured
+        // 2026-10-09, six of seven regions).
+        // AWS DynamoDB's Query message diverges from Scan: Query omits the rejected
+        // value entirely and capitalises 'Limit', whereas Scan keeps the value and
+        // lowercases 'limit'. Do not collapse these into a shared helper. The two
+        // come back together, Limit first (captured 2026-10-09, six of seven
+        // regions).
+        let mut first_pass = Vec::new();
+        if raw.limit == Some(0) {
+            first_pass.push(
+                "Value at 'Limit' failed to satisfy constraint: \
+                 Member must have value greater than or equal to 1"
+                    .to_string(),
+            );
+        }
+        if raw.table_name.as_deref() == Some("") {
+            first_pass.push(crate::validation::EMPTY_TABLE_NAME_REJECTION.to_string());
+        }
+        if let Some(msg) = format_validation_errors(&first_pass) {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+        }
+
+        let mut errors = crate::validation::item_table_name_errors(raw.table_name.as_deref());
         let table_name = raw.table_name.unwrap_or_default();
 
         // ReturnConsumedCapacity enum
@@ -99,37 +118,6 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
             raw.return_consumed_capacity.as_deref(),
         ) {
             errors.push(msg);
-        }
-
-        // Select enum
-        if let Some(ref sel) = raw.select
-            && ![
-                "ALL_ATTRIBUTES",
-                "ALL_PROJECTED_ATTRIBUTES",
-                "COUNT",
-                "SPECIFIC_ATTRIBUTES",
-            ]
-            .contains(&sel.as_str())
-        {
-            errors.push(format!(
-                    "Value '{}' at 'select' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
-                    sel
-                ));
-        }
-
-        // Limit must be >= 1.
-        // AWS DynamoDB's Query message diverges from Scan: Query omits the rejected
-        // value entirely and capitalises 'Limit', whereas Scan keeps the value and
-        // lowercases 'limit'. Do not collapse these into a shared helper.
-        if let Some(limit) = raw.limit
-            && limit == 0
-        {
-            errors.push(
-                "Value at 'Limit' failed to satisfy constraint: \
-                     Member must have value greater than or equal to 1"
-                    .to_string(),
-            );
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -178,7 +166,7 @@ pub async fn execute<S: StorageBackend>(
     mut request: QueryRequest,
 ) -> Result<QueryResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    crate::validation::validate_item_table_name(&request.table_name)?;
 
     // ---- Expression vs non-expression mixing validation ----
     // DynamoDB checks this before anything else (except table name format and ESK values).
@@ -223,6 +211,35 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_values_raw: &no_raw_eav,
         };
         helpers::validate_expression_params(&ctx)?;
+    }
+
+    // ---- Select, after the mixing check (captured 2026-10-09) ----
+    if let Some(ref sel) = request.select
+        && ![
+            "ALL_ATTRIBUTES",
+            "ALL_PROJECTED_ATTRIBUTES",
+            "COUNT",
+            "SPECIFIC_ATTRIBUTES",
+        ]
+        .contains(&sel.as_str())
+    {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&format!(
+                "Value '{sel}' at 'select' failed to satisfy constraint: Member must satisfy \
+                 enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, \
+                 ALL_PROJECTED_ATTRIBUTES]"
+            )),
+        ));
+    }
+
+    // ---- ConditionalOperator only joins legacy QueryFilter conditions, so it
+    // is refused without two of them, whatever its value. Query reports it
+    // without the envelope (captured 2026-10-09, all seven regions). ----
+    if let Some(msg) = crate::validation::conditional_operator_misuse(
+        request.conditional_operator.as_deref(),
+        crate::validation::legacy_condition_count(request.query_filter.as_ref()),
+    ) {
+        return Err(DynoxideError::ValidationException(msg.to_string()));
     }
 
     // ---- Validate filter attribute values (before argument counts, matching DynamoDB) ----

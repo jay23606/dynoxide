@@ -54,17 +54,18 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = DeleteItemRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        use crate::validation::format_validation_errors;
 
-        let mut errors = Vec::new();
-
-        // Table name constraints first (DynamoDB ordering for DeleteItem)
-        errors.extend(table_name_constraint_errors(
-            raw.table_name.as_deref(),
-            TableNameContext::ReadWrite,
-        ));
+        // An empty name is the newer validation layer's own check and is
+        // reported on its own; any other name error leads the member errors,
+        // one per name (captured 2026-10-09, five of seven regions).
+        if raw.table_name.as_deref() == Some("") {
+            return Err(serde::de::Error::custom(format!(
+                "VALIDATION:{}",
+                crate::validation::envelope_message(crate::validation::EMPTY_TABLE_NAME_REJECTION)
+            )));
+        }
+        let mut errors = crate::validation::item_table_name_errors(raw.table_name.as_deref());
         let table_name = raw.table_name.unwrap_or_default();
 
         // Key constraint
@@ -87,12 +88,7 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
         if let Some(ref rv) = raw.return_values
             && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv.as_str())
         {
-            errors.push(format!(
-                "Value '{}' at 'returnValues' failed to satisfy constraint: \
-                     Member must satisfy enum value set: \
-                     [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]",
-                rv
-            ));
+            errors.push(crate::validation::RETURN_VALUES_REJECTION.to_string());
         }
 
         // ReturnItemCollectionMetrics enum
@@ -104,6 +100,15 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
                      Member must satisfy enum value set: [SIZE, NONE]",
                 ricm
             ));
+        }
+
+        // ReturnValuesOnConditionCheckFailure enum, after the others
+        // (captured 2026-10-09).
+        if let Some(msg) = crate::validation::return_values_on_condition_check_failure_rejection(
+            raw.return_values_on_condition_check_failure.as_deref(),
+            "returnValuesOnConditionCheckFailure",
+        ) {
+            errors.push(msg);
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -145,7 +150,7 @@ pub async fn execute<S: StorageBackend>(
     mut request: DeleteItemRequest,
 ) -> Result<DeleteItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    crate::validation::validate_item_table_name(&request.table_name)?;
 
     // Validate expression/non-expression parameter conflicts
     {
@@ -153,6 +158,9 @@ pub async fn execute<S: StorageBackend>(
         let mut expr_params = Vec::new();
         if request.expected.is_some() {
             non_expr.push("Expected");
+        }
+        if request.conditional_operator.is_some() {
+            non_expr.push("ConditionalOperator");
         }
         if request.condition_expression.is_some() {
             expr_params.push("ConditionExpression");
@@ -165,9 +173,33 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &request.expression_attribute_values_raw,
         };
-        if let Some(parsed_eav) = helpers::validate_expression_params(&ctx)? {
-            request.expression_attribute_values = Some(parsed_eav);
+        // Mixing expression and non-expression parameters comes back in the
+        // envelope, as on PutItem and UpdateItem (captured 2026-10-09, five of
+        // seven regions). The other families keep their bare form here.
+        match helpers::validate_expression_params(&ctx) {
+            Ok(Some(parsed_eav)) => request.expression_attribute_values = Some(parsed_eav),
+            Ok(None) => {}
+            Err(crate::validation::ClassifiedValidationError::Enveloped(msg))
+                if msg.starts_with("Can not use both expression and non-expression") =>
+            {
+                return Err(DynoxideError::ValidationException(
+                    crate::validation::envelope_message(&msg),
+                ));
+            }
+            Err(e) => return Err(e.into()),
         }
+    }
+
+    // ConditionalOperator only joins legacy Expected conditions, so it is
+    // refused without two of them, whatever its value. DeleteItem reports the
+    // request-validation family without the tag, so the envelope is added here.
+    if let Some(msg) = crate::validation::conditional_operator_misuse(
+        request.conditional_operator.as_deref(),
+        crate::validation::legacy_condition_count(request.expected.as_ref()),
+    ) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(msg),
+        ));
     }
 
     // Validate key attribute values (unsupported datatypes, invalid numbers)

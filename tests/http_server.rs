@@ -909,9 +909,10 @@ async fn test_update_item_return_values_invalid_enveloped() {
     .await;
     assert_validation_error(
         resp,
-        "1 validation error detected: Value 'BOGUS' at 'returnValues' failed to satisfy \
-         constraint: Member must satisfy enum value set: \
-         [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]",
+        // The validation framework's generic form, in 31 of 33 regions
+        // (captured 2026-10-08): no value, no member, DynamoDB's own order.
+        "1 validation error detected: Failed to satisfy constraint: Member must satisfy enum \
+         value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]",
     )
     .await;
 }
@@ -1438,7 +1439,8 @@ async fn test_search_vectors_top_k_zero_is_enveloped_over_the_wire() {
     .await;
     assert_validation_error(
         resp,
-        "1 validation error detected: Value '0' at 'topK' failed to satisfy constraint: \
+        // The newer validation layer's wording (captured 2026-10-09).
+        "1 validation error detected: Value at 'TopK' failed to satisfy constraint: \
          Member must have value greater than or equal to 1",
     )
     .await;

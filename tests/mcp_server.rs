@@ -3875,7 +3875,7 @@ fn an_agents_search_is_held_to_the_wire_request_model() {
     assert!(is_tool_error(&resp), "expected a tool error: {resp}");
     let msg = tool_content(&resp)["message"].as_str().unwrap().to_string();
     assert!(
-        msg.contains("'topK' failed to satisfy constraint"),
+        msg.contains("at 'TopK' failed to satisfy constraint"),
         "topK must answer the request-model constraint: {msg}"
     );
 
