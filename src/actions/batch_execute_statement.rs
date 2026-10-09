@@ -24,19 +24,16 @@ pub struct BatchExecuteStatementRequest {
 /// deserialise it. The enclosing `BatchExecuteStatementRequest` is deliberately
 /// not marked: it carries `Statements` and `ReturnConsumedCapacity`, which is
 /// the whole of DynamoDB's shape.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct BatchStatementRequest {
-    #[serde(rename = "Statement")]
     pub statement: String,
-    #[serde(rename = "Parameters", default)]
     pub parameters: Option<Vec<AttributeValue>>,
     /// Per member, not per batch. Does not change which rows come back, because
     /// every read against SQLite is already strongly consistent, but it does
     /// change the rate the read is charged at: a keyed batch `SELECT` costs 0.5
     /// without it and 1 with it, and a batch mixing the two sums both rates.
     /// Captured eu-west-2 2026-08-15.
-    #[serde(rename = "ConsistentRead", default)]
     pub consistent_read: Option<bool>,
     /// Accepted and inert, which is what DynamoDB does with it. A batch member
     /// whose condition fails returns the same response whether this is
@@ -44,8 +41,71 @@ pub struct BatchStatementRequest {
     /// against a `TransactWriteItems` `ConditionCheck` in the same round, which
     /// does return it. The field is deserialised so a client setting it meets a
     /// field dynoxide knows rather than one it drops.
-    #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
+    /// A parameter DynamoDB refused as the request was decoded, such as a
+    /// number it can't store. DynamoDB reports it against this statement and
+    /// runs the rest (captured eu-west-2 and us-east-1, 2026-10-09), so the
+    /// refusal is carried here rather than failing the whole request.
+    pub(crate) parameter_rejection: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for BatchStatementRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "Statement")]
+            statement: String,
+            #[serde(rename = "Parameters", default)]
+            parameters: Option<Vec<serde_json::Value>>,
+            #[serde(rename = "ConsistentRead", default)]
+            consistent_read: Option<bool>,
+            #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
+            return_values_on_condition_check_failure: Option<String>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let mut parameter_rejection = None;
+        let parameters = match wire.parameters {
+            None => None,
+            Some(raw) => {
+                let mut parameters = Vec::with_capacity(raw.len());
+                const EMPTY: &str = "Supplied AttributeValue is empty, must contain exactly \
+                                     one of the supported datatypes";
+                for value in raw {
+                    if value.as_object().is_some_and(|fields| fields.is_empty()) {
+                        parameter_rejection.get_or_insert_with(|| EMPTY.to_string());
+                        continue;
+                    }
+                    match serde_json::from_value::<AttributeValue>(value) {
+                        Ok(parameter) => parameters.push(parameter),
+                        // A value refusal belongs to this statement, an empty
+                        // value among them; anything else, a malformed value,
+                        // still fails the request.
+                        Err(e) => {
+                            let message = e.to_string();
+                            if !message.starts_with(crate::serde_errors::VALIDATION_MARKER)
+                                && !message.starts_with(EMPTY)
+                            {
+                                return Err(serde::de::Error::custom(message));
+                            }
+                            parameter_rejection.get_or_insert_with(|| {
+                                crate::serde_errors::clean_serde_message(&message).to_string()
+                            });
+                        }
+                    }
+                }
+                Some(parameters)
+            }
+        };
+        Ok(Self {
+            statement: wire.statement,
+            parameters,
+            consistent_read: wire.consistent_read,
+            return_values_on_condition_check_failure: wire.return_values_on_condition_check_failure,
+            parameter_rejection,
+        })
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -145,6 +205,31 @@ pub async fn execute<S: StorageBackend>(
     let mut failures: Vec<(String, f64)> = Vec::new();
 
     for (stmt_req, prepared) in request.statements.iter().zip(prepared) {
+        // A statement's parameters are checked before anything else about it,
+        // used or not and ahead of a missing table, and a failure is reported
+        // against that statement with the bare message while the rest run
+        // (captured eu-west-2 and us-east-1, 2026-10-09).
+        let rejection = stmt_req.parameter_rejection.clone().or_else(|| {
+            stmt_req.parameters.as_ref().and_then(|parameters| {
+                parameters
+                    .iter()
+                    .try_for_each(partiql::executor::check_parameter_value)
+                    .err()
+                    .map(|e| e.to_string())
+            })
+        });
+        if let Some(message) = rejection {
+            responses.push(BatchStatementResponse {
+                error: Some(BatchStatementError {
+                    code: "ValidationError".to_string(),
+                    message,
+                }),
+                item: None,
+                table_name: None,
+            });
+            continue;
+        }
+
         // A COUNT projection is rejected before parsing with the bare message
         // captured on ExecuteStatement, carried here under the same
         // per-statement ValidationError code a parse failure uses.
@@ -193,17 +278,39 @@ pub async fn execute<S: StorageBackend>(
                 // there. Letting it through to `execute_page` is what produces
                 // that, because table resolution is the first thing a SELECT
                 // does.
-                let table_resolved = table.as_deref().is_some_and(|t| tables.contains_key(t));
-                let unkeyed_read = matches!(stmt, partiql::parser::Statement::Select { .. })
-                    && table_resolved
-                    && (prepared.target.is_none() || partiql::parser::index_name(&stmt).is_some());
-                if unkeyed_read {
+                //
+                // Overlapping key conditions are refused first, and a key of the
+                // wrong type is reported in ExecuteStatement's words (captured
+                // eu-west-2 and us-east-1, 2026-10-09).
+                let resolved_table = table.as_deref().and_then(|t| tables.get(t));
+                let unkeyed = || {
+                    "Select statements within BatchExecuteStatement must specify the \
+                     primary key in the where clause."
+                        .to_string()
+                };
+                let refusal = match resolved_table {
+                    Some(resolved) if matches!(stmt, partiql::parser::Statement::Select { .. }) => {
+                        if partiql::parser::index_name(&stmt).is_some() {
+                            Some(unkeyed())
+                        } else if let Err(e) =
+                            partiql::executor::reject_overlapping_select(&stmt, params, resolved)
+                        {
+                            Some(e.to_string())
+                        } else {
+                            match partiql::executor::keyed_select(&stmt, params, resolved) {
+                                partiql::executor::KeyedSelect::ByPrimaryKey => None,
+                                partiql::executor::KeyedSelect::NotByPrimaryKey => Some(unkeyed()),
+                                partiql::executor::KeyedSelect::KeyType(message) => Some(message),
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(message) = refusal {
                     responses.push(BatchStatementResponse {
                         error: Some(BatchStatementError {
                             code: "ValidationError".to_string(),
-                            message: "Select statements within BatchExecuteStatement must \
-                                      specify the primary key in the where clause."
-                                .to_string(),
+                            message,
                         }),
                         item: None,
                         table_name: None,

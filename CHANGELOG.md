@@ -182,6 +182,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `native-sqlite` and `encryption` compile guard because the default features
   stay on. It now adds `--no-default-features`, as the rest of the page does.
 
+### Fixed
+
+- PartiQL reads a number written with an exponent as one number, so
+  `WHERE pk = 1e5` matches 100000 rather than 1, and `INSERT ... VALUE
+  {'pk': 2e3}` parses. A literal whose exponent, or whose scale (the digits
+  after the point less the exponent), is out of range is refused as a statement
+  that is not well formed, as DynamoDB does.
+- PartiQL reads `--` and `/* ... */` comments as whitespace wherever they
+  appear. A comment before the WHERE clause used to make a SELECT return every
+  row, and a block comment was refused.
+- A PartiQL table alias (`FROM "T" t` or `FROM "T" AS t`) on SELECT, UPDATE or
+  DELETE is refused with DynamoDB's "Aliasing is not supported". A SELECT used
+  to run it as an unfiltered read.
+- A PartiQL statement with a token left over after it, such as
+  `WHERE pk = 1 foo`, is refused with "Unexpected token after expression"
+  rather than run without the extra token. A SELECT's `ORDER BY` clause must
+  be well formed and last, so a WHERE written after it is refused rather than
+  dropped.
+- PartiQL applies a SELECT's `ORDER BY`. It used to be accepted and ignored,
+  so `ORDER BY sk DESC` came back ascending. As in DynamoDB, it reads each
+  partition the WHERE clause pins, in partition-key order, by the sort key
+  term's direction (descending when only the partition key is named), on a
+  table or an index, a page at a time when the read is paged. The forms
+  DynamoDB refuses are refused with its messages: no WHERE clause, a term that
+  is a nested path or not part of the key, a partition key not pinned with `=`
+  or `IN`, and more than one partition without the partition key in the
+  clause. `NULLS FIRST` and `NULLS LAST` are accepted.
+- PartiQL reads a number written with no digit before its point, such as `.5`
+  or `-.25e1`, where it used to refuse the statement. A number takes one
+  point, so `1.2.3` is refused as a token left over, and an exponent marker
+  with no digits (`5e`) is refused as a statement that is not well formed.
+- PartiQL checks a number written in a WHERE clause the way it checks one being
+  stored, so `WHERE pk = 1e126` is refused with DynamoDB's overflow message
+  rather than run as a comparison that matches nothing. Number errors on
+  PartiQL literals end with DynamoDB's ` under <path>`, naming where the
+  number sits inside the value (`under root`, `under root.x`, `under root[1]`),
+  and are reported before the table or item is looked up, the first one
+  written first and an UPDATE's WHERE clause before its SET. A literal at the
+  very top of the exponent range is reported as an underflow, as DynamoDB's
+  PartiQL reports it.
+- A PartiQL literal nested 32 levels deep is refused where it reaches that
+  level, with DynamoDB's `Nesting Levels have exceeded supported limits` and
+  the path to it, and a parameter nested exactly 32 levels deep gets the same
+  short message rather than the long one.
+- PartiQL statements check every parameter value before reading the
+  statement, as any attribute value is checked (its numbers, and empty or
+  duplicated sets), so a parameter DynamoDB can't store is refused even when
+  the statement doesn't use it: on `ExecuteStatement`, against the statement in
+  a `BatchExecuteStatement` (an empty value included), and for the whole
+  request in an `ExecuteTransaction`, which writes nothing.
+- A PartiQL statement against a table that doesn't exist says `Requested
+  resource not found`, as DynamoDB does, without `: Table: <name> not found`;
+  in a transaction it cancels with the `ResourceNotFound` reason rather than
+  `InternalError`.
+- An empty map key anywhere in a PartiQL literal is refused with DynamoDB's
+  `Path component cannot be an empty string`, where it used to be stored.
+- A PartiQL SELECT whose OR branches name overlapping keys, such as
+  `pk = 'a' OR pk = 'a'` or sort-key ranges (`begins_with` included) that meet
+  in one partition, is refused with DynamoDB's `Overlapping conditions with
+  range keys are not supported in where clause`. As in DynamoDB, a clause with
+  a branch that puts two different conditions, or `NOT ... BETWEEN`, on the
+  sort key isn't checked, and the check comes after an `ORDER BY` term is
+  checked and before the rest of the `ORDER BY` checks.
+- A PartiQL key value DynamoDB can't read the key by is refused with its
+  messages: `Key value must be of type S, N, or B` naming the key and the type
+  for a type no key can have, such as a map, rather than `Invalid key value`,
+  and `Key attribute's data type should match its data type in table's schema`
+  for a key type that isn't the key's, where a SELECT, UPDATE or DELETE used to
+  match nothing and an INSERT gave PutItem's message. Both apply to literals
+  and parameters, to the sort key and to an index's keys, and a SELECT's OR
+  branches are checked in the order written until one that isn't a key read.
+  In a transaction, a SELECT key, or an UPDATE or DELETE key of the wrong key
+  type, cancels with GetItem's `The provided key element does not match the
+  schema`, an UPDATE or DELETE key no key can have is refused up front, and an
+  INSERT keeps PutItem's message.
+- A SELECT in a `BatchExecuteStatement` or an `ExecuteTransaction` may name only
+  the primary key, as DynamoDB requires: each key attribute once, with `=` or
+  an `IN` of one value, the same condition written twice counting once. One
+  that also filters on another attribute is refused rather than run, and
+  overlapping key conditions are reported first.
+- `ExecuteTransaction` reports a statement that doesn't parse with
+  `Validation failed in TransactStatements[N]: ` in front, as it already did
+  for its other per-statement refusals.
+- A PartiQL statement that doesn't begin with SELECT, INSERT, UPDATE or DELETE
+  is refused as DynamoDB refuses it, reading it as an expression rather than
+  answering `Expected data manipulation` to everything: `Unsupported
+  operation: Id` for a lone name, `Path`, `Lit`, `List` and the like for other
+  whole expressions, `EXISTS can only be used in ExecuteTransaction write
+  requests.` for an operator, comparison or call, and DynamoDB's syntax
+  messages where one breaks off or carries on (`Unexpected token after
+  expression` for `INSRT INTO ...`, `Expected RIGHT_BRACKET`, `Unexpected
+  keyword` and others). `SET a = 1` and `REMOVE a` are refused for having no
+  table, and a verb with nothing it needs after it (`DELETE` alone, `INSERT`
+  with no `INTO`) is refused in DynamoDB's words.
+- A PartiQL statement may end with a semicolon, as in DynamoDB; a second
+  statement after it is refused with `Unexpected token after semicolon. (Only
+  one query is allowed.)`.
+- PartiQL refuses a `begins_with` operand that isn't a string or binary, and
+  BETWEEN bounds of different types or with the lower above the upper, with
+  DynamoDB's messages, `NOT` or not, before the table is looked up.
+- A PartiQL INSERT of a key that already exists is reported as a duplicate
+  before an item nested to the limit is.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security
