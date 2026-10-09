@@ -10,9 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `--log quiet` suppresses informational startup and shutdown messages on
-  stderr. Without the flag the output is unchanged.
-- `server::ServerOptions` and `server::start_with_options` give embedded Rust
-  callers the same switch.
+  stderr. It works on `serve` and the no-subcommand form, `serve --mcp`, `mcp`
+  (stdio and `--http`), and `import --serve` or `--mcp`. Warnings, errors, the
+  first-run MCP token message and the import's own report still print. On
+  `import`, `--log` conflicts with `--output`. Without the flag the output is
+  unchanged.
+- `ServerOptions` (at the crate root, and at `server::ServerOptions`),
+  `server::start_with_options` and `mcp::serve_http_with_options` give embedded
+  Rust callers the same switch for both servers.
 
 ## [1.2.1] - 2026-09-20
 

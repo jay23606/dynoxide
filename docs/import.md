@@ -547,6 +547,12 @@ instead.
 | `--mcp` | off | Start an MCP server on the imported data |
 | `--mcp-port` | `8100` | MCP HTTP port, used with `--serve --mcp` |
 | `--mcp-read-only` | off | Reject write operations over MCP (requires `--mcp`) |
+| `--log quiet` | off | Suppress the started servers' informational lines (conflicts with `--output`) |
+
+`--log quiet` only quiets the servers. The import's own progress lines, its
+summary and its warnings always print, because they are the record of what was
+imported and anonymised, and the exposure check still stops the run with exit
+3.
 
 Anonymisation applies the same way in serve mode: pass `--rules` and the data
 is masked before it reaches the in-memory database.

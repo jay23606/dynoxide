@@ -128,6 +128,17 @@ The search is exact brute-force KNN over the whole index, so the top-k it return
 
 The tools are thin wrappers over the same engine the wire surface uses, so an agent sees the same behaviour and the same error text a DynamoDB client would.
 
+## Logging
+
+`--log quiet` suppresses the `MCP HTTP server listening on ...` line and the
+`Loaded data model` line, on both transports and on `serve --mcp`. The warning
+printed when authentication is disabled and the message showing a newly
+generated token still print, as do errors.
+
+```sh
+dynoxide mcp --http --log quiet
+```
+
 ## Safety options
 
 ```sh

@@ -83,6 +83,10 @@ pub(crate) mod serde_errors;
 pub(crate) mod serialization_checks;
 #[cfg(feature = "http-server")]
 pub mod server;
+// One startup-options type for the DynamoDB HTTP server and the MCP HTTP
+// transport, outside both because either builds without the other.
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+mod server_options;
 #[cfg(feature = "mcp-server")]
 pub(crate) mod snapshots;
 pub mod storage;
@@ -119,6 +123,9 @@ pub use storage_backend::BackendError;
 pub use storage_backend::WasmBridgeBackend;
 
 pub use types::{AttributeValue, ConversionError, Item};
+
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+pub use server_options::ServerOptions;
 
 /// The product version: what `dynoxide --version`, the HTTP headers and the
 /// MCP server report, and what the CLI, containers, browser engine and npm

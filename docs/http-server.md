@@ -63,4 +63,14 @@ informational startup and shutdown messages on stderr, use quiet mode:
 dynoxide --log quiet --port 8000
 ```
 
+With `--mcp`, quiet mode also covers the MCP listening line and the
+`Loaded data model` line. Two MCP lines still print, because they are about
+access rather than progress: the warning that `--mcp-no-auth` has turned
+authentication off, and the message showing a newly generated token. Errors
+always print.
+
+Quiet mode removes the `Dynoxide listening on ...` line, so a script that waits
+for Dynoxide to come up should wait on the port or on `GET /` rather than on
+that line.
+
 `RUST_LOG` continues to control tracing independently.
