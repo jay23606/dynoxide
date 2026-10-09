@@ -49,7 +49,8 @@ or behaviour note that motivates the change. Cleaner ergonomics or
   recent stable toolchain that satisfies the MSRV works.
 - `cargo build` to compile, `cargo test` to run the test suite.
 - `cargo fmt --check` and `cargo clippy -- -D warnings` must pass
-  before a PR is merge-ready; CI enforces both.
+  before a PR is merge-ready; CI enforces both, in the root crate and
+  in the separate `benchmarks/` package.
 
 ## Tests
 

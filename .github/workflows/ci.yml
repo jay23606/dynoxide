@@ -196,6 +196,41 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --lib
 
+  benchmarks-lint:
+    name: Benchmarks lint
+    runs-on: ubuntu-latest
+
+    # benchmarks/ is its own cargo package rather than a workspace member, so
+    # the lint job above never reaches it, and the benchmark workflow only
+    # runs `cargo bench` on two of its targets. Formatting, clippy and the
+    # remaining benches and binaries could break with nothing noticing.
+    # Clippy over every target also type-checks every target, so it doubles
+    # as the compile check. No --locked: benchmarks/Cargo.lock is not kept in
+    # step with the root crate's version.
+    defaults:
+      run:
+        working-directory: benchmarks
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benchmarks
+
+      - name: Format
+        run: cargo fmt --check
+
+      # Both configurations: iai_core compiles a different main without the
+      # feature, and that fallback is what `cargo bench` builds by default.
+      - name: Clippy (every target, default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (every target, iai-callgrind)
+        run: cargo clippy --all-targets --features iai-callgrind -- -D warnings
+
   benchmark-scripts:
     name: Benchmark script tests
     runs-on: ubuntu-latest
