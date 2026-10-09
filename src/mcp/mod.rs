@@ -84,6 +84,21 @@ pub async fn serve_http_with_shutdown(
     config: McpConfig,
     shutdown: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    serve_http_with_options(db, opts, config, shutdown, crate::ServerOptions::default()).await
+}
+
+/// Start the MCP server over Streamable HTTP with an external shutdown signal
+/// and explicit startup options.
+///
+/// [`crate::ServerOptions::quiet`] suppresses the listening line. Auth
+/// warnings are printed by the caller and are not affected.
+pub async fn serve_http_with_options(
+    db: Database,
+    opts: HttpOptions,
+    config: McpConfig,
+    shutdown: Option<tokio_util::sync::CancellationToken>,
+    options: crate::ServerOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
@@ -143,7 +158,9 @@ pub async fn serve_http_with_shutdown(
     let listener = tokio::net::TcpListener::from_std(std_listener)?;
     let local_addr = listener.local_addr()?;
 
-    eprintln!("MCP HTTP server listening on http://{local_addr}/mcp");
+    if !options.suppresses_informational_messages() {
+        eprintln!("MCP HTTP server listening on http://{local_addr}/mcp");
+    }
 
     // Don't use with_graceful_shutdown for the MCP transport: persistent
     // Streamable-HTTP sessions held open by MCP clients (Claude Code, Cursor,

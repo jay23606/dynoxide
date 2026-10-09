@@ -29,20 +29,7 @@ const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 const TARGET_PREFIX: &str = "DynamoDB_20120810.";
 const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810.";
 
-/// Options controlling HTTP server output.
-#[derive(Debug, Clone, Default)]
-pub struct ServerOptions {
-    suppress_informational_messages: bool,
-}
-
-impl ServerOptions {
-    /// Suppress informational server output.
-    pub const fn quiet() -> Self {
-        Self {
-            suppress_informational_messages: true,
-        }
-    }
-}
+pub use crate::server_options::ServerOptions;
 
 /// Check whether the port is already in use by attempting a TCP connection.
 ///
@@ -99,12 +86,12 @@ pub async fn start_with_options(
 
     let app = build_router(db);
 
-    if !options.suppress_informational_messages {
+    if !options.suppresses_informational_messages() {
         eprintln!("Dynoxide listening on http://{addr}");
     }
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(options.suppress_informational_messages))
+        .with_graceful_shutdown(shutdown_signal(options.suppresses_informational_messages()))
         .await
         .map_err(|e| format!("server failed: {e}"))
 }

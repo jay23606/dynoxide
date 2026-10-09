@@ -194,6 +194,10 @@ struct McpArgs {
     #[arg(long, value_name = "PATH")]
     encryption_key_file: Option<PathBuf>,
 
+    /// Logging mode
+    #[arg(long, value_enum, value_name = "MODE")]
+    log: Option<LogMode>,
+
     /// Use Streamable HTTP transport instead of stdio
     #[arg(long)]
     http: bool,
@@ -289,6 +293,11 @@ struct ImportArgs {
     /// output. Without it such a run exits 3, so a pipeline stops.
     #[arg(long)]
     accept_exposure: bool,
+
+    /// Logging mode for the servers started by --serve or --mcp
+    #[cfg(any(feature = "http-server", feature = "mcp-server"))]
+    #[arg(long, value_enum, value_name = "MODE", conflicts_with = "output")]
+    log: Option<LogMode>,
 
     /// After import, start an HTTP server with the imported data (in-memory)
     #[cfg(feature = "http-server")]
@@ -490,8 +499,6 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "http-server")]
 async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let is_quiet = args.log == Some(LogMode::Quiet);
-
     #[cfg(not(feature = "encryption"))]
     reject_encryption_on_plain_build(args.encryption_key_file.as_ref())?;
 
@@ -522,22 +529,19 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(schema_path) = &args.schema {
         let n = dynoxide::import::scaffold_from_schema(&db, schema_path)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        if !is_quiet {
+        if !is_quiet(args.log) {
             eprintln!("Scaffolded {} table(s) from schema", n);
         }
     }
 
-    let server_options = if is_quiet {
-        dynoxide::server::ServerOptions::quiet()
-    } else {
-        dynoxide::server::ServerOptions::default()
-    };
+    let server_options = server_options(args.log);
 
     #[cfg(feature = "mcp-server")]
     if args.mcp {
         use tokio_util::sync::CancellationToken;
 
-        let mcp_data_model = load_data_model(args.mcp_data_model.as_ref())?;
+        let quiet = is_quiet(args.log);
+        let mcp_data_model = load_data_model(args.mcp_data_model.as_ref(), quiet)?;
         let mcp_config = dynoxide::mcp::McpConfig {
             read_only: args.mcp_read_only,
             data_model: mcp_data_model,
@@ -553,8 +557,9 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mcp_db = db.clone();
         let mcp_shutdown = CancellationToken::new();
         let mcp_shutdown_clone = mcp_shutdown.clone();
+        let mcp_options = server_options.clone();
 
-        if !is_quiet {
+        if !quiet {
             eprintln!(
                 "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
                 args.host, args.port, args.mcp_host, args.mcp_port
@@ -570,7 +575,13 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 mcp_shutdown_clone.cancel();
                 r
             },
-            dynoxide::mcp::serve_http_with_shutdown(mcp_db, opts, mcp_config, Some(mcp_shutdown),),
+            dynoxide::mcp::serve_http_with_options(
+                mcp_db,
+                opts,
+                mcp_config,
+                Some(mcp_shutdown),
+                mcp_options,
+            ),
         );
         http_result?;
         mcp_result?;
@@ -579,6 +590,24 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     dynoxide::server::start_with_options(&args.host, args.port, db, server_options).await?;
     Ok(())
+}
+
+/// Whether `--log` asks for quiet mode, for the lines this binary prints
+/// itself.
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+fn is_quiet(log: Option<LogMode>) -> bool {
+    log == Some(LogMode::Quiet)
+}
+
+/// What `--log` asks of the servers. Every command that starts one maps the
+/// flag here, so a new mode is added in one place.
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+fn server_options(log: Option<LogMode>) -> dynoxide::ServerOptions {
+    if is_quiet(log) {
+        dynoxide::ServerOptions::quiet()
+    } else {
+        dynoxide::ServerOptions::default()
+    }
 }
 
 /// Reject encryption key sources on non-encryption builds with a helpful error.
@@ -612,20 +641,24 @@ fn reject_encryption_on_plain_build(
     Ok(())
 }
 
-/// Load a data model from a schema file, if provided.
+/// Load a data model from a schema file, if provided. `quiet` suppresses the
+/// line saying what was loaded.
 #[cfg(feature = "mcp-server")]
 fn load_data_model(
     path: Option<&PathBuf>,
+    quiet: bool,
 ) -> Result<Option<dynoxide::schema::DataModel>, Box<dyn std::error::Error>> {
     match path {
         Some(p) => {
             let model = dynoxide::schema::onetable::parse_onetable_file(p)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            eprintln!(
-                "Loaded data model: {} ({} entities)",
-                model.schema_format,
-                model.entities.len()
-            );
+            if !quiet {
+                eprintln!(
+                    "Loaded data model: {} ({} entities)",
+                    model.schema_format,
+                    model.entities.len()
+                );
+            }
             Ok(Some(model))
         }
         None => Ok(None),
@@ -897,7 +930,7 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    let data_model = load_data_model(args.data_model.as_ref())?;
+    let data_model = load_data_model(args.data_model.as_ref(), is_quiet(args.log))?;
 
     let mcp_config = dynoxide::mcp::McpConfig {
         read_only: args.read_only,
@@ -916,7 +949,8 @@ async fn run_mcp(args: McpArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.no_auth,
             args.allowed_host.clone(),
         )?;
-        dynoxide::mcp::serve_http(db, opts, mcp_config).await
+        dynoxide::mcp::serve_http_with_options(db, opts, mcp_config, None, server_options(args.log))
+            .await
     } else {
         dynoxide::mcp::serve_stdio(db, mcp_config).await
     }
@@ -1040,6 +1074,8 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
     #[cfg(not(feature = "mcp-server"))]
     let wants_mcp = false;
 
+    let quiet = is_quiet(args.log);
+
     if wants_serve || wants_mcp {
         // In-memory mode: import then serve
         let db = Database::memory()?;
@@ -1049,15 +1085,21 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
         // outcome worse than writing a file, because the real values are
         // handed out on request rather than sitting in a file nobody opened.
         finish_import(&summary, args.accept_exposure);
-        eprintln!();
+        // The import report always prints; this only separates it from the
+        // server output that follows, which quiet mode suppresses.
+        if !quiet {
+            eprintln!();
+        }
 
         // Both --serve and --mcp: run HTTP + MCP concurrently
         #[cfg(all(feature = "http-server", feature = "mcp-server"))]
         if wants_serve && wants_mcp {
             use tokio_util::sync::CancellationToken;
 
-            let mcp_data_model =
-                load_data_model(args.mcp_data_model.as_ref().or(args.data_model.as_ref()))?;
+            let mcp_data_model = load_data_model(
+                args.mcp_data_model.as_ref().or(args.data_model.as_ref()),
+                quiet,
+            )?;
             let mcp_config = dynoxide::mcp::McpConfig {
                 read_only: args.mcp_read_only,
                 data_model: mcp_data_model,
@@ -1075,22 +1117,31 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
             let mcp_shutdown = CancellationToken::new();
             let mcp_shutdown_clone = mcp_shutdown.clone();
 
-            eprintln!(
-                "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
-                args.host, args.port, args.mcp_host, args.mcp_port
-            );
+            if !quiet {
+                eprintln!(
+                    "Starting DynamoDB HTTP server on {}:{} + MCP server on {}:{}",
+                    args.host, args.port, args.mcp_host, args.mcp_port
+                );
+            }
 
             let (http_result, mcp_result) = tokio::join!(
                 async {
-                    let r = dynoxide::server::start(&args.host, args.port, db).await;
+                    let r = dynoxide::server::start_with_options(
+                        &args.host,
+                        args.port,
+                        db,
+                        server_options(args.log),
+                    )
+                    .await;
                     mcp_shutdown_clone.cancel();
                     r
                 },
-                dynoxide::mcp::serve_http_with_shutdown(
+                dynoxide::mcp::serve_http_with_options(
                     mcp_db,
                     opts,
                     mcp_config,
                     Some(mcp_shutdown),
+                    server_options(args.log),
                 ),
             );
             http_result?;
@@ -1100,14 +1151,22 @@ async fn run_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> 
 
         #[cfg(feature = "http-server")]
         if wants_serve {
-            dynoxide::server::start(&args.host, args.port, db).await?;
+            dynoxide::server::start_with_options(
+                &args.host,
+                args.port,
+                db,
+                server_options(args.log),
+            )
+            .await?;
             return Ok(());
         }
 
         #[cfg(feature = "mcp-server")]
         if wants_mcp {
-            let mcp_data_model =
-                load_data_model(args.mcp_data_model.as_ref().or(args.data_model.as_ref()))?;
+            let mcp_data_model = load_data_model(
+                args.mcp_data_model.as_ref().or(args.data_model.as_ref()),
+                quiet,
+            )?;
             let mcp_config = dynoxide::mcp::McpConfig {
                 read_only: args.mcp_read_only,
                 data_model: mcp_data_model,
@@ -1348,6 +1407,66 @@ mod tests {
                     "expected parse error for {argv:?}"
                 );
             }
+        }
+
+        #[cfg(feature = "mcp-server")]
+        #[test]
+        fn quiet_log_mode_parses_for_mcp() {
+            let cli = Cli::try_parse_from(["dynoxide", "mcp", "--log", "quiet"]).unwrap();
+            match cli.command {
+                Some(Commands::Mcp(args)) => assert_eq!(args.log, Some(LogMode::Quiet)),
+                _ => panic!("expected mcp subcommand"),
+            }
+            assert!(Cli::try_parse_from(["dynoxide", "mcp", "--log", "loud"]).is_err());
+        }
+
+        #[cfg(all(
+            feature = "import",
+            any(feature = "http-server", feature = "mcp-server")
+        ))]
+        #[test]
+        fn quiet_log_mode_parses_for_import_in_serve_mode() {
+            let base = ["dynoxide", "import", "--source", "s", "--schema", "f.json"];
+
+            #[cfg(feature = "http-server")]
+            {
+                let argv = [&base[..], &["--serve", "--log", "quiet"]].concat();
+                let cli = Cli::try_parse_from(argv).unwrap();
+                match cli.command {
+                    Some(Commands::Import(args)) => assert_eq!(args.log, Some(LogMode::Quiet)),
+                    _ => panic!("expected import subcommand"),
+                }
+                let argv = [&base[..], &["--serve", "--log", "loud"]].concat();
+                assert!(Cli::try_parse_from(argv).is_err());
+            }
+
+            #[cfg(feature = "mcp-server")]
+            {
+                let argv = [&base[..], &["--mcp", "--log", "quiet"]].concat();
+                assert!(Cli::try_parse_from(argv).is_ok());
+            }
+        }
+
+        /// `--log` only changes what a started server prints, so on a file
+        /// import it would be accepted and then ignored. Refuse it instead.
+        #[cfg(all(
+            feature = "import",
+            any(feature = "http-server", feature = "mcp-server")
+        ))]
+        #[test]
+        fn import_log_conflicts_with_output() {
+            let argv = [
+                "dynoxide", "import", "--source", "s", "--schema", "f.json", "--output", "out.db",
+                "--log", "quiet",
+            ];
+            let err = match Cli::try_parse_from(argv) {
+                Ok(_) => panic!("--log with --output should be a parse error"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("--output") && err.contains("--log"),
+                "the error should name both flags: {err}"
+            );
         }
     }
 

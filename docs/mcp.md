@@ -158,6 +158,17 @@ The single-item tools, `query`, `scan` and `execute_partiql` return one object. 
 
 When `--max-items` caps a `query` or `scan`, the figure is for the capped read, because that is the read that ran. On `query`, `scan` and `search_vectors` the block counts towards `--max-size-bytes`, so a page that only just fitted can be refused once capacity is asked for.
 
+## Logging
+
+`--log quiet` suppresses the `MCP HTTP server listening on ...` line and the
+`Loaded data model` line, on both transports and on `serve --mcp`. The warning
+printed when authentication is disabled and the message showing a newly
+generated token still print, as do errors.
+
+```sh
+dynoxide mcp --http --log quiet
+```
+
 ## Safety options
 
 ```sh

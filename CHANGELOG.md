@@ -150,6 +150,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it carries on. A sweep reads no more of a table than it held when the sweep
   reached it, so a table that keeps growing cannot keep it running, and an item
   written while the sweep is under way may be left for the next one.
+  stderr. It works on `serve` and the no-subcommand form, `serve --mcp`, `mcp`
+  (stdio and `--http`), and `import --serve` or `--mcp`. Warnings, errors, the
+  first-run MCP token message and the import's own report still print. On
+  `import`, `--log` conflicts with `--output`. Without the flag the output is
+  unchanged.
+- `ServerOptions` (at the crate root, and at `server::ServerOptions`),
+  `server::start_with_options` and `mcp::serve_http_with_options` give embedded
+  Rust callers the same switch for both servers.
 
 ## [1.2.1] - 2026-09-20
 
