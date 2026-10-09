@@ -218,7 +218,9 @@ fn test_insert_single_item() {
         &db,
         "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Charlie'}",
     );
-    assert!(resp.items.is_none()); // write ops return no items
+    // A write returns an empty Items list (captured eu-west-2, us-east-1,
+    // eu-west-1 and us-west-2, 2026-10-09).
+    assert_eq!(resp.items, Some(vec![]));
 
     // Verify the item exists
     let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
@@ -426,8 +428,10 @@ fn test_delete_without_returning_still_returns_no_items() {
     create_test_table(&db, "Users");
     put_test_item(&db, "Users", "u1", "Alice");
 
+    // An empty Items list, not none (captured eu-west-2, us-east-1, eu-west-1
+    // and us-west-2, 2026-10-09).
     let resp = exec(&db, "DELETE FROM \"Users\" WHERE pk = 'u1'");
-    assert!(resp.items.is_none());
+    assert_eq!(resp.items, Some(vec![]));
 }
 
 #[test]

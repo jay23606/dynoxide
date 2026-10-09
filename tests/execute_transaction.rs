@@ -67,8 +67,9 @@ fn test_multiple_inserts_all_succeed() {
     };
 
     let resp = db.execute_transaction(request).unwrap();
-    assert!(resp.responses.is_some());
-    assert_eq!(resp.responses.unwrap().len(), 3);
+    // A transaction of writes answers with an empty Responses list (captured
+    // eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+    assert_eq!(resp.responses.map(|r| r.len()), Some(0));
 
     // Verify all items exist
     let items = select_all(&db, "Users");
@@ -455,11 +456,9 @@ fn test_parameterised_statements() {
     };
 
     let resp = db.execute_transaction(request).unwrap();
-    let responses = resp.responses.unwrap();
-    assert_eq!(responses.len(), 2);
-
-    // Neither UPDATE carries a RETURNING clause, so neither yields an item.
-    assert!(responses.iter().all(|r| r.item.is_none()));
+    // A transaction of writes answers with an empty Responses list (captured
+    // eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+    assert_eq!(resp.responses.map(|r| r.len()), Some(0));
 
     // Both parameters resolved to the item they named.
     let items = select_all(&db, "Users");

@@ -267,6 +267,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A PartiQL statement may end with a semicolon, as in DynamoDB; a second
   statement after it is refused with `Unexpected token after semicolon. (Only
   one query is allowed.)`.
+- A successful PartiQL INSERT, UPDATE or DELETE through `ExecuteStatement`
+  returns an empty `Items` list unless it has a `RETURNING` clause, and an
+  `ExecuteTransaction` of writes returns an empty `Responses` list, as DynamoDB
+  does. They used to return no `Items` at all and one empty entry per
+  statement.
 - A PartiQL WHERE clause that stops where a condition should start is refused
   in DynamoDB's words: `Unexpected term` when nothing follows `WHERE`, `NOT` or
   an opening parenthesis, `Missing right-hand side expression of infix

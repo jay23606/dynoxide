@@ -271,6 +271,15 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         build_write_capacity(&charges, mode)
     };
 
+    // A transaction of writes answers with an empty `Responses` list, not one
+    // empty entry per statement; a transaction of reads has one entry per
+    // statement (captured eu-west-2, us-east-1, eu-west-1 and us-west-2,
+    // 2026-10-09).
+    let responses = if is_read_set(&parsed) {
+        responses
+    } else {
+        Vec::new()
+    };
     Ok(CachedTransaction {
         response: ExecuteTransactionResponse {
             responses: Some(responses),

@@ -198,8 +198,11 @@ pub async fn execute<S: StorageBackend>(
         )
     });
 
+    // A write without a RETURNING clause answers with an empty `Items` list,
+    // not without one (captured eu-west-2, us-east-1, eu-west-1 and
+    // us-west-2, 2026-10-09).
     Ok(ExecuteStatementResponse {
-        items,
+        items: Some(items.unwrap_or_default()),
         next_token,
         consumed_capacity,
     })
