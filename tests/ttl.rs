@@ -505,6 +505,172 @@ fn test_sweep_with_no_ttl_enabled_tables() {
     assert_eq!(item_count(&db, "TestTable"), 1);
 }
 
+// -----------------------------------------------------------------------
+// Sweeps spanning several pages
+// -----------------------------------------------------------------------
+
+/// A table whose items carry `gsi_pk`, indexed by a GSI projecting everything.
+fn create_gsi_table(db: &Database, table_name: &str) {
+    db.create_table(CreateTableRequest {
+        table_name: table_name.to_string(),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::HASH,
+        }],
+        attribute_definitions: vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsi_pk".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ],
+        global_secondary_indexes: Some(vec![dynoxide::types::GlobalSecondaryIndex {
+            index_name: "ByGsiPk".to_string(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "gsi_pk".to_string(),
+                key_type: KeyType::HASH,
+            }],
+            projection: dynoxide::types::Projection {
+                projection_type: Some(dynoxide::types::ProjectionType::ALL),
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+        }]),
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+fn gsi_item_count(db: &Database, table_name: &str) -> usize {
+    db.scan(dynoxide::actions::scan::ScanRequest {
+        table_name: table_name.to_string(),
+        index_name: Some("ByGsiPk".to_string()),
+        ..Default::default()
+    })
+    .unwrap()
+    .count
+}
+
+#[test]
+fn test_sweep_across_pages_deletes_only_expired_items() {
+    // More items than one page holds, with expired and live items interleaved
+    // by key so every page carries both.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "TestTable");
+    enable_ttl(&db, "TestTable", "ttl");
+
+    for i in 0..170 {
+        let ttl = if i % 17 < 13 { 1000 } else { 9999999999 };
+        put_item_with_ttl(&db, "TestTable", &format!("item{i:04}"), ttl);
+    }
+
+    let deleted = db.sweep_ttl().unwrap();
+    assert_eq!(deleted, 130);
+    assert_eq!(item_count(&db, "TestTable"), 40);
+
+    // Nothing is left for a second sweep to take.
+    assert_eq!(db.sweep_ttl().unwrap(), 0);
+}
+
+#[test]
+fn test_sweep_across_pages_covers_every_ttl_table() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "TableA");
+    create_test_table(&db, "TableB");
+    enable_ttl(&db, "TableA", "ttl");
+    enable_ttl(&db, "TableB", "ttl");
+
+    for i in 0..120 {
+        put_item_with_ttl(&db, "TableA", &format!("a{i:04}"), 1000);
+    }
+    for i in 0..5 {
+        put_item_with_ttl(&db, "TableB", &format!("b{i:04}"), 1000);
+    }
+
+    assert_eq!(db.sweep_ttl().unwrap(), 125);
+    assert_eq!(item_count(&db, "TableA"), 0);
+    assert_eq!(item_count(&db, "TableB"), 0);
+}
+
+#[test]
+fn test_sweep_across_pages_removes_every_gsi_entry() {
+    let db = Database::memory().unwrap();
+    create_gsi_table(&db, "TestTable");
+    enable_ttl(&db, "TestTable", "ttl");
+
+    for i in 0..110 {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), AttributeValue::S(format!("item{i:04}")));
+        item.insert("gsi_pk".to_string(), AttributeValue::S(format!("g{i}")));
+        item.insert("ttl".to_string(), AttributeValue::N("1000".to_string()));
+        db.put_item(PutItemRequest {
+            table_name: "TestTable".to_string(),
+            item,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    assert_eq!(gsi_item_count(&db, "TestTable"), 110);
+
+    assert_eq!(db.sweep_ttl().unwrap(), 110);
+    assert_eq!(item_count(&db, "TestTable"), 0);
+    assert_eq!(gsi_item_count(&db, "TestTable"), 0);
+}
+
+#[test]
+fn test_sweep_across_pages_records_one_stream_remove_per_item() {
+    let db = Database::memory().unwrap();
+    create_test_table_with_streams(&db, "TestTable");
+    enable_ttl(&db, "TestTable", "ttl");
+
+    for i in 0..60 {
+        put_item_with_ttl(&db, "TestTable", &format!("item{i:04}"), 1000);
+    }
+    assert_eq!(db.sweep_ttl().unwrap(), 60);
+
+    let stream_arn = db
+        .list_streams(ListStreamsRequest {
+            table_name: Some("TestTable".to_string()),
+            exclusive_start_stream_arn: None,
+            limit: None,
+        })
+        .unwrap()
+        .streams[0]
+        .stream_arn
+        .clone();
+    let iterator = db
+        .get_shard_iterator(GetShardIteratorRequest {
+            stream_arn,
+            shard_id: "shardId-00000001-TestTable".to_string(),
+            shard_iterator_type: "TRIM_HORIZON".to_string(),
+            sequence_number: None,
+        })
+        .unwrap()
+        .shard_iterator
+        .unwrap();
+    let records = db
+        .get_records(GetRecordsRequest {
+            shard_iterator: iterator,
+            limit: None,
+        })
+        .unwrap()
+        .records;
+
+    let removes: Vec<_> = records
+        .iter()
+        .filter(|r| r.event_name == "REMOVE")
+        .collect();
+    assert_eq!(removes.len(), 60);
+    for remove in removes {
+        let identity = remove.user_identity.as_ref().unwrap();
+        assert_eq!(identity.identity_type, "Service");
+        assert_eq!(identity.principal_id, "dynamodb.amazonaws.com");
+    }
+}
+
 #[test]
 fn test_update_ttl_empty_attribute_name_rejected() {
     let db = Database::memory().unwrap();

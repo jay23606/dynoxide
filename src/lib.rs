@@ -83,6 +83,10 @@ pub(crate) mod serde_errors;
 pub(crate) mod serialization_checks;
 #[cfg(feature = "http-server")]
 pub mod server;
+// Lets a TTL sweep hand the native database lock to waiting requests between
+// pages.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+pub(crate) mod handoff_mutex;
 #[cfg(feature = "mcp-server")]
 pub(crate) mod snapshots;
 pub mod storage;
@@ -535,10 +539,12 @@ pub const WASM_BACKEND: bool = false;
 /// engine and the public synchronous API is preserved via [`NativeDatabase`].
 ///
 /// Wraps a storage layer and provides DynamoDB-compatible operations.
-/// Thread-safe via `Arc<Mutex<>>`, so clone freely across threads.
+/// Thread-safe: backend access is serialised by one mutex shared through an
+/// `Arc`, which a TTL sweep steps aside from between pages to let waiting
+/// requests in. Clone freely across threads.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub struct Database<S = RusqliteBackend> {
-    inner: Arc<Mutex<S>>,
+    inner: Arc<handoff_mutex::HandoffMutex<S>>,
     tokens: Arc<TokenCaches>,
     vector_lifecycle: Arc<VectorIndexLifecycle>,
 }
@@ -592,7 +598,7 @@ impl Database<RusqliteBackend> {
     pub fn new(path: &str) -> Result<Self> {
         let storage = storage::Storage::new(path)?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(storage)),
+            inner: Arc::new(handoff_mutex::HandoffMutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
             vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
@@ -628,7 +634,7 @@ impl Database<RusqliteBackend> {
 
         let storage = storage::Storage::new_encrypted(path, key)?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(storage)),
+            inner: Arc::new(handoff_mutex::HandoffMutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
             vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
@@ -638,7 +644,7 @@ impl Database<RusqliteBackend> {
     pub fn memory() -> Result<Self> {
         let storage = storage::Storage::memory()?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(storage)),
+            inner: Arc::new(handoff_mutex::HandoffMutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
             vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
@@ -653,7 +659,7 @@ impl Database<RusqliteBackend> {
     pub fn memory_with_clock(clock: Arc<dyn storage_backend::Clock>) -> Result<Self> {
         let storage = storage::Storage::memory()?.with_clock(clock);
         Ok(Self {
-            inner: Arc::new(Mutex::new(storage)),
+            inner: Arc::new(handoff_mutex::HandoffMutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
             vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
@@ -1033,8 +1039,48 @@ impl Database<RusqliteBackend> {
 
     /// Run a TTL sweep, deleting expired items from all TTL-enabled tables.
     /// Returns the number of items deleted.
+    ///
+    /// The sweep takes the database lock a page at a time and lets any request
+    /// already waiting for it go first between pages, so other requests on this
+    /// `Database` wait for one page of the sweep rather than all of it. The
+    /// first page of each table also counts the table's rows, so the longest
+    /// single hold is that count plus one page. Between pages the sweep waits
+    /// up to a second for the queued requests to have their turn, including
+    /// the time they hold the lock, and then goes ahead.
+    ///
+    /// A sweep reads no more of a table than it held when the sweep reached
+    /// it, so an item written while the sweep is under way may be left to the
+    /// next one.
     pub fn sweep_ttl(&self) -> Result<usize> {
-        self.with_storage(|s| pollster::block_on(ttl::sweep_expired_items(s)))
+        self.sweep_ttl_by_page(|_| {}, |_| {})
+    }
+
+    /// [`sweep_ttl`](Self::sweep_ttl), with a hook run at the end of each page
+    /// while the lock is still held, and one run between pages once the lock
+    /// has been released and handed on. Both are given the page number,
+    /// counting from 1.
+    fn sweep_ttl_by_page(
+        &self,
+        mut in_page: impl FnMut(usize),
+        mut between_pages: impl FnMut(usize),
+    ) -> Result<usize> {
+        let mut sweep = self.with_storage(|s| pollster::block_on(ttl::Sweep::begin(s)))?;
+        let mut page = 0;
+        loop {
+            page += 1;
+            // The hand-off starts while this page still holds the lock, so it
+            // is owed to exactly the requests queued behind the page.
+            let hand_off = self.with_storage(|s| {
+                let more = pollster::block_on(sweep.next_page(s))?;
+                in_page(page);
+                Ok(more.then(|| self.inner.start_hand_off()))
+            })?;
+            let Some(hand_off) = hand_off else {
+                return Ok(sweep.deleted());
+            };
+            hand_off.wait();
+            between_pages(page);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1455,6 +1501,11 @@ mod tests {
         );
     }
 }
+
+/// `Database::sweep_ttl` taking the lock a page at a time, and handing it to
+/// waiting requests between pages.
+#[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
+mod ttl_sweep_tests;
 
 /// Cache primitives and the asynchronous driver.
 ///

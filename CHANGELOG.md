@@ -134,6 +134,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IndexSizeBytes`: the number of items the index holds and the total size of
   what it projects for them, where both were always 0. Vector indexes still
   report 0.
+- `Database::sweep_ttl`, and the MCP `sweep_ttl` tool that calls it, no longer
+  hold the database lock for the whole sweep. The sweep takes the lock a page of
+  25 items at a time and lets requests already waiting for it go first between
+  pages, so a read or write waits for one page rather than for a read of every
+  TTL table. The first page of each table also counts its rows, so the longest
+  single hold is that count plus a page. Between pages the sweep waits up to a
+  second for the queued requests, including the time they hold the lock, before
+  it carries on. A sweep reads no more of a table than it held when the sweep
+  reached it, so a table that keeps growing cannot keep it running, and an item
+  written while the sweep is under way may be left for the next one.
 
 ## [1.2.1] - 2026-09-20
 
