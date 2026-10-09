@@ -145,6 +145,22 @@ pub async fn execute<S: StorageBackend>(
     let mut failures: Vec<(String, f64)> = Vec::new();
 
     for (stmt_req, prepared) in request.statements.iter().zip(prepared) {
+        // A parameter nested too deep fails this statement alone, whatever else
+        // is wrong with it.
+        if crate::value_nesting::parameters_nest_too_deep(
+            stmt_req.parameters.as_deref().unwrap_or_default(),
+        ) {
+            responses.push(BatchStatementResponse {
+                error: Some(BatchStatementError {
+                    code: "ValidationError".to_string(),
+                    message: crate::value_nesting::deep_parameter_error().to_string(),
+                }),
+                item: None,
+                table_name: None,
+            });
+            continue;
+        }
+
         // A COUNT projection is rejected before parsing with the bare message
         // captured on ExecuteStatement, carried here under the same
         // per-statement ValidationError code a parse failure uses.

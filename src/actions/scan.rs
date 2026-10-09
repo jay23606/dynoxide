@@ -218,6 +218,9 @@ pub async fn execute<S: StorageBackend>(
         helpers::validate_expression_params(&ctx)?;
     }
 
+    // ---- A ScanFilter value nested too deep is refused first ----
+    crate::value_nesting::check_scan_filter(request.scan_filter.as_ref())?;
+
     // ---- Validate ScanFilter attribute values (before argument counts, matching DynamoDB) ----
     helpers::validate_filter_conditions_raw(request.scan_filter.as_ref(), "ScanFilter")?;
 
@@ -235,6 +238,7 @@ pub async fn execute<S: StorageBackend>(
     } else {
         request.exclusive_start_key.clone()
     };
+    crate::value_nesting::check_scan_start_key(exclusive_start_key.as_ref())?;
 
     // Convert legacy ScanFilter to FilterExpression if no expression is set
     if request.filter_expression.is_none()

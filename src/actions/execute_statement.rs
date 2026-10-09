@@ -60,6 +60,14 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    // A parameter nested too deep is refused before the statement is parsed or
+    // its table looked up.
+    if crate::value_nesting::parameters_nest_too_deep(
+        request.parameters.as_deref().unwrap_or_default(),
+    ) {
+        return Err(crate::value_nesting::deep_parameter_error());
+    }
+
     // A COUNT projection is rejected before parsing, with DynamoDB's bare
     // message rather than the wasn't-well-formed wrapper the parse errors
     // below carry. ExecuteStatement is the captured surface for this shape.

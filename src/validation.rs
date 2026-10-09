@@ -602,7 +602,7 @@ const MAX_NESTING_DEPTH: usize = 32;
 
 /// Real DynamoDB's verbatim message when document nesting exceeds the limit. Shared
 /// by the stored-item and ExpressionAttributeValue checks so both match AWS.
-const NESTING_LIMIT_MESSAGE: &str = "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit";
+pub(crate) const NESTING_LIMIT_MESSAGE: &str = "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit";
 
 /// Validate all attribute values in an item.
 ///

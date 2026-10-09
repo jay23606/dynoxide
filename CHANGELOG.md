@@ -14,6 +14,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `server::ServerOptions` and `server::start_with_options` give embedded Rust
   callers the same switch.
 
+### Fixed
+
+- A request carrying an attribute value nested more than about 60 levels is
+  read and refused with DynamoDB's nesting `ValidationException`, rather than
+  failing to parse with a bare `SerializationException`. As in DynamoDB, an
+  `ExpressionAttributeValues` entry is named in the message and a member such
+  as a bad table name or enum is still reported first. Past about 2,000
+  levels, where DynamoDB itself stops reading the request, it stays a bare
+  `SerializationException`.
+- A key, `ExclusiveStartKey`, or legacy `Expected`, `AttributeUpdates`,
+  `ScanFilter`, `QueryFilter` or `KeyConditions` value nested 32 or more levels
+  is refused with DynamoDB's nesting `ValidationException` before the table is
+  looked up. A key used to be reported as not matching the schema, a
+  transaction was cancelled, and a legacy condition or filter was evaluated.
+  As in DynamoDB, the message sits inside the validation envelope on
+  DeleteItem's and UpdateItem's key, `Expected` and `AttributeUpdates`, and
+  after the starting-key prefix on a Scan's `ExclusiveStartKey`, and a
+  `ScanFilter` value is refused from 33 levels.
+- A Query's `ExclusiveStartKey` that doesn't fit the key schema is refused
+  with "The provided starting key is invalid" alone, as DynamoDB does, where it
+  used to add "The provided key element does not match the schema". An invalid
+  value in it (`NULL: false`, an empty set) is reported without the
+  starting-key prefix, and a start key from another partition or outside the
+  sort key condition is refused with DynamoDB's messages rather than paged
+  from.
+- A legacy `KeyConditions` value whose type isn't the key's schema type is
+  refused with "Condition parameter type does not match schema type", and a
+  BETWEEN whose two values differ in type with "AttributeValues inside
+  AttributeValueList must be of same type". A map used to be reported as
+  "Cannot convert partition key value to string".
+- A PartiQL parameter nested 33 or more levels is refused before its statement
+  is parsed or its table looked up, as DynamoDB does: at the top level on
+  ExecuteStatement and ExecuteTransaction, where a transaction used to be
+  cancelled, and against that statement alone in a BatchExecuteStatement. It
+  used to run, or come back as "Invalid key value".
+
 ## [1.2.1] - 2026-09-20
 
 ### Security

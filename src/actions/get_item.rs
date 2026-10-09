@@ -132,6 +132,9 @@ pub async fn execute<S: StorageBackend>(
         helpers::validate_expression_params(&ctx)?;
     }
 
+    // A key nested too deep is refused before it is matched to the schema.
+    crate::value_nesting::check_key(&request.key)?;
+
     // Validate key attribute values (unsupported datatypes, invalid numbers)
     crate::validation::validate_key_attribute_values(&request.key)?;
 

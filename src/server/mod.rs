@@ -275,9 +275,18 @@ async fn handle_request(
     };
 
     // Try to parse body as JSON. DynamoDB requires a valid JSON object.
-    // Non-JSON → SerializationException (no message).
-    if !body.is_empty() && serde_json::from_str::<serde_json::Value>(&body).is_err() {
-        return serialization_exception_bare(response_ct);
+    // Non-JSON → SerializationException (no message). Valid JSON nested deeper
+    // than the parser follows is still read, as DynamoDB reads it: see
+    // `deep_nesting`.
+    let mut too_deep = false;
+    if !body.is_empty()
+        && let Err(e) = serde_json::from_str::<serde_json::Value>(&body)
+    {
+        if crate::deep_nesting::is_depth_failure(&e) {
+            too_deep = true;
+        } else {
+            return serialization_exception_bare(response_ct);
+        }
     }
 
     // Check x-amz-target header
@@ -317,7 +326,19 @@ async fn handle_request(
     tracing::debug!(operation, body_len = body.len(), "request");
     tracing::trace!(operation, body = %body, "request body");
 
-    match dispatch(&db, operation, &body) {
+    let result = if too_deep {
+        match crate::deep_nesting::resolve(operation, &body) {
+            crate::deep_nesting::DeepBody::Unreadable => {
+                return serialization_exception_bare(response_ct);
+            }
+            crate::deep_nesting::DeepBody::Refuse(e) => Err(e),
+            crate::deep_nesting::DeepBody::Run(rewritten) => dispatch(&db, operation, &rewritten),
+        }
+    } else {
+        dispatch(&db, operation, &body)
+    };
+
+    match result {
         Ok(json) => {
             tracing::debug!(operation, body_len = json.len(), "response");
             tracing::trace!(operation, body = %json, "response body");

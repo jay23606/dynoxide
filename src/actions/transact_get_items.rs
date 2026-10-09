@@ -79,6 +79,12 @@ pub async fn execute<S: StorageBackend>(
     // for a missing partition or sort key, which would leak as HTTP 500
     // instead of a per-action ValidationError. validate_key_only is the
     // ValidationException-returning equivalent.
+    // A key nested too deep fails the whole request at the top level, before
+    // any table is looked up.
+    for transact_item in &request.transact_items {
+        crate::value_nesting::check_key(&transact_item.get.key)?;
+    }
+
     let mut reasons: Vec<CancellationReason> = Vec::with_capacity(request.transact_items.len());
     let mut validated_schemas: Vec<Option<helpers::KeySchema>> =
         Vec::with_capacity(request.transact_items.len());
