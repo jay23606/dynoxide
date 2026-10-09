@@ -1927,7 +1927,10 @@ fn test_set_rejects_deep_missing_intermediate() {
 
 // ---------------------------------------------------------------------------
 // Expression size limit (4096 bytes) - rejected on each expression surface.
-// Confirmed against real DynamoDB (eu-west-2).
+// The message ends at `size;` with no figure, on every surface captured in
+// us-east-1 and eu-west-2 on 2026-10-09, except a Scan FilterExpression and a
+// transaction's ConditionExpression, where us-east-1 still appends
+// `expression size: <n>` and eu-west-2 doesn't.
 // ---------------------------------------------------------------------------
 
 // Each expression surface prefixes the size error with `Invalid <Type>Expression:`,
@@ -1960,10 +1963,10 @@ fn test_update_expression_over_size_limit_rejected() {
         .unwrap_err();
 
     // UpdateItem wraps UpdateExpression parse-time errors in the
-    // request-validation envelope (eu-west-2).
+    // request-validation envelope.
     assert_eq!(
         err.to_string(),
-        format!("1 validation error detected: {UPDATE_OVERSIZE_MSG}; expression size: 4097")
+        format!("1 validation error detected: {UPDATE_OVERSIZE_MSG};")
     );
 }
 
@@ -1987,10 +1990,10 @@ fn test_condition_expression_over_size_limit_rejected() {
         .unwrap_err();
 
     // PutItem wraps ConditionExpression parse-time errors in the
-    // request-validation envelope (eu-west-2).
+    // request-validation envelope.
     assert_eq!(
         err.to_string(),
-        format!("1 validation error detected: {CONDITION_OVERSIZE_MSG}; expression size: 4097")
+        format!("1 validation error detected: {CONDITION_OVERSIZE_MSG};")
     );
 }
 
@@ -2013,10 +2016,123 @@ fn test_projection_expression_over_size_limit_rejected() {
         })
         .unwrap_err();
 
-    assert!(
-        err.to_string().contains(PROJECTION_OVERSIZE_MSG),
-        "unexpected error: {err}"
+    assert_eq!(err.to_string(), format!("{PROJECTION_OVERSIZE_MSG};"));
+}
+
+#[test]
+fn test_expression_size_message_on_the_other_surfaces() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(&db, "Tbl", &[("pk", AttributeValue::S("k1".into()))]);
+    let over = format!("{} = :v", "a".repeat(4092));
+    assert_eq!(over.len(), 4097);
+    let values = Some(make_item(&[
+        (":v", AttributeValue::S("x".into())),
+        (":p", AttributeValue::S("k1".into())),
+    ]));
+
+    // DeleteItem: enveloped, no figure.
+    let err = db
+        .delete_item(DeleteItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some(over.clone()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("1 validation error detected: {CONDITION_OVERSIZE_MSG};")
     );
+
+    // UpdateItem's ConditionExpression: enveloped, no figure.
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET b = :v".into()),
+            condition_expression: Some(over.clone()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("1 validation error detected: {CONDITION_OVERSIZE_MSG};")
+    );
+
+    // Query: KeyConditionExpression and FilterExpression, bare, no figure.
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "Tbl",
+                "KeyConditionExpression": format!("pk = :p AND {}", "a".repeat(4085)),
+                "ExpressionAttributeValues": {":p": {"S": "k1"}},
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid KeyConditionExpression: Expression size has exceeded the maximum allowed size;"
+    );
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "Tbl",
+                "KeyConditionExpression": "pk = :p",
+                "FilterExpression": over,
+                "ExpressionAttributeValues": values,
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid FilterExpression: Expression size has exceeded the maximum allowed size;"
+    );
+
+    // Scan's FilterExpression keeps the figure: us-east-1 sends it, eu-west-2
+    // doesn't, and Dynoxide follows us-east-1.
+    let err = db
+        .scan(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "Tbl",
+                "FilterExpression": format!("{} = :v", "a".repeat(4092)),
+                "ExpressionAttributeValues": {":v": {"S": "x"}},
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid FilterExpression: Expression size has exceeded the maximum allowed size; \
+         expression size: 4097"
+    );
+
+    // BatchGetItem and TransactGetItems projections: bare, no figure.
+    let projection = "a".repeat(4097);
+    let err = db
+        .batch_get_item(
+            serde_json::from_value(serde_json::json!({
+                "RequestItems": {"Tbl": {"Keys": [{"pk": {"S": "k1"}}],
+                    "ProjectionExpression": projection}}
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(err.to_string(), format!("{PROJECTION_OVERSIZE_MSG};"));
+    let err = db
+        .transact_get_items(
+            serde_json::from_value(serde_json::json!({
+                "TransactItems": [{"Get": {"TableName": "Tbl", "Key": {"pk": {"S": "k1"}},
+                    "ProjectionExpression": projection}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(err.to_string(), format!("{PROJECTION_OVERSIZE_MSG};"));
 }
 
 #[test]
@@ -2070,7 +2186,7 @@ fn test_put_condition_syntax_error_enveloped() {
 
     assert_eq!(
         err.to_string(),
-        "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"!\""
+        r#"1 validation error detected: Invalid ConditionExpression: Syntax error; token: "!", near: "= !!""#
     );
 }
 
@@ -2209,8 +2325,7 @@ fn test_update_expression_syntax_error_enveloped() {
 
     assert_eq!(
         err.to_string(),
-        "1 validation error detected: Invalid UpdateExpression: \
-         Syntax error; Expected attribute name, got end of expression"
+        r#"1 validation error detected: Invalid UpdateExpression: Syntax error; token: "<EOF>", near: "SET""#
     );
 }
 
@@ -2230,7 +2345,7 @@ fn test_update_condition_syntax_error_enveloped() {
 
     assert_eq!(
         err.to_string(),
-        "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"!\""
+        r#"1 validation error detected: Invalid ConditionExpression: Syntax error; token: "!", near: "= !!""#
     );
 }
 

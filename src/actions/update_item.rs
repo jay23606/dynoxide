@@ -376,16 +376,23 @@ async fn execute_inner<S: StorageBackend>(
         crate::expressions::update::track_references(&parsed, &tracker)
             .map_err(|e| DynoxideError::EnvelopedValidation(wrap_invalid_update_expression(e)))?;
 
-        // Also walk the ConditionExpression to track its attribute usage
-        if let Some(ref ce) = request.condition_expression
-            && let Ok(cond_parsed) = crate::expressions::condition::parse(ce)
-        {
-            crate::expressions::condition::track_references(&cond_parsed, &tracker)
-                .map_err(DynoxideError::EnvelopedValidation)?;
+        // Also walk the ConditionExpression to track its attribute usage. One
+        // that doesn't parse is reported here, ahead of any unused value
+        // (us-east-1 and eu-west-2, 2026-10-09).
+        if let Some(ref ce) = request.condition_expression {
+            let cond_parsed = crate::expressions::condition::parse(ce).map_err(|e| {
+                DynoxideError::EnvelopedValidation(format!("Invalid ConditionExpression: {e}"))
+            })?;
+            crate::expressions::condition::track_references(&cond_parsed, &tracker).map_err(
+                |e| DynoxideError::EnvelopedValidation(format!("Invalid ConditionExpression: {e}")),
+            )?;
         }
 
-        // Check for unused expression attribute names/values
-        tracker.check_unused()?;
+        // Check for unused expression attribute names/values. Enveloped, and
+        // ahead of the table lookup (us-east-1 and eu-west-2, 2026-10-09).
+        tracker
+            .check_unused()
+            .map_err(crate::validation::tag_for_envelope)?;
     }
 
     // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.)
@@ -592,6 +599,13 @@ async fn execute_inner<S: StorageBackend>(
         // Note: unused expression attribute validation already done in pre-validation
         // block (Tracker 1). Not repeated here: runtime evaluation may skip branches
         // (e.g., if_not_exists short-circuits) which would cause false positives.
+
+        // An UpdateExpression that leaves the item nested too deep (a value
+        // written far down an existing path) gets the short nesting message,
+        // bare. Captured us-east-1 and eu-west-2, 2026-10-09.
+        if request.update_expression.is_some() {
+            crate::validation::validate_updated_item_nesting(&item)?;
+        }
 
         // Validate attribute values after update expression applied. This
         // checks the post-update item, not the request, so its errors stay

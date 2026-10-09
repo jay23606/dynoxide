@@ -343,7 +343,9 @@ pub async fn execute<S: StorageBackend>(
             &request.expression_attribute_values,
         );
         if let Err(e) = expressions::key_condition::parse(kce, &temp_tracker) {
-            return Err(DynoxideError::ValidationException(e));
+            return Err(DynoxideError::ValidationException(key_condition_error(
+                kce, e,
+            )));
         }
     }
 
@@ -499,8 +501,10 @@ pub async fn execute<S: StorageBackend>(
     );
 
     // Parse KeyConditionExpression
-    let key_cond = expressions::key_condition::parse(&key_condition_expression, &tracker)
-        .map_err(DynoxideError::ValidationException)?;
+    let key_cond =
+        expressions::key_condition::parse(&key_condition_expression, &tracker).map_err(|e| {
+            DynoxideError::ValidationException(key_condition_error(&key_condition_expression, e))
+        })?;
 
     // Validate pk_name matches the effective partition key
     if key_cond.pk_name != effective_pk {
@@ -1014,4 +1018,20 @@ fn reject_vector_index(
         ));
     }
     Ok(())
+}
+
+/// A KeyConditionExpression parse failure as DynamoDB reports it. DynamoDB
+/// reads the expression with the general expression grammar before applying
+/// the key condition's own rules, so when the text breaks that grammar the
+/// error is its `Syntax error; token: ..., near: ...` (or an unknown function
+/// name). Size and redundant-parenthesis errors come first and keep their
+/// wording, as does every failure of the key condition's own rules.
+fn key_condition_error(expr: &str, err: String) -> String {
+    if err.contains("Expression size has exceeded") || err.contains("redundant parentheses") {
+        return err;
+    }
+    match expressions::condition::syntax_error(expr) {
+        Some(syntax) => format!("Invalid KeyConditionExpression: {syntax}"),
+        None => err,
+    }
 }

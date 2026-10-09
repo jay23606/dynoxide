@@ -177,6 +177,16 @@ pub(crate) fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
     }
 }
 
+/// Tag a plain `ValidationException` for the request-validation envelope, for
+/// a PutItem or UpdateItem call site whose shared helper reports it plain.
+/// Every other error passes through unchanged.
+pub(crate) fn tag_for_envelope(err: DynoxideError) -> DynoxideError {
+    match err {
+        DynoxideError::ValidationException(msg) => DynoxideError::EnvelopedValidation(msg),
+        other => other,
+    }
+}
+
 /// Convert the wire-invisible `EnvelopedValidation` tag back to a plain,
 /// unenveloped `ValidationException`. Every other error passes through
 /// unchanged.
@@ -602,7 +612,28 @@ const MAX_NESTING_DEPTH: usize = 32;
 
 /// Real DynamoDB's verbatim message when document nesting exceeds the limit. Shared
 /// by the stored-item and ExpressionAttributeValue checks so both match AWS.
-const NESTING_LIMIT_MESSAGE: &str = "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit";
+pub(crate) const NESTING_LIMIT_MESSAGE: &str = "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit";
+
+/// The short form of the nesting message, without the clause about the item's
+/// attributes. UpdateItem sends it, bare, when the item an update would leave
+/// behind is nested too deep, and a transaction's Update gives it as the
+/// cancellation reason. Captured us-east-1 and eu-west-2, 2026-10-09.
+pub(crate) const UPDATED_ITEM_NESTING_MESSAGE: &str =
+    "Nesting Levels have exceeded supported limits";
+
+/// Refuse an updated item nested deeper than DynamoDB allows, with the short
+/// message an update gets.
+pub(crate) fn validate_updated_item_nesting(item: &Item) -> Result<()> {
+    if item
+        .values()
+        .any(|value| validate_nesting_depth(value).is_err())
+    {
+        return Err(DynoxideError::ValidationException(
+            UPDATED_ITEM_NESTING_MESSAGE.to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Validate all attribute values in an item.
 ///
@@ -632,17 +663,46 @@ pub(crate) fn validate_item_attribute_values_classified(
     item: &Item,
 ) -> std::result::Result<(), ClassifiedValidationError> {
     for value in item.values() {
-        validate_attribute_value(value, 0)?;
+        validate_attribute_value(value, 0).map_err(|e| match e {
+            // From 63 levels a second check answers first, with the same
+            // message outside the envelope.
+            ClassifiedValidationError::Enveloped(msg)
+                if msg == NESTING_LIMIT_MESSAGE && nesting_depth(value) > SECOND_NESTING_LIMIT =>
+            {
+                ClassifiedValidationError::bare(msg)
+            }
+            other => other,
+        })?;
     }
     Ok(())
+}
+
+/// The depth past which a single-item request's nesting is refused by a
+/// second check, in a different form: a stored item's message loses the
+/// envelope, and an ExpressionAttributeValues entry is refused naming its key.
+/// Values at 62 levels get the first check's answer and values at 63 the
+/// second's. Captured us-east-1 and eu-west-2, 2026-10-09.
+pub(crate) const SECOND_NESTING_LIMIT: usize = 62;
+
+/// How many lists and maps deep a value goes: a scalar is 0, a map holding a
+/// scalar is 1.
+pub(crate) fn nesting_depth(value: &AttributeValue) -> usize {
+    match value {
+        AttributeValue::L(list) => 1 + list.iter().map(nesting_depth).max().unwrap_or(0),
+        AttributeValue::M(map) => 1 + map.values().map(nesting_depth).max().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn validate_attribute_value(
     value: &AttributeValue,
     depth: usize,
 ) -> std::result::Result<(), ClassifiedValidationError> {
+    // PutItem wraps the nesting rejection in the envelope (us-east-1 and
+    // eu-west-2, 2026-10-09); BatchWriteItem and a transaction's Put send it
+    // bare, which the untagged callers keep.
     if depth >= MAX_NESTING_DEPTH {
-        return Err(ClassifiedValidationError::bare(NESTING_LIMIT_MESSAGE));
+        return Err(ClassifiedValidationError::enveloped(NESTING_LIMIT_MESSAGE));
     }
     match value {
         AttributeValue::SS(set) if set.is_empty() => Err(ClassifiedValidationError::enveloped(
