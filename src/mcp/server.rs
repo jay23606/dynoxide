@@ -171,6 +171,20 @@ pub struct McpServer {
 // Tool parameter types
 // ---------------------------------------------------------------------------
 
+/// The description every capacity-bearing tool gives `return_consumed_capacity`.
+const RETURN_CONSUMED_CAPACITY: &str = "What consumed capacity to return: TOTAL for the \
+    operation's total, INDEXES for the total broken down by table and index, or NONE (the \
+    default) for none. Figures follow DynamoDB's charging rules and match what the DynamoDB \
+    API returns for the same request.";
+
+/// The schema's `enum` for `return_consumed_capacity`, so a client can see the
+/// values without parsing the description. Null is listed because the field is
+/// optional and a null means the same as leaving it out. The field itself stays
+/// a string, so an unknown value still reaches the handler and gets DynamoDB's
+/// own error rather than a deserialisation failure.
+const RETURN_CONSUMED_CAPACITY_VALUES: [Option<&str>; 4] =
+    [Some("INDEXES"), Some("TOTAL"), Some("NONE"), None];
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TableNameParam {
     #[schemars(description = "Name of the table")]
@@ -282,6 +296,13 @@ pub struct PutItemParams {
 
     #[schemars(description = "What to return on ConditionalCheckFailedException: ALL_OLD or NONE")]
     pub return_values_on_condition_check_failure: Option<String>,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -303,6 +324,13 @@ pub struct GetItemParams {
     #[schemars(description = "Whether to use strongly consistent reads")]
     #[serde(default)]
     pub consistent_read: Option<bool>,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -340,6 +368,13 @@ pub struct UpdateItemParams {
 
     #[schemars(description = "What to return on ConditionalCheckFailedException: ALL_OLD or NONE")]
     pub return_values_on_condition_check_failure: Option<String>,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -373,6 +408,13 @@ pub struct SearchVectorsParams {
 
     #[schemars(description = "Optional expression attribute values as DynamoDB-typed JSON")]
     pub expression_attribute_values: Option<serde_json::Value>,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -417,6 +459,13 @@ pub struct QueryParams {
         description = "What to return: ALL_ATTRIBUTES (default), ALL_PROJECTED_ATTRIBUTES, COUNT, or SPECIFIC_ATTRIBUTES. When COUNT, the response contains only Count and ScannedCount (no items)."
     )]
     pub select: Option<String>,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -461,6 +510,13 @@ pub struct ScanParams {
         description = "Total number of parallel scan segments (1 to 1000000). Must be used with segment."
     )]
     pub total_segments: Option<u32>,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -491,6 +547,13 @@ pub struct DeleteItemParams {
 
     #[schemars(description = "What to return on ConditionalCheckFailedException: ALL_OLD or NONE")]
     pub return_values_on_condition_check_failure: Option<String>,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -499,6 +562,13 @@ pub struct BatchWriteItemParams {
         description = "Map of table name to array of write requests. Each request is either {put_request: {item: ...}} or {delete_request: {key: ...}}. Max 25 operations total."
     )]
     pub request_items: serde_json::Value,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -507,6 +577,13 @@ pub struct BatchGetItemParams {
         description = "Map of table name to {keys: [...], projection_expression?, expression_attribute_names?}. Max 100 keys total."
     )]
     pub request_items: serde_json::Value,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -534,6 +611,13 @@ pub struct ExecutePartiqlParams {
         description = "Continuation token from a previous SELECT response, to fetch the next page. Pass back the NextToken the last call returned; its absence means there are no more pages. The statement and parameters must stay identical across pages; a token replayed with a different statement or parameters is rejected with a ValidationException."
     )]
     pub next_token: Option<String>,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -616,6 +700,13 @@ pub struct TransactWriteItemsParams {
         description = "Idempotency token (max 36 chars). Same token returns cached result."
     )]
     pub client_request_token: Option<String>,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -624,6 +715,13 @@ pub struct TransactGetItemsParams {
         description = "Array of get items (max 100). Each item is: {Get: {TableName, Key, ProjectionExpression?, ExpressionAttributeNames?}}"
     )]
     pub transact_items: serde_json::Value,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -632,6 +730,13 @@ pub struct BatchExecutePartiqlParams {
         description = "Array of PartiQL statements. Each is {Statement: \"...\", Parameters?: [...], ConsistentRead?: true|false, ReturnValuesOnConditionCheckFailure?: \"ALL_OLD\"|\"NONE\"}. ConsistentRead is per member and sets the rate that member's read is charged at rather than which rows come back. ReturnValuesOnConditionCheckFailure is accepted and inert, as it is on DynamoDB. A batch is all-read or all-write, and a SELECT member must name the table's primary key and may not name an index."
     )]
     pub statements: serde_json::Value,
+
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -642,6 +747,12 @@ pub struct ExecuteTransactionPartiqlParams {
     pub transact_statements: serde_json::Value,
     #[schemars(description = "Optional idempotency token for the transaction")]
     pub client_request_token: Option<String>,
+    #[schemars(
+        description = RETURN_CONSUMED_CAPACITY,
+        extend("enum" = RETURN_CONSUMED_CAPACITY_VALUES)
+    )]
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -897,6 +1008,16 @@ fn tool_validation_error(error_type: &str, message: &str) -> CallToolResult {
         })
         .to_string(),
     )])
+}
+
+/// Refuse a `return_consumed_capacity` outside DynamoDB's enum with the error a
+/// wire client gets, before the tool reads or writes anything. Most tools build
+/// their action request directly, which skips the check the wire path makes
+/// while deserialising, so every capacity-bearing tool asks here instead.
+fn refuse_bad_capacity_mode(mode: Option<&str>) -> Option<CallToolResult> {
+    crate::validation::reject_bad_capacity_mode(mode)
+        .err()
+        .map(to_tool_error)
 }
 
 /// Parse a required JSON value into a typed result, returning a tool validation
@@ -1274,6 +1395,9 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("put_item") {
             return Ok(err);
         }
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
         let item = match parse_dynamo_map(
             params.item,
             "item",
@@ -1300,6 +1424,7 @@ impl McpServer {
             return_values: params.return_values,
             return_values_on_condition_check_failure: params
                 .return_values_on_condition_check_failure,
+            return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
         match self.db.put_item(request) {
@@ -1313,6 +1438,9 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<GetItemParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
         let key = match parse_dynamo_map(
             params.key,
             "key",
@@ -1328,6 +1456,7 @@ impl McpServer {
             projection_expression: params.projection_expression,
             expression_attribute_names: params.expression_attribute_names,
             consistent_read: params.consistent_read,
+            return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
         match self.db.get_item(request) {
@@ -1344,6 +1473,9 @@ impl McpServer {
         Parameters(params): Parameters<UpdateItemParams>,
     ) -> Result<CallToolResult, McpError> {
         if let Some(err) = self.reject_if_read_only("update_item") {
+            return Ok(err);
+        }
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
         let key = match parse_dynamo_map(
@@ -1373,6 +1505,7 @@ impl McpServer {
             return_values: params.return_values,
             return_values_on_condition_check_failure: params
                 .return_values_on_condition_check_failure,
+            return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
         match self.db.update_item(request) {
@@ -1388,6 +1521,9 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SearchVectorsParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
@@ -1410,7 +1546,7 @@ impl McpServer {
             "SearchVector": params.search_vector,
             "TopK": params.top_k,
         });
-        let optional: [(&str, Option<serde_json::Value>); 4] = [
+        let optional: [(&str, Option<serde_json::Value>); 5] = [
             (
                 "SearchConditionExpression",
                 params
@@ -1430,6 +1566,10 @@ impl McpServer {
             (
                 "ExpressionAttributeValues",
                 expression_attribute_values.and_then(|v| serde_json::to_value(v).ok()),
+            ),
+            (
+                "ReturnConsumedCapacity",
+                params.return_consumed_capacity.map(serde_json::Value::from),
             ),
         ];
         for (name, value) in optional {
@@ -1459,6 +1599,9 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<QueryParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
@@ -1488,6 +1631,7 @@ impl McpServer {
             exclusive_start_key,
             index_name: params.index_name,
             select: params.select,
+            return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
         match self.db.query(request) {
@@ -1504,6 +1648,9 @@ impl McpServer {
         description = "Scan an entire table or GSI/LSI, optionally applying a filter expression. Use query instead when you know the partition key. Use select=COUNT to get only Count and ScannedCount without items. Use Segment and TotalSegments for parallel scan; segment filtering uses FNV-1a hash at the SQLite level."
     )]
     fn scan(&self, Parameters(params): Parameters<ScanParams>) -> Result<CallToolResult, McpError> {
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
         let expression_attribute_values = match parse_optional_dynamo_map(
             params.expression_attribute_values,
             "expression_attribute_values",
@@ -1533,6 +1680,7 @@ impl McpServer {
             select: params.select,
             segment: params.segment,
             total_segments: params.total_segments,
+            return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
         match self.db.scan(request) {
@@ -1553,6 +1701,9 @@ impl McpServer {
         Parameters(params): Parameters<DeleteItemParams>,
     ) -> Result<CallToolResult, McpError> {
         if let Some(err) = self.reject_if_read_only("delete_item") {
+            return Ok(err);
+        }
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
             return Ok(err);
         }
         let key = match parse_dynamo_map(
@@ -1581,6 +1732,7 @@ impl McpServer {
             return_values: params.return_values,
             return_values_on_condition_check_failure: params
                 .return_values_on_condition_check_failure,
+            return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
         match self.db.delete_item(request) {
@@ -1599,6 +1751,9 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("batch_write_item") {
             return Ok(err);
         }
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
         // Parse the request_items Value into the typed struct.
         // We accept both PascalCase and snake_case keys for agent ergonomics.
         let request_items = match parse_batch_write_request_items(params.request_items) {
@@ -1608,6 +1763,7 @@ impl McpServer {
 
         let request = crate::actions::batch_write_item::BatchWriteItemRequest {
             request_items,
+            return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
         match self.db.batch_write_item(request) {
@@ -1623,6 +1779,9 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<BatchGetItemParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
         let request_items = match parse_batch_get_request_items(params.request_items) {
             Ok(v) => v,
             Err(e) => return Ok(e),
@@ -1630,7 +1789,7 @@ impl McpServer {
 
         let request = crate::actions::batch_get_item::BatchGetItemRequest {
             request_items,
-            ..Default::default()
+            return_consumed_capacity: params.return_consumed_capacity,
         };
         match self.db.batch_get_item(request) {
             Ok(resp) => json_result(&resp),
@@ -1660,6 +1819,9 @@ impl McpServer {
                     "Multi-statement PartiQL is not allowed in read-only mode",
                 ));
             }
+        }
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
         }
         let parameters: Option<Vec<AttributeValue>> = match params.parameters {
             Some(val) => match serde_json::from_value(val) {
@@ -1694,7 +1856,7 @@ impl McpServer {
             limit: params.limit,
             next_token: params.next_token,
             consistent_read: params.consistent_read,
-            ..Default::default()
+            return_consumed_capacity: params.return_consumed_capacity,
         };
         match self.db.execute_statement(request) {
             Ok(resp) => json_result(&resp),
@@ -1996,6 +2158,9 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("transact_write_items") {
             return Ok(err);
         }
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
         let transact_items = match parse_json_param(params.transact_items, "transact_items") {
             Ok(v) => v,
             Err(err) => return Ok(err),
@@ -2003,6 +2168,7 @@ impl McpServer {
         let request = crate::actions::transact_write_items::TransactWriteItemsRequest {
             transact_items,
             client_request_token: params.client_request_token,
+            return_consumed_capacity: params.return_consumed_capacity,
             ..Default::default()
         };
         match self.db.transact_write_items(request) {
@@ -2018,13 +2184,16 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<TransactGetItemsParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
         let transact_items = match parse_json_param(params.transact_items, "transact_items") {
             Ok(v) => v,
             Err(err) => return Ok(err),
         };
         let request = crate::actions::transact_get_items::TransactGetItemsRequest {
             transact_items,
-            ..Default::default()
+            return_consumed_capacity: params.return_consumed_capacity,
         };
         match self.db.transact_get_items(request) {
             Ok(resp) => json_result(&resp),
@@ -2067,9 +2236,13 @@ impl McpServer {
             }
         }
 
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
+
         let request = crate::actions::batch_execute_statement::BatchExecuteStatementRequest {
             statements,
-            ..Default::default()
+            return_consumed_capacity: params.return_consumed_capacity,
         };
         match self.db.batch_execute_statement(request) {
             Ok(resp) => json_result(&resp),
@@ -2091,6 +2264,9 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("execute_transaction_partiql") {
             return Ok(err);
         }
+        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
+            return Ok(err);
+        }
 
         let transact_statements: Vec<crate::actions::execute_transaction::ParameterizedStatement> =
             match parse_json_param(params.transact_statements, "transact_statements") {
@@ -2101,7 +2277,7 @@ impl McpServer {
         let request = crate::actions::execute_transaction::ExecuteTransactionRequest {
             transact_statements,
             client_request_token: params.client_request_token,
-            ..Default::default()
+            return_consumed_capacity: params.return_consumed_capacity,
         };
         match self.db.execute_transaction(request) {
             Ok(resp) => json_result(&resp),
@@ -2366,12 +2542,17 @@ impl ServerHandler for McpServer {
             - Items use DynamoDB JSON format: `{\"pk\": {\"S\": \"value\"}, \"age\": {\"N\": \"30\"}}`\n\
             - Tool names prefixed with `[WRITE]` modify data; `[DESTRUCTIVE]` may cause data loss.\n\
             - In read-only mode (`--read-only`), all write tools return an error.\n\
-            - Batch tools accept both PascalCase and snake_case keys (e.g. `PutRequest` or `put_request`).\n\n\
+            - Batch tools accept both PascalCase and snake_case keys (e.g. `PutRequest` or `put_request`).\n\
+            - The item, query, scan, search_vectors, batch_get_item, batch_write_item, \
+            transaction and PartiQL tools take `return_consumed_capacity`: TOTAL or INDEXES adds \
+            the block DynamoDB would return under a `ConsumedCapacity` key, and NONE, the default, \
+            adds nothing.\n\n\
             ## Available tools\n\
             Tables: list_tables, describe_table, create_table, delete_table, update_table\n\
             Items: put_item, get_item, update_item, delete_item\n\
             Batch: batch_write_item, batch_get_item, bulk_put_items\n\
             Query: query, scan\n\
+            Vector search: search_vectors\n\
             Transactions: transact_write_items, transact_get_items\n\
             PartiQL: execute_partiql, batch_execute_partiql, execute_transaction_partiql\n\
             TTL: update_time_to_live, describe_time_to_live, sweep_ttl\n\
@@ -2785,5 +2966,651 @@ mod tests {
         assert_eq!(json["notices"][0]["concern"], "exposure");
         assert_eq!(json["notices"][1]["concern"], "caution");
         assert_eq!(json["notices"].as_array().unwrap().len(), 3);
+    }
+}
+
+/// `return_consumed_capacity` on the tools. Each tool has to hand back the
+/// block its action returns for the same request against the same data,
+/// refuse a value outside DynamoDB's enum with the error a wire client gets,
+/// and add nothing when the caller does not ask.
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// What DynamoDB returns for a mode outside its enum, on every operation
+    /// that takes one (captured eu-west-2, 2026-10-08).
+    const BOGUS_MODE: &str = "1 validation error detected: Value 'BOGUS' at \
+        'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy \
+        enum value set: [INDEXES, TOTAL, NONE]";
+
+    fn wire<T: serde::de::DeserializeOwned>(value: Value) -> T {
+        serde_json::from_value(value).expect("fixture request deserialises")
+    }
+
+    /// Two tables, built the same way every time so two copies answer any
+    /// request with the same figures. `Cap` has a GSI and an LSI, so a write's
+    /// INDEXES block carries both arms; `Vecs` has a vector index for search.
+    fn seeded() -> Database {
+        let db = Database::memory().unwrap();
+        db.create_table(wire(json!({
+            "TableName": "Cap",
+            "BillingMode": "PAY_PER_REQUEST",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "g", "AttributeType": "S"},
+                {"AttributeName": "l", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "byG",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "byL",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "l", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        })))
+        .unwrap();
+        for (sk, g, l, size) in [
+            ("s1", Some("g1"), "l1", 600),
+            ("s2", Some("g1"), "l2", 5000),
+            ("s3", None, "l3", 9000),
+        ] {
+            let mut item = json!({
+                "pk": {"S": "p"}, "sk": {"S": sk}, "l": {"S": l},
+                "data": {"S": "x".repeat(size)}
+            });
+            if let Some(g) = g {
+                item["g"] = json!({"S": g});
+            }
+            db.put_item(wire(json!({"TableName": "Cap", "Item": item})))
+                .unwrap();
+        }
+        db.create_table(wire(json!({
+            "TableName": "Vecs",
+            "BillingMode": "PAY_PER_REQUEST",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "VectorIndexes": [{
+                "IndexName": "cosine",
+                "VectorAttribute": {"AttributeName": "embedding"},
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE",
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        })))
+        .unwrap();
+        for (pk, v) in [("a", ["1", "0", "0"]), ("b", ["0", "1", "0"])] {
+            let embedding: Vec<Value> = v.iter().map(|n| json!({"N": n})).collect();
+            db.put_item(wire(json!({
+                "TableName": "Vecs",
+                "Item": {"pk": {"S": pk}, "embedding": {"L": embedding}}
+            })))
+            .unwrap();
+        }
+        db
+    }
+
+    fn server() -> McpServer {
+        McpServer::new(Arc::new(seeded()))
+    }
+
+    /// A tool's reply parsed as JSON, and whether it is an error.
+    fn reply(result: Result<CallToolResult, McpError>) -> (bool, Value) {
+        let result = result.expect("the tool answers rather than failing the protocol");
+        let text = &result.content[0]
+            .as_text()
+            .expect("tools reply in text")
+            .text;
+        (
+            result.is_error == Some(true),
+            serde_json::from_str(text).expect("tools reply in JSON"),
+        )
+    }
+
+    /// A capacity block with any per-table list sorted by table name. The
+    /// batch and transaction operations build that list from a map, so its
+    /// order varies between two runs of the same request.
+    fn by_table(block: Value) -> Value {
+        match block {
+            Value::Array(mut entries) => {
+                entries.sort_by(|a, b| {
+                    a["TableName"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .cmp(b["TableName"].as_str().unwrap_or_default())
+                });
+                Value::Array(entries)
+            }
+            other => other,
+        }
+    }
+
+    type ToolCall = fn(&McpServer, Value) -> Result<CallToolResult, McpError>;
+    type ActionCall = fn(&Database, Value) -> Value;
+
+    /// One tool and the action behind it, given the same request in each
+    /// shape: `args` as the tool takes it, `request` as the wire takes it.
+    struct Case {
+        tool: ToolCall,
+        args: Value,
+        action: ActionCall,
+        request: Value,
+    }
+
+    impl Case {
+        fn call(&self, server: &McpServer, mode: Option<&str>) -> (bool, Value) {
+            match mode {
+                Some(mode) => self.call_with(server, json!(mode)),
+                None => reply((self.tool)(server, self.args.clone())),
+            }
+        }
+
+        /// Call with `return_consumed_capacity` set to any JSON value.
+        fn call_with(&self, server: &McpServer, mode: Value) -> (bool, Value) {
+            let mut args = self.args.clone();
+            args["return_consumed_capacity"] = mode;
+            reply((self.tool)(server, args))
+        }
+
+        /// The action's own block for `mode`, from a fresh copy of the data.
+        fn expected(&self, mode: &str) -> Value {
+            let mut request = self.request.clone();
+            request["ReturnConsumedCapacity"] = json!(mode);
+            let body = (self.action)(&seeded(), request);
+            assert!(
+                !body["ConsumedCapacity"].is_null(),
+                "{mode}: the action reported no capacity, so a match would prove nothing"
+            );
+            by_table(body["ConsumedCapacity"].clone())
+        }
+
+        /// The tool's block for `mode`, from a fresh copy of the data.
+        fn reported(&self, mode: &str) -> Value {
+            let (is_error, body) = self.call(&server(), Some(mode));
+            assert!(!is_error, "{mode}: the tool failed: {body}");
+            by_table(body["ConsumedCapacity"].clone())
+        }
+
+        /// Every check the fourteen tools share.
+        fn check(&self) {
+            for mode in ["TOTAL", "INDEXES"] {
+                assert_eq!(self.reported(mode), self.expected(mode), "{mode}");
+            }
+            for mode in [Some("NONE"), None] {
+                let (is_error, body) = self.call(&server(), mode);
+                assert!(!is_error, "{mode:?}: the tool failed: {body}");
+                assert!(
+                    body.get("ConsumedCapacity").is_none(),
+                    "{mode:?}: unasked capacity in {body}"
+                );
+            }
+            // An explicit null is how some clients spell "not set".
+            let (is_error, body) = self.call_with(&server(), Value::Null);
+            assert!(!is_error, "null: the tool failed: {body}");
+            assert!(
+                body.get("ConsumedCapacity").is_none(),
+                "null: unasked capacity in {body}"
+            );
+            let (is_error, body) = self.call(&server(), Some("BOGUS"));
+            assert!(is_error, "BOGUS was accepted: {body}");
+            assert_eq!(body["error_type"], "ValidationException");
+            assert_eq!(body["message"], BOGUS_MODE);
+        }
+    }
+
+    fn get_item_case(consistent: bool) -> Case {
+        let key = json!({"pk": {"S": "p"}, "sk": {"S": "s2"}});
+        Case {
+            tool: |s, v| s.get_item(Parameters(wire(v))),
+            args: json!({"table_name": "Cap", "key": key, "consistent_read": consistent}),
+            action: |db, v| serde_json::to_value(db.get_item(wire(v)).unwrap()).unwrap(),
+            request: json!({"TableName": "Cap", "Key": key, "ConsistentRead": consistent}),
+        }
+    }
+
+    fn put_item_case() -> Case {
+        let item = json!({
+            "pk": {"S": "p"}, "sk": {"S": "s9"}, "g": {"S": "g9"}, "l": {"S": "l9"},
+            "data": {"S": "y".repeat(1500)}
+        });
+        Case {
+            tool: |s, v| s.put_item(Parameters(wire(v))),
+            args: json!({"table_name": "Cap", "item": item}),
+            action: |db, v| serde_json::to_value(db.put_item(wire(v)).unwrap()).unwrap(),
+            request: json!({"TableName": "Cap", "Item": item}),
+        }
+    }
+
+    fn query_case(index: Option<&str>) -> Case {
+        let mut args = json!({
+            "table_name": "Cap",
+            "key_condition_expression": "pk = :p",
+            "expression_attribute_values": {":p": {"S": "p"}}
+        });
+        let mut request = json!({
+            "TableName": "Cap",
+            "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "p"}}
+        });
+        if let Some(index) = index {
+            args["index_name"] = json!(index);
+            request["IndexName"] = json!(index);
+        }
+        Case {
+            tool: |s, v| s.query(Parameters(wire(v))),
+            args,
+            action: |db, v| serde_json::to_value(db.query(wire(v)).unwrap()).unwrap(),
+            request,
+        }
+    }
+
+    fn transact_write_case() -> Case {
+        let items = json!([
+            {"Put": {"TableName": "Cap", "Item": {
+                "pk": {"S": "p"}, "sk": {"S": "s8"}, "g": {"S": "g8"}, "l": {"S": "l8"}
+            }}},
+            {"ConditionCheck": {
+                "TableName": "Cap",
+                "Key": {"pk": {"S": "p"}, "sk": {"S": "s1"}},
+                "ConditionExpression": "attribute_exists(pk)"
+            }}
+        ]);
+        Case {
+            tool: |s, v| s.transact_write_items(Parameters(wire(v))),
+            args: json!({"transact_items": items}),
+            action: |db, v| {
+                serde_json::to_value(db.transact_write_items(wire(v)).unwrap()).unwrap()
+            },
+            request: json!({"TransactItems": items}),
+        }
+    }
+
+    #[test]
+    fn get_item_reports_the_actions_capacity() {
+        get_item_case(false).check();
+    }
+
+    #[test]
+    fn a_consistent_get_item_reports_the_doubled_rate() {
+        let eventual = get_item_case(false).reported("TOTAL");
+        let consistent = get_item_case(true);
+        consistent.check();
+        assert_eq!(
+            consistent.reported("TOTAL")["CapacityUnits"]
+                .as_f64()
+                .unwrap(),
+            eventual["CapacityUnits"].as_f64().unwrap() * 2.0
+        );
+    }
+
+    #[test]
+    fn put_item_reports_the_actions_capacity() {
+        let case = put_item_case();
+        case.check();
+        let indexes = case.reported("INDEXES");
+        assert!(
+            indexes["GlobalSecondaryIndexes"]["byG"].is_object(),
+            "no GSI arm in {indexes}"
+        );
+        assert!(
+            indexes["LocalSecondaryIndexes"]["byL"].is_object(),
+            "no LSI arm in {indexes}"
+        );
+    }
+
+    #[test]
+    fn update_item_reports_the_actions_capacity() {
+        let key = json!({"pk": {"S": "p"}, "sk": {"S": "s1"}});
+        Case {
+            tool: |s, v| s.update_item(Parameters(wire(v))),
+            args: json!({
+                "table_name": "Cap", "key": key,
+                "update_expression": "SET g = :g",
+                "expression_attribute_values": {":g": {"S": "g3"}}
+            }),
+            action: |db, v| serde_json::to_value(db.update_item(wire(v)).unwrap()).unwrap(),
+            request: json!({
+                "TableName": "Cap", "Key": key,
+                "UpdateExpression": "SET g = :g",
+                "ExpressionAttributeValues": {":g": {"S": "g3"}}
+            }),
+        }
+        .check();
+    }
+
+    #[test]
+    fn delete_item_reports_the_actions_capacity() {
+        let key = json!({"pk": {"S": "p"}, "sk": {"S": "s2"}});
+        Case {
+            tool: |s, v| s.delete_item(Parameters(wire(v))),
+            args: json!({"table_name": "Cap", "key": key}),
+            action: |db, v| serde_json::to_value(db.delete_item(wire(v)).unwrap()).unwrap(),
+            request: json!({"TableName": "Cap", "Key": key}),
+        }
+        .check();
+    }
+
+    #[test]
+    fn query_reports_the_actions_capacity() {
+        query_case(None).check();
+    }
+
+    #[test]
+    fn an_lsi_query_reports_the_actions_capacity() {
+        let case = query_case(Some("byL"));
+        case.check();
+        let indexes = case.reported("INDEXES");
+        assert!(
+            indexes["LocalSecondaryIndexes"]["byL"].is_object(),
+            "no LSI arm in {indexes}"
+        );
+    }
+
+    #[test]
+    fn a_count_query_reports_the_actions_capacity() {
+        let mut case = query_case(None);
+        case.args["select"] = json!("COUNT");
+        case.request["Select"] = json!("COUNT");
+        case.check();
+    }
+
+    #[test]
+    fn a_capped_query_reports_the_capped_read() {
+        let config = McpConfig {
+            max_items: Some(1),
+            ..McpConfig::default()
+        };
+        let capped = McpServer::with_config(Arc::new(seeded()), config);
+        let case = query_case(None);
+        let (is_error, body) = case.call(&capped, Some("TOTAL"));
+        assert!(!is_error, "{body}");
+        let mut request = case.request.clone();
+        request["Limit"] = json!(1);
+        let expected = Case { request, ..case }.expected("TOTAL");
+        assert_eq!(body["ConsumedCapacity"], expected);
+        assert_ne!(
+            body["ConsumedCapacity"],
+            query_case(None).expected("TOTAL"),
+            "the cap made no difference to the figure, so this proves nothing"
+        );
+    }
+
+    #[test]
+    fn scan_reports_the_actions_capacity() {
+        Case {
+            tool: |s, v| s.scan(Parameters(wire(v))),
+            args: json!({"table_name": "Cap", "filter_expression": "attribute_exists(g)"}),
+            action: |db, v| serde_json::to_value(db.scan(wire(v)).unwrap()).unwrap(),
+            request: json!({"TableName": "Cap", "FilterExpression": "attribute_exists(g)"}),
+        }
+        .check();
+    }
+
+    #[test]
+    fn search_vectors_reports_the_actions_capacity() {
+        let vector = json!([{"N": "1"}, {"N": "0"}, {"N": "0"}]);
+        Case {
+            tool: |s, v| s.search_vectors(Parameters(wire(v))),
+            args: json!({
+                "table_name": "Vecs", "index_name": "cosine",
+                "search_vector": vector, "top_k": 1
+            }),
+            action: |db, v| serde_json::to_value(db.search_vectors(wire(v)).unwrap()).unwrap(),
+            request: json!({
+                "TableName": "Vecs", "IndexName": "cosine",
+                "SearchVector": vector, "TopK": 1
+            }),
+        }
+        .check();
+    }
+
+    #[test]
+    fn batch_get_item_reports_the_actions_capacity() {
+        let items = json!({
+            "Cap": {"Keys": [
+                {"pk": {"S": "p"}, "sk": {"S": "s1"}},
+                {"pk": {"S": "p"}, "sk": {"S": "s3"}}
+            ]},
+            "Vecs": {"Keys": [{"pk": {"S": "a"}}]}
+        });
+        Case {
+            tool: |s, v| s.batch_get_item(Parameters(wire(v))),
+            args: json!({"request_items": items}),
+            action: |db, v| serde_json::to_value(db.batch_get_item(wire(v)).unwrap()).unwrap(),
+            request: json!({"RequestItems": items}),
+        }
+        .check();
+    }
+
+    #[test]
+    fn batch_write_item_reports_the_actions_capacity() {
+        let items = json!({
+            "Cap": [
+                {"PutRequest": {"Item": {
+                    "pk": {"S": "p"}, "sk": {"S": "s7"}, "g": {"S": "g7"}, "l": {"S": "l7"}
+                }}},
+                {"DeleteRequest": {"Key": {"pk": {"S": "p"}, "sk": {"S": "s1"}}}}
+            ]
+        });
+        Case {
+            tool: |s, v| s.batch_write_item(Parameters(wire(v))),
+            args: json!({"request_items": items}),
+            action: |db, v| serde_json::to_value(db.batch_write_item(wire(v)).unwrap()).unwrap(),
+            request: json!({"RequestItems": items}),
+        }
+        .check();
+    }
+
+    #[test]
+    fn transact_get_items_reports_the_actions_capacity() {
+        let items = json!([
+            {"Get": {"TableName": "Cap", "Key": {"pk": {"S": "p"}, "sk": {"S": "s2"}}}},
+            {"Get": {"TableName": "Vecs", "Key": {"pk": {"S": "a"}}}}
+        ]);
+        Case {
+            tool: |s, v| s.transact_get_items(Parameters(wire(v))),
+            args: json!({"transact_items": items}),
+            action: |db, v| serde_json::to_value(db.transact_get_items(wire(v)).unwrap()).unwrap(),
+            request: json!({"TransactItems": items}),
+        }
+        .check();
+    }
+
+    #[test]
+    fn transact_write_items_reports_the_actions_capacity() {
+        transact_write_case().check();
+    }
+
+    #[test]
+    fn a_replayed_transaction_reports_what_the_action_reports() {
+        let mut case = transact_write_case();
+        case.args["client_request_token"] = json!("replay-token");
+        case.request["ClientRequestToken"] = json!("replay-token");
+
+        let server = server();
+        case.call(&server, Some("TOTAL"));
+        let (is_error, replayed) = case.call(&server, Some("TOTAL"));
+        assert!(!is_error, "{replayed}");
+
+        let db = seeded();
+        let mut request = case.request.clone();
+        request["ReturnConsumedCapacity"] = json!("TOTAL");
+        (case.action)(&db, request.clone());
+        let expected = (case.action)(&db, request);
+        assert!(!expected["ConsumedCapacity"].is_null());
+        assert_eq!(
+            by_table(replayed["ConsumedCapacity"].clone()),
+            by_table(expected["ConsumedCapacity"].clone())
+        );
+    }
+
+    #[test]
+    fn execute_partiql_select_reports_the_actions_capacity() {
+        let statement = "SELECT * FROM \"Cap\" WHERE pk = 'p'";
+        Case {
+            tool: |s, v| s.execute_partiql(Parameters(wire(v))),
+            args: json!({"statement": statement}),
+            action: |db, v| serde_json::to_value(db.execute_statement(wire(v)).unwrap()).unwrap(),
+            request: json!({"Statement": statement}),
+        }
+        .check();
+    }
+
+    #[test]
+    fn an_index_qualified_select_reports_the_actions_capacity() {
+        let statement = "SELECT * FROM \"Cap\".\"byG\" WHERE g = 'g1'";
+        let case = Case {
+            tool: |s, v| s.execute_partiql(Parameters(wire(v))),
+            args: json!({"statement": statement}),
+            action: |db, v| serde_json::to_value(db.execute_statement(wire(v)).unwrap()).unwrap(),
+            request: json!({"Statement": statement}),
+        };
+        case.check();
+        let indexes = case.reported("INDEXES");
+        assert!(
+            indexes["GlobalSecondaryIndexes"]["byG"].is_object(),
+            "no GSI arm in {indexes}"
+        );
+    }
+
+    #[test]
+    fn execute_partiql_update_reports_the_actions_capacity() {
+        let statement = "UPDATE \"Cap\" SET g = 'g5' WHERE pk = 'p' AND sk = 's1'";
+        Case {
+            tool: |s, v| s.execute_partiql(Parameters(wire(v))),
+            args: json!({"statement": statement}),
+            action: |db, v| serde_json::to_value(db.execute_statement(wire(v)).unwrap()).unwrap(),
+            request: json!({"Statement": statement}),
+        }
+        .check();
+    }
+
+    #[test]
+    fn batch_execute_partiql_reports_the_actions_capacity() {
+        // The first member fails on a key that exists; the batch still
+        // charges it the write it attempted.
+        let statements = json!([
+            {"Statement": "INSERT INTO \"Cap\" VALUE {'pk': 'p', 'sk': 's1'}"},
+            {"Statement": "INSERT INTO \"Cap\" VALUE {'pk': 'n', 'sk': 'n1', 'g': 'g6'}"}
+        ]);
+        Case {
+            tool: |s, v| s.batch_execute_partiql(Parameters(wire(v))),
+            args: json!({"statements": statements}),
+            action: |db, v| {
+                serde_json::to_value(db.batch_execute_statement(wire(v)).unwrap()).unwrap()
+            },
+            request: json!({"Statements": statements}),
+        }
+        .check();
+    }
+
+    #[test]
+    fn execute_transaction_partiql_reports_the_actions_capacity() {
+        let statements = json!([
+            {"Statement": "UPDATE \"Cap\" SET g = 'g4' WHERE pk = 'p' AND sk = 's1'"},
+            {"Statement": "INSERT INTO \"Cap\" VALUE {'pk': 'n', 'sk': 'n2'}"}
+        ]);
+        Case {
+            tool: |s, v| s.execute_transaction_partiql(Parameters(wire(v))),
+            args: json!({"transact_statements": statements}),
+            action: |db, v| serde_json::to_value(db.execute_transaction(wire(v)).unwrap()).unwrap(),
+            request: json!({"TransactStatements": statements}),
+        }
+        .check();
+    }
+
+    #[test]
+    fn a_refused_mode_writes_nothing() {
+        let server = server();
+        let key = json!({"pk": {"S": "p"}, "sk": {"S": "w1"}});
+        let mut item = key.clone();
+        item["g"] = json!({"S": "gw"});
+        let attempts: [(ToolCall, Value); 3] = [
+            (
+                |s, v| s.put_item(Parameters(wire(v))),
+                json!({"table_name": "Cap", "item": item}),
+            ),
+            (
+                |s, v| s.batch_write_item(Parameters(wire(v))),
+                json!({"request_items": {"Cap": [{"PutRequest": {"Item": item}}]}}),
+            ),
+            (
+                |s, v| s.transact_write_items(Parameters(wire(v))),
+                json!({"transact_items": [{"Put": {"TableName": "Cap", "Item": item}}]}),
+            ),
+        ];
+        for (tool, mut args) in attempts {
+            args["return_consumed_capacity"] = json!("BOGUS");
+            let (is_error, body) = reply(tool(&server, args));
+            assert!(is_error, "BOGUS was accepted: {body}");
+            assert_eq!(body["message"], BOGUS_MODE);
+            let (_, got) = reply(server.get_item(Parameters(wire(json!({
+                "table_name": "Cap", "key": key
+            })))));
+            assert!(got.get("Item").is_none(), "a refused request wrote {got}");
+        }
+    }
+
+    #[test]
+    fn the_mode_is_case_sensitive() {
+        let (is_error, body) = get_item_case(false).call(&server(), Some("total"));
+        assert!(is_error, "lower-case total was accepted: {body}");
+        assert_eq!(body["message"], BOGUS_MODE.replace("BOGUS", "total"));
+    }
+
+    #[test]
+    fn a_read_only_server_refuses_a_write_before_checking_the_mode() {
+        let config = McpConfig {
+            read_only: true,
+            ..McpConfig::default()
+        };
+        let read_only = McpServer::with_config(Arc::new(seeded()), config);
+        let (is_error, body) = put_item_case().call(&read_only, Some("BOGUS"));
+        assert!(is_error);
+        assert_eq!(body["error_type"], "AccessDeniedException", "{body}");
+    }
+
+    #[test]
+    fn a_read_only_server_still_reports_select_capacity() {
+        let config = McpConfig {
+            read_only: true,
+            ..McpConfig::default()
+        };
+        let read_only = McpServer::with_config(Arc::new(seeded()), config);
+        let (is_error, body) = reply(read_only.execute_partiql(Parameters(wire(json!({
+            "statement": "SELECT * FROM \"Cap\" WHERE pk = 'p'",
+            "return_consumed_capacity": "TOTAL"
+        })))));
+        assert!(!is_error, "{body}");
+        assert!(
+            body["ConsumedCapacity"].is_object(),
+            "no capacity in {body}"
+        );
+    }
+
+    #[test]
+    fn a_failed_condition_carries_no_capacity() {
+        let (is_error, body) = reply(server().update_item(Parameters(wire(json!({
+            "table_name": "Cap",
+            "key": {"pk": {"S": "p"}, "sk": {"S": "s1"}},
+            "update_expression": "SET g = :g",
+            "condition_expression": "attribute_not_exists(pk)",
+            "expression_attribute_values": {":g": {"S": "g3"}},
+            "return_consumed_capacity": "TOTAL"
+        })))));
+        assert!(is_error, "{body}");
+        assert_eq!(body["error_type"], "ConditionalCheckFailedException");
+        assert!(body.get("ConsumedCapacity").is_none(), "{body}");
     }
 }

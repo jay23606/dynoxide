@@ -344,7 +344,7 @@ async fn execute_transaction<S: StorageBackend>(
     // Ahead of the cache, not only inside the work: a replayed token skips the
     // work entirely, and the token is keyed on the statements alone, so a replay
     // may carry a capacity mode the first call never did.
-    actions::execute_transaction::reject_bad_capacity_mode(capacity_mode.as_deref())?;
+    crate::validation::reject_bad_capacity_mode(capacity_mode.as_deref())?;
 
     let response = crate::run_idempotent_async(
         ctx.tokens.execute_transaction(),
