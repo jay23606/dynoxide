@@ -59,7 +59,9 @@ with AWS DynamoDB's observable behaviour is the headline goal.
   feature combinations fail to compile (for example
   `native-sqlite + encryption`). A `wasm-check` job builds the library
   for `wasm32-unknown-unknown` with `--no-default-features --features
-  wasm-sqlite`. If you change feature gates or
+  wasm-sqlite` (and `wasm-harness`), and runs `cargo clippy -- -D
+  warnings` on both, so code only the wasm build compiles is linted
+  too. If you change feature gates or
   anything cross-cutting, running the relevant matrix leg locally
   saves a CI round-trip. `.github/workflows/ci.yml` is the
   authoritative list.

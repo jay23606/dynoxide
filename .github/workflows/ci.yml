@@ -288,6 +288,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo check (wasm32, wasm-sqlite)
@@ -297,6 +298,16 @@ jobs:
       # catches trait or re-export drift the wasm-sqlite check alone misses.
       - name: cargo check (wasm32, wasm-harness)
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm-harness --lib
+
+      # The lint job runs clippy on the native build only, so warnings in code
+      # that only the wasm build compiles (or code that only it leaves unused)
+      # accumulated unseen. Both features, so the harness's extra surface is
+      # covered too.
+      - name: Clippy (wasm32, wasm-sqlite)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features wasm-sqlite --lib -- -D warnings
+
+      - name: Clippy (wasm32, wasm-harness)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features wasm-harness --lib -- -D warnings
 
   engine-client:
     name: Engine client tests

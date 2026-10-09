@@ -1,7 +1,5 @@
 use crate::actions::helpers;
-use crate::actions::index_capacity::{
-    WriteCapacity, aggregate_by_table, per_table_capacity, transactional_read_units,
-};
+use crate::actions::index_capacity::{WriteCapacity, aggregate_by_table, per_table_capacity};
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
@@ -120,7 +118,9 @@ pub struct TransactWriteItemsResponse {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CachedWrite {
     pub(crate) response: TransactWriteItemsResponse,
-    /// Per-action `(table, image size)`.
+    /// Per-action `(table, image size)`. Only the native `Database` replays a
+    /// transaction: the wasm engine refuses `TransactWriteItems`.
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
     pub(crate) replay_sizes: Vec<(String, usize)>,
 }
 
@@ -209,6 +209,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
             consumed_capacity: build_write_capacity(&capacity, &request.return_consumed_capacity),
             item_collection_metrics: None,
         },
+        #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
         replay_sizes: replay_sizes(&capacity),
     })
 }
@@ -218,6 +219,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
 /// The write is sized on the larger of the two images, and a capture shows the
 /// replay charging against that same image, so the choice is made once here
 /// rather than twice with a chance of drifting apart.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 fn replay_sizes(capacity: &[WriteCapacity]) -> Vec<(String, usize)> {
     capacity
         .iter()
@@ -264,11 +266,12 @@ fn build_write_capacity(
 /// not carry over). The read cost is computed at 4KB read granularity, which
 /// diverges from the first-call write magnitude above 1KB. `cached` is what the
 /// first call stored: its response, and the image sizes to bill against.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub(crate) fn replay_response(cached: &CachedWrite, mode: &Option<String>) -> CachedWrite {
     CachedWrite {
         response: TransactWriteItemsResponse {
             consumed_capacity: crate::types::build_transactional_capacity(
-                &transactional_read_units(&cached.replay_sizes),
+                &crate::actions::index_capacity::transactional_read_units(&cached.replay_sizes),
                 mode,
                 crate::types::transactional_read_capacity,
             ),
