@@ -263,19 +263,54 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Both features must fail
+      # Each case asserts its guard's own message, not just a failed build. A
+      # build can fail for reasons that have nothing to do with the guard (the
+      # no-backend cases still fail on type errors with their guard removed),
+      # and an exit-status check would pass on those. The cases name their
+      # features with --no-default-features so the defaults cannot satisfy a
+      # guard on the probe's behalf. The off-Apple guard is reachable because
+      # this job runs on Linux.
+      - name: Backend guards must fail on their own message
         run: |
-          if cargo check --features "native-sqlite,encryption" 2>&1; then
-            echo "ERROR: both features should cause compile_error!"
-            exit 1
-          fi
-
-      - name: Neither feature must fail
-        run: |
-          if cargo check --no-default-features --features http-server 2>&1; then
-            echo "ERROR: no SQLite backend should cause compile_error!"
-            exit 1
-          fi
+          must_fail_on() {
+            desc="$1"
+            message="$2"
+            shift 2
+            if out=$(cargo check --lib "$@" 2>&1); then
+              echo "ERROR: $desc should cause compile_error!"
+              exit 1
+            fi
+            if ! grep -qF -- "$message" <<<"$out"; then
+              echo "ERROR: $desc failed, but not on its guard:"
+              echo "$out"
+              exit 1
+            fi
+            echo "OK: $desc"
+          }
+          # The backticks are part of the guard message, not an expansion.
+          # shellcheck disable=SC2016
+          must_fail_on "native-sqlite with encryption" \
+            'Features `native-sqlite` and `encryption`' \
+            --no-default-features --features native-sqlite,encryption
+          # The backticks are part of the guard message, not an expansion.
+          # shellcheck disable=SC2016
+          must_fail_on "native-sqlite with encryption-cc" \
+            'Features `native-sqlite` and `encryption`' \
+            --no-default-features --features native-sqlite,encryption-cc
+          must_fail_on "no storage backend at all" \
+            'A storage backend feature must be enabled' \
+            --no-default-features
+          must_fail_on "no storage backend, with a server feature" \
+            'A storage backend feature must be enabled' \
+            --no-default-features --features http-server
+          # The backticks are part of the guard message, not an expansion.
+          # shellcheck disable=SC2016
+          must_fail_on "encryption with encryption-cc" \
+            'Features `encryption` and `encryption-cc` are mutually exclusive' \
+            --no-default-features --features encryption,encryption-cc
+          must_fail_on "encryption-cc off Apple platforms" \
+            'intended for Apple platforms only' \
+            --no-default-features --features encryption-cc
 
       # A non-zero exit is not enough on its own: every combination below
       # already failed to compile before the guard existed, on unrelated type
