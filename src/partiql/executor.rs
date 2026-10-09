@@ -2550,8 +2550,10 @@ async fn execute_update<S: StorageBackend>(
 
     // Apply SET clauses with nested path support
     for clause in set_clauses {
-        let val = resolve_set_value(&clause.value, &item, parameters)?;
-        set_nested_value(&mut item, &clause.path, val)?;
+        match resolve_set_value(&clause.value, &item, parameters)? {
+            Some(val) => set_nested_value(&mut item, &clause.path, val)?,
+            None => remove_nested_value(&mut item, &clause.path),
+        }
     }
 
     // Apply REMOVE clauses
@@ -2969,13 +2971,109 @@ fn resolve_value(val: &PartiqlValue, parameters: &[AttributeValue]) -> Result<At
     }
 }
 
-/// Resolve a SetValue to a concrete AttributeValue, potentially using the current item.
+/// What a SET assignment leaves at its path: the value to write, or `None`
+/// for a `set_delete` that empties the set or never found one, which leaves
+/// the path absent.
 fn resolve_set_value(
+    val: &SetValue,
+    item: &Item,
+    parameters: &[AttributeValue],
+) -> Result<Option<AttributeValue>> {
+    if let SetValue::SetCall {
+        delete,
+        path,
+        members,
+        refusal_at,
+    } = val
+    {
+        return resolve_set_call(*delete, path, members, refusal_at, item, parameters);
+    }
+    resolve_set_operand(val, item, parameters).map(Some)
+}
+
+/// `set_add` or `set_delete` against the set stored at `path`.
+///
+/// A missing attribute takes the members on `set_add` and stays missing on
+/// `set_delete`, and removing every member removes the attribute. Members of
+/// another type than the stored set, or a stored value that isn't a set, are
+/// an operand of the wrong type; numbers are compared by value. The members
+/// themselves are checked as a parameter is, duplicates included (captured
+/// eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+fn resolve_set_call(
+    delete: bool,
+    path: &str,
+    members: &PartiqlValue,
+    refusal_at: &str,
+    item: &Item,
+    parameters: &[AttributeValue],
+) -> Result<Option<AttributeValue>> {
+    let name = if delete { "SET_DELETE" } else { "SET_ADD" };
+    let members = resolve_value(members, parameters)?;
+    if !matches!(
+        members,
+        AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
+    ) {
+        return Err(DynoxideError::ValidationException(format!(
+            "The second argument to {name} must be a value with type SET at {refusal_at}"
+        )));
+    }
+    crate::validation::validate_parameter_value(&members)?;
+    let wrong_type = || {
+        DynoxideError::ValidationException(
+            "An operand in the update expression has an incorrect data type".to_string(),
+        )
+    };
+    fn combine<T: Clone, K: PartialEq>(
+        held: &[T],
+        change: &[T],
+        delete: bool,
+        key: impl Fn(&T) -> K,
+    ) -> Vec<T> {
+        let in_change = |m: &T| change.iter().any(|c| key(c) == key(m));
+        if delete {
+            held.iter().filter(|m| !in_change(m)).cloned().collect()
+        } else {
+            let mut out = held.to_vec();
+            for m in change {
+                if !out.iter().any(|h| key(h) == key(m)) {
+                    out.push(m.clone());
+                }
+            }
+            out
+        }
+    }
+    let result = match (resolve_nested_path(item, path), &members) {
+        (None, _) => return Ok((!delete).then_some(members)),
+        (Some(AttributeValue::SS(held)), AttributeValue::SS(change)) => {
+            AttributeValue::SS(combine(held, change, delete, String::clone))
+        }
+        (Some(AttributeValue::NS(held)), AttributeValue::NS(change)) => {
+            AttributeValue::NS(combine(held, change, delete, |n: &String| {
+                crate::types::normalize_dynamo_number(n)
+            }))
+        }
+        (Some(AttributeValue::BS(held)), AttributeValue::BS(change)) => {
+            AttributeValue::BS(combine(held, change, delete, Vec::clone))
+        }
+        _ => return Err(wrong_type()),
+    };
+    let empty = match &result {
+        AttributeValue::SS(m) | AttributeValue::NS(m) => m.is_empty(),
+        AttributeValue::BS(m) => m.is_empty(),
+        _ => false,
+    };
+    Ok((!empty).then_some(result))
+}
+
+/// Resolve a SetValue other than a set call to a concrete AttributeValue,
+/// potentially using the current item.
+fn resolve_set_operand(
     val: &SetValue,
     item: &Item,
     parameters: &[AttributeValue],
 ) -> Result<AttributeValue> {
     match val {
+        SetValue::SetCall { .. } => unreachable!("resolve_set_value handles a set call"),
         SetValue::Simple(pv) => resolve_value(pv, parameters),
         SetValue::Add(attr, pv) => {
             let current = resolve_nested_path(item, attr);

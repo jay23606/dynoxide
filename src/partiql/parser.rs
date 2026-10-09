@@ -322,6 +322,16 @@ pub enum SetValue {
     Sub(String, PartiqlValue),
     /// `list_append(path, value)` or `list_append(value, path)`.
     ListAppend(PartiqlValue, PartiqlValue),
+    /// `set_add(path, set)` or `set_delete(path, set)`: the set at `path`,
+    /// which the call assigns back to, with the members added or removed.
+    /// `refusal_at` is where DynamoDB points when the members turn out not to
+    /// be a set, which a parameter only shows once it is bound.
+    SetCall {
+        delete: bool,
+        path: String,
+        members: PartiqlValue,
+        refusal_at: String,
+    },
 }
 
 /// A WHERE clause with OR-group semantics.
@@ -1475,7 +1485,7 @@ fn parse_update_clauses(t: &mut Tokenizer) -> Result<(Vec<SetClause>, Vec<String
                 if eq != "=" {
                     return Err(format!("Expected '=' but got '{eq}'"));
                 }
-                let value = parse_set_value(t)?;
+                let value = parse_set_value(t, &path)?;
                 set_clauses.push(SetClause { path, value });
             }
             match t.peek_token()? {
@@ -1522,10 +1532,17 @@ fn parse_from_first(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     })
 }
 
-/// Parse the right-hand side of a SET assignment: `value`, `path + value`, `path - value`,
-/// or `list_append(a, b)`.
-fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
+/// Parse the right-hand side of a SET assignment to `target`: `value`,
+/// `path + value`, `path - value`, `list_append(a, b)`, or `set_add` and
+/// `set_delete`.
+fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> {
     t.clause = LiteralClause::Set;
+    if let Some(tok) = t.peek_token()?
+        && let Some(delete) = set_function(&tok)
+        && t.peek_token_at(1)?.as_deref() == Some("(")
+    {
+        return parse_set_call(t, target, delete);
+    }
     // Check for list_append function
     if let Some(ref tok) = t.peek_token()?
         && tok.eq_ignore_ascii_case("list_append")
@@ -1580,6 +1597,101 @@ fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
         }
         _ => Ok(SetValue::Simple(first)),
     }
+}
+
+/// Whether a name calls `set_add` (false) or `set_delete` (true).
+fn set_function(tok: &str) -> Option<bool> {
+    if is_keyword(tok, "set_add") {
+        Some(false)
+    } else if is_keyword(tok, "set_delete") {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Read `set_add(...)` or `set_delete(...)` as the value assigned to `target`.
+///
+/// DynamoDB judges the call before it looks the table up, without the syntax
+/// envelope, and names where it stands: first that it has two arguments, then
+/// that the first is the path it assigns to, both at the function's name, then
+/// that the second is a set, at the first argument. Part of a larger
+/// expression, the call is one it doesn't recognise (captured eu-west-2,
+/// us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+fn parse_set_call(t: &mut Tokenizer, target: &str, delete: bool) -> Result<SetValue, String> {
+    let name = if delete { "SET_DELETE" } else { "SET_ADD" };
+    let call = t.pos;
+    t.next_token()?; // the name
+    t.next_token()?; // (
+    // Each argument: the token it starts at, and the path it names or the
+    // value it is.
+    let mut args: Vec<(usize, Result<String, PartiqlValue>)> = Vec::new();
+    if t.peek_token()?.as_deref() == Some(")") {
+        t.next_token()?;
+    } else {
+        loop {
+            let start = t.pos;
+            let tok = t.next_token()?.ok_or(UNEXPECTED_TERM)?;
+            let arg = if is_name(&tok) {
+                Ok(parse_dotted_path_from_token(&tok, t)?)
+            } else {
+                t.pos -= 1;
+                Err(parse_value(t, 0)?)
+            };
+            args.push((start, arg));
+            match t.next_token()?.as_deref() {
+                Some(",") => continue,
+                Some(")") => break,
+                Some(other) => return Err(format!("Expected ')' but got '{other}'")),
+                None => return Err("Expected ')'".to_string()),
+            }
+        }
+    }
+    if t.peek_token()?.is_some_and(|tok| tok == "+" || tok == "-") {
+        t.note_unrecognized_function(call);
+        t.next_token()?;
+        parse_value(t, 0)?;
+        return Ok(SetValue::Simple(PartiqlValue::Literal(
+            AttributeValue::NULL(true),
+        )));
+    }
+    let call_at = t.position(t.span_at(call));
+    let first_at = args
+        .first()
+        .map(|(start, _)| t.position(t.span_at(*start)))
+        .unwrap_or_default();
+    let mut members = PartiqlValue::Literal(AttributeValue::NULL(true));
+    match args.as_slice() {
+        [(_, first), (_, second)] => {
+            if first.as_deref() != Ok(target) {
+                t.note_operand_refusal(format!(
+                    "The first argument to {name} must equal the assignment value at {call_at}"
+                ));
+            } else if !matches!(
+                second,
+                Err(PartiqlValue::Parameter(_))
+                    | Err(PartiqlValue::Literal(
+                        AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
+                    ))
+            ) {
+                t.note_operand_refusal(format!(
+                    "The second argument to {name} must be a value with type SET at {first_at}"
+                ));
+            }
+            if let Err(value) = second {
+                members = value.clone();
+            }
+        }
+        _ => t.note_operand_refusal(format!(
+            "{name} must have exactly two arguments at {call_at}"
+        )),
+    }
+    Ok(SetValue::SetCall {
+        delete,
+        path: target.to_string(),
+        members,
+        refusal_at: first_at,
+    })
 }
 
 fn parse_delete(t: &mut Tokenizer) -> Result<Statement, ParseError> {
@@ -2521,6 +2633,17 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
         return Ok(PartiqlValue::Literal(AttributeValue::S(s)));
     }
 
+    // An empty bag, which the tokenizer reads as `<`, `<>`, `>`.
+    if tok == "<"
+        && t.peek_token()?.as_deref() == Some("<>")
+        && t.peek_token_at(1)?.as_deref() == Some(">")
+    {
+        t.next_token()?;
+        t.next_token()?;
+        t.note_empty_bag();
+        return Ok(PartiqlValue::Literal(AttributeValue::SS(Vec::new())));
+    }
+
     // Set literal: << val1, val2 >>
     if tok == "<"
         && let Some(ref next) = t.peek_token()?
@@ -2544,6 +2667,10 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
                 continue;
             }
             elements.push(parse_value(t, depth + 1)?);
+        }
+        if elements.is_empty() {
+            t.note_empty_bag();
+            return Ok(PartiqlValue::Literal(AttributeValue::SS(Vec::new())));
         }
         return set_literal_to_value(elements);
     }
@@ -2857,6 +2984,18 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
         return Ok(AttributeValue::L(items));
     }
 
+    // An empty bag, which the tokenizer reads as `<`, `<>`, `>`.
+    if tok == "<"
+        && t.peek_token_at(1)?.as_deref() == Some("<>")
+        && t.peek_token_at(2)?.as_deref() == Some(">")
+    {
+        for _ in 0..3 {
+            t.next_token()?;
+        }
+        t.note_empty_bag();
+        return Ok(AttributeValue::SS(Vec::new()));
+    }
+
     // Set literal: << val1, val2 >>
     if tok == "<"
         && let Some(ref next_tok) = t.peek_token_at(1)?
@@ -2880,11 +3019,47 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
             }
             elements.push(parse_item_value(t, depth + 1)?);
         }
+        if elements.is_empty() {
+            t.note_empty_bag();
+            return Ok(AttributeValue::SS(Vec::new()));
+        }
         return item_value_set_literal(elements);
     }
 
     // Scalar value
     let tok = t.next_token()?.ok_or("Expected value")?;
+
+    // A function call is a value DynamoDB can't store. It names the function
+    // when the call is an attribute's whole value and calls it `Call` deeper
+    // in, with the path and where it stands (captured eu-west-2, us-east-1,
+    // eu-west-1 and us-west-2, 2026-10-09).
+    if tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && t.peek_token()?.as_deref() == Some("(")
+    {
+        let index = t.pos - 1;
+        let name = if depth == 0 {
+            tok.to_lowercase()
+        } else {
+            "Call".to_string()
+        };
+        let path: String = t.value_path.concat();
+        let at = t.position(t.span_at(index));
+        t.literal_errors.push((
+            t.clause,
+            format!("Unsupported data type: {name} under key root{path} at {at}"),
+        ));
+        let mut open = 0usize;
+        loop {
+            match t.next_token()?.as_deref() {
+                Some("(") => open += 1,
+                Some(")") if open == 1 => break,
+                Some(")") => open -= 1,
+                Some(_) => {}
+                None => return Err("Expected ')'".to_string()),
+            }
+        }
+        return Ok(AttributeValue::NULL(true));
+    }
 
     // String
     if tok.starts_with('\'') && tok.ends_with('\'') && tok.len() >= 2 {
@@ -3144,6 +3319,14 @@ impl Tokenizer {
             let at = self.position(self.span_at(index));
             self.unrecognized_function = Some(format!("Unrecognized function: {name} at {at}"));
         }
+    }
+
+    /// Note an empty bag, `<<>>`, which DynamoDB refuses wherever it is
+    /// written, once the statement has parsed (captured eu-west-2, us-east-1,
+    /// eu-west-1 and us-west-2, 2026-10-09).
+    fn note_empty_bag(&mut self) {
+        self.literal_errors
+            .push((self.clause, "Empty bags are not supported".to_string()));
     }
 
     /// Note an operand a condition function can't take.

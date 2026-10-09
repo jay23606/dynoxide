@@ -306,6 +306,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to run as `attribute_exists`. An OR with no key condition under it no longer
   counts as a second key range for the overlap check, so `pk = 'a' AND (x = 1
   OR x = 2)` runs.
+- PartiQL's `set_add` and `set_delete` work in an UPDATE's SET clause, as in
+  DynamoDB, where they used to fail with `Unexpected token after expression`.
+  A malformed call is refused with DynamoDB's message and position before the
+  table is looked up, members of the wrong type with its incorrect data type
+  message, and `<<>>` anywhere with `Empty bags are not supported`. A function
+  call in an INSERT value is refused as an unsupported data type.
 - PartiQL refuses a `begins_with` operand that isn't a string or binary, and
   BETWEEN bounds of different types or with the lower above the upper, with
   DynamoDB's messages, `NOT` or not, before the table is looked up.
