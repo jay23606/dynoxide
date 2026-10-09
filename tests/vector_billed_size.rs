@@ -469,3 +469,60 @@ async fn the_item_limit_sizes_the_vector_by_its_numbers() {
         "{err}"
     );
 }
+
+/// On a table with a vector index, a GSI's or LSI's share of a write is sized
+/// by the number rule even when the entry carries the vector (captured
+/// eu-west-2 and us-east-1, 2026-10-09), so their `IndexSizeBytes` is the
+/// number-rule size of the entries while `TableSizeBytes` stays on the billed
+/// size. For these three items, as written to the capture table
+/// `_capture_20261009_vidx_size2`: 690 for the table, 750 for each ALL index
+/// (`3.5` costs 3 bytes, its digits paired on each side of the point).
+#[tokio::test(flavor = "current_thread")]
+async fn secondary_indexes_on_a_vector_table_size_entries_by_their_numbers() {
+    let storage = Storage::memory().unwrap();
+    let req = json!({
+        "TableName": "Vidx",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
+            {"AttributeName": "l", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [{"IndexName": "gAll",
+            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}}],
+        "LocalSecondaryIndexes": [{"IndexName": "lAll",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "l", "KeyType": "RANGE"}
+            ],
+            "Projection": {"ProjectionType": "ALL"}}],
+        "VectorIndexes": [vector_index("vAll", "embedding", 3, "ALL")],
+        "BillingMode": "PAY_PER_REQUEST"
+    });
+    create_table::execute(&storage, serde_json::from_value(req).unwrap())
+        .await
+        .unwrap();
+    let big = "12345678901234567890123456789012345678";
+    for item in [
+        json!({"pk": {"S": "a"}, "sk": {"S": "1"}, "g": {"S": "g1"}, "l": {"S": "l1"},
+            "embedding": numbers(&[big, big, big]), "data": {"S": "x".repeat(100)}}),
+        json!({"pk": {"S": "a"}, "sk": {"S": "2"}, "g": {"S": "g2"}, "l": {"S": "l2"},
+            "embedding": numbers(&["0.123456789", "-7", "3.5"]), "data": {"S": "y".repeat(200)}}),
+        json!({"pk": {"S": "b"}, "sk": {"S": "1"}, "g": {"S": "g3"}, "l": {"S": "l3"},
+            "data": {"S": "z".repeat(300)}}),
+    ] {
+        put(&storage, "Vidx", item).await;
+    }
+
+    let table = describe(&storage, "Vidx").await;
+    assert_eq!(table.table_size_bytes, Some(690));
+    let gsi = &table.global_secondary_indexes.unwrap()[0];
+    assert_eq!((gsi.item_count, gsi.index_size_bytes), (Some(3), Some(750)));
+    let lsi = &table.local_secondary_indexes.unwrap()[0];
+    assert_eq!((lsi.item_count, lsi.index_size_bytes), (Some(3), Some(750)));
+}

@@ -100,9 +100,16 @@ pub(crate) async fn fill_index_figures<S: StorageBackend>(
         }
     }
     let table_name = desc.table_name.clone();
+    // An ALL index's entries are whole base items, whose stored size the base
+    // rows already hold, so the figures can come from a join. On a table with
+    // vector indexes the stored size is the billed one, vector at 4 bytes per
+    // dimension, but an index's share is sized by the number rule even when
+    // its entries carry the vector (write units captured eu-west-2 and
+    // us-east-1, 2026-10-09), so there every entry is sized from its own JSON.
+    let stored_size_fits = desc.vector_indexes.as_ref().is_none_or(Vec::is_empty);
     for gsi in desc.global_secondary_indexes.iter_mut().flatten() {
-        let whole_items =
-            gsi.projection.projection_type.clone().unwrap_or_default() == ProjectionType::ALL;
+        let whole_items = stored_size_fits
+            && gsi.projection.projection_type.clone().unwrap_or_default() == ProjectionType::ALL;
         (gsi.item_count, gsi.index_size_bytes) = read(
             storage
                 .gsi_item_count_and_size(&table_name, &gsi.index_name, whole_items)
@@ -110,8 +117,8 @@ pub(crate) async fn fill_index_figures<S: StorageBackend>(
         );
     }
     for lsi in desc.local_secondary_indexes.iter_mut().flatten() {
-        let whole_items =
-            lsi.projection.projection_type.clone().unwrap_or_default() == ProjectionType::ALL;
+        let whole_items = stored_size_fits
+            && lsi.projection.projection_type.clone().unwrap_or_default() == ProjectionType::ALL;
         (lsi.item_count, lsi.index_size_bytes) = read(
             storage
                 .lsi_item_count_and_size(&table_name, &lsi.index_name, whole_items)
