@@ -317,6 +317,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   numeric value: <text>`, and `1e2147483647` is an underflow, in every position
   and on every PartiQL operation. They used to be range-checked as an item's
   numbers are, as an overflow or underflow by the exponent's sign.
+- A PartiQL WHERE clause's `IS` tests NULL, BOOLEAN, BLOB, STRING, NUMERIC,
+  STRUCT, TUPLE and LIST as well as MISSING, and `IS NOT` their complement, as
+  DynamoDB does; only MISSING used to work. Another type name is refused with
+  DynamoDB's `Unsupported data type for IS operator` message, and `INT4`,
+  `INT8`, `DOUBLE PRECISION` and `CHARACTER VARYING` read as type names. An
+  operator where a value should be, as in `pk = LIKE`, is `Unexpected
+  operator`; `pk = LIKE` used to compare with the string `LIKE`. A negated or
+  `<>` sort key condition stops the overlap check, as `NOT ... BETWEEN`
+  already did. `DELETE FROM` with no table is `Expected identifier for simple
+  path`, and `SELECT * FROM` with none is `Unexpected term` or `Unexpected
+  keyword`.
 - PartiQL refuses a `begins_with` operand that isn't a string or binary, and
   BETWEEN bounds of different types or with the lower above the upper, with
   DynamoDB's messages, `NOT` or not, before the table is looked up.

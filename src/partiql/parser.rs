@@ -443,6 +443,42 @@ pub enum WhereCondition {
     NotContains(String, PartiqlValue),
     IsMissing(String),
     IsNotMissing(String),
+    /// `path IS <type>` for a type other than MISSING.
+    IsType(String, TypeTest),
+    /// `path IS NOT <type>`: true for a missing attribute too.
+    IsNotType(String, TypeTest),
+}
+
+/// What `IS <type>` tests in a WHERE clause: the types DynamoDB supports there
+/// other than MISSING, which has its own condition (captured eu-west-2 and
+/// us-east-1, 2026-10-09).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TypeTest {
+    Null,
+    Boolean,
+    Blob,
+    String,
+    Numeric,
+    /// `STRUCT` or `TUPLE`: a map.
+    Struct,
+    List,
+}
+
+impl TypeTest {
+    /// Whether a stored value is of this type. A set is none of them.
+    pub fn matches(self, value: &AttributeValue) -> bool {
+        matches!(
+            (self, value),
+            (TypeTest::Null, AttributeValue::NULL(_))
+                | (TypeTest::Boolean, AttributeValue::BOOL(_))
+                | (TypeTest::Blob, AttributeValue::B(_))
+                | (TypeTest::String, AttributeValue::S(_))
+                | (TypeTest::Numeric, AttributeValue::N(_))
+                | (TypeTest::Struct, AttributeValue::M(_))
+                | (TypeTest::List, AttributeValue::L(_))
+        )
+    }
 }
 
 /// A comparison condition (path op value).
@@ -704,37 +740,73 @@ const CLAUSE_KEYWORDS: &[&str] = &[
     "DESC",
 ];
 
-/// The type names `IS` may test for.
-const TYPE_NAMES: &[&str] = &[
-    "NULL",
-    "MISSING",
-    "BOOL",
-    "BOOLEAN",
-    "SMALLINT",
-    "INT",
-    "INTEGER",
-    "BIGINT",
-    "FLOAT",
-    "REAL",
-    "DECIMAL",
-    "NUMERIC",
-    "TIMESTAMP",
-    "DATE",
-    "TIME",
-    "CHAR",
-    "CHARACTER",
-    "VARCHAR",
-    "STRING",
-    "SYMBOL",
-    "BLOB",
-    "CLOB",
-    "STRUCT",
-    "TUPLE",
-    "LIST",
-    "SEXP",
-    "BAG",
-    "ANY",
-];
+/// A type name as `IS` reads it.
+enum TypeName {
+    Missing,
+    Test(TypeTest),
+    /// A type PartiQL knows that DynamoDB doesn't test for in a WHERE clause,
+    /// by the name its refusal gives it.
+    Unsupported(&'static str),
+}
+
+/// Read the type name after `IS` or `IS NOT`: one word, `DOUBLE PRECISION` or
+/// `CHARACTER VARYING`, with an optional `(n)` or `(n, m)` after it. `None`
+/// when the words aren't a type name, which DynamoDB refuses as `Expected type
+/// name` (captured eu-west-2 and us-east-1, 2026-10-09).
+fn read_type_name(t: &mut Tokenizer) -> Result<Option<TypeName>, String> {
+    use TypeName::{Missing, Test, Unsupported};
+    let Some(word) = t.next_token()? else {
+        return Ok(None);
+    };
+    let mut then = |next: &str| -> Result<bool, String> {
+        let follows = t.peek_token()?.is_some_and(|tok| is_keyword(&tok, next));
+        if follows {
+            t.next_token()?;
+        }
+        Ok(follows)
+    };
+    let name = match word.to_ascii_uppercase().as_str() {
+        "NULL" => Test(TypeTest::Null),
+        "MISSING" => Missing,
+        "BOOL" | "BOOLEAN" => Test(TypeTest::Boolean),
+        "BLOB" => Test(TypeTest::Blob),
+        "STRING" => Test(TypeTest::String),
+        "NUMERIC" => Test(TypeTest::Numeric),
+        "STRUCT" | "TUPLE" => Test(TypeTest::Struct),
+        "LIST" => Test(TypeTest::List),
+        "SMALLINT" => Unsupported("SmallintType"),
+        "INT" | "INTEGER" => Unsupported("IntegerType"),
+        "INT4" => Unsupported("Integer4Type"),
+        "INT8" | "BIGINT" => Unsupported("Integer8Type"),
+        "FLOAT" => Unsupported("FloatType"),
+        "REAL" => Unsupported("RealType"),
+        "DOUBLE" if then("PRECISION")? => Unsupported("DoublePrecisionType"),
+        "DECIMAL" => Unsupported("DecimalType"),
+        "TIMESTAMP" => Unsupported("TimestampType"),
+        "DATE" => Unsupported("DateType"),
+        "TIME" => Unsupported("TimeType"),
+        "CHARACTER" if then("VARYING")? => Unsupported("CharacterVaryingType"),
+        "CHAR" | "CHARACTER" => Unsupported("CharacterType"),
+        "VARCHAR" => Unsupported("CharacterVaryingType"),
+        "SYMBOL" => Unsupported("SymbolType"),
+        "CLOB" => Unsupported("ClobType"),
+        "SEXP" => Unsupported("SexpType"),
+        "BAG" => Unsupported("BagType"),
+        "ANY" => Unsupported("AnyType"),
+        _ => return Ok(None),
+    };
+    if t.peek_token()?.as_deref() == Some("(") {
+        t.next_token()?;
+        loop {
+            match t.next_token()?.as_deref() {
+                Some(")") => break,
+                Some(tok) if tok == "," || is_number_token(tok) => {}
+                _ => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(name))
+}
 
 fn is_keyword(tok: &str, word: &str) -> bool {
     tok.eq_ignore_ascii_case(word)
@@ -895,13 +967,13 @@ fn read_comparison(t: &mut Tokenizer) -> ExprResult {
         if negated {
             t.next_token()?;
         }
-        return Ok(match t.next_token()? {
-            Some(tok) if is_any(&tok, TYPE_NAMES) => Ok(if negated {
+        return Ok(match read_type_name(t)? {
+            Some(_) => Ok(if negated {
                 ExprKind::Other
             } else {
                 ExprKind::IsType
             }),
-            _ => Err("Expected type name"),
+            None => Err("Expected type name"),
         });
     }
     let negated = is_keyword(&next, "NOT");
@@ -1290,6 +1362,13 @@ fn parse_select(t: &mut Tokenizer) -> Result<Statement, ParseError> {
 
     // Expect FROM
     expect_keyword(t, "FROM")?;
+    // Nothing or a keyword where the table should be (captured eu-west-2 and
+    // us-east-1, 2026-10-09).
+    match t.peek_token()?.as_deref() {
+        None | Some(";") => return Err(UNEXPECTED_TERM.into()),
+        Some(tok) if is_any(tok, KEYWORDS) => return Err(UNEXPECTED_KEYWORD.into()),
+        _ => {}
+    }
 
     // Parse table name, plus any index the FROM clause qualified it with
     let target = parse_table_name(t)?;
@@ -1696,6 +1775,11 @@ fn parse_set_call(t: &mut Tokenizer, target: &str, delete: bool) -> Result<SetVa
 
 fn parse_delete(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     expect_keyword(t, "FROM")?;
+    // Nothing, a semicolon or a keyword where the table should be (captured
+    // eu-west-2 and us-east-1, 2026-10-09).
+    if !t.peek_token()?.as_deref().is_some_and(is_name) {
+        return Err(EXPECTED_SIMPLE_PATH.into());
+    }
     let target = parse_table_name(t)?;
     reject_alias(t)?;
     let where_clause = parse_optional_where(t)?;
@@ -2282,6 +2366,8 @@ fn negate_condition(cond: WhereCondition) -> Result<BoolExpr, String> {
         W::NotBeginsWith(p, v) => W::BeginsWith(p, v).into(),
         W::IsMissing(p) => W::IsNotMissing(p).into(),
         W::IsNotMissing(p) => W::IsMissing(p).into(),
+        W::IsType(p, test) => W::IsNotType(p, test).into(),
+        W::IsNotType(p, test) => W::IsType(p, test).into(),
         W::Contains(p, v) => W::NotContains(p, v).into(),
         W::NotContains(p, v) => W::Contains(p, v).into(),
         // Not `< low OR > high`, which would drop a row with no such attribute.
@@ -2414,6 +2500,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
     // and a clause keyword as an unexpected keyword (captured eu-west-2,
     // us-east-1, eu-west-1 and us-west-2, 2026-10-09). `NOT` reaches here only
     // as part of `NOT EXISTS(...)` or `NOT BEGINS_WITH(...)`.
+    let path_start = t.pos;
     let tok = match t.next_token()? {
         None => return Err(UNEXPECTED_TERM.to_string()),
         Some(tok) if tok == ";" => return Err(UNEXPECTED_TERM.to_string()),
@@ -2538,17 +2625,31 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                 }
                 "IS" => {
                     t.next_token()?; // consume IS
-                    let kw = t.next_token()?.ok_or("Expected MISSING or NOT after IS")?;
-                    let kw_upper = kw.to_uppercase();
-                    match kw_upper.as_str() {
-                        "MISSING" => Ok(WhereCondition::IsMissing(path)),
-                        "NOT" => {
-                            expect_keyword(t, "MISSING")?;
+                    let negated = t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "NOT"));
+                    if negated {
+                        t.next_token()?;
+                    }
+                    match read_type_name(t)? {
+                        None => Err("Expected type name".to_string()),
+                        Some(TypeName::Missing) if negated => {
                             Ok(WhereCondition::IsNotMissing(path))
                         }
-                        other => Err(format!(
-                            "Expected MISSING or NOT MISSING after IS, got '{other}'"
-                        )),
+                        Some(TypeName::Missing) => Ok(WhereCondition::IsMissing(path)),
+                        Some(TypeName::Test(test)) if negated => {
+                            Ok(WhereCondition::IsNotType(path, test))
+                        }
+                        Some(TypeName::Test(test)) => Ok(WhereCondition::IsType(path, test)),
+                        Some(TypeName::Unsupported(name)) => {
+                            let at = t.position(t.span_at(path_start));
+                            t.note_operand_refusal(format!(
+                                "Unsupported data type for IS operator: {name}. Supported \
+                                 data types are [MISSING, NULL, BOOLEAN, BLOB, STRING, \
+                                 NUMERIC, STRUCT, TUPLE, LIST] at {at}"
+                            ));
+                            // Never evaluated: the statement is refused once it
+                            // has parsed.
+                            Ok(WhereCondition::IsMissing(path))
+                        }
                     }
                 }
                 _ => {
@@ -2628,6 +2729,16 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
     }
 
     // String literal: 'value'
+    // An operator or a clause keyword where a value should start is refused
+    // as DynamoDB refuses it (captured eu-west-2 and us-east-1, 2026-10-09:
+    // `pk = LIKE`, `pk = IN`, `pk = WHERE`).
+    if !is_keyword(&tok, "NOT") && is_any(&tok, OPERATOR_WORDS) {
+        return Err(UNEXPECTED_OPERATOR.to_string());
+    }
+    if is_any(&tok, CLAUSE_KEYWORDS) {
+        return Err(UNEXPECTED_KEYWORD.to_string());
+    }
+
     if tok.starts_with('\'') && tok.ends_with('\'') && tok.len() >= 2 {
         let s = tok[1..tok.len() - 1].to_string();
         return Ok(PartiqlValue::Literal(AttributeValue::S(s)));

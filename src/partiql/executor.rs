@@ -561,7 +561,8 @@ fn reject_overlapping_key_conditions(
                             CompOp::Le => add(vec![SortKeyAtom::Below(v, true)]),
                             CompOp::Gt => add(vec![SortKeyAtom::Above(v, false)]),
                             CompOp::Ge => add(vec![SortKeyAtom::Above(v, true)]),
-                            CompOp::Ne => {}
+                            // Like a negated sort key condition, below.
+                            CompOp::Ne => return Ok(()),
                         }
                     }
                 }
@@ -584,6 +585,17 @@ fn reject_overlapping_key_conditions(
                 // Captured eu-west-2 and us-east-1, 2026-10-09: `pk = 'a' AND
                 // NOT sk BETWEEN 1 AND 2 OR pk = 'a' AND sk = 3` runs.
                 WhereCondition::NotBetween(path, _, _) if Some(path.as_str()) == read_sk => {
+                    return Ok(());
+                }
+                // Captured eu-west-2 and us-east-1, 2026-10-09: a negated or
+                // `<>` sort key condition in any branch stops the check, as
+                // `NOT ... BETWEEN` does: `pk = 'a' AND NOT sk = '1' OR pk =
+                // 'a' AND sk = '2'` and `pk = 'a' OR pk = 'a' AND NOT sk =
+                // '1'` both run.
+                WhereCondition::NotComparison(c) if Some(c.path.as_str()) == read_sk => {
+                    return Ok(());
+                }
+                WhereCondition::NotBeginsWith(path, _) if Some(path.as_str()) == read_sk => {
                     return Ok(());
                 }
                 _ => {}
@@ -1923,7 +1935,9 @@ fn condition_path(condition: &WhereCondition) -> &str {
         | WhereCondition::Contains(p, _)
         | WhereCondition::NotContains(p, _)
         | WhereCondition::IsMissing(p)
-        | WhereCondition::IsNotMissing(p) => p.as_str(),
+        | WhereCondition::IsNotMissing(p)
+        | WhereCondition::IsType(p, _)
+        | WhereCondition::IsNotType(p, _) => p.as_str(),
     }
 }
 
@@ -2148,6 +2162,8 @@ fn translate_sk_conditions(
             | WhereCondition::NotExists(path)
             | WhereCondition::IsMissing(path)
             | WhereCondition::IsNotMissing(path)
+            | WhereCondition::IsType(path, _)
+            | WhereCondition::IsNotType(path, _)
                 if path == sk_name =>
             {
                 return None;
@@ -3363,6 +3379,16 @@ fn matches_conditions(
             }
             WhereCondition::NotExists(path) | WhereCondition::IsMissing(path) => {
                 if resolve_nested_path(item, path).is_some() {
+                    return false;
+                }
+            }
+            WhereCondition::IsType(path, test) => {
+                if !resolve_nested_path(item, path).is_some_and(|v| test.matches(v)) {
+                    return false;
+                }
+            }
+            WhereCondition::IsNotType(path, test) => {
+                if resolve_nested_path(item, path).is_some_and(|v| test.matches(v)) {
                     return false;
                 }
             }
