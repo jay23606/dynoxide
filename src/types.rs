@@ -403,6 +403,7 @@ pub fn normalize_number_for_sort(num_str: &str) -> String {
 /// - Magnitude at most 9.9999999999999999999999999999999999999E+125
 /// - Positive values must be at least 1E-130
 /// - Negative values must be at most -1E-130
+/// - Zero is held to the same range, as if its last written digit were a 1
 pub fn validate_dynamo_number(
     num_str: &str,
 ) -> std::result::Result<(), crate::errors::DynoxideError> {
@@ -426,21 +427,42 @@ pub fn validate_dynamo_number(
         )));
     }
 
+    // DynamoDB reads the exponent as a 64-bit integer, and one that does not
+    // fit is a value it cannot convert rather than an overflow. Inside that,
+    // an exponent of any size is range-checked below (captured eu-west-2,
+    // 2026-10-08).
+    if num_str
+        .find(['e', 'E'])
+        .is_some_and(|pos| num_str[pos + 1..].parse::<i64>().is_err())
+    {
+        return Err(crate::errors::DynoxideError::ValidationException(format!(
+            "The parameter cannot be converted to a numeric value: {num_str}"
+        )));
+    }
+
     // parse_number_parts ignores the sign characters, so the magnitude checks
     // below hold for both signs.
     let (mantissa_digits, exponent) = parse_number_parts(num_str);
 
-    // Zero is always valid
-    if mantissa_digits.is_empty() || mantissa_digits.iter().all(|&d| d == 0) {
-        return Ok(());
-    }
-
-    // Check significant digits (mantissa_digits has leading/trailing zeros already stripped)
-    if mantissa_digits.len() > 38 {
-        return Err(crate::errors::DynoxideError::ValidationException(
-            "Attempting to store more than 38 significant digits in a Number".to_string(),
-        ));
-    }
+    let exponent = if mantissa_digits.is_empty() || mantissa_digits.iter().all(|&d| d == 0) {
+        // Zero has no magnitude of its own, but DynamoDB still range-checks
+        // it, as if its last written digit were a 1: `0e126` overflows like
+        // `1e126`, and `0.0e-130` underflows like `0.1e-130` (captured
+        // eu-west-2, 2026-10-08).
+        let (coeff, written_exponent) = split_exponent(num_str);
+        let frac_digits = coeff.find('.').map_or(0, |dot| coeff.len() - dot - 1);
+        written_exponent
+            .saturating_sub(frac_digits as i64)
+            .saturating_add(1)
+    } else {
+        // Check significant digits (mantissa_digits has leading/trailing zeros already stripped)
+        if mantissa_digits.len() > 38 {
+            return Err(crate::errors::DynoxideError::ValidationException(
+                "Attempting to store more than 38 significant digits in a Number".to_string(),
+            ));
+        }
+        i64::from(exponent)
+    };
 
     // Check magnitude: exponent represents the power such that value = 0.mantissa * 10^exponent
     // Max magnitude: 9.999...E+125 means exponent = 126 (since 0.999... * 10^126 = 9.99...E+125)
@@ -451,7 +473,7 @@ pub fn validate_dynamo_number(
         ));
     }
 
-    // Check underflow for non-zero values
+    // Check underflow
     // Min positive: 1E-130 means exponent = -129 (since 0.1 * 10^-129 = 1E-130)
     // But with more digits, exponent can be lower, e.g. 1.0E-130 has (mantissa=[1], exponent=-129)
     // Actually, the smallest representable is 1E-130. In our representation, 1E-130 = 0.1 * 10^-129
@@ -637,15 +659,24 @@ fn zero_encoding() -> String {
     format!("1{}{}", "0".repeat(4), "0".repeat(40))
 }
 
+/// The exponent as four digits, offset by 5000.
+///
+/// DynamoDB's range only needs -129 to 126, but a library caller can reach the
+/// encoder with a number it never validated. One outside -5000 to 4999 sorts at
+/// the matching extreme rather than overflowing into an unrelated key.
+fn encoded_exponent(exponent: i32) -> u16 {
+    (exponent.clamp(-5000, 4999) + 5000) as u16
+}
+
 fn encode_positive(mantissa: &[u8], exponent: i32) -> String {
-    let exp_encoded = (exponent + 5000) as u16;
+    let exp_encoded = encoded_exponent(exponent);
     let mantissa_str = mantissa_to_string(mantissa, 40);
     format!("2{exp_encoded:04}{mantissa_str}")
 }
 
 fn encode_negative(mantissa: &[u8], exponent: i32) -> String {
     // For negatives, we complement everything so larger absolute values sort first (smaller)
-    let exp_encoded = 9999 - (exponent + 5000) as u16;
+    let exp_encoded = 9999 - encoded_exponent(exponent);
     let mantissa_str = complement_mantissa(mantissa, 40);
     format!("0{exp_encoded:04}{mantissa_str}")
 }
@@ -653,15 +684,12 @@ fn encode_negative(mantissa: &[u8], exponent: i32) -> String {
 /// Parse a non-negative number string into (mantissa digits, exponent).
 /// Mantissa is normalized: first digit is non-zero, exponent is the power of 10
 /// such that the number = 0.mantissa * 10^exponent.
+///
+/// An exponent outside the i32 range saturates at its bound, so a value far
+/// outside DynamoDB's range still lands on the right side of it.
 pub(crate) fn parse_number_parts(s: &str) -> (Vec<u8>, i32) {
     // Handle scientific notation
-    let (coeff, exp_part) = if let Some(pos) = s.to_ascii_lowercase().find('e') {
-        let coeff = &s[..pos];
-        let exp: i32 = s[pos + 1..].parse().unwrap_or(0);
-        (coeff, exp)
-    } else {
-        (s, 0)
-    };
+    let (coeff, exp_part) = split_exponent(s);
 
     // Split coefficient into integer and fraction parts
     let (int_part, frac_part) = if let Some(dot) = coeff.find('.') {
@@ -683,7 +711,7 @@ pub(crate) fn parse_number_parts(s: &str) -> (Vec<u8>, i32) {
     }
 
     // The integer part length gives us the base exponent
-    let int_len = int_part.chars().filter(|c| c.is_ascii_digit()).count() as i32;
+    let int_len = int_part.chars().filter(|c| c.is_ascii_digit()).count() as i64;
 
     // Find first non-zero digit
     let leading_zeros = digits.iter().take_while(|&&d| d == 0).count();
@@ -700,9 +728,32 @@ pub(crate) fn parse_number_parts(s: &str) -> (Vec<u8>, i32) {
 
     // exponent = int_len - leading_zeros + exp_part
     // But we need to account for whether leading zeros were in int or frac part
-    let exponent = int_len - leading_zeros as i32 + exp_part;
+    let exponent = (int_len - leading_zeros as i64).saturating_add(exp_part);
+    let exponent = exponent.clamp(i32::MIN.into(), i32::MAX.into()) as i32;
 
     (digits, exponent)
+}
+
+/// Split a number at its `e` or `E` into the coefficient and the exponent
+/// written after it, which is 0 when there is none.
+///
+/// An exponent too large for an i64 saturates at the bound on its side rather
+/// than reading as 0, which used to turn `1e99999999999` into 1. Anything
+/// else that fails to parse also reads as 0, for callers that have not been
+/// through `validate_dynamo_number`.
+fn split_exponent(s: &str) -> (&str, i64) {
+    let Some(pos) = s.find(['e', 'E']) else {
+        return (s, 0);
+    };
+    let exponent = match s[pos + 1..].parse::<i64>() {
+        Ok(exponent) => exponent,
+        Err(e) => match e.kind() {
+            std::num::IntErrorKind::PosOverflow => i64::MAX,
+            std::num::IntErrorKind::NegOverflow => i64::MIN,
+            _ => 0,
+        },
+    };
+    (&s[..pos], exponent)
 }
 
 fn mantissa_to_string(digits: &[u8], width: usize) -> String {
@@ -2120,6 +2171,41 @@ mod tests {
         assert!(c < d);
     }
 
+    // A library caller can reach the key encoder with a number that never
+    // went through validation. One far outside DynamoDB's range sorts at the
+    // matching extreme rather than overflowing the encoded exponent.
+    #[test]
+    fn test_number_sort_out_of_range_sorts_at_the_extremes() {
+        let ordered = [
+            "-1e99999999999",
+            "-9.9999999999999999999999999999999999999E125",
+            "-1E-130",
+            "-1e-99999999999",
+            "0",
+            "1e-99999999999",
+            "1E-130",
+            "9.9999999999999999999999999999999999999E125",
+            "1e99999999999",
+        ];
+        for pair in ordered.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            assert!(
+                normalize_number_for_sort(a) < normalize_number_for_sort(b),
+                "{a} should sort before {b}"
+            );
+        }
+    }
+
+    // Only an exponent too large for an i64 saturates. Anything else that
+    // fails to parse keeps reading as 0 for callers that never validated.
+    #[test]
+    fn test_split_exponent_reads_an_unparseable_exponent_as_zero() {
+        assert_eq!(split_exponent("1e"), ("1", 0));
+        assert_eq!(split_exponent("1e+"), ("1", 0));
+        assert_eq!(split_exponent("1e99999999999999999999"), ("1", i64::MAX));
+        assert_eq!(split_exponent("1e-99999999999999999999"), ("1", i64::MIN));
+    }
+
     // Number validation/normalisation is pinned to real DynamoDB behaviour
     // (captured against AWS for issue #109). validate_dynamo_number accepts
     // exactly the grammar DynamoDB accepts, including a leading '+'; the bare
@@ -2154,6 +2240,97 @@ mod tests {
                 "expected {input:?} to be rejected with ValidationException, got {:?}",
                 validate_dynamo_number(input)
             );
+        }
+    }
+
+    fn validation_message(input: &str) -> Option<String> {
+        match validate_dynamo_number(input) {
+            Ok(()) => None,
+            Err(crate::errors::DynoxideError::ValidationException(m)) => Some(m),
+            Err(e) => panic!("expected a ValidationException for {input:?}, got {e:?}"),
+        }
+    }
+
+    const OVERFLOW: &str =
+        "Number overflow. Attempting to store a number with magnitude larger than supported range";
+    const UNDERFLOW: &str = "Number underflow. Attempting to store a number with magnitude smaller than supported range";
+
+    // An exponent too large for an i32 used to be read as 0, so 1e99999999999
+    // passed the range checks and was stored as 1. Every expectation here was
+    // captured against eu-west-2, 2026-10-08.
+    #[test]
+    fn test_validate_number_range_checks_exponents_beyond_i32() {
+        for (input, expected) in [
+            ("1e99999999999", OVERFLOW),
+            ("-1e99999999999", OVERFLOW),
+            ("1E+99999999999", OVERFLOW),
+            ("1e-99999999999", UNDERFLOW),
+            ("-1e-99999999999", UNDERFLOW),
+            ("1e2147483648", OVERFLOW),
+            ("1e-2147483649", UNDERFLOW),
+            // Fits in an i32, but the digits before the point push it past.
+            ("10e2147483647", OVERFLOW),
+            ("0.01e-2147483648", UNDERFLOW),
+            ("1e9223372036854775807", OVERFLOW),
+            ("1e-9223372036854775808", UNDERFLOW),
+            ("10e9223372036854775807", OVERFLOW),
+            ("0.01e-9223372036854775808", UNDERFLOW),
+        ] {
+            assert_eq!(
+                validation_message(input).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+        }
+    }
+
+    // DynamoDB reads the exponent as a 64-bit integer. One that does not fit
+    // is a value it cannot convert, not an overflow (captured eu-west-2,
+    // 2026-10-08).
+    #[test]
+    fn test_validate_number_rejects_exponent_beyond_i64_as_unconvertible() {
+        for input in [
+            "1e9223372036854775808",
+            "1e+9223372036854775808",
+            "1e-9223372036854775809",
+            "0e9223372036854775808",
+        ] {
+            assert_eq!(
+                validation_message(input),
+                Some(format!(
+                    "The parameter cannot be converted to a numeric value: {input}"
+                )),
+                "{input}"
+            );
+        }
+    }
+
+    // A zero is range-checked as if its last written digit were a 1, so
+    // `0e126` overflows like `1e126` and `0.0e-130` underflows like
+    // `0.1e-130`. Captured eu-west-2, 2026-10-08.
+    #[test]
+    fn test_validate_number_range_checks_zero_by_its_last_written_digit() {
+        let zeros_130 = format!("0.{}", "0".repeat(130));
+        let zeros_131 = format!("0.{}", "0".repeat(131));
+        for (input, expected) in [
+            ("0e125", None),
+            ("0e126", Some(OVERFLOW)),
+            ("0.0e126", None),
+            ("0.0e127", Some(OVERFLOW)),
+            ("0.00e127", None),
+            ("00e126", Some(OVERFLOW)),
+            ("00.00e126", None),
+            ("-0e127", Some(OVERFLOW)),
+            ("0e99999999999", Some(OVERFLOW)),
+            ("0e-130", None),
+            ("0e-131", Some(UNDERFLOW)),
+            ("0.0e-129", None),
+            ("0.0e-130", Some(UNDERFLOW)),
+            ("0e-99999999999", Some(UNDERFLOW)),
+            (zeros_130.as_str(), None),
+            (zeros_131.as_str(), Some(UNDERFLOW)),
+        ] {
+            assert_eq!(validation_message(input).as_deref(), expected, "{input}");
         }
     }
 
