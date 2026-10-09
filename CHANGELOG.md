@@ -159,6 +159,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `server::start_with_options` and `mcp::serve_http_with_options` give embedded
   Rust callers the same switch for both servers.
 
+### Fixed
+
+- `--help` no longer shows the value of `DYNOXIDE_MCP_AUTH_TOKEN` when it is
+  set. It still names the variable. The MCP auth types' debug output no
+  longer shows the token either.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security

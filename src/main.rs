@@ -141,7 +141,7 @@ struct ServeArgs {
 
     /// Bearer token for the MCP HTTP transport. Overrides the persisted token.
     #[cfg(feature = "mcp-server")]
-    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN")]
+    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN", hide_env_values = true)]
     mcp_token: Option<String>,
 
     /// Disable MCP HTTP authentication (loopback binds only)
@@ -211,7 +211,7 @@ struct McpArgs {
     port: u16,
 
     /// Bearer token for the HTTP transport. Overrides the persisted token.
-    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN")]
+    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
     /// Disable HTTP authentication (loopback binds only)
@@ -345,7 +345,7 @@ struct ImportArgs {
 
     /// Bearer token for the MCP HTTP transport. Overrides the persisted token.
     #[cfg(feature = "mcp-server")]
-    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN")]
+    #[arg(long, env = "DYNOXIDE_MCP_AUTH_TOKEN", hide_env_values = true)]
     mcp_token: Option<String>,
 
     /// Disable MCP HTTP authentication (loopback binds only)
@@ -1467,6 +1467,43 @@ mod tests {
                 err.contains("--output") && err.contains("--log"),
                 "the error should name both flags: {err}"
             );
+        }
+
+        /// Environment variables whose value is safe to show in `--help`.
+        /// Every other env-backed flag must hide its value, because clap
+        /// prints the current value next to the flag by default.
+        const ENV_VALUES_SHOWN_IN_HELP: &[&str] =
+            &["DYNOXIDE_HEALTHCHECK_HOST", "DYNOXIDE_HEALTHCHECK_PORT"];
+
+        fn env_backed_args(cmd: &clap::Command, path: &str, out: &mut Vec<(String, String, bool)>) {
+            for arg in cmd.get_arguments() {
+                if let Some(env) = arg.get_env() {
+                    out.push((
+                        format!("{path} --{}", arg.get_id()),
+                        env.to_string_lossy().into_owned(),
+                        arg.is_hide_env_values_set(),
+                    ));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                env_backed_args(sub, &format!("{path} {}", sub.get_name()), out);
+            }
+        }
+
+        #[test]
+        fn every_env_backed_flag_hides_its_value_unless_allowed() {
+            use clap::CommandFactory;
+
+            let mut args = Vec::new();
+            env_backed_args(&Cli::command(), "dynoxide", &mut args);
+            assert!(!args.is_empty(), "expected env-backed flags to check");
+            for (flag, env, hidden) in &args {
+                assert!(
+                    *hidden || ENV_VALUES_SHOWN_IN_HELP.contains(&env.as_str()),
+                    "{flag} reads {env} but `--help` would print its value; add \
+                     `hide_env_values = true`, or list {env} as safe to show"
+                );
+            }
         }
     }
 
