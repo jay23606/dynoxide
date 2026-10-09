@@ -1374,9 +1374,11 @@ fn a_key_condition_syntax_error_wins_over_an_operand_type() {
     )
     .unwrap_err()
     .to_string();
-    assert!(
-        err.contains("Unexpected token in KeyConditionExpression: junk"),
-        "got {err}"
+    // The syntax error comes in DynamoDB's token and near form (captured
+    // us-east-1 and eu-west-2, 2026-10-09).
+    assert_eq!(
+        err,
+        "Invalid KeyConditionExpression: Syntax error; token: \"junk\", near: \") junk\""
     );
 }
 

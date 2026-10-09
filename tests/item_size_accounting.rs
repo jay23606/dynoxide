@@ -703,7 +703,9 @@ fn the_charge_is_checked_after_request_validation_and_before_the_update_applies(
                 return_values: Some("BOGUS".to_string()),
                 ..base("SET c = :v")
             },
-            "returnValues",
+            // The generic form, captured with this ordering run (eu-west-2,
+            // 2026-10-09).
+            "Member must satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]",
         ),
     ];
     let charge_first: Vec<(&str, UpdateItemRequest)> = vec![
