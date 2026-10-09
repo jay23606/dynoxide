@@ -172,6 +172,26 @@ find the product release. The crates.io badge in the README shows the crate.
 A product release does not always mean a new crate, and a crate release does
 not always mean new binaries.
 
+## Prereleases
+
+A version with a prerelease part, such as `1.3.0-rc.1`, ships through the same
+pipeline as any other, but it only reaches people who ask for it by name or by
+channel.
+
+| Surface | What a prerelease does |
+|---|---|
+| GitHub Release | Published, and flagged as a prerelease, so it never becomes the Latest release |
+| GitHub Action | `version: latest` keeps downloading the Latest release; ask for `version: v1.3.0-rc.1` to get the rc |
+| npm | Published to the `next` dist-tag: `npm install dynoxide@next`, or the exact version |
+| Containers | Tagged with the exact version only; `latest`, `1` and `1.3` stay on the last stable release |
+| crates.io | Published only when the crate version is a prerelease too; a stable crate version waits for the stable release |
+| Homebrew | Not published. The tap holds one formula, so an rc there would reach everyone on their next `brew upgrade` |
+| MCP registry | Not published. The registry treats the highest semver as latest, and `1.3.0-rc.1` sorts above `1.2.1` |
+| dynoxide.dev | Not rebuilt. The site reads its version from npm's `latest` |
+
+The MCPB bundle is packed and published by hand (see `docs/mcp-registries.md`),
+so a prerelease tag never reaches it.
+
 ## The browser engine
 
 `@dynoxide/wasm-engine` is versioned with the other installable artefacts and covered by the

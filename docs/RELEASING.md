@@ -35,6 +35,14 @@ and its artefacts are downloadable as soon as it exists, which is how the
 composite action resolves `version: latest`. Aborting at the gate leaves the
 GitHub Release in place; delete or mark it a draft if that matters.
 
+A prerelease tag such as `v1.3.0-rc.1` runs the same pipeline, but only
+reaches people who ask for it. Its GitHub Release is flagged as a prerelease,
+so `version: latest` keeps resolving to the last stable release. npm publishes
+it to `next`, and the image gets its exact tag and no other. A stable crate
+version is not published from it. The Homebrew tap, the MCP registry and the
+site are left alone. `docs/versioning.md` lists what every surface does with
+one.
+
 ## Verifying a release
 
 - **sha256sums.txt** is attached to every GitHub Release. Download it

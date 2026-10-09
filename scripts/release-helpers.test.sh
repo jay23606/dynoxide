@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Exercises the small scripts the release workflows share: is-semver.sh,
-# npm-dist-tag.sh, is-crate-published.sh and check-release-binary-version.sh.
+# is-prerelease.sh, npm-dist-tag.sh, is-crate-published.sh,
+# crate-publish-decision.sh and check-release-binary-version.sh.
 #
 # Each of these replaced a copy of the same logic in two or three workflow
 # files, and workflow steps only run at tag time, when a mistake is already
@@ -55,6 +56,30 @@ if [ "$semver_cases" -lt 10 ]; then
   failures=$((failures + 1)); checked=$((checked + 1))
 fi
 
+# A workflow_dispatch input can hold a newline, and a rule that matched line by
+# line would accept a value whose first line is a version. These cannot live in
+# semver-cases.txt, which is read a line at a time.
+expect 1 "" "is-semver refuses a version followed by another line" "$SEMVER" $'1.2.0\nnot a version'
+expect 1 "" "is-semver refuses a version preceded by another line" "$SEMVER" $'not a version\n1.2.0'
+expect 1 "" "is-semver refuses a version with a trailing newline" "$SEMVER" $'1.2.0\n'
+
+# --- is-prerelease.sh -------------------------------------------------------
+#
+# The Homebrew, MCP registry and site jobs are skipped on `true`, so a release
+# read as a prerelease would silently leave the tap behind. Both directions
+# are pinned, along with the shapes that are not versions at all.
+
+PRERELEASE="$SCRIPTS/is-prerelease.sh"
+expect 0 "false" "a release is not a prerelease" "$PRERELEASE" 1.2.0
+expect 0 "false" "a release with multi-digit parts is not a prerelease" "$PRERELEASE" 10.20.30
+expect 0 "true" "an rc is a prerelease" "$PRERELEASE" 1.2.0-rc.1
+expect 0 "true" "a hyphen inside the identifier is a prerelease" "$PRERELEASE" 1.2.0-beta-2
+expect 0 "true" "a numeric prerelease identifier is a prerelease" "$PRERELEASE" 1.2.0-0
+expect 1 "" "a trailing hyphen is not a version" "$PRERELEASE" "1.2.0-"
+expect 1 "" "a tag is not a version" "$PRERELEASE" v1.2.0-rc.1
+expect 1 "" "an empty version is refused" "$PRERELEASE" ""
+expect 1 "" "a release followed by an rc on the next line is not a version" "$PRERELEASE" $'1.2.0\n1.2.0-rc.1'
+
 # --- npm-dist-tag.sh --------------------------------------------------------
 
 DIST_TAG="$SCRIPTS/npm-dist-tag.sh"
@@ -100,7 +125,165 @@ expect 1 "" "a curl that cannot connect is refused rather than read as unpublish
 printf '200\n' > "$CODES"
 expect 1 "" "a missing version argument is refused" "$PROBE" dynoxide-rs
 
+# --- crate-publish-decision.sh ----------------------------------------------
+#
+# The whole truth table, since release.yml and publish-crate.yml both act on
+# it and a crate version can never be replaced once it is wrong. Arguments are
+# the crate, its version and the product version. The same curl stand-in
+# answers for crates.io.
+
+DECIDE="$SCRIPTS/crate-publish-decision.sh"
+
+printf '404\n' > "$CODES"
+expect 0 "publish" "a release publishes an unpublished crate" "$DECIDE" dynoxide-rs 2.1.0 1.3.0
+printf '200\n' > "$CODES"
+expect 0 "already-published" "a release skips a published crate" "$DECIDE" dynoxide-rs 2.1.0 1.3.0
+printf '404\n' > "$CODES"
+expect 0 "publish" "a release publishes an unpublished prerelease crate" "$DECIDE" dynoxide-rs 2.1.0-rc.1 1.3.0
+printf '200\n' > "$CODES"
+expect 0 "already-published" "a release skips a published prerelease crate" "$DECIDE" dynoxide-rs 2.1.0-rc.1 1.3.0
+printf '404\n' > "$CODES"
+expect 0 "stable-crate-on-prerelease" "a prerelease never publishes a stable crate" "$DECIDE" dynoxide-rs 2.1.0 1.3.0-rc.1
+printf '404\n' > "$CODES"
+expect 0 "publish" "a prerelease publishes an unpublished prerelease crate" "$DECIDE" dynoxide-rs 2.1.0-rc.1 1.3.0-rc.1
+printf '200\n' > "$CODES"
+expect 0 "already-published" "a prerelease skips a published prerelease crate" "$DECIDE" dynoxide-rs 2.1.0-rc.1 1.3.0-rc.1
+printf '429\n429\n429\n429\n429\n' > "$CODES"
+expect 1 "" "a release refuses to guess when crates.io will not answer" "$DECIDE" dynoxide-rs 2.1.0 1.3.0
+
+# A prerelease with a stable crate is decided before crates.io is asked, so an
+# outage there cannot hold back npm and the containers for an rc. The stand-in
+# could not connect if it were called, and its answers must still be unread.
+printf '\n\n\n\n\n' > "$CODES"
+expect 0 "stable-crate-on-prerelease" "a prerelease with a stable crate needs no answer from crates.io" "$DECIDE" dynoxide-rs 2.1.0 1.3.0-rc.1
+checked=$((checked + 1))
+if [ "$(wc -l < "$CODES" | tr -d ' ')" -ne 5 ]; then
+  echo "FAIL  - crates.io was asked about a stable crate on a prerelease"
+  failures=$((failures + 1))
+else
+  echo "ok    - crates.io was not asked about a stable crate on a prerelease"
+fi
+
+printf '404\n' > "$CODES"
+expect 1 "" "a tag is not a product version" "$DECIDE" dynoxide-rs 2.1.0 v1.3.0
+expect 1 "" "a malformed crate version is refused" "$DECIDE" dynoxide-rs 2.1.0-rc..1 1.3.0
+expect 1 "" "a missing product version is refused" "$DECIDE" dynoxide-rs 2.1.0
+
 unset CURL STUB_CODES RETRY_DELAY
+
+# --- release.yml prerelease gates -------------------------------------------
+#
+# The scripts above decide what a prerelease is, but release.yml decides what
+# happens to one, and a gate wired the wrong way round would hand an rc to the
+# tap or hold a stable release back with every job still green. Workflows only
+# run at tag time, so their gates are read here instead: the stable-only jobs
+# must compare validate's prerelease output with exactly what is-prerelease.sh
+# prints for a release, and the GitHub Release must take its prerelease flag
+# from the same output.
+#
+# A small reader rather than a YAML library, since nothing installs one on the
+# runner: jobs sit at two spaces under `jobs:`, their keys at four.
+
+check_gates() {
+  python3 - "$@" <<'PY'
+import re, sys
+
+path, stable = sys.argv[1], sys.argv[2]
+lines = open(path).read().splitlines()
+problems, checks = [], 0
+
+def expr(value):
+    value = value.strip()
+    m = re.fullmatch(r"\$\{\{(.*)\}\}", value)
+    return re.sub(r"\s+", " ", (m.group(1) if m else value).strip())
+
+jobs, current = {}, None
+if "jobs:" not in lines:
+    sys.exit(f"{path}: no top-level jobs: key")
+for line in lines[lines.index("jobs:") + 1:]:
+    if line and not line.startswith((" ", "#")):
+        break
+    m = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", line)
+    if m:
+        current = m.group(1)
+        jobs[current] = []
+    elif current:
+        jobs[current].append(line)
+
+def keys(job, key):
+    found = [re.fullmatch(rf"    {key}:\s*(.*)", l) for l in jobs.get(job, [])]
+    return [f.group(1) for f in found if f]
+
+def check(ok, message):
+    global checks
+    checks += 1
+    if not ok:
+        problems.append(message)
+
+validate = jobs.get("validate", [])
+check(any(re.fullmatch(r"\s+prerelease:\s*\$\{\{\s*steps\.resolve\.outputs\.prerelease\s*\}\}\s*", l) for l in validate),
+      "validate does not declare a prerelease output from steps.resolve")
+check(any("scripts/is-prerelease.sh" in l for l in validate),
+      "validate does not run scripts/is-prerelease.sh")
+
+gate = f"needs.validate.outputs.prerelease == '{stable}'"
+for job in ("publish-homebrew", "publish-mcp-registry", "notify-site"):
+    if job not in jobs:
+        check(False, f"{job}: job not found")
+        continue
+    ifs = keys(job, "if")
+    check(len(ifs) == 1 and expr(ifs[0]) == gate,
+          f"{job}: if is {ifs or 'missing'}, wanted {gate}")
+    check(any(re.search(r"\bvalidate\b", n) for n in keys(job, "needs")),
+          f"{job}: does not need validate")
+
+release = jobs.get("github-release", [])
+step, inside = [], False
+for line in release:
+    if re.match(r"      - ", line):
+        inside = re.fullmatch(r"      - name:\s*Create Release\s*", line) is not None
+        continue
+    if inside:
+        step.append(line)
+flags = [m.group(1) for m in (re.fullmatch(r"          prerelease:\s*(.*)", l) for l in step) if m]
+flag = f"needs.validate.outputs.prerelease != '{stable}'"
+check(len(flags) == 1 and expr(flags[0]) == flag,
+      f"github-release Create Release: prerelease is {flags or 'missing'}, wanted {flag}")
+
+for p in problems:
+    print(p)
+print(f"{checks} gate checks on {path}, {len(problems)} wrong")
+sys.exit(1 if problems else 0)
+PY
+}
+
+RELEASE_YML="$SCRIPTS/../.github/workflows/release.yml"
+STABLE=$("$PRERELEASE" 1.3.0)
+expect 0 "" "release.yml gates the stable-only jobs and the Release flag on the prerelease answer" check_gates "$RELEASE_YML" "$STABLE"
+
+# Each gate is broken on a copy and the reader has to notice. perl swaps the
+# nth match only, so each case breaks one job and leaves the others intact. A
+# swap that matched nothing leaves the copy clean, and the case then fails.
+nth() {
+  N="$1" FIND="$2" REPL="$3" perl -0pe \
+    '$n = 0; s/\Q$ENV{FIND}\E/++$n == $ENV{N} ? $ENV{REPL} : $&/ge' \
+    "$RELEASE_YML" > "$FIXTURE/release.yml"
+}
+GATE="    if: needs.validate.outputs.prerelease == 'false'"
+
+nth 1 "$GATE
+" ""
+expect 1 "" "a stable-only job with its gate removed is caught" check_gates "$FIXTURE/release.yml" "$STABLE"
+nth 2 "== 'false'" "== 'true'"
+expect 1 "" "a stable-only job with its gate inverted is caught" check_gates "$FIXTURE/release.yml" "$STABLE"
+nth 3 "== 'false'" "!= 'true'"
+expect 1 "" "a gate that fails open on a missing answer is caught" check_gates "$FIXTURE/release.yml" "$STABLE"
+nth 1 "prerelease: \${{ needs.validate.outputs.prerelease != 'false' }}" "prerelease: false"
+expect 1 "" "a GitHub Release flag that ignores the answer is caught" check_gates "$FIXTURE/release.yml" "$STABLE"
+nth 1 "      prerelease: \${{ steps.resolve.outputs.prerelease }}
+" ""
+expect 1 "" "a validate job without the prerelease output is caught" check_gates "$FIXTURE/release.yml" "$STABLE"
+expect 1 "" "gates compared with a value is-prerelease.sh does not print are caught" check_gates "$RELEASE_YML" "no"
 
 # --- check-release-binary-version.sh ----------------------------------------
 

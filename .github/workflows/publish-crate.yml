@@ -32,28 +32,49 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag }}
+
+      # Recovery is run by hand against a tag, so the crate version it finds
+      # may already be published, or may be a stable version sitting under a
+      # prerelease tag, which the release itself would have skipped. Either
+      # way there is nothing this run should publish, so it stops with the
+      # reason, before the tests, rather than succeeding having done nothing.
+      # The decision is the script release.yml uses, so the two paths cannot
+      # drift.
+      - name: Decide whether to publish the crate
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="$INPUT_TAG"
+          VERSION="${TAG#v}"
+          # Same shape rule as release.yml, from the same script.
+          if [ "$VERSION" = "$TAG" ] || ! scripts/is-semver.sh "$VERSION"; then
+            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z or vX.Y.Z-pre.N)"
+            exit 1
+          fi
+          CRATE=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          DECISION=$(scripts/crate-publish-decision.sh dynoxide-rs "$CRATE" "$VERSION") || {
+            echo "::error::could not decide whether to publish dynoxide-rs $CRATE for $TAG. Refusing to guess."
+            exit 1
+          }
+          case "$DECISION" in
+            publish)
+              echo "dynoxide-rs $CRATE is not published; continuing" ;;
+            already-published)
+              echo "::error::dynoxide-rs $CRATE is already on crates.io. Nothing to recover."
+              exit 1 ;;
+            stable-crate-on-prerelease)
+              echo "::error::$TAG is a prerelease and dynoxide-rs $CRATE is not. A stable crate is only published from a stable tag; recover it from that release."
+              exit 1 ;;
+            *)
+              echo "::error::unexpected crate publish decision '$DECISION'"
+              exit 1 ;;
+          esac
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
         run: cargo test
-
-      # Recovery is run by hand against a tag, so the crate version it finds
-      # may already be published. Say so and stop, rather than failing on a
-      # cargo error that reads like something went wrong. The probe is the
-      # script release.yml uses, so the two paths cannot drift.
-      - name: Is this crate version already published
-        run: |
-          CRATE=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          ALREADY=$(scripts/is-crate-published.sh dynoxide-rs "$CRATE") || {
-            echo "::error::could not determine whether dynoxide-rs $CRATE is published. Refusing to guess."
-            exit 1
-          }
-          if [ "$ALREADY" = true ]; then
-            echo "::error::dynoxide-rs $CRATE is already on crates.io. Nothing to recover."
-            exit 1
-          fi
-          echo "dynoxide-rs $CRATE is not published; continuing"
 
       # Trusted Publishing, as release.yml uses. crates.io matches the
       # exchange on the workflow filename, so this recovery path needs its own
