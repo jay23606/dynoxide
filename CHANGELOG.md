@@ -146,8 +146,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dynoxide reports them live.
 - `DescribeTable` and `UpdateTable` report each GSI's and LSI's `ItemCount` and
   `IndexSizeBytes`: the number of items the index holds and the total size of
-  what it projects for them, where both were always 0. Vector indexes still
-  report 0.
+  what it projects for them, where both were always 0. Each vector index
+  reports its entries and their billable size, as DynamoDB does: the vector at
+  4 bytes per dimension, its attribute's name and the rest of the projection.
+- On a table with a vector index, a write is charged for the vector at 4 bytes
+  per dimension, whatever numbers it holds, and `TableSizeBytes` counts it the
+  same way, as DynamoDB does. Dynoxide used to size it as a list of numbers, so
+  a write of a 1,024-dimension embedding could cost two or three units more
+  than on DynamoDB. Read units and the 400 KB item limit still size the vector
+  by its numbers, which is DynamoDB's rule for those. A database written by an
+  earlier version has its vector tables' sizes recomputed once when it is
+  opened, and creating or deleting a vector index recomputes that table's.
 - `Database::sweep_ttl`, and the MCP `sweep_ttl` tool that calls it, no longer
   hold the database lock for the whole sweep. The sweep takes the lock a page of
   25 items at a time and lets requests already waiting for it go first between

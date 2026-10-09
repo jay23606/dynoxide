@@ -275,13 +275,15 @@ pub async fn execute<S: StorageBackend>(
                 // Normalize sets (deduplication)
                 crate::validation::normalize_item_sets(&mut put_req.item);
 
-                // Validate item size
-                let size = types::item_size(&put_req.item);
-                if size > types::MAX_ITEM_SIZE {
+                // Validate item size, by the number rule, as DynamoDB does
+                if types::item_size(&put_req.item) > types::MAX_ITEM_SIZE {
                     return Err(DynoxideError::ValidationException(
                         "Item size has exceeded the maximum allowed size".to_string(),
                     ));
                 }
+                // What the row records and the write is charged: the billed
+                // size, with a vector attribute at 4 bytes per dimension.
+                let size = types::billed_item_size(&put_req.item, &vector_defs);
 
                 // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
                 let (pk, sk) = helpers::extract_key_strings(&put_req.item, &key_schema)?;
@@ -351,7 +353,9 @@ pub async fn execute<S: StorageBackend>(
                         )
                         .await?;
                         Ok((
-                            old_item.as_ref().map(types::item_size),
+                            old_item
+                                .as_ref()
+                                .map(|old| types::billed_item_size(old, &vector_defs)),
                             gsi_units,
                             lsi_units,
                             vector_bytes,
@@ -429,7 +433,9 @@ pub async fn execute<S: StorageBackend>(
                 // Accumulate WCU: based on old item size if it existed, else 1 WCU
                 *table_wcu.entry(table_name.clone()).or_insert(0.0) +=
                     types::table_write_capacity_units(
-                        old_item.as_ref().map(types::item_size),
+                        old_item
+                            .as_ref()
+                            .map(|old| types::billed_item_size(old, &vector_defs)),
                         None,
                     );
 

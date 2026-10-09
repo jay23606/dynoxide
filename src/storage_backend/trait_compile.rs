@@ -438,6 +438,22 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn vector_item_count_and_size(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+    ) -> Result<(i64, i64), BackendError> {
+        unimplemented!()
+    }
+
+    async fn set_item_sizes(
+        &self,
+        _table_name: &str,
+        _sizes: &[(String, String, usize)],
+    ) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {
         unimplemented!()
     }

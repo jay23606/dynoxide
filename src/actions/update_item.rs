@@ -734,12 +734,17 @@ async fn execute_inner<S: StorageBackend>(
         // checked before the transaction. The charge binds while the statement
         // carries more than it adds to the item; once the stored item holds
         // enough besides, the item's own size does.
-        let size = types::item_size(&item);
-        if size > types::MAX_ITEM_SIZE {
+        if types::item_size(&item) > types::MAX_ITEM_SIZE {
             return Err(DynoxideError::ValidationException(
                 "Item size to update has exceeded the maximum allowed size".to_string(),
             ));
         }
+
+        // What the row records and the write is charged: the billed size, with
+        // a vector attribute at 4 bytes per dimension. The limit above sizes it
+        // by its numbers, as DynamoDB does.
+        let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+        let size = types::billed_item_size(&item, &vector_defs);
 
         // Serialize and store
         let item_json = serde_json::to_string(&item)
@@ -765,7 +770,7 @@ async fn execute_inner<S: StorageBackend>(
         // rather than an absent one. The index delta has to see genuine absence,
         // so gate on whether a row was actually read back.
         let prior_image = existing_json.is_some().then_some(&old_item);
-        let old_size = prior_image.map(types::item_size);
+        let old_size = prior_image.map(|old| types::billed_item_size(old, &vector_defs));
 
         let target = super::gsi::IndexWrite {
             table_name: &request.table_name,

@@ -2366,16 +2366,19 @@ async fn execute_insert<S: StorageBackend>(
 
     let item_json = serde_json::to_string(&item)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-    let item_size = crate::types::item_size(&item);
 
     // An INSERT is held to the same flat limit as PutItem, and reports it in the
     // same words. Captured against eu-west-2, where the ceiling is 409,600 on
     // the item itself.
-    if item_size > crate::types::MAX_ITEM_SIZE {
+    if crate::types::item_size(&item) > crate::types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
             "Item size has exceeded the maximum allowed size".to_string(),
         ));
     }
+    // What the row records and the write is charged: the billed size, with a
+    // vector attribute at 4 bytes per dimension.
+    let vector_defs = crate::actions::vector_index::parse_vector_defs(meta)?;
+    let item_size = crate::types::billed_item_size(&item, &vector_defs);
 
     let hash_prefix = item
         .get(&key_schema.partition_key)
@@ -2416,7 +2419,9 @@ async fn execute_insert<S: StorageBackend>(
     // here; `old_item` only ever comes back empty.
     Ok(WriteCapacity::new(
         table_name,
-        old_item.as_ref().map(crate::types::item_size),
+        old_item
+            .as_ref()
+            .map(|old| crate::types::billed_item_size(old, &vector_defs)),
         Some(item_size),
         gsi_units,
         lsi_units,
@@ -2514,18 +2519,20 @@ async fn execute_update<S: StorageBackend>(
 
     let item_json = serde_json::to_string(&item)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-    let item_size = crate::types::item_size(&item);
 
     // A PartiQL UPDATE is measured flat against the resulting item, the same as
     // an INSERT, and unlike the standalone UpdateItem, which is also charged for
     // what its request carries. Captured against eu-west-2: an update this
     // surface accepts at 409,600 is refused by UpdateItem at the same key. Only
     // the wording is shared with UpdateItem.
-    if item_size > crate::types::MAX_ITEM_SIZE {
+    if crate::types::item_size(&item) > crate::types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
             "Item size to update has exceeded the maximum allowed size".to_string(),
         ));
     }
+    // What the row records and the write is charged: the billed size.
+    let vector_defs = crate::actions::vector_index::parse_vector_defs(meta)?;
+    let item_size = crate::types::billed_item_size(&item, &vector_defs);
 
     let hash_prefix = item
         .get(&key_schema.partition_key)
@@ -2588,7 +2595,7 @@ async fn execute_update<S: StorageBackend>(
         projection,
         WriteCapacity::new(
             table_name,
-            old_ref.map(crate::types::item_size),
+            old_ref.map(|old| crate::types::billed_item_size(old, &vector_defs)),
             Some(item_size),
             gsi_units,
             lsi_units,
@@ -2788,9 +2795,17 @@ async fn execute_delete<S: StorageBackend>(
 
     // A delete is charged on the item it removed, so a no-op delete against a
     // missing target carries no image and falls back to the one-unit minimum.
-    let capacity =
-        WriteCapacity::from_items(table_name, old_item.as_ref(), None, gsi_units, lsi_units)
-            .with_vector_bytes(vector_bytes);
+    let vector_defs = crate::actions::vector_index::parse_vector_defs(meta)?;
+    let capacity = WriteCapacity::new(
+        table_name,
+        old_item
+            .as_ref()
+            .map(|old| crate::types::billed_item_size(old, &vector_defs)),
+        None,
+        gsi_units,
+        lsi_units,
+    )
+    .with_vector_bytes(vector_bytes);
     Ok((old_item, capacity))
 }
 

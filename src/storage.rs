@@ -463,6 +463,9 @@ impl Storage {
         if version < 10 {
             self.migrate_v9_to_v10()?;
         }
+        if version < 11 {
+            self.migrate_v10_to_v11()?;
+        }
 
         Ok(())
     }
@@ -684,6 +687,21 @@ impl Storage {
     fn migrate_v9_to_v10(&self) -> Result<()> {
         pollster::block_on(crate::actions::gsi::rebuild_multi_attribute_gsis(self))?;
         let version = crate::actions::gsi::MULTI_ATTRIBUTE_KEY_SCHEMA_VERSION.to_string();
+        let (sql, params) = sql_builders::set_schema_version(&version);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        Ok(())
+    }
+
+    /// Migrate from schema v10 to v11: recompute the stored size of every item
+    /// in a table with a vector index, which earlier versions recorded by the
+    /// number rule. See
+    /// [`recompute_vector_table_sizes`](crate::actions::vector_index::recompute_vector_table_sizes).
+    fn migrate_v10_to_v11(&self) -> Result<()> {
+        pollster::block_on(crate::actions::vector_index::recompute_vector_table_sizes(
+            self,
+        ))?;
+        let version = crate::actions::vector_index::VECTOR_BILLED_SIZE_SCHEMA_VERSION.to_string();
         let (sql, params) = sql_builders::set_schema_version(&version);
         self.conn
             .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
@@ -1554,6 +1572,32 @@ impl Storage {
         } else {
             self.count_and_size_entries(sql_builders::lsi_entries_item_json(table_name, index_name))
         }
+    }
+
+    /// Count a vector index's entries and total their stored billable sizes.
+    /// See [`StorageBackend::vector_item_count_and_size`].
+    pub fn vector_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(i64, i64)> {
+        self.count_and_size(sql_builders::vector_count_and_size(table_name, index_name))
+    }
+
+    /// Rewrite the stored `item_size` of the given rows. See
+    /// [`StorageBackend::set_item_sizes`].
+    pub fn set_item_sizes(
+        &self,
+        table_name: &str,
+        sizes: &[(String, String, usize)],
+    ) -> Result<()> {
+        for (pk, sk, size) in sizes {
+            let (sql, params) = sql_builders::set_item_size(table_name, pk, sk, *size);
+            self.conn
+                .prepare_cached(&sql)?
+                .execute(rusqlite::params_from_iter(params.iter()))?;
+        }
+        Ok(())
     }
 
     fn count_and_size(

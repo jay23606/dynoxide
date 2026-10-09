@@ -769,7 +769,10 @@ async fn execute_put<S: StorageBackend>(
 
     // The item-size limit was applied to this put before the transaction opened,
     // and normalising cannot grow the item, so there is nothing to recheck here.
-    let size = types::item_size(&item);
+    // What the row records and the write is charged is the billed size, with a
+    // vector attribute at 4 bytes per dimension.
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+    let size = types::billed_item_size(&item, &vector_defs);
 
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&item, &key_schema)?;
@@ -846,7 +849,9 @@ async fn execute_put<S: StorageBackend>(
 
     Ok(WriteCapacity::new(
         &put.table_name,
-        old_item.as_ref().map(types::item_size),
+        old_item
+            .as_ref()
+            .map(|old| types::billed_item_size(old, &vector_defs)),
         Some(size),
         gsi_units,
         lsi_units,
@@ -936,12 +941,13 @@ async fn execute_update<S: StorageBackend>(
     // A transacted update is measured flat against the resulting item, unlike the
     // standalone UpdateItem, which is also charged for what its request carries.
     // Both were captured against eu-west-2; the two really do differ.
-    let size = types::item_size(&item);
-    if size > types::MAX_ITEM_SIZE {
+    if types::item_size(&item) > types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
             "Item size to update has exceeded the maximum allowed size".to_string(),
         ));
     }
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+    let size = types::billed_item_size(&item, &vector_defs);
 
     // Save old item reference for streams
     let old_for_stream = existing_json.clone();
@@ -986,7 +992,9 @@ async fn execute_update<S: StorageBackend>(
     // rather than an insert.
     Ok(WriteCapacity::new(
         &update.table_name,
-        old_item.as_ref().map(types::item_size),
+        old_item
+            .as_ref()
+            .map(|old| types::billed_item_size(old, &vector_defs)),
         Some(size),
         gsi_units,
         lsi_units,
@@ -1067,9 +1075,12 @@ async fn execute_delete<S: StorageBackend>(
         crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
     }
 
-    Ok(WriteCapacity::from_items(
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+    Ok(WriteCapacity::new(
         &delete.table_name,
-        old_item.as_ref(),
+        old_item
+            .as_ref()
+            .map(|old| types::billed_item_size(old, &vector_defs)),
         None,
         gsi_units,
         lsi_units,
@@ -1126,6 +1137,7 @@ async fn execute_condition_check<S: StorageBackend>(
     Ok(WriteCapacity::condition_check(
         &check.table_name,
         existing_json.is_some().then_some(&existing_item),
+        &super::vector_index::parse_vector_defs(&meta)?,
     ))
 }
 

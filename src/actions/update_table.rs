@@ -926,6 +926,16 @@ pub async fn execute<S: StorageBackend>(
                     current_vixs.retain(|v| v.index_name != delete.index_name);
                 }
             }
+
+            // An item is billed at a size that depends on which attributes a
+            // vector index reads, so the stored sizes TableSizeBytes sums
+            // follow the index set as it now stands.
+            super::vector_index::recompute_billed_sizes(
+                storage,
+                &request.table_name,
+                &current_vixs,
+            )
+            .await?;
         }
 
         // Reconcile AttributeDefinitions to exactly the attributes still

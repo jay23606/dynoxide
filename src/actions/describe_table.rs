@@ -84,9 +84,11 @@ pub(crate) async fn item_count_and_size<S: StorageBackend>(
 /// KEYS_ONLY GSI and a KEYS_ONLY LSI over the same four items. An index whose
 /// figures can't be read reports neither.
 ///
-/// Vector indexes keep their zeros. Their entries carry the vector at its f32
-/// width, so whether DynamoDB reports that or the projected item's size has to
-/// come from a capture rather than from the GSI rule.
+/// A vector index reports its entries and the billable size each write stored
+/// with its entry: the vector at 4 bytes per dimension, its attribute's name,
+/// and the rest of the projected item. Read back from DynamoDB in eu-west-2 on
+/// 9 October 2026: 358 bytes for two entries under an ALL projection and 50
+/// under KEYS_ONLY, not the projected items' own sizes.
 pub(crate) async fn fill_index_figures<S: StorageBackend>(
     storage: &S,
     desc: &mut TableDescription,
@@ -113,6 +115,13 @@ pub(crate) async fn fill_index_figures<S: StorageBackend>(
         (lsi.item_count, lsi.index_size_bytes) = read(
             storage
                 .lsi_item_count_and_size(&table_name, &lsi.index_name, whole_items)
+                .await,
+        );
+    }
+    for vix in desc.vector_indexes.iter_mut().flatten() {
+        (vix.item_count, vix.index_size_bytes) = read(
+            storage
+                .vector_item_count_and_size(&table_name, &vix.index_name)
                 .await,
         );
     }

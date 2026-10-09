@@ -475,6 +475,22 @@ impl StorageBackend for Storage {
             .map_err(dyno_to_backend)
     }
 
+    async fn vector_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(i64, i64), BackendError> {
+        Storage::vector_item_count_and_size(self, table_name, index_name).map_err(dyno_to_backend)
+    }
+
+    async fn set_item_sizes(
+        &self,
+        table_name: &str,
+        sizes: &[(String, String, usize)],
+    ) -> Result<(), BackendError> {
+        Storage::set_item_sizes(self, table_name, sizes).map_err(dyno_to_backend)
+    }
+
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {
         Storage::db_size_bytes(self).map_err(dyno_to_backend)
     }

@@ -283,6 +283,14 @@ axis is the captured one: a write's
 plus the item size of the rest of the projected entry, held to a 1KB floor, and
 matches eu-west-2 byte for byte across fixtures from 3 to 512 dimensions.
 
+The base table charges the vector the same way. On a table with a vector index,
+an attribute an index reads costs its name plus `4 * dimensions` in a write's
+units and in `TableSizeBytes`, whatever numbers it holds, while read units and
+the 400 KB item limit size it as the list of numbers it is. Both rules are
+DynamoDB's, captured in eu-west-2 and us-east-1 at 1, 3, 6, 8, 256 and 1,024
+dimensions. A vector index's `ItemCount` and `IndexSizeBytes` count its entries
+and total their write figure without the floor.
+
 A vector index is not reachable through PartiQL, matching AWS: naming one in a
 `"table"."index"` qualifier answers `Scan operation not supported on this index
 type`. PartiQL reads of the base table return the vector attribute like any

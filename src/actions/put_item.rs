@@ -348,12 +348,14 @@ async fn execute_inner<S: StorageBackend>(
     crate::validation::normalize_item_sets(&mut request.item);
 
     // Size again, now over what is actually written: the figure recorded
-    // alongside the row and the capacity charged for the write. It matches the
-    // limit check above, which measured the request as it arrived, because a
+    // alongside the row and the capacity charged for the write. This is the
+    // billed size, which counts a vector attribute at 4 bytes per dimension;
+    // the limit check above keeps the number rule, as DynamoDB's does. On a
+    // table without vector indexes the two are the same figure, because a
     // number is sized by its significant digits and normalising does not change
-    // those. Do not reintroduce a measure that counts characters, or the two
-    // sites drift apart and an over-limit item gets stored.
-    let size = types::item_size(&request.item);
+    // those.
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+    let size = types::billed_item_size(&request.item, &vector_defs);
 
     // Extract key values
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
@@ -529,7 +531,12 @@ async fn execute_inner<S: StorageBackend>(
 
     let consumed_capacity = types::consumed_capacity_with_vector_indexes(
         &request.table_name,
-        types::table_write_capacity_units(old_item.as_ref().map(types::item_size), Some(size)),
+        types::table_write_capacity_units(
+            old_item
+                .as_ref()
+                .map(|old| types::billed_item_size(old, &vector_defs)),
+            Some(size),
+        ),
         &gsi_units,
         &lsi_units,
         &vector_bytes,

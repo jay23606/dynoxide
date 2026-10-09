@@ -829,6 +829,43 @@ pub fn item_size(item: &Item) -> usize {
         .sum()
 }
 
+/// The bytes DynamoDB bills a vector at: its f32 width, 4 bytes per
+/// dimension, whatever numbers it holds. Shared by the base item's billed size
+/// and the vector index entry.
+pub(crate) fn vector_billed_bytes(dimensions: u32) -> usize {
+    4 * dimensions as usize
+}
+
+/// The size DynamoDB bills a write of `item` at, and the figure TableSizeBytes
+/// sums, on a table whose vector indexes are `vector_indexes`.
+///
+/// An attribute a vector index reads costs its name plus
+/// [`vector_billed_bytes`], once however many indexes read it; everything else
+/// is sized as [`item_size`] sizes it. Read units and the 400 KB limit still
+/// use [`item_size`]: DynamoDB sizes the vector by its numbers for both.
+/// Captured eu-west-2 and us-east-1, 2026-10-09, at 1, 3, 6, 8, 256 and 1,024
+/// dimensions, with two indexes on different attributes charged their own
+/// dimensions each.
+///
+/// A value that is not a valid vector for its index is sized as usual. A live
+/// write refuses one, so only an item written before the index existed can
+/// hold one, and the index skips it too.
+pub(crate) fn billed_item_size(item: &Item, vector_indexes: &[VectorIndex]) -> usize {
+    if vector_indexes.is_empty() {
+        return item_size(item);
+    }
+    item.iter()
+        .map(|(name, value)| {
+            let billed = vector_indexes
+                .iter()
+                .filter(|vix| vix.vector_attribute.attribute_name == *name)
+                .find(|vix| vector_f32_values(value, vix.dimensions).is_some())
+                .map(|vix| vector_billed_bytes(vix.dimensions));
+            name.len() + billed.unwrap_or_else(|| value.size())
+        })
+        .sum()
+}
+
 /// Maximum item size in bytes (400 KB).
 pub const MAX_ITEM_SIZE: usize = 400 * 1024;
 

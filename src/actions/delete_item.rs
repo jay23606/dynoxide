@@ -447,10 +447,17 @@ pub async fn execute<S: StorageBackend>(
     )
     .await?;
 
-    // Calculate consumed capacity from old item size (write for delete)
+    // Calculate consumed capacity from old item size (write for delete), on the
+    // billed size, as every write is.
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
     let consumed_capacity = types::consumed_capacity_with_vector_indexes(
         &request.table_name,
-        types::table_write_capacity_units(old_item.as_ref().map(types::item_size), None),
+        types::table_write_capacity_units(
+            old_item
+                .as_ref()
+                .map(|old| types::billed_item_size(old, &vector_defs)),
+            None,
+        ),
         &gsi_units,
         &lsi_units,
         &vector_bytes,

@@ -173,19 +173,27 @@ impl WasmBridgeBackend {
             clock: SystemClock::arc(),
         };
         // A database an earlier build wrote may hold a multi-attribute GSI keyed
-        // on its first attributes only. Rebuild those through the path the
-        // native migration takes, then record the version so it runs once.
-        if recorded_version
-            .is_some_and(|v| v < crate::actions::gsi::MULTI_ATTRIBUTE_KEY_SCHEMA_VERSION)
-        {
-            crate::actions::gsi::rebuild_multi_attribute_gsis(&backend)
-                .await
-                .map_err(|e| {
-                    BackendError::Io(format!("rebuilding multi-attribute indexes: {e}"))
-                })?;
-            backend
-                .record_schema_version(sql_builders::SCHEMA_VERSION)
-                .await?;
+        // on its first attributes only, and number-rule sizes for the items of
+        // a vector table. Bring both up to date through the paths the native
+        // migrations take, then record the version so each runs once.
+        if let Some(recorded) = recorded_version {
+            if recorded < crate::actions::gsi::MULTI_ATTRIBUTE_KEY_SCHEMA_VERSION {
+                crate::actions::gsi::rebuild_multi_attribute_gsis(&backend)
+                    .await
+                    .map_err(|e| {
+                        BackendError::Io(format!("rebuilding multi-attribute indexes: {e}"))
+                    })?;
+            }
+            if recorded < crate::actions::vector_index::VECTOR_BILLED_SIZE_SCHEMA_VERSION {
+                crate::actions::vector_index::recompute_vector_table_sizes(&backend)
+                    .await
+                    .map_err(|e| {
+                        BackendError::Io(format!("recomputing vector table sizes: {e}"))
+                    })?;
+                backend
+                    .record_schema_version(sql_builders::SCHEMA_VERSION)
+                    .await?;
+            }
         }
         // Record the schema version (if none is recorded yet) so future wasm
         // schema changes can migrate versioned, as the native backend does,
@@ -1189,6 +1197,27 @@ impl StorageBackend for WasmBridgeBackend {
             let (sql, params) = sql_builders::lsi_entries_item_json(table_name, index_name);
             self.count_and_size_entries(&sql, params).await
         }
+    }
+
+    async fn vector_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(i64, i64), BackendError> {
+        let (sql, params) = sql_builders::vector_count_and_size(table_name, index_name);
+        self.count_and_size(&sql, params).await
+    }
+
+    async fn set_item_sizes(
+        &self,
+        table_name: &str,
+        sizes: &[(String, String, usize)],
+    ) -> Result<(), BackendError> {
+        for (pk, sk, size) in sizes {
+            let (sql, params) = sql_builders::set_item_size(table_name, pk, sk, *size);
+            self.exec(&sql, params).await?;
+        }
+        Ok(())
     }
 
     // --- Introspection ---------------------------------------------------

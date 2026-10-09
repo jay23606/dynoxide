@@ -4,7 +4,7 @@ use crate::actions::lsi;
 use crate::errors::{DynoxideError, Result};
 use crate::storage_backend::BaseItemRow;
 use crate::storage_backend::StorageBackend;
-use crate::types::item_size;
+use crate::types::billed_item_size;
 use crate::{ImportOptions, ImportResult};
 use web_time::SystemTime;
 
@@ -122,11 +122,13 @@ async fn execute_inner<S: StorageBackend>(
             // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
             let (pk, sk) = helpers::extract_key_strings(&item, &key_schema)?;
 
-            // 6. Serialize and calculate size
+            // 6. Serialize and calculate size: the billed size, which
+            // TableSizeBytes sums, with a vector attribute at 4 bytes per
+            // dimension.
             let item_json = serde_json::to_string(&item).map_err(|e| {
                 DynoxideError::InternalServerError(format!("JSON serialization failed: {e}"))
             })?;
-            let size = item_size(&item);
+            let size = billed_item_size(&item, &vector_defs);
             total_bytes += size;
 
             // Compute hash prefix for parallel scan ordering

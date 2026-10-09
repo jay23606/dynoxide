@@ -770,6 +770,22 @@ pub trait StorageBackend: private::Sealed {
         whole_items: bool,
     ) -> Result<(i64, i64), BackendError>;
 
+    /// The number of entries in a vector index and the total of their stored
+    /// billable sizes: its `ItemCount` and `IndexSizeBytes`.
+    async fn vector_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(i64, i64), BackendError>;
+
+    /// Rewrite the stored `item_size` of the given rows, each a
+    /// `(pk, sk, item_size)`, leaving the rows otherwise unchanged.
+    async fn set_item_sizes(
+        &self,
+        table_name: &str,
+        sizes: &[(String, String, usize)],
+    ) -> Result<(), BackendError>;
+
     // -----------------------------------------------------------------------
     // Introspection
     // -----------------------------------------------------------------------

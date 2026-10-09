@@ -227,9 +227,21 @@ impl WriteCapacity {
     ///
     /// The record carries no after-image, because the check leaves none behind.
     /// `table_write_capacity_units` charges a present-then-absent pair on the
-    /// old image alone, which is the captured figure.
-    pub fn condition_check(table_name: &str, item: Option<&Item>) -> Self {
-        Self::from_items(table_name, item, None, HashMap::new(), HashMap::new())
+    /// old image alone, which is the captured figure. The image is taken at its
+    /// billed size, a vector attribute at 4 bytes per dimension, as other
+    /// write charges are.
+    pub fn condition_check(
+        table_name: &str,
+        item: Option<&Item>,
+        vector_indexes: &[crate::types::VectorIndex],
+    ) -> Self {
+        Self::new(
+            table_name,
+            item.map(|i| crate::types::billed_item_size(i, vector_indexes)),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+        )
     }
 }
 
@@ -970,7 +982,7 @@ mod tests {
         // Capture K2: a condition check whose target does not exist reports
         // table 2. Built through the constructor the action actually calls,
         // rather than through an equivalent-looking `new`.
-        let record = WriteCapacity::condition_check("t", None);
+        let record = WriteCapacity::condition_check("t", None, &[]);
         assert_eq!(record.old_size, None);
         assert_eq!(record.new_size, None);
 
@@ -983,7 +995,7 @@ mod tests {
         // Capture F1: a condition check against a 3023B item reports table 6,
         // despite writing nothing. Sizing it on the key would report 2.
         let existing = item(&[("pk", "f1"), ("sk", "1"), ("other", &pad(3000))]);
-        let record = WriteCapacity::condition_check("t", Some(&existing));
+        let record = WriteCapacity::condition_check("t", Some(&existing), &[]);
         assert!(record.gsi_units.is_empty());
         assert!(record.lsi_units.is_empty());
 

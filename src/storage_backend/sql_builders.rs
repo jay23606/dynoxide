@@ -106,7 +106,7 @@ pub(crate) const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribu
 /// migration chain off it; the wasm backend records it on open (see
 /// [`init_schema_version`]) so future wasm schema changes can migrate
 /// versioned instead of accreting one unconditional ALTER per column.
-pub const SCHEMA_VERSION: &str = "10";
+pub const SCHEMA_VERSION: &str = "11";
 
 /// Add the `vector_index_definitions` column to `_tables`.
 ///
@@ -508,6 +508,28 @@ pub fn item_count_and_size(table_name: &str) -> (String, Vec<SqlParam<'static>>)
     )
 }
 
+/// Set one stored item's `item_size` in place, leaving the row otherwise as it
+/// is. Used when what an item is billed at changes without the item changing,
+/// such as a vector index being created on or deleted from its table.
+pub fn set_item_size<'a>(
+    table_name: &str,
+    pk: &'a str,
+    sk: &'a str,
+    item_size: usize,
+) -> (String, Vec<SqlParam<'a>>) {
+    (
+        format!(
+            "UPDATE \"{}\" SET item_size = ?3 WHERE pk = ?1 AND sk = ?2",
+            escape_table_name(table_name)
+        ),
+        vec![
+            SqlParam::text(pk),
+            SqlParam::text(sk),
+            SqlParam::Integer(item_size as i64),
+        ],
+    )
+}
+
 // --- Secondary index tables (GSI/LSI) -----------------------------------
 
 /// Create a GSI table plus its base-key index (a two-statement batch).
@@ -817,6 +839,21 @@ pub fn gsi_count_and_size_from_base(
         &format!("{table_name}::gsi::{index_name}"),
         "table_pk",
         "table_sk",
+    )
+}
+
+/// Count a vector index's entries and total the billable size each write
+/// stored with its entry: the index's `ItemCount` and `IndexSizeBytes`.
+pub fn vector_count_and_size(
+    table_name: &str,
+    index_name: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    (
+        format!(
+            "SELECT COUNT(*), COALESCE(SUM(entry_bytes), 0) FROM \"{}\"",
+            escape_table_name(&format!("{table_name}::vector::{index_name}"))
+        ),
+        Vec::new(),
     )
 }
 
