@@ -175,6 +175,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishes a prerelease to `next`, and containers still get the exact tag
   only. `docs/versioning.md` has the full list.
 
+### Fixed
+
+- `docs/library.md` no longer tells readers to run
+  `cargo add dynoxide-rs --features encryption`, which stops on the
+  `native-sqlite` and `encryption` compile guard because the default features
+  stay on. It now adds `--no-default-features`, as the rest of the page does.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security
