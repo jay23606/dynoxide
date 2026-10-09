@@ -1376,12 +1376,7 @@ async fn execute_select<S: StorageBackend>(
             }
         }
 
-        if idx
-            .def
-            .hash_attrs
-            .iter()
-            .all(|attr| keys_index(where_clause, attr))
-        {
+        if keys_index(where_clause, read_pk) {
             let missing: Vec<String> = where_attributes(where_clause)
                 .into_iter()
                 .filter(|attr| !idx.projects(attr, table_key_schema))
@@ -1544,30 +1539,14 @@ async fn evaluate_window<S: StorageBackend>(
     consistent_read: bool,
     order: Option<&OrderPlan>,
 ) -> Result<Window> {
-    // A keyed read needs an equality on every partition key attribute: one for
-    // a table or an LSI, up to four for a GSI with a multi-attribute key.
-    let hash_attrs: Vec<&str> = match index {
-        Some(idx) => idx.def.hash_attrs.iter().map(String::as_str).collect(),
-        None => vec![read_pk],
-    };
-    let pk_conditions: Option<Vec<&crate::partiql::parser::Condition>> =
-        where_clause.and_then(|wc| {
-            hash_attrs
-                .iter()
-                .map(|attr| find_pk_condition(wc, attr))
-                .collect()
-        });
+    // A keyed read needs an equality on the partition key. An index whose key
+    // has more than one attribute never gets here: its reads are refused first
+    // (see `reject_multi_attribute_index`).
+    let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, read_pk));
     // A partition key value no key can have only gets this far when the clause
     // isn't read by key (see `check_read_key_types`), and it matches no row.
-    let pk_key = match pk_conditions {
-        Some(pk_conds) => {
-            let pk_vals = pk_conds
-                .iter()
-                .map(|c| resolve_value(&c.value, parameters))
-                .collect::<Result<Vec<_>>>()?;
-            let pk_refs: Vec<&AttributeValue> = pk_vals.iter().collect();
-            Some(crate::actions::gsi::composite_key_string(&pk_refs))
-        }
+    let pk_key = match pk_condition {
+        Some(cond) => Some(resolve_value(&cond.value, parameters)?.to_key_string()),
         None => None,
     };
 
@@ -1592,13 +1571,8 @@ async fn evaluate_window<S: StorageBackend>(
         // than rows in the whole partition, which is how DynamoDB paces a
         // key-bound read. find_pk_condition only fires on a single-OR-group
         // WHERE, so the group holding the sort-key conditions is unambiguous.
-        // A multi-attribute sort key is stored as one composite string, which a
-        // condition on its first attribute cannot bound, so nothing is pushed
-        // down for it: the partition is read whole and the WHERE clause
-        // filters it, which stays correct.
-        let single_sort_key = index.is_none_or(|idx| idx.def.range_attrs.len() <= 1);
         let sk_conditions = match (read_sk, where_clause) {
-            (Some(sk_name), Some(wc)) if single_sort_key => {
+            (Some(sk_name), Some(wc)) => {
                 translate_sk_conditions(&wc.groups[0], sk_name, parameters)
             }
             _ => None,
