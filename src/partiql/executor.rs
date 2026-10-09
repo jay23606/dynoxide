@@ -2459,14 +2459,11 @@ async fn execute_update<S: StorageBackend>(
     let key_schema = &resolved.key_schema;
 
     // WHERE clause is required for UPDATE to identify the item
-    let wc = where_clause.ok_or_else(|| {
-        DynoxideError::ValidationException("UPDATE requires a WHERE clause".to_string())
-    })?;
+    let wc = where_clause.ok_or_else(mandatory_key_equality)?;
 
-    // An UPDATE addresses one item, so the clause has to name one. Judged on the
-    // flattened groups rather than on the syntax, which was wrong both ways
-    // round: see `single_item_key`.
-    let (pk_str, sk_str) = single_item_key("UPDATE", wc, key_schema, parameters)?;
+    // An UPDATE addresses one item, named by the clause's top-level key
+    // equalities: see `single_item_key`.
+    let (pk_str, sk_str) = single_item_key(wc, key_schema, parameters)?;
 
     // Get existing item
     let existing_json = storage.get_item(table_name, &pk_str, &sk_str).await?;
@@ -2739,15 +2736,12 @@ async fn execute_delete<S: StorageBackend>(
     let meta = &resolved.meta;
     let key_schema = &resolved.key_schema;
 
-    let wc = where_clause.ok_or_else(|| {
-        DynoxideError::ValidationException("DELETE requires a WHERE clause".to_string())
-    })?;
+    let wc = where_clause.ok_or_else(mandatory_key_equality)?;
 
-    // A DELETE addresses one item, so the clause has to name one, including the
-    // sort key where the table has one. Judged on the flattened groups rather
-    // than on the syntax, which was wrong both ways round: see
+    // A DELETE addresses one item, named by the clause's top-level key
+    // equalities, the sort key included where the table has one: see
     // `single_item_key`.
-    let (pk_str, sk_str) = single_item_key("DELETE", wc, key_schema, parameters)?;
+    let (pk_str, sk_str) = single_item_key(wc, key_schema, parameters)?;
 
     // Non-key WHERE predicates act as a condition on the existing item, like a
     // conditional write. AWS raises ConditionalCheckFailedException when the item
@@ -2823,87 +2817,59 @@ async fn require_table<S: StorageBackend>(
     crate::actions::helpers::require_table_for_item_op(storage, table_name).await
 }
 
-/// Find a comparison condition matching a given path with Eq operator,
-/// searching across all OR groups.
 /// The single item a write's WHERE clause addresses, as `(pk, sk)` key strings,
 /// or the rejection to give the author.
 ///
-/// UPDATE and DELETE address exactly one item, so their WHERE clause has to name
-/// exactly one. Judging that on what the author wrote is wrong in both
-/// directions once De Morgan is involved. `NOT (NOT pk='a' AND NOT pk='b')`
-/// contains no `OR` and names two items, and it used to be accepted and then
-/// silently write only one of them. `pk='a' AND NOT (v='x' OR v='y')` contains
-/// an `OR` and names one item, and it used to be refused. So the judgement is
-/// made on the flattened clause: every group has to pin the same partition key
-/// equality, and the same sort key equality where the table has one.
-///
-/// `wrote_or` survives only to choose the wording, so an author who wrote an
-/// `OR` still hears about their `OR` rather than about a flattening they never
-/// asked for.
+/// UPDATE and DELETE address exactly one item, and DynamoDB takes it from the
+/// equalities among the clause's top-level conditions, the ones joined to the
+/// rest by `AND` alone. A key named only under an `OR`, a `NOT` or an `IN` is
+/// not pinned, even when every branch names the same item: `pk = 'a' OR pk =
+/// 'a'` and `NOT (NOT pk = 'a')` are both refused, while `pk = 'a' AND (b = 1
+/// OR c = 2)` runs with the `OR` as a condition. A key given two different
+/// values is refused on its own terms (captured eu-west-2 and us-east-1,
+/// 2026-10-09).
 fn single_item_key(
-    verb: &str,
     wc: &WhereClause,
     key_schema: &crate::actions::helpers::KeySchema,
     parameters: &[AttributeValue],
 ) -> Result<(String, String)> {
-    // A clause that never expanded can only fail by leaving a key unpinned, and
-    // that is the message AWS gives for it.
-    let unpinned = || {
-        DynoxideError::ValidationException(
-            "Where clause does not contain a mandatory equality on all key attributes".to_string(),
-        )
-    };
-    let expands = || {
-        DynoxideError::ValidationException(if wc.wrote_or {
-            format!("{verb} does not support OR conditions in WHERE clause")
-        } else {
-            format!("{verb} requires a WHERE clause that identifies a single item")
-        })
-    };
-    // More than one group means the clause is a disjunction, however it was
-    // spelled, so a group that fails is a second item rather than a typo.
-    let refusal = || {
-        if wc.groups.len() > 1 {
-            expands()
-        } else {
-            unpinned()
-        }
-    };
-
-    let mut pinned: Option<(String, String)> = None;
-    for group in &wc.groups {
-        let pk_cond = find_comparison(group, &key_schema.partition_key).ok_or_else(refusal)?;
-        let pk = typed_key(
-            &resolve_value(&pk_cond.value, parameters)?,
-            &key_schema.partition_key,
-            Some(&key_schema.partition_key_type),
-        )?;
-        let sk = match key_schema.sort_key {
-            Some(ref sk_name) => {
-                let sk_cond = find_comparison(group, sk_name).ok_or_else(refusal)?;
-                typed_key(
-                    &resolve_value(&sk_cond.value, parameters)?,
-                    sk_name,
-                    key_schema.sort_key_type.as_ref(),
-                )?
-            }
-            None => String::new(),
-        };
-        let key = (pk, sk);
-        match pinned {
-            // Every group has to name the same item, or the statement addresses
-            // more than one and cannot run as a single write.
-            Some(ref already) => {
-                if *already != key {
-                    return Err(expands());
+    let pinned = |name: &str, declared: Option<&ScalarAttributeType>| -> Result<String> {
+        let mut key: Option<String> = None;
+        for cond in wc.top_level_equalities.iter().filter(|c| c.path == name) {
+            let value = typed_key(&resolve_value(&cond.value, parameters)?, name, declared)?;
+            match key {
+                Some(ref already) if *already != value => {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "Multiple conditions on same key {name}. Only single item \
+                         Update/Insert/Delete are supported"
+                    )));
                 }
+                _ => key = Some(value),
             }
-            None => pinned = Some(key),
         }
-    }
-    pinned.ok_or_else(unpinned)
+        key.ok_or_else(mandatory_key_equality)
+    };
+    let pk = pinned(
+        &key_schema.partition_key,
+        Some(&key_schema.partition_key_type),
+    )?;
+    let sk = match key_schema.sort_key {
+        Some(ref sk_name) => pinned(sk_name, key_schema.sort_key_type.as_ref())?,
+        None => String::new(),
+    };
+    Ok((pk, sk))
 }
 
+/// DynamoDB's refusal of an UPDATE or DELETE that doesn't pin its key with
+/// top-level equalities, a missing WHERE clause included.
+fn mandatory_key_equality() -> DynoxideError {
+    DynoxideError::ValidationException(
+        "Where clause does not contain a mandatory equality on all key attributes".to_string(),
+    )
+}
+
+/// Find a comparison condition matching a given path with Eq operator,
+/// searching across all OR groups.
 fn find_comparison_in_groups<'a>(
     groups: &'a [Vec<WhereCondition>],
     path: &str,

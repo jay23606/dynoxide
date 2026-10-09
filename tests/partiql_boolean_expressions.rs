@@ -621,7 +621,12 @@ fn a_not_that_names_two_items_in_an_update_where_is_refused() {
         })
         .expect_err("a clause naming two items must not run as one write")
         .to_string();
-    assert!(err.contains("identifies a single item"), "got {err}");
+    // DynamoDB's words for a key not pinned by a top-level equality (captured
+    // eu-west-2 and us-east-1, 2026-10-09).
+    assert!(
+        err.contains("Where clause does not contain a mandatory equality on all key attributes"),
+        "got {err}"
+    );
     // And nothing was written on the way to the refusal.
     assert_eq!(selects(&db, "b='z'"), "");
 }
@@ -636,14 +641,18 @@ fn a_not_that_names_two_items_in_a_delete_where_is_refused() {
         })
         .expect_err("a clause naming two items must not run as one delete")
         .to_string();
-    assert!(err.contains("identifies a single item"), "got {err}");
+    assert!(
+        err.contains("Where clause does not contain a mandatory equality on all key attributes"),
+        "got {err}"
+    );
     assert_eq!(selects(&db, "pk='1' OR pk='2'"), "1,2");
 }
 
 #[test]
 fn an_or_in_an_update_where_is_still_refused() {
-    // The control. An OR the author did write is still refused, and the
-    // message still names it.
+    // The control. An OR the author did write is still refused, in DynamoDB's
+    // words: a key named only under an OR is not pinned (captured eu-west-2 and
+    // us-east-1, 2026-10-09).
     let db = seeded();
     let err = db
         .execute_statement(ExecuteStatementRequest {
@@ -652,5 +661,8 @@ fn an_or_in_an_update_where_is_still_refused() {
         })
         .expect_err("an OR in an UPDATE WHERE is refused")
         .to_string();
-    assert!(err.contains("does not support OR conditions"), "got {err}");
+    assert!(
+        err.contains("Where clause does not contain a mandatory equality on all key attributes"),
+        "got {err}"
+    );
 }

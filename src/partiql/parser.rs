@@ -342,6 +342,13 @@ pub struct WhereClause {
     /// what the author actually wrote, so it is recorded here before the
     /// flattening rather than inferred from the result of it.
     pub wrote_or: bool,
+    /// The equalities among the clause's top-level conditions: those joined to
+    /// the rest by `AND` alone, outside any `OR` or `NOT`, parentheses aside.
+    /// An UPDATE or DELETE takes its key from these and only these, as
+    /// DynamoDB does: `pk = 'a' OR pk = 'a'` names one item but is refused,
+    /// and `pk = 'a' AND (b = 1 OR c = 2)` is accepted (captured eu-west-2 and
+    /// us-east-1, 2026-10-09).
+    pub(crate) top_level_equalities: Vec<Condition>,
 }
 
 impl WhereClause {
@@ -355,7 +362,11 @@ impl WhereClause {
     /// it, and flattens `pk='x' AND NOT (a=1 OR b=2)` from a clause that has one
     /// into groups that all name the same item.
     pub fn from_groups_written(groups: Vec<Vec<WhereCondition>>, wrote_or: bool) -> Self {
-        Self { groups, wrote_or }
+        Self {
+            groups,
+            wrote_or,
+            top_level_equalities: Vec::new(),
+        }
     }
 }
 
@@ -486,6 +497,7 @@ pub(crate) fn parse_statement(input: &str) -> Result<Statement, ParseFailure> {
             Err("Expected FROM after DELETE".into())
         }
         "DELETE" => parse_delete(&mut tokenizer),
+        "FROM" if next.as_deref().is_some_and(is_name) => parse_from_first(&mut tokenizer),
         // A statement that does not begin with a DML keyword is not valid
         // PartiQL, and DynamoDB says why by reading it as an expression.
         _ => {
@@ -1383,45 +1395,53 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     let target = parse_table_name(t)?;
     reject_alias(t)?;
 
-    // SET and REMOVE are both optional but at least one must be present.
-    // Parse SET clauses if the next keyword is SET.
-    let mut set_clauses = Vec::new();
-    let mut remove_paths = Vec::new();
-
-    if let Some(ref tok) = t.peek_token()?
-        && tok.eq_ignore_ascii_case("SET")
-    {
-        t.next_token()?; // consume SET
-        loop {
-            let path_tok = t.next_token()?.ok_or("Expected attribute path in SET")?;
-            let path = parse_dotted_path_from_token(&path_tok, t)?;
-
-            let eq = t.next_token()?.ok_or("Expected '='")?;
-            if eq != "=" {
-                return Err(format!("Expected '=' but got '{eq}'").into());
-            }
-
-            let value = parse_set_value(t)?;
-            set_clauses.push(SetClause { path, value });
-
-            match t.peek_token()? {
-                Some(ref s) if s == "," => {
-                    t.next_token()?; // consume comma
-                }
-                _ => break,
-            }
-        }
+    let (set_clauses, remove_paths) = parse_update_clauses(t)?;
+    if set_clauses.is_empty() && remove_paths.is_empty() {
+        return Err("UPDATE requires at least one SET or REMOVE clause".into());
     }
 
-    // Check for REMOVE keyword
-    if let Some(ref tok) = t.peek_token()?
-        && tok.eq_ignore_ascii_case("REMOVE")
-    {
-        t.next_token()?; // consume REMOVE
+    let where_clause = parse_optional_where(t)?;
+    let returning = parse_optional_returning(t)?;
+
+    Ok(Statement::Update {
+        table_name: target.name,
+        index_name: target.index,
+        set_clauses,
+        remove_paths,
+        where_clause,
+        returning,
+    })
+}
+
+/// Read an UPDATE's `SET` and `REMOVE` clauses: any number of each, in any
+/// order, each a comma-separated list (captured eu-west-2 and us-east-1,
+/// 2026-10-09: `SET c = 1 REMOVE a SET d = 2` and `REMOVE a REMOVE b` both
+/// run). A keyword with nothing after it is a path missing.
+fn parse_update_clauses(t: &mut Tokenizer) -> Result<(Vec<SetClause>, Vec<String>), String> {
+    let mut set_clauses = Vec::new();
+    let mut remove_paths = Vec::new();
+    while let Some(keyword) = t.peek_token()? {
+        let remove = if is_keyword(&keyword, "SET") {
+            false
+        } else if is_keyword(&keyword, "REMOVE") {
+            true
+        } else {
+            break;
+        };
+        t.next_token()?;
         loop {
-            let path_tok = t.next_token()?.ok_or("Expected attribute path in REMOVE")?;
+            let path_tok = t.next_token()?.ok_or(EXPECTED_SIMPLE_PATH)?;
             let path = parse_dotted_path_from_token(&path_tok, t)?;
-            remove_paths.push(path);
+            if remove {
+                remove_paths.push(path);
+            } else {
+                let eq = t.next_token()?.ok_or("Expected '='")?;
+                if eq != "=" {
+                    return Err(format!("Expected '=' but got '{eq}'"));
+                }
+                let value = parse_set_value(t)?;
+                set_clauses.push(SetClause { path, value });
+            }
             match t.peek_token()? {
                 Some(ref s) if s == "," => {
                     t.next_token()?;
@@ -1430,14 +1450,32 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, ParseError> {
             }
         }
     }
+    Ok((set_clauses, remove_paths))
+}
 
-    if set_clauses.is_empty() && remove_paths.is_empty() {
-        return Err("UPDATE requires at least one SET or REMOVE clause".into());
+/// `FROM "T" [WHERE ...] SET ...|REMOVE ... [RETURNING ...]`, which DynamoDB
+/// runs as an UPDATE. The WHERE clause comes before the SET and REMOVE
+/// clauses; one after them is a token left over. Without a SET or REMOVE the
+/// statement has no verb, and a WHERE with nothing before its SET reads as
+/// one with no verb too (captured eu-west-2 and us-east-1, 2026-10-09).
+fn parse_from_first(t: &mut Tokenizer) -> Result<Statement, ParseError> {
+    const NO_VERB: &str = "Expected data manipulation";
+    let target = parse_table_name(t)?;
+    reject_alias(t)?;
+    let is_dml_keyword = |tok: Option<String>| {
+        tok.is_some_and(|tok| is_keyword(&tok, "SET") || is_keyword(&tok, "REMOVE"))
+    };
+    if t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "WHERE"))
+        && is_dml_keyword(t.peek_token_at(1)?)
+    {
+        return Err(NO_VERB.into());
     }
-
     let where_clause = parse_optional_where(t)?;
+    if !is_dml_keyword(t.peek_token()?) {
+        return Err(NO_VERB.into());
+    }
+    let (set_clauses, remove_paths) = parse_update_clauses(t)?;
     let returning = parse_optional_returning(t)?;
-
     Ok(Statement::Update {
         table_name: target.name,
         index_name: target.index,
@@ -1678,8 +1716,10 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
         Some(ref s) if s.eq_ignore_ascii_case("WHERE") => {
             t.next_token()?; // consume WHERE
             t.clause = LiteralClause::Where;
-            let (groups, wrote_or) = parse_conditions_with_or(t)?;
-            Ok(Some(WhereClause::from_groups_written(groups, wrote_or)))
+            let (groups, wrote_or, top_level_equalities) = parse_conditions_with_or(t)?;
+            let mut clause = WhereClause::from_groups_written(groups, wrote_or);
+            clause.top_level_equalities = top_level_equalities;
+            Ok(Some(clause))
         }
         _ => Ok(None),
     }
@@ -1692,11 +1732,32 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
 /// `OR`. That has to be read off the tree before `push_not_down` runs: De Morgan
 /// turns a negated conjunction into a disjunction, so counting groups afterwards
 /// reports an `OR` in a clause that never had one.
-fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<(Vec<Vec<WhereCondition>>, bool), String> {
+fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, String> {
     let expr = parse_or_expr(t, 0)?;
     let wrote_or = contains_or(&expr);
+    let mut equalities = Vec::new();
+    top_level_equalities(&expr, &mut equalities);
     let expr = push_not_down(expr, false)?;
-    Ok((to_dnf(expr)?, wrote_or))
+    Ok((to_dnf(expr)?, wrote_or, equalities))
+}
+
+/// A WHERE clause's OR-groups, whether it was written with an `OR`, and the
+/// equalities among its top-level conditions.
+type ParsedConditions = (Vec<Vec<WhereCondition>>, bool, Vec<Condition>);
+
+/// Collect the `path = value` conditions joined to the rest of the clause by
+/// `AND` alone. Parentheses leave no node of their own, so a parenthesised
+/// conjunction counts; an `OR` or a `NOT` hides everything under it.
+fn top_level_equalities(expr: &BoolExpr, out: &mut Vec<Condition>) {
+    match expr {
+        BoolExpr::And(terms) => terms
+            .iter()
+            .for_each(|term| top_level_equalities(term, out)),
+        BoolExpr::Leaf(WhereCondition::Comparison(cond)) if cond.op == CompOp::Eq => {
+            out.push(cond.clone())
+        }
+        _ => {}
+    }
 }
 
 /// Whether an expression as parsed holds an `OR` anywhere.

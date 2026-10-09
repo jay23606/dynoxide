@@ -287,6 +287,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator` when nothing follows `AND` or `OR`, and `Unexpected operator` or
   `Unexpected keyword` when an operator or a clause keyword stands in its
   place. It used to say `Expected condition in WHERE`.
+- PartiQL runs `FROM "T" WHERE ... SET ...` (or `REMOVE ...`) as an UPDATE, as
+  DynamoDB does, where it used to say `Expected data manipulation`, and an
+  UPDATE of either form takes any number of SET and REMOVE clauses in any
+  order. An UPDATE or DELETE takes its key only from equalities among the WHERE
+  clause's top-level conditions: a key named only under an `OR`, a `NOT` or an
+  `IN`, or no WHERE clause at all, is refused with `Where clause does not
+  contain a mandatory equality on all key attributes`, and a key given two
+  values with `Multiple conditions on same key`. `pk = 'a' AND pk = 'b'` used
+  to update the first item it named.
 - PartiQL refuses a `begins_with` operand that isn't a string or binary, and
   BETWEEN bounds of different types or with the lower above the upper, with
   DynamoDB's messages, `NOT` or not, before the table is looked up.
