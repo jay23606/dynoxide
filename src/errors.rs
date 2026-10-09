@@ -12,7 +12,11 @@ pub struct CancellationReason {
     pub code: String,
     #[serde(rename = "Message", skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Item",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::item_in_hash_order"
+    )]
     pub item: Option<HashMap<String, crate::types::AttributeValue>>,
 }
 

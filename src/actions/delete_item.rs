@@ -152,6 +152,18 @@ pub async fn execute<S: StorageBackend>(
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_item_table_name(&request.table_name)?;
 
+    // An empty attribute name is refused as the request is read, ahead of every
+    // other value check, the condition and the table lookup (captured in ten
+    // regions). The values may still be raw JSON at this point.
+    crate::empty_names::check_single_item_write(
+        &request.key,
+        false,
+        request.expected.as_ref(),
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+        request.expression_attribute_values_raw.as_ref(),
+    )?;
+
     // Validate expression/non-expression parameter conflicts
     {
         let mut non_expr = Vec::new();

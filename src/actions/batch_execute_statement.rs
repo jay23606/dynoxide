@@ -124,7 +124,11 @@ pub struct BatchExecuteStatementResponse {
 pub struct BatchStatementResponse {
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     pub error: Option<BatchStatementError>,
-    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Item",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::item_in_hash_order"
+    )]
     pub item: Option<Item>,
     /// The member statement's target table, echoed on a successful response
     /// (with or without an `Item`), matching DynamoDB. Omitted on a
@@ -241,6 +245,20 @@ pub async fn execute<S: StorageBackend>(
                 error: Some(BatchStatementError {
                     code: "ValidationError".to_string(),
                     message: msg,
+                }),
+                item: None,
+                table_name: None,
+            });
+            continue;
+        }
+
+        // A parameter holding an empty attribute name fails its own statement,
+        // and the rest of the batch runs (captured in ten regions).
+        if crate::empty_names::parameters_have_empty_name(stmt_req.parameters.as_deref()) {
+            responses.push(BatchStatementResponse {
+                error: Some(BatchStatementError {
+                    code: "ValidationError".to_string(),
+                    message: crate::empty_names::MESSAGE.to_string(),
                 }),
                 item: None,
                 table_name: None,

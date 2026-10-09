@@ -60,6 +60,8 @@ compile_error!(
 pub mod actions;
 pub mod auth_material;
 pub mod bench_counters;
+// Where DynamoDB refuses an empty attribute name, and how it words it.
+pub(crate) mod empty_names;
 pub mod errors;
 pub mod expressions;
 #[cfg(feature = "import")]
@@ -72,6 +74,8 @@ pub mod mcp;
 pub(crate) mod net;
 pub mod partiql;
 pub mod schema;
+// The order DynamoDB returns set members in, per operation.
+pub(crate) mod set_order;
 // Surface-neutral mapping of serde failures to DynamoDB errors; the HTTP
 // server consumes the request wrappers and the shared message cleaning is
 // used wherever raw serde messages are decoded by hand.

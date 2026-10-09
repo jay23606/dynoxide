@@ -132,6 +132,21 @@ pub async fn execute<S: StorageBackend>(
     // --- Pre-table validations ---
     // DynamoDB validates attribute values, item size, and empty write requests
     // BEFORE checking table existence.
+
+    // An empty attribute name in an item or a key is refused bare, before
+    // anything else here, a missing table included (captured in ten regions).
+    let empty_name = request.request_items.values().flatten().any(|wr| {
+        wr.put_request
+            .as_ref()
+            .is_some_and(|put| crate::empty_names::map_has_empty_name(&put.item))
+            || wr
+                .delete_request
+                .as_ref()
+                .is_some_and(|delete| crate::empty_names::map_has_empty_name(&delete.key))
+    });
+    if empty_name {
+        return Err(crate::empty_names::bare());
+    }
     for write_requests in request.request_items.values() {
         for wr in write_requests {
             if wr.put_request.is_none() && wr.delete_request.is_none() {

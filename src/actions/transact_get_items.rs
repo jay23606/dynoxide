@@ -102,7 +102,11 @@ pub struct TransactGetItemsResponse {
 
 #[derive(Debug, Default, Serialize)]
 pub struct TransactGetResponse {
-    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Item",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::item_in_hash_order"
+    )]
     pub item: Option<Item>,
 }
 
@@ -156,6 +160,29 @@ pub async fn execute<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(msg));
     }
 
+    // An empty attribute name in a key or the expression names is a top-level
+    // rejection, not a cancellation reason, ahead of the table lookups
+    // (captured in ten regions).
+    for transact_item in &request.transact_items {
+        let get = &transact_item.get;
+        if crate::empty_names::map_has_empty_name(&get.key) {
+            return Err(crate::empty_names::bare());
+        }
+        if let Some(placeholder) =
+            crate::empty_names::empty_placeholder(get.expression_attribute_names.as_ref())
+        {
+            return Err(DynoxideError::ValidationException(
+                crate::empty_names::placeholder_message(placeholder),
+            ));
+        }
+    }
+
+    // A key nested too deep fails the whole request at the top level, before
+    // any table is looked up.
+    for transact_item in &request.transact_items {
+        crate::value_nesting::check_key(&transact_item.get.key)?;
+    }
+
     // Per-action validation pass.
     //
     // AWS surfaces per-action validation failures (empty Key, schema mismatch,
@@ -166,12 +193,6 @@ pub async fn execute<S: StorageBackend>(
     // for a missing partition or sort key, which would leak as HTTP 500
     // instead of a per-action ValidationError. validate_key_only is the
     // ValidationException-returning equivalent.
-    // A key nested too deep fails the whole request at the top level, before
-    // any table is looked up.
-    for transact_item in &request.transact_items {
-        crate::value_nesting::check_key(&transact_item.get.key)?;
-    }
-
     let mut reasons: Vec<CancellationReason> = Vec::with_capacity(request.transact_items.len());
     let mut validated_schemas: Vec<Option<helpers::KeySchema>> =
         Vec::with_capacity(request.transact_items.len());

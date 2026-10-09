@@ -1345,11 +1345,14 @@ fn validate_key_attr_value(value: &AttributeValue) -> Result<()> {
     Ok(())
 }
 
-/// Normalize sets within an item by deduplicating them in-place.
+/// Normalize sets within an item by deduplicating and sorting them in-place.
 ///
-/// - SS: deduplicates by string value
-/// - NS: deduplicates by numeric value (e.g., "1.0" and "1" are the same)
-/// - BS: deduplicates by byte content
+/// - SS: deduplicates by string value, then sorts by bytes
+/// - NS: deduplicates by numeric value (e.g., "1.0" and "1" are the same),
+///   then sorts by value
+/// - BS: deduplicates by byte content, then sorts by bytes
+///
+/// The sorted order is the one DynamoDB stores and returns sets in.
 ///
 /// Recursively normalizes sets inside L (list) and M (map) values.
 pub fn normalize_item_sets(item: &mut Item) {
@@ -1366,6 +1369,7 @@ fn normalize_attribute_sets(value: &mut AttributeValue) {
         AttributeValue::SS(set) => {
             let mut seen = std::collections::HashSet::new();
             set.retain(|s| seen.insert(s.clone()));
+            crate::set_order::sort_string_set(set);
         }
         AttributeValue::NS(set) => {
             let mut seen = std::collections::HashSet::new();
@@ -1374,10 +1378,12 @@ fn normalize_attribute_sets(value: &mut AttributeValue) {
             for n in set.iter_mut() {
                 *n = crate::types::normalize_dynamo_number(n);
             }
+            crate::set_order::sort_number_set(set);
         }
         AttributeValue::BS(set) => {
             let mut seen = std::collections::HashSet::new();
             set.retain(|b| seen.insert(b.clone()));
+            crate::set_order::sort_binary_set(set);
         }
         AttributeValue::L(list) => {
             for v in list.iter_mut() {

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3e951854d7cd29a9de3c7a735b3b3fd0bc30e68c419917c8bc150771746dba59 # shrinks to val = SS(["p", "a"])
+cc 1ad6dfdbbd2dab774a2d228c26e8ca708e66e15238e852c1e79ba2bbefae252d # shrinks to item = {"a": NS(["8293", "0"])}

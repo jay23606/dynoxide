@@ -135,6 +135,54 @@ pub async fn execute<S: StorageBackend>(
     Ok(execute_cached(storage, request).await?.response)
 }
 
+/// Refuse an empty attribute name in one action: in the item or key (bare),
+/// in its expression names, or in its expression values. The values are
+/// reported naming their key, as eight of ten regions do; eu-west-2 and
+/// eu-north-1 answer the bare message.
+fn empty_name_in_write_action(item: &TransactWriteItem) -> Result<()> {
+    let (attributes, names, values) = if let Some(ref put) = item.put {
+        (
+            &put.item,
+            put.expression_attribute_names.as_ref(),
+            put.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(ref update) = item.update {
+        (
+            &update.key,
+            update.expression_attribute_names.as_ref(),
+            update.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(ref delete) = item.delete {
+        (
+            &delete.key,
+            delete.expression_attribute_names.as_ref(),
+            delete.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(ref check) = item.condition_check {
+        (
+            &check.key,
+            check.expression_attribute_names.as_ref(),
+            check.expression_attribute_values.as_ref(),
+        )
+    } else {
+        return Ok(());
+    };
+    if crate::empty_names::map_has_empty_name(attributes) {
+        return Err(crate::empty_names::bare());
+    }
+    if let Some(placeholder) = crate::empty_names::empty_placeholder(names) {
+        return Err(DynoxideError::ValidationException(
+            crate::empty_names::placeholder_message(placeholder),
+        ));
+    }
+    if let Some(key) = crate::empty_names::value_placeholder(values, None) {
+        return Err(DynoxideError::ValidationException(
+            crate::empty_names::value_placeholder_message(key),
+        ));
+    }
+    Ok(())
+}
+
 /// The request-level checks, in the order DynamoDB reports them: the
 /// `TransactItems` length; then the request's own members, `ClientRequestToken`,
 /// `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`, reported together
@@ -301,6 +349,13 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
     check_request(&request)?;
     let items = &request.transact_items;
 
+    // An empty attribute name anywhere in an action is a top-level rejection,
+    // after the request's own members and ahead of the table lookups and the
+    // transaction (captured in ten regions).
+    for item in items {
+        empty_name_in_write_action(item)?;
+    }
+
     // Validate: each action's request-only checks (value depth, Put item,
     // expression sizes and condition syntax), in request order, before any
     // table is looked up (#223). The request's own members come first, as
@@ -309,8 +364,6 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         validate_action_request(item)?;
     }
 
-    // Validate: no duplicate item targets. A key that can't be stringified (non-scalar
-    // or missing) is skipped here and reported by the in-loop validation instead (#95).
     // A Delete, ConditionCheck or Update key nested too deep fails the whole
     // request at the top level, before any table is looked up.
     for item in items {
@@ -325,6 +378,8 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         }
     }
 
+    // Validate: no duplicate item targets. A key that can't be stringified (non-scalar
+    // or missing) is skipped here and reported by the in-loop validation instead (#95).
     let mut seen_targets = HashSet::new();
     for item in items {
         if let Some(target) = get_item_target(storage, item).await?

@@ -187,7 +187,11 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
 
 #[derive(Debug, Default, Serialize)]
 pub struct ScanResponse {
-    #[serde(rename = "Items", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Items",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::items_in_hash_order"
+    )]
     pub items: Option<Vec<Item>>,
     #[serde(rename = "Count")]
     pub count: usize,
@@ -205,6 +209,45 @@ pub async fn execute<S: StorageBackend>(
 ) -> Result<ScanResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_scan_table_name(&request.table_name)?;
+
+    // An empty attribute name is refused ahead of the table lookup and the
+    // expressions (captured in ten regions). AttributesToGet and a ScanFilter
+    // value answer bare; the ExclusiveStartKey and the expression values name
+    // what they are, as seven of the ten regions do (eu-west-2, eu-central-1 and
+    // ap-southeast-2 answer bare). An empty name in ScanFilter itself is accepted.
+    if crate::empty_names::names_include_empty(request.attributes_to_get.as_ref())
+        || crate::empty_names::filter_values_have_empty_name(request.scan_filter.as_ref())
+    {
+        return Err(crate::empty_names::bare());
+    }
+    if request
+        .exclusive_start_key
+        .as_ref()
+        .is_some_and(crate::empty_names::map_has_empty_name)
+        || request
+            .exclusive_start_key_raw
+            .as_ref()
+            .is_some_and(crate::empty_names::json_map_has_empty_name)
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "The provided starting key is invalid: {}",
+            crate::empty_names::MESSAGE
+        )));
+    }
+    if let Some(placeholder) =
+        crate::empty_names::empty_placeholder(request.expression_attribute_names.as_ref())
+    {
+        return Err(DynoxideError::ValidationException(
+            crate::empty_names::placeholder_message(placeholder),
+        ));
+    }
+    if let Some(key) =
+        crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
+    {
+        return Err(DynoxideError::ValidationException(
+            crate::empty_names::value_placeholder_message(key),
+        ));
+    }
 
     // ---- Expression vs non-expression mixing validation ----
     {
