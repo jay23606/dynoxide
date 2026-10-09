@@ -358,7 +358,7 @@ Parameter placeholders (`?`) supported in all positions including nested list/ma
 | Empty set rejection | Enforced on all write paths |
 | Number precision (38 digits, ±1E+126 range) | Enforced on all write paths |
 | Set deduplication (SS/NS/BS) | Enforced on all write paths |
-| 400KB item size limit | Enforced |
+| 400KB item size limit | Enforced. A standalone `UpdateItem` is also held to a charge worked out from its request, as DynamoDB holds it; `TransactWriteItems` updates and PartiQL `UPDATE` are measured by the finished item |
 | Unused ExpressionAttributeNames/Values | Rejected with ValidationException |
 | ReturnValues parameter validation | Enforced (PutItem, DeleteItem accept only NONE/ALL_OLD) |
 | Key attribute protection | UpdateItem rejects REMOVE/ADD/DELETE on key attributes |

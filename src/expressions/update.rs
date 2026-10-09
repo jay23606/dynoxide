@@ -64,30 +64,139 @@ pub struct DeleteAction {
 }
 
 impl UpdateExpr {
-    /// Bytes DynamoDB adds on top of the resulting item when it measures an
-    /// update against the 400KB limit.
+    /// What DynamoDB charges a standalone `UpdateItem` for this statement when
+    /// it holds the request to the 400KB limit.
     ///
-    /// An update is not sized the way a put is. DynamoDB leaves the key
-    /// attributes out of the figure and charges a fixed amount per action, so
-    /// the same finished item can be small enough to `PutItem` and too large to
-    /// reach by `UpdateItem`. Measured against eu-west-2 by bisecting the gate:
-    /// three bytes for the update itself, nineteen for each action that writes a
-    /// value, and two for each that clears one. The cost does not vary with the
-    /// value written, the attribute name, or the expression text.
+    /// The charge comes from the request alone. Nothing the table already
+    /// stores enters it: an attribute the statement leaves alone, the rest of a
+    /// map or list it writes into, the members a set already holds and the value
+    /// a path operand reads are all free. Each clause is charged for its target
+    /// path and for the operands it is written with, never for the value it
+    /// produces:
     ///
-    /// Two forms cost more than this reports, both of which leave the engine
-    /// accepting a little more than DynamoDB rather than less: assigning through
-    /// a list index costs one byte more, and an arithmetic assignment such as
-    /// `SET n = n + :one` costs fifty more.
-    pub fn size_overhead(&self) -> usize {
-        const UPDATE: usize = 3;
+    /// ```text
+    /// statement              3 + every clause
+    /// SET target = expr      19 + target + expr
+    /// ADD target :v          19 + target + size of :v
+    /// REMOVE target          1 + target
+    /// DELETE target :v       1 + target (the members removed are free)
+    ///
+    /// target                 first element, plus 4 + element for each later one
+    /// path operand           1, plus 14 + element for every element
+    /// element                UTF-8 bytes of the resolved name, or the digits
+    ///                        of a list index
+    ///
+    /// :v                     the value's size, at every use
+    /// a + b                  34 + a + b
+    /// a - b                  37 + a + b
+    /// if_not_exists(p, v)    39 + path operand p + v
+    /// list_append(a, b)      37 + a + b
+    /// ( x )                  x
+    /// ```
+    ///
+    /// Captured against eu-west-2 on 9 October 2026 by bisecting the update
+    /// gate across 86 statements, with every accepted item read back and the
+    /// next byte refused. The ConditionExpression and ReturnValues add nothing,
+    /// and a `#name` placeholder is charged at the length of the name it stands
+    /// for. Names and values must already be validated; one that does not
+    /// resolve is an error.
+    pub fn request_charge(&self, tracker: &TrackedExpressionAttributes) -> Result<usize, String> {
+        const STATEMENT: usize = 3;
         const WRITES_A_VALUE: usize = 19;
-        const CLEARS_A_VALUE: usize = 2;
+        const CLEARS: usize = 1;
 
-        UPDATE
-            + WRITES_A_VALUE * (self.set_actions.len() + self.add_actions.len())
-            + CLEARS_A_VALUE * (self.remove_actions.len() + self.delete_actions.len())
+        let mut charge = STATEMENT;
+        for action in &self.set_actions {
+            charge += WRITES_A_VALUE
+                + target_charge(&action.path, tracker)?
+                + set_value_charge(&action.value, tracker)?;
+        }
+        for action in &self.add_actions {
+            charge += WRITES_A_VALUE
+                + target_charge(&action.path, tracker)?
+                + tracker.resolve_value(&action.value_ref)?.size();
+        }
+        for path in &self.remove_actions {
+            charge += CLEARS + target_charge(path, tracker)?;
+        }
+        for action in &self.delete_actions {
+            charge += CLEARS + target_charge(&action.path, tracker)?;
+        }
+        Ok(charge)
     }
+}
+
+/// The length a path element counts for in the request charge.
+fn element_charge(
+    element: &PathElement,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<usize, String> {
+    Ok(match element {
+        PathElement::Attribute(name) if name.starts_with('#') => tracker.resolve_name(name)?.len(),
+        PathElement::Attribute(name) => name.len(),
+        PathElement::Index(index) => index.to_string().len(),
+    })
+}
+
+/// A path the statement writes to: its first element, then four bytes plus
+/// the element for each step after it.
+fn target_charge(
+    path: &[PathElement],
+    tracker: &TrackedExpressionAttributes,
+) -> Result<usize, String> {
+    const STEP: usize = 4;
+    let mut charge = 0;
+    for (i, element) in path.iter().enumerate() {
+        charge += element_charge(element, tracker)? + if i == 0 { 0 } else { STEP };
+    }
+    Ok(charge)
+}
+
+/// A path the statement reads from. Charged for the path alone; the value it
+/// reads is free.
+fn path_operand_charge(
+    path: &[PathElement],
+    tracker: &TrackedExpressionAttributes,
+) -> Result<usize, String> {
+    const OPERAND: usize = 1;
+    const STEP: usize = 14;
+    let mut charge = OPERAND;
+    for element in path {
+        charge += STEP + element_charge(element, tracker)?;
+    }
+    Ok(charge)
+}
+
+fn set_value_charge(
+    value: &SetValue,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<usize, String> {
+    const PLUS: usize = 34;
+    const MINUS: usize = 37;
+    Ok(match value {
+        SetValue::Operand(operand) => operand_charge(operand, tracker)?,
+        SetValue::Plus(a, b) => PLUS + operand_charge(a, tracker)? + operand_charge(b, tracker)?,
+        SetValue::Minus(a, b) => MINUS + operand_charge(a, tracker)? + operand_charge(b, tracker)?,
+    })
+}
+
+fn operand_charge(
+    operand: &SetOperand,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<usize, String> {
+    const IF_NOT_EXISTS: usize = 39;
+    const LIST_APPEND: usize = 37;
+    Ok(match operand {
+        SetOperand::Path(path) => path_operand_charge(path, tracker)?,
+        SetOperand::ValueRef(name) => tracker.resolve_value(name)?.size(),
+        SetOperand::IfNotExists(path, fallback) => {
+            IF_NOT_EXISTS + path_operand_charge(path, tracker)? + operand_charge(fallback, tracker)?
+        }
+        SetOperand::ListAppend(a, b) => {
+            LIST_APPEND + operand_charge(a, tracker)? + operand_charge(b, tracker)?
+        }
+        SetOperand::Group(inner) => set_value_charge(inner, tracker)?,
+    })
 }
 
 /// Parse an UpdateExpression string.
@@ -508,10 +617,20 @@ pub fn apply(
     // reads see the original snapshot. (Overlapping target paths are rejected by
     // `check_path_overlaps`, so no SET can legitimately read another's output.)
     let snapshot = item.clone();
+    let mut writes = Vec::with_capacity(expr.set_actions.len());
     for action in &expr.set_actions {
         let resolved_path = resolve_path_elements(&action.path, tracker)?;
         let value = evaluate_set_value(&action.value, &snapshot, tracker)?;
-        set_path(item, &resolved_path, value)?;
+        writes.push((resolved_path, value));
+    }
+    // A SET past the end of a list appends, and two of them on the same list
+    // append in the order of their indexes rather than of their clauses
+    // (eu-west-2, 9 October 2026). Every value is already worked out from the
+    // snapshot and no two targets overlap, so writing in path order changes
+    // nothing else.
+    writes.sort_by(|(a, _), (b, _)| compare_paths(a, b));
+    for (path, value) in writes {
+        set_path(item, &path, value)?;
     }
 
     // Process REMOVE actions
@@ -539,6 +658,24 @@ pub fn apply(
     }
 
     Ok(())
+}
+
+/// Order two resolved paths element by element, with list indexes compared as
+/// numbers.
+fn compare_paths(a: &[PathElement], b: &[PathElement]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (x, y) in a.iter().zip(b) {
+        let order = match (x, y) {
+            (PathElement::Attribute(x), PathElement::Attribute(y)) => x.cmp(y),
+            (PathElement::Index(x), PathElement::Index(y)) => x.cmp(y),
+            (PathElement::Attribute(_), PathElement::Index(_)) => Ordering::Less,
+            (PathElement::Index(_), PathElement::Attribute(_)) => Ordering::Greater,
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -971,43 +1108,199 @@ fn format_number(n: &bigdecimal::BigDecimal) -> String {
 }
 
 #[cfg(test)]
-mod overhead_tests {
+mod charge_tests {
     use super::parse;
+    use crate::expressions::TrackedExpressionAttributes;
+    use crate::types::AttributeValue;
+    use std::collections::HashMap;
 
-    /// Ground truth measured against eu-west-2 by bisecting the update gate and
-    /// reading the accepted item back, so the figures are the true item sizes
-    /// rather than predicted ones. Each entry is the overhead DynamoDB added on
-    /// top of the resulting item once the key attributes were taken out.
-    #[test]
-    fn size_overhead_matches_dynamodb() {
-        let cases: &[(&str, usize)] = &[
-            ("SET b = :v", 22),
-            ("SET b = :v, c = :w", 41),
-            ("SET b = :v REMOVE r", 24),
-            ("SET b = :v DELETE t :d", 24),
-            ("SET b = :v ADD n :one", 41),
-            ("SET b = :v, m.f = :w", 41),
-            ("REMOVE r", 5),
-            ("REMOVE r, s", 7),
-        ];
-        for (expr, expected) in cases {
-            let parsed = parse(expr).unwrap_or_else(|e| panic!("parse {expr:?}: {e}"));
-            assert_eq!(parsed.size_overhead(), *expected, "overhead of {expr:?}");
-        }
+    fn s(len: usize) -> AttributeValue {
+        AttributeValue::S("x".repeat(len))
     }
 
-    /// The two forms the model knowingly under-charges. Both leave the engine
-    /// accepting a little more than DynamoDB, never less, which is the direction
-    /// to be wrong in. Asserted exactly rather than as a bound, so that dropping
-    /// the per-action charge altogether fails here instead of passing.
+    fn values() -> HashMap<String, AttributeValue> {
+        let list = |items: Vec<AttributeValue>| AttributeValue::L(items);
+        HashMap::from([
+            (":v1".to_string(), s(1)),
+            (":v10".to_string(), s(10)),
+            (":s100".to_string(), s(100)),
+            (":one".to_string(), AttributeValue::N("1".to_string())),
+            (
+                ":big".to_string(),
+                AttributeValue::N("12345678901234567890".to_string()),
+            ),
+            (":lst".to_string(), list(vec![s(10)])),
+            (":empty".to_string(), list(vec![])),
+            (":b100".to_string(), AttributeValue::B(vec![7; 100])),
+            (":true".to_string(), AttributeValue::BOOL(true)),
+            (":null".to_string(), AttributeValue::NULL(true)),
+            (
+                ":ns".to_string(),
+                AttributeValue::NS(vec!["1".to_string(), "22".to_string(), "333".to_string()]),
+            ),
+            (
+                ":bs".to_string(),
+                AttributeValue::BS(vec![vec![1; 100], vec![2; 50]]),
+            ),
+            (
+                ":map".to_string(),
+                AttributeValue::M(HashMap::from([("a".to_string(), s(100))])),
+            ),
+            (
+                ":mixed".to_string(),
+                list(vec![s(100), AttributeValue::N("5".to_string())]),
+            ),
+        ])
+    }
+
+    fn names() -> HashMap<String, String> {
+        HashMap::from([
+            ("#t".to_string(), "abcdefghij".to_string()),
+            ("#b".to_string(), "b".to_string()),
+            ("#e".to_string(), "\u{20ac}\u{20ac}".to_string()),
+            ("#a".to_string(), "\u{e9}".to_string()),
+            ("#m".to_string(), "\u{1f600}".to_string()),
+        ])
+    }
+
+    /// The charge of one statement, resolving only the names and values it uses.
+    fn charge(expr: &str) -> usize {
+        let names = Some(names());
+        let values = Some(values());
+        let tracker = TrackedExpressionAttributes::without_tracking(&names, &values);
+        parse(expr)
+            .unwrap_or_else(|e| panic!("parse {expr:?}: {e}"))
+            .request_charge(&tracker)
+            .unwrap_or_else(|e| panic!("charge {expr:?}: {e}"))
+    }
+
+    /// Every form the UpdateExpression grammar allows, at the cost eu-west-2
+    /// charged for it on 9 October 2026. Each figure is the whole statement:
+    /// three for the statement itself plus its clauses.
     #[test]
-    fn size_overhead_undercharges_the_two_known_forms() {
-        // DynamoDB charges 42 for a list-index assignment and 91 for arithmetic,
-        // against the 41 the model charges for either.
-        assert_eq!(parse("SET b = :v, l[0] = :w").unwrap().size_overhead(), 41);
-        assert_eq!(
-            parse("SET b = :v, n = n + :one").unwrap().size_overhead(),
-            41
+    fn each_form_is_charged_at_its_captured_cost() {
+        let cases: &[(&str, usize)] = &[
+            // Clauses, with a value operand.
+            ("SET b = :v1", 3 + 19 + 1 + 1),
+            ("SET #b = :v1", 3 + 19 + 1 + 1),
+            ("SET b = :v1, c = :v1", 3 + 2 * (19 + 1 + 1)),
+            ("ADD n :one", 3 + 19 + 1 + 2),
+            ("ADD abcdefghij :one", 3 + 19 + 10 + 2),
+            ("ADD m.n :one", 3 + 19 + 6 + 2),
+            ("REMOVE r", 3 + 1 + 1),
+            ("REMOVE abcdefghij", 3 + 1 + 10),
+            ("DELETE ss :v10", 3 + 1 + 2),
+            ("DELETE abcdefghij :v10", 3 + 1 + 10),
+            ("DELETE m.ss :v10", 3 + 1 + 7),
+            // Targets: the first element, then 4 plus each later element.
+            ("SET l[0] = :v10", 3 + 19 + 6 + 10),
+            ("SET l[10] = :v10", 3 + 19 + 7 + 10),
+            ("SET m.a.x = :v10", 3 + 19 + 11 + 10),
+            ("SET mmmmm.xxxxx = :v10", 3 + 19 + 14 + 10),
+            ("SET l[0].x = :v10", 3 + 19 + 11 + 10),
+            ("REMOVE l[1]", 3 + 1 + 6),
+            ("REMOVE l[10]", 3 + 1 + 7),
+            ("REMOVE m.y", 3 + 1 + 6),
+            ("REMOVE m.a.y", 3 + 1 + 11),
+            ("REMOVE abcdefghij[1]", 3 + 1 + 15),
+            // A name counts its UTF-8 bytes.
+            ("SET #e = :v10", 3 + 19 + 6 + 10),
+            ("SET #a = :v10", 3 + 19 + 2 + 10),
+            ("SET #m = :v10", 3 + 19 + 4 + 10),
+            ("SET m.#e = :v10", 3 + 19 + 11 + 10),
+            // Path operands: 1, then 14 plus each element; the value read is free.
+            ("SET c = big", 3 + 19 + 1 + 18),
+            ("SET c = abcdefghij", 3 + 19 + 1 + 25),
+            ("SET c = #t", 3 + 19 + 1 + 25),
+            ("SET c = #e", 3 + 19 + 1 + 21),
+            ("SET c = m.z", 3 + 19 + 1 + 31),
+            ("SET c = m.a.z", 3 + 19 + 1 + 46),
+            ("SET c = l[0]", 3 + 19 + 1 + 31),
+            ("SET c = l[10]", 3 + 19 + 1 + 32),
+            // Arithmetic, and parentheses, which cost nothing.
+            ("SET n = n + :one", 3 + 19 + 1 + 34 + 16 + 2),
+            ("SET n = :one + n", 3 + 19 + 1 + 34 + 16 + 2),
+            ("SET n = (n + :one)", 3 + 19 + 1 + 34 + 16 + 2),
+            ("SET n = n + :big", 3 + 19 + 1 + 34 + 16 + 11),
+            ("SET n = n + n", 3 + 19 + 1 + 34 + 16 + 16),
+            ("SET n = :v1 + :v10", 3 + 19 + 1 + 34 + 1 + 10),
+            ("SET n = n - :one", 3 + 19 + 1 + 37 + 16 + 2),
+            ("SET n = :v1 - :v10", 3 + 19 + 1 + 37 + 1 + 10),
+            ("SET #t = #t + :one", 3 + 19 + 10 + 34 + 25 + 2),
+            // if_not_exists and list_append.
+            ("SET c = if_not_exists(c, :v1)", 3 + 19 + 1 + 39 + 16 + 1),
+            ("SET l = list_append(l, :lst)", 3 + 19 + 1 + 37 + 16 + 14),
+            ("SET l = list_append(:lst, l)", 3 + 19 + 1 + 37 + 14 + 16),
+            (
+                "SET l = list_append(:empty, :lst)",
+                3 + 19 + 1 + 37 + 3 + 14,
+            ),
+            (
+                "SET l = list_append(if_not_exists(l, :empty), :lst)",
+                3 + 19 + 1 + 37 + (39 + 16 + 3) + 14,
+            ),
+            // Every value type costs its size, at every use.
+            (
+                "SET c = if_not_exists(c, :s100)",
+                3 + 19 + 1 + 39 + 16 + 100,
+            ),
+            (
+                "SET c = if_not_exists(c, :b100)",
+                3 + 19 + 1 + 39 + 16 + 100,
+            ),
+            ("SET c = if_not_exists(c, :true)", 3 + 19 + 1 + 39 + 16 + 1),
+            ("SET c = if_not_exists(c, :null)", 3 + 19 + 1 + 39 + 16 + 1),
+            ("SET c = if_not_exists(c, :ns)", 3 + 19 + 1 + 39 + 16 + 7),
+            ("SET c = if_not_exists(c, :bs)", 3 + 19 + 1 + 39 + 16 + 150),
+            ("SET c = if_not_exists(c, :map)", 3 + 19 + 1 + 39 + 16 + 105),
+            (
+                "SET c = if_not_exists(c, :mixed)",
+                3 + 19 + 1 + 39 + 16 + 107,
+            ),
+            (
+                "SET c = if_not_exists(c, :s100), d = if_not_exists(d, :s100)",
+                3 + 2 * (19 + 1 + 39 + 16 + 100),
+            ),
+            // Clauses add up.
+            (
+                "SET c = :v10 ADD n :one REMOVE r DELETE ss :v1",
+                3 + (19 + 1 + 10) + (19 + 1 + 2) + (1 + 1) + (1 + 2),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (expr, expected) in cases {
+            let got = charge(expr);
+            if got != *expected {
+                wrong.push(format!(
+                    "{expr:?}: charged {got}, eu-west-2 charges {expected}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} forms charged wrongly:\n{}",
+            wrong.len(),
+            cases.len(),
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn an_unresolved_name_or_value_is_an_error_rather_than_free() {
+        let names = None;
+        let values = None;
+        let tracker = TrackedExpressionAttributes::without_tracking(&names, &values);
+        assert!(
+            parse("SET b = :v")
+                .unwrap()
+                .request_charge(&tracker)
+                .is_err()
+        );
+        assert!(
+            parse("SET #b = b")
+                .unwrap()
+                .request_charge(&tracker)
+                .is_err()
         );
     }
 }

@@ -2470,10 +2470,10 @@ async fn execute_update<S: StorageBackend>(
     let item_size = crate::types::item_size(&item);
 
     // A PartiQL UPDATE is measured flat against the resulting item, the same as
-    // an INSERT, and unlike the standalone UpdateItem, which takes the key
-    // attributes out and charges per action. Captured against eu-west-2: an
-    // update this surface accepts at 409,600 is refused by UpdateItem at the
-    // same key. Only the wording is shared with UpdateItem.
+    // an INSERT, and unlike the standalone UpdateItem, which is also charged for
+    // what its request carries. Captured against eu-west-2: an update this
+    // surface accepts at 409,600 is refused by UpdateItem at the same key. Only
+    // the wording is shared with UpdateItem.
     if item_size > crate::types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
             "Item size to update has exceeded the maximum allowed size".to_string(),
