@@ -7,10 +7,11 @@ use crate::errors::{DynoxideError, Result};
 use crate::expressions::condition::compare_values;
 use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
 use crate::partiql::parser::{
-    CompOp, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause, WhereCondition,
+    CompOp, OrderByTerm, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause,
+    WhereCondition,
 };
 use crate::storage_backend::StorageBackend;
-use crate::types::{AttributeValue, Item};
+use crate::types::{AttributeValue, Item, ScalarAttributeType};
 use std::collections::HashMap;
 
 /// Execute a parsed PartiQL statement.
@@ -104,6 +105,835 @@ fn statement_where_clause(stmt: &Statement) -> Option<&WhereClause> {
     }
 }
 
+/// A key value as stored, or DynamoDB's refusal of a value that can't be a key:
+/// `Key value must be of type S, N, or B. Key name: pk, Key type: M` (captured
+/// eu-west-2, 2026-10-09, for a map; other types are named the same way).
+fn key_string(value: &AttributeValue, key_name: &str) -> Result<String> {
+    value.to_key_string().ok_or_else(|| {
+        DynoxideError::ValidationException(format!(
+            "Key value must be of type S, N, or B. Key name: {key_name}, Key type: {}",
+            value.type_name()
+        ))
+    })
+}
+
+/// Why a key value can't be used, in DynamoDB's words (captured eu-west-2 and
+/// us-east-1, 2026-10-09).
+#[derive(Debug)]
+pub(crate) enum KeyFault {
+    /// A type no key can have: a map, a list, a boolean, null or a set.
+    NotAKeyType(String),
+    /// A key type, but not the one the table declares for this key.
+    WrongType(String),
+}
+
+impl From<KeyFault> for DynoxideError {
+    fn from(fault: KeyFault) -> Self {
+        match fault {
+            KeyFault::NotAKeyType(message) | KeyFault::WrongType(message) => {
+                DynoxideError::ValidationException(message)
+            }
+        }
+    }
+}
+
+/// A key value as stored, checked against the type declared for the key: one
+/// no key can have is `Key value must be of type S, N, or B. Key name: pk, Key
+/// type: M`, and one of another key type is `Key attribute's data type should
+/// match its data type in table's schema: Key pk`. With no declared type to
+/// hand, only the first is checked.
+fn typed_key(
+    value: &AttributeValue,
+    key_name: &str,
+    declared: Option<&ScalarAttributeType>,
+) -> std::result::Result<String, KeyFault> {
+    let Some(stored) = value.to_key_string() else {
+        return Err(KeyFault::NotAKeyType(format!(
+            "Key value must be of type S, N, or B. Key name: {key_name}, Key type: {}",
+            value.type_name()
+        )));
+    };
+    let matches = match declared {
+        None => true,
+        Some(ScalarAttributeType::S) => matches!(value, AttributeValue::S(_)),
+        Some(ScalarAttributeType::N) => matches!(value, AttributeValue::N(_)),
+        Some(ScalarAttributeType::B) => matches!(value, AttributeValue::B(_)),
+    };
+    if !matches {
+        return Err(KeyFault::WrongType(format!(
+            "Key attribute's data type should match its data type in table's schema: Key {key_name}"
+        )));
+    }
+    Ok(stored)
+}
+
+/// The type `AttributeDefinitions` declares for an attribute.
+fn declared_attribute_type(
+    meta: &crate::storage::TableMetadata,
+    attr: &str,
+) -> Option<ScalarAttributeType> {
+    let defs: Vec<crate::types::AttributeDefinition> =
+        serde_json::from_str(&meta.attribute_definitions).ok()?;
+    defs.into_iter()
+        .find(|d| d.attribute_name == attr)
+        .map(|d| d.attribute_type)
+}
+
+/// One condition a branch of a WHERE clause puts on a key attribute: what it
+/// does and the values it names, resolved. `=` and `IN` are one kind, so
+/// `pk = 1` and `pk IN [1]` are the same condition.
+struct KeyCondition {
+    op: &'static str,
+    values: Vec<AttributeValue>,
+}
+
+impl PartialEq for KeyCondition {
+    fn eq(&self, other: &Self) -> bool {
+        self.op == other.op
+            && if self.op == "=" {
+                self.values.len() == other.values.len()
+                    && self.values.iter().all(|v| other.values.contains(v))
+            } else {
+                self.values == other.values
+            }
+    }
+}
+
+/// The distinct conditions a branch puts on one key attribute, in the order
+/// written; the same condition written twice counts once. A partition key is
+/// read by `=` and `IN`, a sort key by those, the ordering comparisons,
+/// `BETWEEN` and `begins_with`. `None` when a value can't be resolved, which is
+/// reported elsewhere.
+fn key_conditions(
+    group: &[WhereCondition],
+    key: &str,
+    sort_key: bool,
+    parameters: &[AttributeValue],
+) -> Option<Vec<KeyCondition>> {
+    let resolve = |values: &[&PartiqlValue]| -> Option<Vec<AttributeValue>> {
+        values
+            .iter()
+            .map(|v| resolve_value(v, parameters).ok())
+            .collect()
+    };
+    let mut found: Vec<KeyCondition> = Vec::new();
+    for cond in group {
+        let (op, values): (&'static str, Vec<&PartiqlValue>) = match cond {
+            WhereCondition::Comparison(c) if c.path == key => match c.op {
+                CompOp::Eq => ("=", vec![&c.value]),
+                CompOp::Lt if sort_key => ("<", vec![&c.value]),
+                CompOp::Le if sort_key => ("<=", vec![&c.value]),
+                CompOp::Gt if sort_key => (">", vec![&c.value]),
+                CompOp::Ge if sort_key => (">=", vec![&c.value]),
+                _ => continue,
+            },
+            WhereCondition::In(path, values) if path == key => ("=", values.iter().collect()),
+            WhereCondition::Between(path, lo, hi) if sort_key && path == key => {
+                ("BETWEEN", vec![lo, hi])
+            }
+            WhereCondition::BeginsWith(path, prefix) if sort_key && path == key => {
+                ("begins_with", vec![prefix])
+            }
+            _ => continue,
+        };
+        let mut resolved = resolve(&values)?;
+        if op == "=" {
+            let mut distinct = Vec::with_capacity(resolved.len());
+            for value in resolved {
+                if !distinct.contains(&value) {
+                    distinct.push(value);
+                }
+            }
+            resolved = distinct;
+        }
+        let condition = KeyCondition {
+            op,
+            values: resolved,
+        };
+        if !found.contains(&condition) {
+            found.push(condition);
+        }
+    }
+    Some(found)
+}
+
+/// Refuse a SELECT key value DynamoDB can't read the key by, as
+/// [`typed_key`] words it (captured eu-west-2 and us-east-1, 2026-10-09).
+///
+/// The OR branches are checked in the order written. A branch that names the
+/// partition key with one `=` or `IN` has its values checked, then the sort
+/// key's, whatever the condition on it. A branch that doesn't name the
+/// partition key, or names it or the sort key two different ways, ends the
+/// checking there, its own values unchecked, and what is left just filters:
+/// `pk = true AND pk = 'x'` returns nothing, and `a = 1 OR pk = true` returns
+/// nothing where `pk = true OR a = 1` is refused. `pk = 1 AND pk IN [1]` is one
+/// condition, as is the same one written twice.
+fn check_read_key_types(
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    read_pk: &str,
+    read_sk: Option<&str>,
+    declared: &dyn Fn(&str) -> Option<ScalarAttributeType>,
+) -> Result<()> {
+    let Some(wc) = where_clause else {
+        return Ok(());
+    };
+    for group in &wc.groups {
+        let Some(pk) = key_conditions(group, read_pk, false, parameters) else {
+            return Ok(());
+        };
+        let pk = match pk.as_slice() {
+            [one] => one,
+            _ => return Ok(()),
+        };
+        let sk = match read_sk {
+            Some(sk_name) => {
+                let Some(conditions) = key_conditions(group, sk_name, true, parameters) else {
+                    return Ok(());
+                };
+                if conditions.len() > 1 {
+                    return Ok(());
+                }
+                conditions.into_iter().next().map(|c| (sk_name, c.values))
+            }
+            None => None,
+        };
+        for (name, values) in std::iter::once((read_pk, pk.values.clone())).chain(sk) {
+            let declared = declared(name);
+            for value in &values {
+                typed_key(value, name, declared.as_ref())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a batch or a transaction makes of a SELECT. Both serve it as a
+/// GetItem, so its WHERE clause may name each key attribute with `=` and
+/// nothing else (captured eu-west-2, 2026-10-09: `WHERE pk = 'a' AND data = ?`
+/// is refused by both, where ExecuteStatement runs it).
+pub(crate) enum KeyedSelect {
+    /// It names exactly the primary key.
+    ByPrimaryKey,
+    /// It names something else as well, or not the whole key.
+    NotByPrimaryKey,
+    /// It names the key, with a value of a type no key can have; the message
+    /// is the one ExecuteStatement gives.
+    KeyType(String),
+}
+
+pub(crate) fn keyed_select(
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    resolved: &ResolvedTable,
+) -> KeyedSelect {
+    let Statement::Select {
+        where_clause: Some(wc),
+        ..
+    } = stmt
+    else {
+        return KeyedSelect::NotByPrimaryKey;
+    };
+    let [group] = wc.groups.as_slice() else {
+        return KeyedSelect::NotByPrimaryKey;
+    };
+    let schema = &resolved.key_schema;
+    let keys: Vec<(&str, Option<&ScalarAttributeType>)> = std::iter::once((
+        schema.partition_key.as_str(),
+        Some(&schema.partition_key_type),
+    ))
+    .chain(
+        schema
+            .sort_key
+            .as_deref()
+            .map(|sk| (sk, schema.sort_key_type.as_ref())),
+    )
+    .collect();
+    // Each condition has to be an `=`, or an `IN` with one value, on a key
+    // attribute; the same one written twice is still one (captured eu-west-2
+    // and us-east-1, 2026-10-09).
+    let names_a_key = |path: &str| keys.iter().any(|(name, _)| *name == path);
+    let single = group.iter().all(|cond| match cond {
+        WhereCondition::Comparison(c) => c.op == CompOp::Eq && names_a_key(&c.path),
+        WhereCondition::In(path, values) => values.len() == 1 && names_a_key(path),
+        _ => false,
+    });
+    if !single {
+        return KeyedSelect::NotByPrimaryKey;
+    }
+    let mut values = Vec::with_capacity(keys.len());
+    for (name, declared) in &keys {
+        let Some(conditions) = key_conditions(group, name, false, parameters) else {
+            return KeyedSelect::NotByPrimaryKey;
+        };
+        // `pk = 'a' AND pk IN ['a']` names one value (captured eu-west-2 and
+        // us-east-1, 2026-10-09).
+        let [KeyCondition { values: named, .. }] = conditions.as_slice() else {
+            return KeyedSelect::NotByPrimaryKey;
+        };
+        let [value] = named.as_slice() else {
+            return KeyedSelect::NotByPrimaryKey;
+        };
+        values.push((*name, *declared, value.clone()));
+    }
+    for (name, declared, value) in values {
+        if let Err(KeyFault::NotAKeyType(message) | KeyFault::WrongType(message)) =
+            typed_key(&value, name, declared)
+        {
+            return KeyedSelect::KeyType(message);
+        }
+    }
+    KeyedSelect::ByPrimaryKey
+}
+
+/// Refuse a SELECT in a batch or a transaction whose key conditions overlap,
+/// which DynamoDB checks before it checks that the SELECT names one item
+/// (captured eu-west-2 and us-east-1, 2026-10-09: `pk IN ['a', 'a'] AND sk =
+/// 1` is refused for overlapping).
+pub(crate) fn reject_overlapping_select(
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    resolved: &ResolvedTable,
+) -> Result<()> {
+    let Statement::Select { where_clause, .. } = stmt else {
+        return Ok(());
+    };
+    reject_overlapping_key_conditions(
+        where_clause.as_ref(),
+        parameters,
+        &resolved.key_schema.partition_key,
+        resolved.key_schema.sort_key.as_deref(),
+    )
+}
+
+/// Refuse the key value of an UPDATE or DELETE that DynamoDB refuses, as
+/// [`typed_key`] words it: what a transaction checks of a write's key before
+/// it runs anything.
+pub(crate) fn write_key_fault(
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    resolved: &ResolvedTable,
+) -> Option<KeyFault> {
+    let (Statement::Update {
+        where_clause: Some(wc),
+        ..
+    }
+    | Statement::Delete {
+        where_clause: Some(wc),
+        ..
+    }) = stmt
+    else {
+        return None;
+    };
+    let schema = &resolved.key_schema;
+    let keys = std::iter::once((&schema.partition_key, Some(&schema.partition_key_type))).chain(
+        schema
+            .sort_key
+            .as_ref()
+            .map(|sk| (sk, schema.sort_key_type.as_ref())),
+    );
+    let keys: Vec<_> = keys.collect();
+    for group in &wc.groups {
+        for (name, declared) in &keys {
+            let Some(cond) = find_comparison(group, name) else {
+                continue;
+            };
+            let Ok(value) = resolve_value(&cond.value, parameters) else {
+                continue;
+            };
+            if let Err(fault) = typed_key(&value, name, *declared) {
+                return Some(fault);
+            }
+        }
+    }
+    None
+}
+
+/// Check an INSERT's key the way a transaction does, with PutItem's messages:
+/// a key of the wrong type is `One or more parameter values were invalid: Type
+/// mismatch for key pk expected: N actual: M`, where ExecuteStatement and
+/// BatchExecuteStatement give `Key attribute's data type should match its data
+/// type in table's schema` (captured eu-west-2 and us-east-1, 2026-10-09).
+pub(crate) fn check_transaction_insert_keys(
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    resolved: &ResolvedTable,
+) -> Result<()> {
+    let Statement::Insert { item, .. } = stmt else {
+        return Ok(());
+    };
+    let item = resolve_insert_item(item, parameters)?;
+    crate::actions::helpers::validate_item_keys(&item, &resolved.key_schema, &resolved.meta)
+}
+
+/// Check one statement parameter as any attribute value is checked, with no
+/// path in the message: its numbers, and empty or duplicated sets. DynamoDB
+/// checks a statement's parameters before it reads the statement, whether it
+/// uses them or not, on `ExecuteStatement`, `BatchExecuteStatement` and
+/// `ExecuteTransaction` alike (captured eu-west-2 and us-east-1, 2026-10-09).
+pub(crate) fn check_parameter_value(value: &AttributeValue) -> Result<()> {
+    crate::validation::validate_parameter_value(value)
+}
+
+/// One thing a branch of a WHERE clause says about the sort key, as a stored
+/// key, so values compare in the key's own order.
+#[derive(PartialEq)]
+enum SortKeyAtom {
+    /// Equal to one of these.
+    Points(Vec<String>),
+    /// At least, or more than, this.
+    Above(String, bool),
+    /// At most, or less than, this.
+    Below(String, bool),
+    /// Starting with this.
+    Prefix(String),
+}
+
+/// Refuse a SELECT whose key conditions overlap, as DynamoDB does (captured
+/// eu-west-2 and us-east-1, 2026-10-09).
+///
+/// When every OR branch pins the partition key with `=` or `IN`, DynamoDB
+/// reads the clause as one key range per branch and partition, the sort key
+/// conditions narrowing each, and refuses it when two ranges share a key: the
+/// same partition named twice with no sort key condition between them, sort
+/// key ranges that meet (closed ends touching count), a key repeated in an
+/// `IN` list, or `1` and `1.0`. Other conditions don't narrow a range. A branch
+/// that doesn't pin the partition key makes the read a scan, and nothing is
+/// checked; nor is anything when a branch puts two different conditions on
+/// the sort key (`sk > 0 AND sk < 3`), though the same one twice counts once,
+/// or a `NOT ... BETWEEN` on it.
+fn reject_overlapping_key_conditions(
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Result<()> {
+    let overlap = || {
+        DynoxideError::ValidationException(
+            "Overlapping conditions with range keys are not supported in where clause".to_string(),
+        )
+    };
+    let Some(wc) = where_clause else {
+        return Ok(());
+    };
+    let key = |value: &PartiqlValue| {
+        resolve_value(value, parameters)
+            .ok()
+            .and_then(|av| av.to_key_string())
+    };
+    let keys_of = |values: &[PartiqlValue]| -> Result<Vec<String>> {
+        let keys: Vec<String> = values.iter().filter_map(key).collect();
+        let mut seen = std::collections::HashSet::new();
+        if keys.iter().any(|k| !seen.insert(k)) {
+            return Err(overlap());
+        }
+        Ok(keys)
+    };
+
+    let mut branches = Vec::with_capacity(wc.groups.len());
+    for group in &wc.groups {
+        let mut partitions: Option<Vec<String>> = None;
+        let mut narrow = |keys: Vec<String>| {
+            partitions = Some(match partitions.take() {
+                None => keys,
+                Some(held) => held.into_iter().filter(|k| keys.contains(k)).collect(),
+            });
+        };
+        // Each sort key condition as the atoms it stands for.
+        let mut conditions: Vec<Vec<SortKeyAtom>> = Vec::new();
+        let mut add = |atoms: Vec<SortKeyAtom>| {
+            if !conditions.contains(&atoms) {
+                conditions.push(atoms);
+            }
+        };
+        for cond in group {
+            match cond {
+                WhereCondition::Comparison(c) if c.path == read_pk && c.op == CompOp::Eq => {
+                    narrow(key(&c.value).into_iter().collect());
+                }
+                WhereCondition::In(path, values) if path == read_pk => narrow(keys_of(values)?),
+                WhereCondition::Comparison(c) if Some(c.path.as_str()) == read_sk => {
+                    if let Some(v) = key(&c.value) {
+                        match c.op {
+                            CompOp::Eq => add(vec![SortKeyAtom::Points(vec![v])]),
+                            CompOp::Lt => add(vec![SortKeyAtom::Below(v, false)]),
+                            CompOp::Le => add(vec![SortKeyAtom::Below(v, true)]),
+                            CompOp::Gt => add(vec![SortKeyAtom::Above(v, false)]),
+                            CompOp::Ge => add(vec![SortKeyAtom::Above(v, true)]),
+                            CompOp::Ne => {}
+                        }
+                    }
+                }
+                WhereCondition::Between(path, lo, hi) if Some(path.as_str()) == read_sk => {
+                    if let (Some(lo), Some(hi)) = (key(lo), key(hi)) {
+                        add(vec![
+                            SortKeyAtom::Above(lo, true),
+                            SortKeyAtom::Below(hi, true),
+                        ]);
+                    }
+                }
+                WhereCondition::In(path, values) if Some(path.as_str()) == read_sk => {
+                    add(vec![SortKeyAtom::Points(keys_of(values)?)]);
+                }
+                WhereCondition::BeginsWith(path, prefix) if Some(path.as_str()) == read_sk => {
+                    if let Some(prefix) = key(prefix) {
+                        add(vec![SortKeyAtom::Prefix(prefix)]);
+                    }
+                }
+                // Captured eu-west-2 and us-east-1, 2026-10-09: `pk = 'a' AND
+                // NOT sk BETWEEN 1 AND 2 OR pk = 'a' AND sk = 3` runs.
+                WhereCondition::NotBetween(path, _, _) if Some(path.as_str()) == read_sk => {
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        if conditions.len() > 1 {
+            return Ok(());
+        }
+        let atoms = conditions.into_iter().next().unwrap_or_default();
+        // A branch that doesn't pin the partition key is a scan, and so is the
+        // read as a whole.
+        let Some(partitions) = partitions else {
+            return Ok(());
+        };
+        branches.push((partitions, atoms));
+    }
+
+    for (i, (partitions, atoms)) in branches.iter().enumerate() {
+        for (other_partitions, other_atoms) in &branches[i + 1..] {
+            let shared = partitions.iter().any(|p| other_partitions.contains(p));
+            let both: Vec<&SortKeyAtom> = atoms.iter().chain(other_atoms).collect();
+            if shared && sort_keys_meet(&both) {
+                return Err(overlap());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether some sort key satisfies every atom at once.
+fn sort_keys_meet(atoms: &[&SortKeyAtom]) -> bool {
+    let mut low: Option<(&str, bool)> = None;
+    let mut high: Option<(&str, bool)> = None;
+    let mut points: Option<Vec<&str>> = None;
+    let mut prefix: Option<&str> = None;
+    for atom in atoms {
+        match atom {
+            SortKeyAtom::Above(v, inclusive) => {
+                low = Some(match low {
+                    Some((held, held_inclusive)) if held > v.as_str() => (held, held_inclusive),
+                    Some((held, held_inclusive)) if held == v.as_str() => {
+                        (held, held_inclusive && *inclusive)
+                    }
+                    _ => (v.as_str(), *inclusive),
+                });
+            }
+            SortKeyAtom::Below(v, inclusive) => {
+                high = Some(match high {
+                    Some((held, held_inclusive)) if held < v.as_str() => (held, held_inclusive),
+                    Some((held, held_inclusive)) if held == v.as_str() => {
+                        (held, held_inclusive && *inclusive)
+                    }
+                    _ => (v.as_str(), *inclusive),
+                });
+            }
+            SortKeyAtom::Points(values) => {
+                points = Some(match points {
+                    None => values.iter().map(String::as_str).collect(),
+                    Some(held) => held
+                        .into_iter()
+                        .filter(|p| values.iter().any(|v| v == p))
+                        .collect(),
+                });
+            }
+            SortKeyAtom::Prefix(p) => {
+                prefix = match prefix {
+                    None => Some(p.as_str()),
+                    Some(held) if p.starts_with(held) => Some(p.as_str()),
+                    Some(held) if held.starts_with(p.as_str()) => Some(held),
+                    Some(_) => return false,
+                };
+            }
+        }
+    }
+    let below_high = |v: &str| high.is_none_or(|(h, inclusive)| v < h || (inclusive && v == h));
+    let within = |v: &str| {
+        low.is_none_or(|(l, inclusive)| v > l || (inclusive && v == l))
+            && below_high(v)
+            && prefix.is_none_or(|p| v.starts_with(p))
+    };
+    if let Some(points) = points {
+        return points.into_iter().any(within);
+    }
+    match prefix {
+        // The smallest key that carries the prefix and clears the lower bound,
+        // then whether the upper bound lets it through.
+        Some(p) => {
+            let smallest = match low {
+                None => p.to_string(),
+                Some((l, inclusive)) if l.starts_with(p) => {
+                    if inclusive {
+                        l.to_string()
+                    } else {
+                        format!("{l}\0")
+                    }
+                }
+                Some((l, _)) if l < p => p.to_string(),
+                Some(_) => return false,
+            };
+            below_high(&smallest)
+        }
+        None => match (low, high) {
+            (Some((l, l_inclusive)), Some((h, h_inclusive))) => {
+                l < h || (l == h && l_inclusive && h_inclusive)
+            }
+            _ => true,
+        },
+    }
+}
+
+/// How a SELECT with an `ORDER BY` reads: which partitions, in what order, and
+/// which way through each.
+struct OrderPlan {
+    /// The partition keys to read, as stored, in the order to read them.
+    partitions: Vec<String>,
+    /// Whether each partition is read in ascending sort-key order.
+    forward: bool,
+}
+
+/// Check a SELECT's `ORDER BY` the way DynamoDB does, and work out the read it
+/// asks for (captured eu-west-2 and us-east-1, 2026-10-09).
+///
+/// DynamoDB serves `ORDER BY` as one Query per partition, so the clause can
+/// only name the read's key, and the WHERE clause has to pin the partition
+/// key with `=` or `IN` in every OR branch. The checks run in this order, each
+/// with its own message: a WHERE clause at all; each term in turn, first that
+/// it is a plain name and then that it is a key attribute; the partition key
+/// pinned in every branch, once; and, when more than one partition is named,
+/// the partition key among the terms.
+///
+/// The partitions are read in partition-key order, descending if that term
+/// says so, and each one by the sort key term's direction. With no sort key
+/// term each partition is read descending, whatever direction the partition
+/// key term gives: `ORDER BY pk ASC` returns 3, 2, 1, where `ORDER BY pk, sk`
+/// returns 1, 2, 3.
+fn check_order_terms(
+    order_by: &[OrderByTerm],
+    where_clause: Option<&WhereClause>,
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Result<()> {
+    let reject = |message: String| DynoxideError::ValidationException(message);
+    if where_clause.is_none() {
+        return Err(reject(
+            "Must have WHERE clause in the statement when using ORDER BY clause.".to_string(),
+        ));
+    }
+    for term in order_by {
+        if let Some(rejection) = &term.rejection {
+            return Err(reject(rejection.clone()));
+        }
+        if term.path != read_pk && Some(term.path.as_str()) != read_sk {
+            return Err(reject(format!(
+                "Attribute {} in ORDER BY clause must be part of the primary key",
+                term.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The rest of [`check_order_terms`]'s checks, once the key values and any
+/// overlap have been checked, and the read the clause asks for.
+fn plan_order(
+    order_by: &[OrderByTerm],
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Result<OrderPlan> {
+    let reject = |message: String| DynoxideError::ValidationException(message);
+    let Some(wc) = where_clause else {
+        return Err(reject(
+            "Must have WHERE clause in the statement when using ORDER BY clause.".to_string(),
+        ));
+    };
+    let mut partition_values = Vec::new();
+    for group in &wc.groups {
+        let pinned: Vec<Vec<&PartiqlValue>> = group
+            .iter()
+            .filter_map(|cond| match cond {
+                WhereCondition::Comparison(c) if c.path == read_pk && c.op == CompOp::Eq => {
+                    Some(vec![&c.value])
+                }
+                WhereCondition::In(path, values) if path == read_pk => {
+                    Some(values.iter().collect())
+                }
+                _ => None,
+            })
+            .collect();
+        let [values] = pinned.as_slice() else {
+            return Err(reject(
+                "Must have at least one non-optional hash key condition in WHERE clause \
+                 when using ORDER BY clause."
+                    .to_string(),
+            ));
+        };
+        partition_values.extend(values.iter().copied());
+    }
+    let pk_term = order_by.iter().find(|term| term.path == read_pk);
+    if partition_values.len() > 1 && pk_term.is_none() {
+        return Err(reject(
+            "Must have hash key in ORDER BY clause when more than one hash key condition \
+             specified in WHERE clause."
+                .to_string(),
+        ));
+    }
+
+    // A stored partition key sorts the way its type orders, so sorting the
+    // stored form is sorting the keys.
+    let mut partitions = Vec::new();
+    for value in partition_values {
+        let key = key_string(&resolve_value(value, parameters)?, read_pk)?;
+        if !partitions.contains(&key) {
+            partitions.push(key);
+        }
+    }
+    partitions.sort();
+    if pk_term.is_some_and(|term| term.descending) {
+        partitions.reverse();
+    }
+
+    let forward = order_by
+        .iter()
+        .find(|term| Some(term.path.as_str()) == read_sk)
+        .is_some_and(|term| !term.descending);
+    Ok(OrderPlan {
+        partitions,
+        forward,
+    })
+}
+
+/// Read the partitions an ordered SELECT names, one Query each, in the plan's
+/// order, starting after `cursor` and stopping once `limit` rows are read.
+///
+/// A continuation resumes in the partition it stopped in and carries on
+/// through the rest, so the pages together hold every row once, in order.
+#[allow(clippy::too_many_arguments)]
+async fn read_in_order<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    index: Option<&ResolvedIndex>,
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    read_sk: Option<&str>,
+    cursor: Option<&Cursor>,
+    limit: Option<usize>,
+    plan: &OrderPlan,
+) -> Result<Vec<(String, String, String)>> {
+    // Sort-key conditions are pushed into each Query only when the clause is a
+    // single AND group, so they hold in every partition the read visits.
+    let sk_conditions = match (read_sk, where_clause) {
+        (Some(sk_name), Some(wc)) if wc.groups.len() == 1 => {
+            translate_sk_conditions(&wc.groups[0], sk_name, parameters)
+        }
+        _ => None,
+    }
+    .unwrap_or_default();
+    let (sk_condition_sql, sk_param_values) = sk_conditions_to_sql(&sk_conditions);
+    let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
+
+    let first = match cursor {
+        Some(c) => plan
+            .partitions
+            .iter()
+            .position(|pk| *pk == c.pk)
+            .ok_or_else(|| DynoxideError::ValidationException("Invalid NextToken".to_string()))?,
+        None => 0,
+    };
+
+    let mut rows = Vec::new();
+    for (i, pk_str) in plan.partitions.iter().enumerate().skip(first) {
+        let remaining = limit.map(|lim| lim.saturating_sub(rows.len()));
+        if remaining == Some(0) {
+            break;
+        }
+        let resume = cursor.filter(|_| i == first);
+        let params = crate::storage::QueryParams {
+            sk_condition: sk_condition_sql.as_deref(),
+            sk_params: &sk_params_refs,
+            forward: plan.forward,
+            limit: remaining,
+            exclusive_start_sk: resume.map(|c| c.sk.as_str()),
+            exclusive_start_base_pk: resume.and_then(|c| c.base_pk.as_deref()),
+            exclusive_start_base_sk: resume.and_then(|c| c.base_sk.as_deref()),
+        };
+        let page = match index {
+            Some(idx) if idx.is_lsi => {
+                storage
+                    .query_lsi_items(table_name, idx.name(), pk_str, &params)
+                    .await?
+            }
+            Some(idx) => {
+                storage
+                    .query_gsi_items(table_name, idx.name(), pk_str, &params)
+                    .await?
+            }
+            None => storage.query_items(table_name, pk_str, &params).await?,
+        };
+        rows.extend(page);
+    }
+    Ok(rows)
+}
+
+/// Refuse an item nested exactly as deep as DynamoDB allows a value to reach,
+/// with the short message PartiQL gives it. A literal that deep is refused as
+/// the statement is read, so this is a parameter's. One level deeper gets the
+/// usual long message from the item checks (captured eu-west-2 and us-east-1,
+/// 2026-10-09: a parameter 32 levels deep is `Nesting Levels have exceeded
+/// supported limits`, and 33 or more the long form, on INSERT and UPDATE).
+fn reject_item_nested_to_the_limit(item: &Item) -> Result<()> {
+    if item_nested_to_the_limit(item) {
+        return Err(nested_to_the_limit());
+    }
+    Ok(())
+}
+
+/// Whether an item reaches exactly 32 levels, the depth PartiQL refuses with
+/// its short message.
+fn item_nested_to_the_limit(item: &Item) -> bool {
+    fn deepest(value: &AttributeValue) -> usize {
+        let children: Box<dyn Iterator<Item = &AttributeValue>> = match value {
+            AttributeValue::M(map) => Box::new(map.values()),
+            AttributeValue::L(items) => Box::new(items.iter()),
+            _ => return 0,
+        };
+        children.map(|child| 1 + deepest(child)).max().unwrap_or(0)
+    }
+    item.values().map(deepest).max() == Some(32)
+}
+
+fn nested_to_the_limit() -> DynoxideError {
+    DynoxideError::ValidationException("Nesting Levels have exceeded supported limits".to_string())
+}
+
+/// A BETWEEN bound as DynamoDB writes it in a message: `S:x`, `N:3`, `B:[MQ==]`.
+fn bound_operand(value: &AttributeValue) -> String {
+    match value {
+        AttributeValue::S(s) => format!("S:{s}"),
+        AttributeValue::N(n) => format!("N:{n}"),
+        AttributeValue::B(b) => {
+            use base64::Engine;
+            format!(
+                "B:[{}]",
+                base64::engine::general_purpose::STANDARD.encode(b)
+            )
+        }
+        other => other.type_name().to_string(),
+    }
+}
+
 /// Reject an ordering comparison whose operand is a type that has no ordering.
 ///
 /// DynamoDB orders `S`, `N` and `B` and nothing else, and it rejects the
@@ -150,12 +980,41 @@ fn validate_ordering_operands(
                         return Err(reject(op, &value));
                     }
                 }
-                WhereCondition::Between(_, low, high) => {
-                    for operand in [low, high] {
-                        let value = resolve_value(operand, parameters)?;
-                        if !orderable(&value) {
-                            return Err(reject("BETWEEN", &value));
+                // Bounds of one type, the lower first, negated or not
+                // (captured eu-west-2 and us-east-1, 2026-10-09).
+                WhereCondition::Between(_, low, high)
+                | WhereCondition::NotBetween(_, low, high) => {
+                    let low = resolve_value(low, parameters)?;
+                    let high = resolve_value(high, parameters)?;
+                    for value in [&low, &high] {
+                        if !orderable(value) {
+                            return Err(reject("BETWEEN", value));
                         }
+                    }
+                    let bounds = |rule: &str| {
+                        DynoxideError::ValidationException(format!(
+                            "The BETWEEN operator requires {rule}; lower bound operand: \
+                             AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+                            bound_operand(&low),
+                            bound_operand(&high)
+                        ))
+                    };
+                    if std::mem::discriminant(&low) != std::mem::discriminant(&high) {
+                        return Err(bounds("same data type for lower and upper bounds"));
+                    }
+                    if compare_values(&low, &CompOp::Gt, &high) {
+                        return Err(bounds(
+                            "upper bound to be greater than or equal to lower bound",
+                        ));
+                    }
+                }
+                // `begins_with` takes a string or binary operand (captured
+                // eu-west-2 and us-east-1, 2026-10-09).
+                WhereCondition::BeginsWith(_, prefix)
+                | WhereCondition::NotBeginsWith(_, prefix) => {
+                    let value = resolve_value(prefix, parameters)?;
+                    if !matches!(value, AttributeValue::S(_) | AttributeValue::B(_)) {
+                        return Err(reject("begins_with", &value));
                     }
                 }
                 _ => {}
@@ -211,6 +1070,7 @@ pub async fn execute_page<S: StorageBackend>(
             index_name,
             projections,
             where_clause,
+            order_by,
             ..
         } => {
             let outcome = execute_select(
@@ -219,6 +1079,7 @@ pub async fn execute_page<S: StorageBackend>(
                 index_name.as_deref(),
                 projections,
                 where_clause.as_ref(),
+                order_by,
                 parameters,
                 limit,
                 next_token,
@@ -367,6 +1228,7 @@ async fn execute_select<S: StorageBackend>(
     index_name: Option<&str>,
     projections: &[String],
     where_clause: Option<&WhereClause>,
+    order_by: &[OrderByTerm],
     parameters: &[AttributeValue],
     limit: Option<usize>,
     next_token: Option<&str>,
@@ -393,6 +1255,46 @@ async fn execute_select<S: StorageBackend>(
     let index = index_name
         .map(|name| resolve_index(meta, name))
         .transpose()?;
+
+    // The keys the row walk is paced by: the index's when one is named, the
+    // table's otherwise. An LSI's partition key is the table's, so only the
+    // sort key moves in that case.
+    let (read_pk, read_sk) = match index.as_ref() {
+        Some(idx) => (idx.pk_attr(), idx.sk_attr()),
+        None => (
+            table_key_schema.partition_key.as_str(),
+            table_key_schema.sort_key.as_deref(),
+        ),
+    };
+
+    // ORDER BY is checked once the table and any index are known, since what
+    // it may name is their key; a missing table or index is reported first.
+    // Its WHERE and term checks come before the key values are checked, which
+    // come before overlapping conditions, which come before the rest of the
+    // ORDER BY checks (captured eu-west-2 and us-east-1, 2026-10-09).
+    if !order_by.is_empty() {
+        check_order_terms(order_by, where_clause, read_pk, read_sk)?;
+    }
+    let declared = |attr: &str| match index.as_ref() {
+        None if attr == table_key_schema.partition_key => {
+            Some(table_key_schema.partition_key_type.clone())
+        }
+        None => table_key_schema.sort_key_type.clone(),
+        Some(_) => declared_attribute_type(meta, attr),
+    };
+    check_read_key_types(where_clause, parameters, read_pk, read_sk, &declared)?;
+    reject_overlapping_key_conditions(where_clause, parameters, read_pk, read_sk)?;
+    let order = if order_by.is_empty() {
+        None
+    } else {
+        Some(plan_order(
+            order_by,
+            where_clause,
+            parameters,
+            read_pk,
+            read_sk,
+        )?)
+    };
 
     // A strongly consistent read cannot be served from a GSI. PartiQL words
     // this differently from Query, which says "Consistent reads are not
@@ -454,18 +1356,7 @@ async fn execute_select<S: StorageBackend>(
         }
     }
 
-    // The keys the row walk is paced by: the index's when one is named, the
-    // table's otherwise. An LSI's partition key is the table's, so only the
-    // sort key moves in that case.
-    let (read_pk, read_sk) = match index.as_ref() {
-        Some(idx) => (idx.pk_attr(), idx.sk_attr()),
-        None => (
-            table_key_schema.partition_key.as_str(),
-            table_key_schema.sort_key.as_deref(),
-        ),
-    };
-
-    let fingerprint = statement_fingerprint(where_clause, parameters, index_name);
+    let fingerprint = statement_fingerprint(where_clause, parameters, index_name, order_by);
     let cursor = next_token
         .map(|token| decode_next_token(token, table_name, fingerprint))
         .transpose()?;
@@ -510,6 +1401,7 @@ async fn execute_select<S: StorageBackend>(
         limit,
         reach_back,
         consistent_read,
+        order.as_ref(),
     )
     .await?;
 
@@ -607,15 +1499,32 @@ async fn evaluate_window<S: StorageBackend>(
     limit: Option<usize>,
     reach_back: bool,
     consistent_read: bool,
+    order: Option<&OrderPlan>,
 ) -> Result<Window> {
     let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, read_pk));
+    // A partition key value no key can have only gets this far when the clause
+    // isn't read by key (see `check_read_key_types`), and it matches no row.
+    let pk_key = match pk_condition {
+        Some(cond) => Some(resolve_value(&cond.value, parameters)?.to_key_string()),
+        None => None,
+    };
 
-    let rows: Vec<(String, String, String)> = if let Some(pk_cond) = pk_condition {
-        let pk_val = resolve_value(&pk_cond.value, parameters)?;
-        let pk_str = pk_val
-            .to_key_string()
-            .ok_or_else(|| DynoxideError::ValidationException("Invalid key value".to_string()))?;
-
+    let rows: Vec<(String, String, String)> = if let Some(plan) = order {
+        read_in_order(
+            storage,
+            table_name,
+            index,
+            where_clause,
+            parameters,
+            read_sk,
+            cursor,
+            limit,
+            plan,
+        )
+        .await?
+    } else if let Some(None) = pk_key {
+        Vec::new()
+    } else if let Some(Some(pk_str)) = pk_key {
         // Sort-key conditions that a key condition can express are pushed into
         // the SQL, so `limit` counts rows within the key-condition range rather
         // than rows in the whole partition, which is how DynamoDB paces a
@@ -878,6 +1787,7 @@ fn where_attributes(where_clause: Option<&WhereClause>) -> Vec<String> {
                 | WhereCondition::BeginsWith(p, _)
                 | WhereCondition::NotBeginsWith(p, _)
                 | WhereCondition::Between(p, _, _)
+                | WhereCondition::NotBetween(p, _, _)
                 | WhereCondition::In(p, _)
                 | WhereCondition::Contains(p, _)
                 | WhereCondition::NotContains(p, _)
@@ -951,6 +1861,7 @@ fn statement_fingerprint(
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
     index_name: Option<&str>,
+    order_by: &[OrderByTerm],
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -968,6 +1879,12 @@ fn statement_fingerprint(
     serde_json::to_string(parameters)
         .unwrap_or_default()
         .hash(&mut hasher);
+    // So is the order: a position in an ascending read resumed in a
+    // descending one would start from the wrong end. Mixed in only when there
+    // is an ORDER BY, so a statement without one hashes as it always did.
+    if !order_by.is_empty() {
+        format!("{order_by:?}").hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -1136,16 +2053,24 @@ fn find_pk_condition<'a>(
 ) -> Option<&'a crate::partiql::parser::Condition> {
     // Only optimise to a Query when there is a single OR group
     // (multi-group OR with pk in only one group would need a union approach).
-    if wc.groups.len() == 1 {
-        wc.groups[0].iter().find_map(|c| match c {
-            WhereCondition::Comparison(cond) if cond.path == pk_name && cond.op == CompOp::Eq => {
-                Some(cond)
-            }
-            _ => None,
-        })
-    } else {
-        None
+    // A partition key named by more than one condition isn't a key read either
+    // (captured eu-west-2 and us-east-1, 2026-10-09: `pk = true AND pk = 'x'`
+    // is served as a scan and returns nothing).
+    let [group] = wc.groups.as_slice() else {
+        return None;
+    };
+    let mut pinning = group.iter().filter_map(|c| match c {
+        WhereCondition::Comparison(cond) if cond.path == pk_name && cond.op == CompOp::Eq => {
+            Some((Some(cond), std::slice::from_ref(&cond.value)))
+        }
+        WhereCondition::In(path, values) if path == pk_name => Some((None, values.as_slice())),
+        _ => None,
+    });
+    let (first, values) = pinning.next()?;
+    if pinning.any(|(_, other)| other != values) {
+        return None;
     }
+    first
 }
 
 /// A table's metadata and its parsed key schema, worked out once.
@@ -1248,18 +2173,11 @@ fn statement_key(
     }
 }
 
-/// Returns what the insert consumed. An `if_not_exists` duplicate makes it a
-/// no-op, which carries no images and no index units.
-async fn execute_insert<S: StorageBackend>(
-    storage: &S,
-    table_name: &str,
+/// An INSERT's item with its parameters filled in.
+fn resolve_insert_item(
     item_template: &HashMap<String, PartiqlValue>,
     parameters: &[AttributeValue],
-    if_not_exists: bool,
-    capacity_mode: Option<&str>,
-    resolved: Option<&ResolvedTable>,
-) -> Result<WriteCapacity> {
-    // Resolve any parameter placeholders in the item
+) -> Result<Item> {
     let mut item = HashMap::new();
     for (k, v) in item_template {
         let resolved = match v {
@@ -1273,6 +2191,21 @@ async fn execute_insert<S: StorageBackend>(
         };
         item.insert(k.clone(), resolved);
     }
+    Ok(item)
+}
+
+/// Returns what the insert consumed. An `if_not_exists` duplicate makes it a
+/// no-op, which carries no images and no index units.
+async fn execute_insert<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    item_template: &HashMap<String, PartiqlValue>,
+    parameters: &[AttributeValue],
+    if_not_exists: bool,
+    capacity_mode: Option<&str>,
+    resolved: Option<&ResolvedTable>,
+) -> Result<WriteCapacity> {
+    let mut item = resolve_insert_item(item_template, parameters)?;
 
     // Resolved by the caller when a preparation pass already did it, which is
     // what stops a batch reading the same table's metadata and parsing the same
@@ -1288,9 +2221,39 @@ async fn execute_insert<S: StorageBackend>(
     let meta = &resolved.meta;
     let key_schema = &resolved.key_schema;
 
+    // A key of the wrong type, or of a type no key can have, is refused in
+    // PartiQL's words ahead of PutItem's key checks (captured eu-west-2 and
+    // us-east-1, 2026-10-09).
+    let keys = std::iter::once((
+        &key_schema.partition_key,
+        Some(&key_schema.partition_key_type),
+    ))
+    .chain(
+        key_schema
+            .sort_key
+            .as_ref()
+            .map(|sk| (sk, key_schema.sort_key_type.as_ref())),
+    );
+    for (name, declared) in keys {
+        if let Some(value) = item.get(name)
+            && typed_key(value, name, declared).is_err()
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "Key attribute's data type should match its data type in table's schema: Key {name}"
+            )));
+        }
+    }
+
     // Validate keys present
     crate::actions::helpers::validate_item_keys(&item, key_schema, meta)?;
-    crate::validation::validate_item_attribute_values(&item)?;
+    // An item exactly at the nesting limit is a duplicate first when its key
+    // is taken, and otherwise gets PartiQL's short message, so the item checks,
+    // which would give the long one, are held back for it (captured eu-west-2,
+    // 2026-10-09).
+    let at_the_limit = item_nested_to_the_limit(&item);
+    if !at_the_limit {
+        crate::validation::validate_item_attribute_values(&item)?;
+    }
 
     // Deduplicate sets
     crate::validation::normalize_item_sets(&mut item);
@@ -1316,6 +2279,9 @@ async fn execute_insert<S: StorageBackend>(
         return Err(DynoxideError::DuplicateItemException(
             "Duplicate primary key exists in table".to_string(),
         ));
+    }
+    if at_the_limit {
+        return Err(nested_to_the_limit());
     }
 
     let item_json = serde_json::to_string(&item)
@@ -1459,6 +2425,7 @@ async fn execute_update<S: StorageBackend>(
     }
 
     // Validate attribute values after SET clauses applied
+    reject_item_nested_to_the_limit(&item)?;
     crate::validation::validate_item_attribute_values(&item)?;
     crate::validation::normalize_item_sets(&mut item);
 
@@ -1751,11 +2718,14 @@ async fn execute_delete<S: StorageBackend>(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The table a statement names, or DynamoDB's PartiQL answer when there is
+/// none: `Requested resource not found`, with nothing after it, on every
+/// statement kind (captured eu-west-2 and us-east-1, 2026-10-09).
 async fn require_table<S: StorageBackend>(
     storage: &S,
     table_name: &str,
 ) -> Result<crate::storage::TableMetadata> {
-    crate::actions::helpers::require_table(storage, table_name).await
+    crate::actions::helpers::require_table_for_item_op(storage, table_name).await
 }
 
 /// Find a comparison condition matching a given path with Eq operator,
@@ -1808,15 +2778,19 @@ fn single_item_key(
     let mut pinned: Option<(String, String)> = None;
     for group in &wc.groups {
         let pk_cond = find_comparison(group, &key_schema.partition_key).ok_or_else(refusal)?;
-        let pk = resolve_value(&pk_cond.value, parameters)?
-            .to_key_string()
-            .ok_or_else(|| DynoxideError::ValidationException("Invalid key value".to_string()))?;
+        let pk = typed_key(
+            &resolve_value(&pk_cond.value, parameters)?,
+            &key_schema.partition_key,
+            Some(&key_schema.partition_key_type),
+        )?;
         let sk = match key_schema.sort_key {
             Some(ref sk_name) => {
                 let sk_cond = find_comparison(group, sk_name).ok_or_else(refusal)?;
-                resolve_value(&sk_cond.value, parameters)?
-                    .to_key_string()
-                    .unwrap_or_default()
+                typed_key(
+                    &resolve_value(&sk_cond.value, parameters)?,
+                    sk_name,
+                    key_schema.sort_key_type.as_ref(),
+                )?
             }
             None => String::new(),
         };
@@ -2224,6 +3198,23 @@ fn matches_conditions(
                     || !compare_values(item_val, &CompOp::Le, &high_val)
                 {
                     return false;
+                }
+            }
+            WhereCondition::NotBetween(path, low, high) => {
+                // A row without the attribute matches, as for `NOT` of a
+                // comparison.
+                if let Some(item_val) = resolve_nested_path(item, path) {
+                    let (Ok(low_val), Ok(high_val)) = (
+                        resolve_value(low, parameters),
+                        resolve_value(high, parameters),
+                    ) else {
+                        return false;
+                    };
+                    if compare_values(item_val, &CompOp::Ge, &low_val)
+                        && compare_values(item_val, &CompOp::Le, &high_val)
+                    {
+                        return false;
+                    }
                 }
             }
             WhereCondition::In(path, values) => {

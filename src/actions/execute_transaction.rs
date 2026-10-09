@@ -108,6 +108,16 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         ));
     }
 
+    // Every statement's parameters are checked before any statement is read,
+    // used or not and ahead of a missing table, and a failure refuses the
+    // whole request with the bare message (captured eu-west-2 and us-east-1,
+    // 2026-10-09).
+    for stmt in statements {
+        for parameter in stmt.parameters.iter().flatten() {
+            partiql::executor::check_parameter_value(parameter)?;
+        }
+    }
+
     // Parse all statements before executing any, to fail fast on syntax errors
     let mut parsed = Vec::with_capacity(statements.len());
     for (index, stmt) in statements.iter().enumerate() {
@@ -117,8 +127,19 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         if let Some(msg) = partiql::parser::count_projection_rejection(&stmt.statement) {
             return Err(DynoxideError::ValidationException(msg));
         }
-        let ast = partiql::parser::parse(&stmt.statement)
-            .map_err(|e| DynoxideError::ValidationException(e.into_message()))?;
+        // A statement that does not parse, or carries a literal DynamoDB
+        // refuses, is reported with its index in front, as the RETURNING and
+        // index-read refusals below are (captured eu-west-2 and us-east-1,
+        // 2026-10-09).
+        let ast = partiql::parser::parse_statement(&stmt.statement).map_err(|failure| {
+            let message = match failure {
+                partiql::parser::ParseFailure::Statement(e) => e.into_message(),
+                partiql::parser::ParseFailure::Literal(message) => message,
+            };
+            DynoxideError::ValidationException(format!(
+                "Validation failed in TransactStatements[{index}]: {message}"
+            ))
+        })?;
         // DynamoDB rejects a RETURNING clause on any member of a transaction with
         // a top-level ValidationException, before applying any write. This is a
         // plain validation failure, not a TransactionCanceledException.
@@ -161,7 +182,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
     // Keyed by table rather than by statement: the metadata and key schema are
     // per table, and only the key is per statement.
     let mut tables: HashMap<String, ResolvedTable> = HashMap::new();
-    for (stmt, params) in &parsed {
+    for (index, (stmt, params)) in parsed.iter().enumerate() {
         let Some(name) = partiql::parser::table_name(stmt) else {
             continue;
         };
@@ -175,6 +196,37 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         let Some(resolved) = tables.get(name) else {
             continue;
         };
+        // A key value no key can have in an UPDATE or DELETE refuses the
+        // request; one of the wrong key type cancels it when it runs
+        // (captured eu-west-2 and us-east-1, 2026-10-09).
+        if let Some(partiql::executor::KeyFault::NotAKeyType(message)) =
+            partiql::executor::write_key_fault(stmt, params, resolved)
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "Validation failed in TransactStatements[{index}]: {message}"
+            )));
+        }
+        // A SELECT is served as a GetItem, so it may name the primary key and
+        // nothing else, once overlapping key conditions have been ruled out
+        // (captured eu-west-2 and us-east-1, 2026-10-09).
+        if matches!(stmt, partiql::parser::Statement::Select { .. })
+            && let Err(e) = partiql::executor::reject_overlapping_select(stmt, params, resolved)
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "Validation failed in TransactStatements[{index}]: {e}"
+            )));
+        }
+        if matches!(stmt, partiql::parser::Statement::Select { .. })
+            && matches!(
+                partiql::executor::keyed_select(stmt, params, resolved),
+                partiql::executor::KeyedSelect::NotByPrimaryKey
+            )
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "Validation failed in TransactStatements[{index}]: Select statements within \
+                 ExecuteTransaction must specify the primary key in the where clause."
+            )));
+        }
         if let Some(target) = partiql::executor::statement_target_in(stmt, params, resolved)
             && !seen_targets.insert(target)
         {
@@ -347,18 +399,44 @@ async fn execute_within_transaction<S: StorageBackend>(
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
 
     for (stmt, params) in parsed {
-        match partiql::executor::execute_page(
-            storage,
-            stmt,
-            params,
-            None,
-            None,
-            false,
-            capacity_mode,
-            partiql::parser::table_name(stmt).and_then(|t| tables.get(t)),
-        )
-        .await
-        {
+        let resolved = partiql::parser::table_name(stmt).and_then(|t| tables.get(t));
+        // A SELECT key of the wrong type, or of a type no key can have, and an
+        // UPDATE or DELETE key of the wrong type, cancel the transaction with
+        // GetItem's reason; an INSERT key of the wrong type cancels it with
+        // PutItem's (captured eu-west-2 and us-east-1, 2026-10-09).
+        let wrong_key_type = resolved.is_some_and(|resolved| match stmt {
+            partiql::parser::Statement::Select { .. } => matches!(
+                partiql::executor::keyed_select(stmt, params, resolved),
+                partiql::executor::KeyedSelect::KeyType(_)
+            ),
+            _ => partiql::executor::write_key_fault(stmt, params, resolved).is_some(),
+        });
+        let insert_keys = match resolved {
+            Some(resolved) => {
+                partiql::executor::check_transaction_insert_keys(stmt, params, resolved)
+            }
+            None => Ok(()),
+        };
+        let outcome = if wrong_key_type {
+            Err(DynoxideError::ValidationException(
+                "The provided key element does not match the schema".to_string(),
+            ))
+        } else if let Err(e) = insert_keys {
+            Err(e)
+        } else {
+            partiql::executor::execute_page(
+                storage,
+                stmt,
+                params,
+                None,
+                None,
+                false,
+                capacity_mode,
+                resolved,
+            )
+            .await
+        };
+        match outcome {
             Ok(page) => {
                 let table_name = partiql::parser::table_name(stmt).unwrap_or_default();
                 charges.push(match page.capacity {
@@ -384,6 +462,12 @@ async fn execute_within_transaction<S: StorageBackend>(
                         ("ConditionalCheckFailed".to_string(), item)
                     }
                     DynoxideError::DuplicateItemException(_) => ("DuplicateItem".to_string(), None),
+                    // A statement against a table that does not exist cancels
+                    // the transaction with this reason (captured eu-west-2 and
+                    // us-east-1, 2026-10-09).
+                    DynoxideError::ResourceNotFoundException(_) => {
+                        ("ResourceNotFound".to_string(), None)
+                    }
                     // Group KeyEmptyValueValidation with ValidationException so an empty-value
                     // key keeps the "ValidationError" reason instead of falling through to
                     // InternalError (#95).

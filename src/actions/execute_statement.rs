@@ -60,6 +60,14 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    // Every parameter's numbers are checked before the statement is read,
+    // whether the statement uses the parameter or not, with the message any
+    // attribute value gets and no path after it (captured eu-west-2 and
+    // us-east-1, 2026-10-09).
+    for parameter in request.parameters.iter().flatten() {
+        partiql::executor::check_parameter_value(parameter)?;
+    }
+
     // A COUNT projection is rejected before parsing, with DynamoDB's bare
     // message rather than the wasn't-well-formed wrapper the parse errors
     // below carry. ExecuteStatement is the captured surface for this shape.

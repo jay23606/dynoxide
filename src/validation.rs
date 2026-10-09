@@ -637,11 +637,26 @@ pub(crate) fn validate_item_attribute_values_classified(
     Ok(())
 }
 
+/// Check one PartiQL statement parameter as an item's values are checked
+/// (unreadable numbers, empty and duplicated sets), leaving its depth to the
+/// statement it fills in.
+pub(crate) fn validate_parameter_value(value: &AttributeValue) -> crate::Result<()> {
+    validate_attribute_value_within(value, 0, None).map_err(Into::into)
+}
+
 fn validate_attribute_value(
     value: &AttributeValue,
     depth: usize,
 ) -> std::result::Result<(), ClassifiedValidationError> {
-    if depth >= MAX_NESTING_DEPTH {
+    validate_attribute_value_within(value, depth, Some(MAX_NESTING_DEPTH))
+}
+
+fn validate_attribute_value_within(
+    value: &AttributeValue,
+    depth: usize,
+    nesting_limit: Option<usize>,
+) -> std::result::Result<(), ClassifiedValidationError> {
+    if nesting_limit.is_some_and(|limit| depth >= limit) {
         return Err(ClassifiedValidationError::bare(NESTING_LIMIT_MESSAGE));
     }
     match value {
@@ -706,13 +721,13 @@ fn validate_attribute_value(
         }
         AttributeValue::L(list) => {
             for v in list {
-                validate_attribute_value(v, depth + 1)?;
+                validate_attribute_value_within(v, depth + 1, nesting_limit)?;
             }
             Ok(())
         }
         AttributeValue::M(map) => {
             for v in map.values() {
-                validate_attribute_value(v, depth + 1)?;
+                validate_attribute_value_within(v, depth + 1, nesting_limit)?;
             }
             Ok(())
         }

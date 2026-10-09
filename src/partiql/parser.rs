@@ -69,6 +69,9 @@ pub enum Statement {
         index_name: Option<String>,
         projections: Vec<String>, // empty = SELECT *
         where_clause: Option<WhereClause>,
+        /// The `ORDER BY` terms, in the order written. Empty when there is no
+        /// clause.
+        order_by: Vec<OrderByTerm>,
     },
     #[non_exhaustive]
     Insert {
@@ -102,6 +105,22 @@ pub enum Statement {
         /// rejects the other variants. `None` when there is no clause.
         returning: Option<ReturningVariant>,
     },
+}
+
+/// One term of a SELECT's `ORDER BY` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OrderByTerm {
+    /// The attribute path the term names, unquoted.
+    pub path: String,
+    /// Whether the term was written `DESC`. `ASC`, the default, reads as false.
+    pub descending: bool,
+    /// DynamoDB's rejection when the term is not a plain attribute name: a
+    /// nested path or a string. It orders by a top-level attribute only, and
+    /// says so naming where the term starts, which only the parser knows. It
+    /// is raised after the table is resolved, so it is carried rather than
+    /// returned from the parse.
+    pub rejection: Option<String>,
 }
 
 /// A PartiQL `RETURNING` clause variant: the cross product of `ALL`/`MODIFIED`
@@ -348,6 +367,10 @@ pub enum WhereCondition {
     BeginsWith(String, PartiqlValue),
     NotBeginsWith(String, PartiqlValue),
     Between(String, PartiqlValue, PartiqlValue),
+    /// `NOT path BETWEEN low AND high`, kept whole so its bounds are checked
+    /// as BETWEEN's are. A row without the attribute matches, as it does for
+    /// the other negated conditions.
+    NotBetween(String, PartiqlValue, PartiqlValue),
     In(String, Vec<PartiqlValue>),
     Contains(String, PartiqlValue),
     /// `NOT CONTAINS(path, value)`. Reachable only through a `NOT` in front of
@@ -380,22 +403,781 @@ pub enum PartiqlValue {
     Parameter(usize), // 0-based index into the Parameters array
 }
 
+/// Why a statement could not be used: it did not parse, or it parsed and a
+/// literal in it is one DynamoDB refuses. The two are kept apart because a
+/// transaction reports the second against the statement's index.
+pub(crate) enum ParseFailure {
+    Statement(ParseError),
+    Literal(String),
+}
+
+impl From<ParseError> for ParseFailure {
+    fn from(error: ParseError) -> Self {
+        ParseFailure::Statement(error)
+    }
+}
+
+impl From<String> for ParseFailure {
+    fn from(message: String) -> Self {
+        ParseFailure::Statement(ParseError::Syntax(message))
+    }
+}
+
+impl From<&str> for ParseFailure {
+    fn from(message: &str) -> Self {
+        ParseFailure::Statement(ParseError::Syntax(message.to_string()))
+    }
+}
+
 /// Parse a PartiQL statement string.
 pub fn parse(input: &str) -> Result<Statement, ParseError> {
+    parse_statement(input).map_err(|failure| match failure {
+        ParseFailure::Statement(error) => error,
+        ParseFailure::Literal(message) => ParseError::Validation(message),
+    })
+}
+
+/// [`parse`], saying whether a failure came from a literal DynamoDB refuses.
+pub(crate) fn parse_statement(input: &str) -> Result<Statement, ParseFailure> {
     let mut tokenizer = Tokenizer::new(input)?;
     let first = tokenizer
         .next_token()?
         .ok_or("Empty statement")?
         .to_uppercase();
 
-    match first.as_str() {
+    // A verb with nothing it needs after it is refused as DynamoDB refuses it:
+    // an INSERT with no INTO is a keyword where a term should be, and the
+    // others name what is missing (captured eu-west-2 and us-east-1,
+    // 2026-10-09).
+    let next = tokenizer.peek_token()?;
+    let statement = match first.as_str() {
+        "SELECT" if next.is_none() => Err(UNEXPECTED_TERM.into()),
         "SELECT" => parse_select(&mut tokenizer),
+        "INSERT" if !next.as_deref().is_some_and(|tok| is_keyword(tok, "INTO")) => {
+            Err(UNEXPECTED_KEYWORD.into())
+        }
         "INSERT" => parse_insert(&mut tokenizer),
+        "UPDATE"
+            if !next.as_deref().is_some_and(|tok| {
+                tok.starts_with('"')
+                    || tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            }) =>
+        {
+            Err(EXPECTED_SIMPLE_PATH.into())
+        }
         "UPDATE" => parse_update(&mut tokenizer),
+        "DELETE" if !next.as_deref().is_some_and(|tok| is_keyword(tok, "FROM")) => {
+            Err("Expected FROM after DELETE".into())
+        }
         "DELETE" => parse_delete(&mut tokenizer),
         // A statement that does not begin with a DML keyword is not valid
-        // PartiQL; DynamoDB reports this as "Expected data manipulation".
-        _ => Err("Expected data manipulation".into()),
+        // PartiQL, and DynamoDB says why by reading it as an expression.
+        _ => {
+            tokenizer.pos = 0;
+            Err(refuse_non_dml(&mut tokenizer)?)
+        }
+    }?;
+
+    // Every token has to belong to the statement. Without this check a token
+    // left over after the WHERE expression was dropped, so `WHERE pk = 1 foo`
+    // ran as `WHERE pk = 1`, where DynamoDB refuses it (captured eu-west-2,
+    // 2026-10-08, for the WHERE case; the same rule is applied to the other
+    // statements). One semicolon may end the statement; anything after it is
+    // a second statement (captured eu-west-2 and us-east-1, 2026-10-09).
+    end_of_statement(&mut tokenizer)?;
+
+    // A literal DynamoDB can't read is refused once the statement has parsed,
+    // before anything is looked up: a missing table, a missing item or an
+    // ordering comparison on a type with no ordering all come second. The
+    // message is DynamoDB's own, with the path inside the value, `under
+    // root.x` (captured eu-west-2 and us-east-1, 2026-10-09).
+    if let Some(message) = tokenizer.first_literal_error() {
+        return Err(ParseFailure::Literal(message));
+    }
+
+    Ok(statement)
+}
+
+/// Check that the statement has ended: nothing left, or one semicolon and
+/// nothing after it.
+fn end_of_statement(t: &mut Tokenizer) -> Result<(), String> {
+    match t.peek_token()?.as_deref() {
+        None => Ok(()),
+        Some(";") => {
+            t.next_token()?;
+            if t.peek_token()?.is_some() {
+                Err("Unexpected token after semicolon. (Only one query is allowed.)".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        Some(_) => Err("Unexpected token after expression".to_string()),
+    }
+}
+
+/// What a statement read as an expression turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExprKind {
+    /// A number, which a sign in front of it stays part of; reported as `Lit`.
+    Number,
+    Lit,
+    Missing,
+    List,
+    Struct,
+    Bag,
+    Parameter,
+    Id,
+    Path,
+    IsType,
+    SimpleCase,
+    SearchedCase,
+    /// An operator, a comparison, a function call or a subquery: anything else.
+    Other,
+}
+
+/// Why a statement could not be read as an expression, in DynamoDB's words.
+type ExprError = &'static str;
+
+const UNEXPECTED_TERM: ExprError = "Unexpected term";
+const UNEXPECTED_KEYWORD: ExprError = "Unexpected keyword";
+const UNEXPECTED_OPERATOR: ExprError = "Unexpected operator";
+const MISSING_RIGHT_HAND_SIDE: ExprError = "Missing right-hand side expression of infix operator";
+const EXPECTED_SIMPLE_PATH: ExprError = "Expected identifier for simple path";
+
+/// What reading part of an expression gave: what it was, or where it broke
+/// off. The outer error is the tokenizer's.
+type ExprResult = Result<Result<ExprKind, ExprError>, String>;
+
+/// The kind a part of an expression read as, or its error returned at once.
+macro_rules! term {
+    ($read:expr) => {
+        match $read? {
+            Ok(kind) => kind,
+            Err(e) => return Ok(Err(e)),
+        }
+    };
+}
+
+/// Words that work as operators: one of them where a term should start is an
+/// unexpected operator.
+const OPERATOR_WORDS: &[&str] = &["AND", "OR", "NOT", "IS", "IN", "LIKE", "BETWEEN"];
+
+/// Words that can't start a term; one where a term should start is an
+/// unexpected keyword. The ones that can (`SELECT`, `CASE`, `EXISTS (`,
+/// `FROM`, the literals) are read before this list is consulted.
+const KEYWORDS: &[&str] = &[
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "INSERT",
+    "INTO",
+    "VALUE",
+    "VALUES",
+    "UPDATE",
+    "DELETE",
+    "SET",
+    "REMOVE",
+    "ORDER",
+    "BY",
+    "GROUP",
+    "HAVING",
+    "LIMIT",
+    "AS",
+    "AT",
+    "ON",
+    "RETURNING",
+    "UNION",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "ASC",
+    "DESC",
+    "EXISTS",
+    "TRUE",
+    "FALSE",
+    "NULL",
+    "MISSING",
+];
+
+/// The type names `IS` may test for.
+const TYPE_NAMES: &[&str] = &[
+    "NULL",
+    "MISSING",
+    "BOOL",
+    "BOOLEAN",
+    "SMALLINT",
+    "INT",
+    "INTEGER",
+    "BIGINT",
+    "FLOAT",
+    "REAL",
+    "DECIMAL",
+    "NUMERIC",
+    "TIMESTAMP",
+    "DATE",
+    "TIME",
+    "CHAR",
+    "CHARACTER",
+    "VARCHAR",
+    "STRING",
+    "SYMBOL",
+    "BLOB",
+    "CLOB",
+    "STRUCT",
+    "TUPLE",
+    "LIST",
+    "SEXP",
+    "BAG",
+    "ANY",
+];
+
+fn is_keyword(tok: &str, word: &str) -> bool {
+    tok.eq_ignore_ascii_case(word)
+}
+
+fn is_any(tok: &str, words: &[&str]) -> bool {
+    words.iter().any(|w| is_keyword(tok, w))
+}
+
+/// An identifier: a quoted name, or a bare word that isn't a keyword.
+fn is_name(tok: &str) -> bool {
+    tok.starts_with('"')
+        || (tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && !is_any(tok, KEYWORDS)
+            && !is_any(tok, OPERATOR_WORDS))
+}
+
+/// The refusal for a statement that doesn't start with SELECT, INSERT, UPDATE
+/// or DELETE. DynamoDB reads it as a PartiQL expression (captured eu-west-2 and
+/// us-east-1, 2026-10-09):
+///
+/// - a whole expression is refused for what it is, without the envelope:
+///   `Unsupported operation: Id` for `FOO`, `Path` for `FOO.BAR`, `Lit`,
+///   `Missing`, `List`, `Struct`, `Bag`, `Parameter`, `IsType`, `SimpleCase`
+///   or `SearchedCase`, and `EXISTS can only be used in ExecuteTransaction
+///   write requests.` for an operator, comparison, call or subquery
+///   (`FOO AND BAR`, `1 + 1`, `FOO(1)`);
+/// - one followed by more tokens is a token after the expression (`INSRT INTO
+///   ...`), or after a semicolon;
+/// - one that breaks off is refused with the reason: an operator with nothing
+///   after it, a closing bracket or keyword missing, a keyword or operator
+///   where a term should start, or a `FROM` with a table after it, which
+///   DynamoDB reads as the start of a statement with no verb (`SLECT * FROM t`
+///   is "Expected data manipulation");
+/// - `SET a = 1` and `REMOVE a` are statements with no table, and refused for
+///   that once they read.
+fn refuse_non_dml(t: &mut Tokenizer) -> Result<ParseError, String> {
+    if t.peek_token()?
+        .is_some_and(|first| is_keyword(&first, "SET") || is_keyword(&first, "REMOVE"))
+    {
+        if let Err(e) = read_tableless_dml(t)? {
+            return Ok(ParseError::Syntax(e.to_string()));
+        }
+        return Ok(match end_of_statement(t) {
+            Ok(()) => ParseError::Validation(
+                "Only select from a single table or index is supported.".to_string(),
+            ),
+            Err(message) => ParseError::Syntax(message),
+        });
+    }
+    let kind = match read_expression(t)? {
+        Ok(kind) => kind,
+        Err(e) => return Ok(ParseError::Syntax(e.to_string())),
+    };
+    if let Err(message) = end_of_statement(t) {
+        return Ok(ParseError::Syntax(message));
+    }
+    let name = match kind {
+        ExprKind::Number | ExprKind::Lit => "Lit",
+        ExprKind::Missing => "Missing",
+        ExprKind::List => "List",
+        ExprKind::Struct => "Struct",
+        ExprKind::Bag => "Bag",
+        ExprKind::Parameter => "Parameter",
+        ExprKind::Id => "Id",
+        ExprKind::Path => "Path",
+        ExprKind::IsType => "IsType",
+        ExprKind::SimpleCase => "SimpleCase",
+        ExprKind::SearchedCase => "SearchedCase",
+        ExprKind::Other => {
+            return Ok(ParseError::Validation(
+                "EXISTS can only be used in ExecuteTransaction write requests.".to_string(),
+            ));
+        }
+    };
+    Ok(ParseError::Validation(format!(
+        "Unsupported operation: {name}"
+    )))
+}
+
+/// Read `SET path = value [, ...]` or `REMOVE path`.
+fn read_tableless_dml(t: &mut Tokenizer) -> ExprResult {
+    let remove = t
+        .next_token()?
+        .is_some_and(|verb| is_keyword(&verb, "REMOVE"));
+    loop {
+        match t.next_token()? {
+            Some(name) if is_name(&name) => {}
+            _ => return Ok(Err(EXPECTED_SIMPLE_PATH)),
+        }
+        term!(read_path_steps(t, ExprKind::Id));
+        if remove {
+            return Ok(Ok(ExprKind::Other));
+        }
+        if t.next_token()?.as_deref() != Some("=") {
+            return Ok(Err("Expected '='"));
+        }
+        term!(read_expression(t));
+        if t.peek_token()?.as_deref() != Some(",") {
+            return Ok(Ok(ExprKind::Other));
+        }
+        t.next_token()?;
+    }
+}
+
+/// An operand after an infix operator: missing when the statement ends there.
+fn read_operand(t: &mut Tokenizer, read: fn(&mut Tokenizer) -> ExprResult) -> ExprResult {
+    if t.peek_token()?.is_none() {
+        return Ok(Err(MISSING_RIGHT_HAND_SIDE));
+    }
+    read(t)
+}
+
+fn read_expression(t: &mut Tokenizer) -> ExprResult {
+    let mut kind = term!(read_and(t));
+    while t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "OR")) {
+        t.next_token()?;
+        term!(read_operand(t, read_and));
+        kind = ExprKind::Other;
+    }
+    Ok(Ok(kind))
+}
+
+fn read_and(t: &mut Tokenizer) -> ExprResult {
+    let mut kind = term!(read_not(t));
+    while t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "AND")) {
+        t.next_token()?;
+        term!(read_operand(t, read_not));
+        kind = ExprKind::Other;
+    }
+    Ok(Ok(kind))
+}
+
+fn read_not(t: &mut Tokenizer) -> ExprResult {
+    if t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "NOT")) {
+        t.next_token()?;
+        term!(read_not(t));
+        return Ok(Ok(ExprKind::Other));
+    }
+    read_comparison(t)
+}
+
+fn read_comparison(t: &mut Tokenizer) -> ExprResult {
+    let kind = term!(read_additive(t));
+    let Some(next) = t.peek_token()? else {
+        return Ok(Ok(kind));
+    };
+    // `>>` closes a bag rather than comparing.
+    let closes_bag = next == ">" && t.peek_token_at(1)?.as_deref() == Some(">");
+    if !closes_bag && matches!(next.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+        t.next_token()?;
+        term!(read_operand(t, read_additive));
+        return Ok(Ok(ExprKind::Other));
+    }
+    if is_keyword(&next, "IS") {
+        t.next_token()?;
+        let negated = t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "NOT"));
+        if negated {
+            t.next_token()?;
+        }
+        return Ok(match t.next_token()? {
+            Some(tok) if is_any(&tok, TYPE_NAMES) => Ok(if negated {
+                ExprKind::Other
+            } else {
+                ExprKind::IsType
+            }),
+            _ => Err("Expected type name"),
+        });
+    }
+    let negated = is_keyword(&next, "NOT");
+    let operator = if negated {
+        t.peek_token_at(1)?
+    } else {
+        Some(next)
+    };
+    let Some(operator) = operator else {
+        return Ok(Ok(kind));
+    };
+    if !is_any(&operator, &["IN", "LIKE", "BETWEEN"]) {
+        return Ok(Ok(kind));
+    }
+    if negated {
+        t.next_token()?;
+    }
+    t.next_token()?;
+    term!(read_operand(t, read_additive));
+    if is_keyword(&operator, "LIKE")
+        && t.peek_token()?
+            .is_some_and(|tok| is_keyword(&tok, "ESCAPE"))
+    {
+        t.next_token()?;
+        term!(read_operand(t, read_additive));
+    }
+    if is_keyword(&operator, "BETWEEN") {
+        match t.next_token()? {
+            Some(tok) if is_keyword(&tok, "AND") => {}
+            _ => return Ok(Err("Expected AND keyword")),
+        }
+        if t.peek_token()?.is_none() {
+            return Ok(Err("Expected expression after AND"));
+        }
+        term!(read_additive(t));
+    }
+    Ok(Ok(ExprKind::Other))
+}
+
+fn read_additive(t: &mut Tokenizer) -> ExprResult {
+    let mut kind = term!(read_multiplicative(t));
+    while t.peek_token()?.is_some_and(|tok| tok == "+" || tok == "-") {
+        t.next_token()?;
+        term!(read_operand(t, read_multiplicative));
+        kind = ExprKind::Other;
+    }
+    Ok(Ok(kind))
+}
+
+fn read_multiplicative(t: &mut Tokenizer) -> ExprResult {
+    let mut kind = term!(read_unary(t));
+    while t.peek_token()?.is_some_and(|tok| tok == "*") {
+        t.next_token()?;
+        term!(read_operand(t, read_unary));
+        kind = ExprKind::Other;
+    }
+    Ok(Ok(kind))
+}
+
+fn read_unary(t: &mut Tokenizer) -> ExprResult {
+    // `NOT` can start a term too (`FOO = NOT BAR`).
+    if t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "NOT")) {
+        t.next_token()?;
+        term!(read_unary(t));
+        return Ok(Ok(ExprKind::Other));
+    }
+    if t.peek_token()?.is_some_and(|tok| tok == "-" || tok == "+") {
+        t.next_token()?;
+        // A sign on a number is part of the number (`-1`, `- -1`); on anything
+        // else it is an operation (`-'a'`, `-FOO`).
+        return Ok(Ok(match term!(read_unary(t)) {
+            ExprKind::Number => ExprKind::Number,
+            _ => ExprKind::Other,
+        }));
+    }
+    read_primary(t)
+}
+
+/// Read the elements of a list, a bag or a call's arguments up to `close`,
+/// refusing anything else after an element with `missing`.
+fn read_elements(
+    t: &mut Tokenizer,
+    close: &[&str],
+    missing: ExprError,
+) -> Result<Result<(), ExprError>, String> {
+    let closes = |t: &Tokenizer| -> Result<bool, String> {
+        Ok(close
+            .iter()
+            .enumerate()
+            .all(|(i, c)| t.peek_token_at(i).ok().flatten().as_deref() == Some(*c)))
+    };
+    let consume = |t: &mut Tokenizer| -> Result<(), String> {
+        for _ in close {
+            t.next_token()?;
+        }
+        Ok(())
+    };
+    if closes(t)? {
+        return Ok(Ok(consume(t)?));
+    }
+    loop {
+        if let Err(e) = read_expression(t)? {
+            return Ok(Err(e));
+        }
+        if t.peek_token()?.as_deref() == Some(",") {
+            t.next_token()?;
+            continue;
+        }
+        if closes(t)? {
+            return Ok(Ok(consume(t)?));
+        }
+        return Ok(Err(missing));
+    }
+}
+
+/// Read a subquery after its SELECT, as far as the bracket that closes it.
+fn read_subquery(t: &mut Tokenizer) -> ExprResult {
+    if t.peek_token()?.is_none() {
+        return Ok(Err(UNEXPECTED_TERM));
+    }
+    let mut depth = 0usize;
+    while let Some(tok) = t.peek_token()? {
+        match tok.as_str() {
+            "(" => depth += 1,
+            ")" if depth == 0 => break,
+            ")" => depth -= 1,
+            _ => {}
+        }
+        t.next_token()?;
+    }
+    Ok(Ok(ExprKind::Other))
+}
+
+/// Read `(...)` after `EXISTS`, or around an expression, up to its `)`.
+fn read_parenthesised(t: &mut Tokenizer) -> ExprResult {
+    let kind = if t
+        .peek_token()?
+        .is_some_and(|tok| is_keyword(&tok, "SELECT"))
+    {
+        t.next_token()?;
+        term!(read_subquery(t))
+    } else {
+        term!(read_expression(t))
+    };
+    if t.next_token()?.as_deref() != Some(")") {
+        return Ok(Err("Expected RIGHT_PAREN"));
+    }
+    Ok(Ok(kind))
+}
+
+/// Read a CASE expression after its CASE.
+fn read_case(t: &mut Tokenizer) -> ExprResult {
+    let Some(next) = t.peek_token()? else {
+        return Ok(Err(UNEXPECTED_TERM));
+    };
+    let searched = is_keyword(&next, "WHEN");
+    if !searched {
+        term!(read_expression(t));
+    }
+    let mut arms = 0;
+    while t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "WHEN")) {
+        t.next_token()?;
+        term!(read_expression(t));
+        if !t.next_token()?.is_some_and(|tok| is_keyword(&tok, "THEN")) {
+            return Ok(Err("Expected THEN keyword"));
+        }
+        term!(read_expression(t));
+        arms += 1;
+    }
+    if arms == 0 {
+        return Ok(Err("Expected a WHEN clause in CASE"));
+    }
+    if t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "ELSE")) {
+        t.next_token()?;
+        term!(read_expression(t));
+    }
+    if !t.next_token()?.is_some_and(|tok| is_keyword(&tok, "END")) {
+        return Ok(Err("Expected END keyword"));
+    }
+    Ok(Ok(if searched {
+        ExprKind::SearchedCase
+    } else {
+        ExprKind::SimpleCase
+    }))
+}
+
+/// Read any `.name`, `.*`, `[index]` or `[*]` steps after a term; one makes it
+/// a path.
+fn read_path_steps(t: &mut Tokenizer, kind: ExprKind) -> ExprResult {
+    let mut kind = kind;
+    loop {
+        match t.peek_token()?.as_deref() {
+            Some(".") => {
+                t.next_token()?;
+                match t.next_token()? {
+                    Some(step)
+                        if step == "*"
+                            || step.starts_with('"')
+                            || step.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') => {}
+                    _ => return Ok(Err("Invalid path dot component")),
+                }
+            }
+            Some("[") => {
+                t.next_token()?;
+                if t.peek_token()?.as_deref() == Some("*") {
+                    t.next_token()?;
+                } else {
+                    term!(read_expression(t));
+                }
+                if t.next_token()?.as_deref() != Some("]") {
+                    return Ok(Err("Expected RIGHT_BRACKET"));
+                }
+            }
+            _ => return Ok(Ok(kind)),
+        }
+        kind = ExprKind::Path;
+    }
+}
+
+fn read_primary(t: &mut Tokenizer) -> ExprResult {
+    let Some(tok) = t.next_token()? else {
+        return Ok(Err(UNEXPECTED_TERM));
+    };
+    if is_number_token(&tok) {
+        return Ok(Ok(ExprKind::Number));
+    }
+    // Path steps can follow any other term: `'a'.b` and `FOO(1).a` are paths.
+    let kind = match tok.as_str() {
+        _ if tok.starts_with('\'') && tok.len() >= 2 => ExprKind::Lit,
+        _ if is_any(&tok, &["TRUE", "FALSE", "NULL"]) => ExprKind::Lit,
+        _ if is_keyword(&tok, "MISSING") => ExprKind::Missing,
+        "?" => ExprKind::Parameter,
+        "[" => {
+            if let Err(e) = read_elements(t, &["]"], "Expected RIGHT_BRACKET")? {
+                return Ok(Err(e));
+            }
+            ExprKind::List
+        }
+        // An empty bag, which the tokenizer reads as `<`, `<>`, `>`.
+        "<" if t.peek_token()?.as_deref() == Some("<>")
+            && t.peek_token_at(1)?.as_deref() == Some(">") =>
+        {
+            t.next_token()?;
+            t.next_token()?;
+            ExprKind::Bag
+        }
+        "<" if t.peek_token()?.as_deref() == Some("<") => {
+            t.next_token()?;
+            if let Err(e) = read_elements(t, &[">", ">"], "Expected RIGHT_DOUBLE_ANGLE_BRACKET")? {
+                return Ok(Err(e));
+            }
+            ExprKind::Bag
+        }
+        "(" => term!(read_parenthesised(t)),
+        "{" => {
+            if t.peek_token()?.as_deref() == Some("}") {
+                t.next_token()?;
+            } else {
+                loop {
+                    term!(read_expression(t));
+                    if t.next_token()?.as_deref() != Some(":") {
+                        return Ok(Err("Expected COLON"));
+                    }
+                    term!(read_expression(t));
+                    match t.next_token()?.as_deref() {
+                        Some(",") => {}
+                        Some("}") => break,
+                        _ => return Ok(Err("Expected RIGHT_CURLY")),
+                    }
+                }
+            }
+            ExprKind::Struct
+        }
+        _ if is_keyword(&tok, "CASE") => return read_case(t),
+        _ if is_keyword(&tok, "SELECT") => return read_subquery(t),
+        _ if is_keyword(&tok, "EXISTS") => {
+            if t.peek_token()?.as_deref() != Some("(") {
+                return Ok(Err(UNEXPECTED_KEYWORD));
+            }
+            t.next_token()?;
+            term!(read_parenthesised(t));
+            return Ok(Ok(ExprKind::Other));
+        }
+        _ if is_keyword(&tok, "FROM") => {
+            // A FROM in a term is the start of a statement with no verb.
+            return Ok(Err(if t.peek_token()?.is_some_and(|next| is_name(&next)) {
+                "Expected data manipulation"
+            } else {
+                UNEXPECTED_TERM
+            }));
+        }
+        "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" => return Ok(Err(UNEXPECTED_OPERATOR)),
+        _ if is_any(&tok, OPERATOR_WORDS) => return Ok(Err(UNEXPECTED_OPERATOR)),
+        _ if is_any(&tok, KEYWORDS) => return Ok(Err(UNEXPECTED_KEYWORD)),
+        _ if is_name(&tok) => {
+            if t.peek_token()?.as_deref() == Some("(") {
+                t.next_token()?;
+                if let Err(e) = read_elements(t, &[")"], "Expected RIGHT_PAREN")? {
+                    return Ok(Err(e));
+                }
+                ExprKind::Other
+            } else {
+                ExprKind::Id
+            }
+        }
+        _ => return Ok(Err(UNEXPECTED_TERM)),
+    };
+    read_path_steps(t, kind)
+}
+
+/// Read an `ORDER BY path [ASC|DESC] [, ...]` clause. It has to be whole and
+/// last, so nothing can hide behind it.
+fn parse_order_by(t: &mut Tokenizer) -> Result<Vec<OrderByTerm>, String> {
+    expect_keyword(t, "ORDER")?;
+    expect_keyword(t, "BY")?;
+    let mut terms = Vec::new();
+    loop {
+        let span = t.span_at(t.pos);
+        let tok = t
+            .next_token()?
+            .ok_or("Expected attribute path in ORDER BY")?;
+        if tok.eq_ignore_ascii_case("ASC") || tok.eq_ignore_ascii_case("DESC") {
+            return Err(format!(
+                "Expected attribute path in ORDER BY but got '{tok}'"
+            ));
+        }
+        // DynamoDB names what it found and where the term starts, the length
+        // being the first token's as written: `ORDER BY m.x` gets `Type: PATH
+        // at 1:65:1` and `ORDER BY 'sk'` gets `Type: sk at 1:65:4` (captured
+        // eu-west-2 and us-east-1, 2026-10-09).
+        let found = if tok.starts_with('\'') && tok.ends_with('\'') && tok.len() >= 2 {
+            Some(tok[1..tok.len() - 1].to_string())
+        } else if matches!(t.peek_token()?.as_deref(), Some(".") | Some("[")) {
+            Some("PATH".to_string())
+        } else {
+            None
+        };
+        let rejection = found.map(|found| {
+            format!(
+                "Argument to ORDER BY must be of type VariableReference. Type: {found} at {}",
+                t.position(span)
+            )
+        });
+        let path = parse_dotted_path_from_token(&tok, t)?;
+        let mut descending = false;
+        if let Some(direction) = t
+            .peek_token()?
+            .filter(|s| s.eq_ignore_ascii_case("ASC") || s.eq_ignore_ascii_case("DESC"))
+        {
+            t.next_token()?; // consume the direction
+            descending = direction.eq_ignore_ascii_case("DESC");
+        }
+        // `NULLS FIRST` and `NULLS LAST` are accepted after a term (captured
+        // eu-west-2, 2026-10-09). A key is never null, so neither changes the
+        // order.
+        if t.peek_token()?
+            .is_some_and(|s| s.eq_ignore_ascii_case("NULLS"))
+        {
+            t.next_token()?; // consume NULLS
+            let which = t
+                .next_token()?
+                .ok_or("Expected FIRST or LAST after NULLS")?;
+            if !(which.eq_ignore_ascii_case("FIRST") || which.eq_ignore_ascii_case("LAST")) {
+                return Err(format!(
+                    "Expected FIRST or LAST after NULLS but got '{which}'"
+                ));
+            }
+        }
+        terms.push(OrderByTerm {
+            path,
+            descending,
+            rejection,
+        });
+        match t.peek_token()? {
+            Some(ref s) if s == "," => {
+                t.next_token()?; // consume comma
+            }
+            _ => return Ok(terms),
+        }
     }
 }
 
@@ -408,20 +1190,40 @@ fn parse_select(t: &mut Tokenizer) -> Result<Statement, ParseError> {
 
     // Parse table name, plus any index the FROM clause qualified it with
     let target = parse_table_name(t)?;
+    reject_alias(t)?;
 
     // Optional WHERE clause
     let where_clause = parse_optional_where(t)?;
+
+    // Optional ORDER BY, which DynamoDB accepts on a SELECT only.
+    let order_by = if t
+        .peek_token()?
+        .is_some_and(|tok| tok.eq_ignore_ascii_case("ORDER"))
+    {
+        parse_order_by(t)?
+    } else {
+        Vec::new()
+    };
 
     Ok(Statement::Select {
         table_name: target.name,
         index_name: target.index,
         projections,
         where_clause,
+        order_by,
     })
 }
 
 fn parse_projections(t: &mut Tokenizer) -> Result<Vec<String>, String> {
     let tok = t.peek_token()?.ok_or("Expected projection")?;
+    // Captured eu-west-2 and us-east-1, 2026-10-09.
+    if is_keyword(&tok, "FROM") {
+        return Err(
+            "Expected identifier or an expression but found unexpected keyword 'from' \
+                    in a select list."
+                .to_string(),
+        );
+    }
 
     if tok == "*" {
         t.next_token()?; // consume *
@@ -478,6 +1280,10 @@ fn parse_projections(t: &mut Tokenizer) -> Result<Vec<String>, String> {
 
 fn parse_insert(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     expect_keyword(t, "INTO")?;
+    // Captured eu-west-2 and us-east-1, 2026-10-09.
+    if t.peek_token()?.is_none() {
+        return Err(EXPECTED_SIMPLE_PATH.into());
+    }
     let target = parse_table_name(t)?;
     // Unlike UPDATE and DELETE, which parse a qualifier and reject it in
     // execution, DynamoDB rejects one on INSERT here, and reports where the
@@ -490,9 +1296,21 @@ fn parse_insert(t: &mut Tokenizer) -> Result<Statement, ParseError> {
         )));
     }
     let table_name = target.name;
+    // DynamoDB reads an alias on INSERT as a token left over before VALUE,
+    // not as the alias SELECT, UPDATE and DELETE refuse (captured eu-west-2,
+    // 2026-10-09).
+    if let Some(tok) = t.peek_token()?
+        && is_alias(&tok)
+        && (tok.eq_ignore_ascii_case("AS")
+            || t.peek_token_at(1)?
+                .is_some_and(|next| next.eq_ignore_ascii_case("VALUE")))
+    {
+        return Err("Unexpected token after expression".into());
+    }
     expect_keyword(t, "VALUE")?;
 
     // Parse the item literal as a map of possibly-parameterised values
+    t.clause = LiteralClause::Value;
     let item = parse_item_literal_partiql(t, 0)?;
 
     // Check for IF NOT EXISTS
@@ -518,6 +1336,7 @@ fn parse_insert(t: &mut Tokenizer) -> Result<Statement, ParseError> {
 
 fn parse_update(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     let target = parse_table_name(t)?;
+    reject_alias(t)?;
 
     // SET and REMOVE are both optional but at least one must be present.
     // Parse SET clauses if the next keyword is SET.
@@ -587,6 +1406,7 @@ fn parse_update(t: &mut Tokenizer) -> Result<Statement, ParseError> {
 /// Parse the right-hand side of a SET assignment: `value`, `path + value`, `path - value`,
 /// or `list_append(a, b)`.
 fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
+    t.clause = LiteralClause::Set;
     // Check for list_append function
     if let Some(ref tok) = t.peek_token()?
         && tok.eq_ignore_ascii_case("list_append")
@@ -646,6 +1466,7 @@ fn parse_set_value(t: &mut Tokenizer) -> Result<SetValue, String> {
 fn parse_delete(t: &mut Tokenizer) -> Result<Statement, ParseError> {
     expect_keyword(t, "FROM")?;
     let target = parse_table_name(t)?;
+    reject_alias(t)?;
     let where_clause = parse_optional_where(t)?;
     let returning = parse_optional_returning(t)?;
 
@@ -750,10 +1571,68 @@ fn parse_table_name(t: &mut Tokenizer) -> Result<TableTarget, ParseError> {
     Ok(TableTarget { name, index, span })
 }
 
+/// Refuse an alias on the table a SELECT, UPDATE or DELETE names.
+///
+/// DynamoDB reads `FROM "T" t` and `FROM "T" AS t` as aliasing and refuses it
+/// with its own message, outside the syntax-error envelope (captured
+/// eu-west-2, 2026-10-09).
+fn reject_alias(t: &Tokenizer) -> Result<(), ParseError> {
+    if t.peek_token()?.is_some_and(|tok| is_alias(&tok)) {
+        return Err(ParseError::Validation(
+            "Aliasing is not supported".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a token straight after a table name is an alias: `AS`, or a bare
+/// word that is not one of the keywords a statement can carry on with there.
+/// Those keep the handling they had, since what DynamoDB says about each has
+/// not been captured.
+fn is_alias(tok: &str) -> bool {
+    const NOT_AN_ALIAS: &[&str] = &[
+        "WHERE",
+        "SET",
+        "REMOVE",
+        "ORDER",
+        "RETURNING",
+        "VALUE",
+        "VALUES",
+        "LIMIT",
+        "OFFSET",
+        "GROUP",
+        "HAVING",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "JOIN",
+        "INNER",
+        "LEFT",
+        "RIGHT",
+        "OUTER",
+        "CROSS",
+        "ON",
+        "AT",
+        "LET",
+        "AND",
+        "OR",
+        "NOT",
+        "IF",
+    ];
+    let bare_word = tok
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    bare_word
+        && (tok.eq_ignore_ascii_case("AS")
+            || !NOT_AN_ALIAS.iter().any(|kw| tok.eq_ignore_ascii_case(kw)))
+}
+
 fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String> {
     match t.peek_token()? {
         Some(ref s) if s.eq_ignore_ascii_case("WHERE") => {
             t.next_token()?; // consume WHERE
+            t.clause = LiteralClause::Where;
             let (groups, wrote_or) = parse_conditions_with_or(t)?;
             Ok(Some(WhereClause::from_groups_written(groups, wrote_or)))
         }
@@ -931,13 +1810,9 @@ fn negate_condition(cond: WhereCondition) -> Result<BoolExpr, String> {
         W::IsNotMissing(p) => W::IsMissing(p).into(),
         W::Contains(p, v) => W::NotContains(p, v).into(),
         W::NotContains(p, v) => W::Contains(p, v).into(),
-        // Not `< low OR > high`, which would drop a row with no such attribute
-        // twice over. `NOT (>= low) OR NOT (<= high)` says the same thing about
-        // a row that has the attribute and keeps the one that does not.
-        W::Between(p, low, high) => BoolExpr::Or(vec![
-            not_cmp(p.clone(), CompOp::Ge, low),
-            not_cmp(p, CompOp::Le, high),
-        ]),
+        // Not `< low OR > high`, which would drop a row with no such attribute.
+        W::Between(p, low, high) => W::NotBetween(p, low, high).into(),
+        W::NotBetween(p, low, high) => W::Between(p, low, high).into(),
         W::In(p, values) => BoolExpr::And(
             values
                 .into_iter()
@@ -1243,6 +2118,7 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
     if depth > MAX_EXPR_DEPTH {
         return Err(TOO_DEEP.to_string());
     }
+    t.note_depth();
     let tok = t.next_token()?.ok_or("Expected value")?;
 
     if tok == "?" {
@@ -1296,7 +2172,10 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
                 t.next_token()?;
                 continue;
             }
-            items.push(parse_value(t, depth + 1)?);
+            t.value_path.push(format!("[{}]", items.len()));
+            let item = parse_value(t, depth + 1);
+            t.value_path.pop();
+            items.push(item?);
         }
         // We can only produce a Literal list if all elements are literals
         let mut avs = Vec::new();
@@ -1332,12 +2211,15 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
             }
             let key_tok = t.next_token()?.ok_or("Expected key in map literal")?;
             let key = unquote(&key_tok);
+            t.note_key(&key);
             let colon = t.next_token()?.ok_or("Expected ':'")?;
             if colon != ":" {
                 return Err(format!("Expected ':' but got '{colon}'"));
             }
-            let val = parse_value(t, depth + 1)?;
-            match val {
+            t.value_path.push(format!(".{key}"));
+            let val = parse_value(t, depth + 1);
+            t.value_path.pop();
+            match val? {
                 PartiqlValue::Literal(av) => {
                     map.insert(key, av);
                 }
@@ -1355,16 +2237,17 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
     // Negative number: `-` followed by a numeric token
     if (tok == "-" || tok == "+")
         && let Some(ref next) = t.peek_token()?
-        && next.starts_with(|c: char| c.is_ascii_digit())
+        && is_number_token(next)
     {
         let num = t.next_token()?.unwrap();
-        return Ok(PartiqlValue::Literal(AttributeValue::N(format!(
-            "{tok}{num}"
-        ))));
+        let text = format!("{tok}{num}");
+        t.note_number(&text);
+        return Ok(PartiqlValue::Literal(AttributeValue::N(text)));
     }
 
     // Numeric literal
-    if tok.starts_with(|c: char| c.is_ascii_digit()) {
+    if is_number_token(&tok) {
+        t.note_number(&tok);
         return Ok(PartiqlValue::Literal(AttributeValue::N(tok)));
     }
 
@@ -1398,7 +2281,69 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
         return Ok(PartiqlValue::Literal(AttributeValue::S(path)));
     }
 
+    // A point or a sign with no number after it can't start a term (captured
+    // eu-west-2, 2026-10-09: `.`, `.e5`, `-.` and `..5`).
+    if matches!(tok.as_str(), "." | "-" | "+") {
+        return Err("Unexpected term".to_string());
+    }
+
     Err(format!("Unexpected value token: {tok}"))
+}
+
+/// One number literal, as DynamoDB's PartiQL reads it. The message comes back
+/// without the path, for the caller to place.
+///
+/// The usual range and precision checks apply, with one difference at the very
+/// top of the exponent range. DynamoDB reads the literal as Java's
+/// `BigDecimal` and reports underflow, not overflow, once its precision less its
+/// scale reaches `i32::MAX`: `1e2147483645` is an overflow and `1e2147483646`
+/// an underflow, and `1e2147483647` is an underflow where PutItem calls the
+/// same number an overflow (captured eu-west-2, 2026-10-09).
+fn check_literal_number(n: &str) -> Result<(), String> {
+    if let Some((precision, scale)) = literal_precision_and_scale(n)
+        && precision - scale >= i64::from(i32::MAX)
+    {
+        return Err(
+            "Number underflow. Attempting to store a number with magnitude smaller \
+             than supported range"
+                .to_string(),
+        );
+    }
+    crate::types::validate_dynamo_number(n).map_err(|e| match e {
+        crate::errors::DynoxideError::ValidationException(message) => message,
+        other => other.to_string(),
+    })
+}
+
+/// A literal's precision and scale as `BigDecimal` counts them: precision is the
+/// number of digits once leading zeros are dropped (at least one, so zero has
+/// a precision of 1), and scale is the digits written after the point less the
+/// exponent. `None` when the exponent does not read as a number, which the
+/// tokeniser has already refused for anything written into a statement.
+fn literal_precision_and_scale(n: &str) -> Option<(i64, i64)> {
+    let unsigned = n.trim_start_matches(['+', '-']);
+    let (coefficient, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], unsigned[at + 1..].parse::<i64>().ok()?),
+        None => (unsigned, 0),
+    };
+    let fraction_digits = coefficient
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let digits: String = coefficient.chars().filter(char::is_ascii_digit).collect();
+    let significant = digits.trim_start_matches('0').len().max(1);
+    let scale = i64::try_from(fraction_digits).ok()? - exponent;
+    Some((i64::try_from(significant).ok()?, scale))
+}
+
+/// Whether a token is a number: it starts with a digit, or with a point and a
+/// digit (`.5`), which the tokeniser only produces where a value can start.
+fn is_number_token(tok: &str) -> bool {
+    let mut chars = tok.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_digit() => true,
+        Some('.') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => false,
+    }
 }
 
 /// Convert parsed set literal elements into a DynamoDB set type (SS, NS, or BS).
@@ -1470,15 +2415,18 @@ fn parse_item_literal(
         // Parse key
         let key_tok = t.next_token()?.ok_or("Expected key in item literal")?;
         let key = unquote(&key_tok);
+        t.note_key(&key);
 
         let colon = t.next_token()?.ok_or("Expected ':'")?;
         if colon != ":" {
             return Err(format!("Expected ':' but got '{colon}'"));
         }
 
-        // Parse value
-        let val = parse_item_value(t, depth)?;
-        item.insert(key, val);
+        // Parse value, named from the value it is nested in
+        t.value_path.push(format!(".{key}"));
+        let val = parse_item_value(t, depth);
+        t.value_path.pop();
+        item.insert(key, val?);
     }
 
     Ok(item)
@@ -1489,6 +2437,7 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
     if depth > MAX_EXPR_DEPTH {
         return Err(TOO_DEEP.to_string());
     }
+    t.note_depth();
     let tok = t.peek_token()?.ok_or("Expected value")?;
 
     if tok == "{" {
@@ -1511,7 +2460,10 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
                 t.next_token()?;
                 continue;
             }
-            items.push(parse_item_value(t, depth + 1)?);
+            t.value_path.push(format!("[{}]", items.len()));
+            let item = parse_item_value(t, depth + 1);
+            t.value_path.pop();
+            items.push(item?);
         }
         return Ok(AttributeValue::L(items));
     }
@@ -1553,14 +2505,17 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
     // Negative number: `-` followed by a numeric token
     if (tok == "-" || tok == "+")
         && let Some(ref next) = t.peek_token()?
-        && next.starts_with(|c: char| c.is_ascii_digit())
+        && is_number_token(next)
     {
         let num = t.next_token()?.unwrap();
-        return Ok(AttributeValue::N(format!("{tok}{num}")));
+        let text = format!("{tok}{num}");
+        t.note_number(&text);
+        return Ok(AttributeValue::N(text));
     }
 
     // Number
-    if tok.starts_with(|c: char| c.is_ascii_digit()) {
+    if is_number_token(&tok) {
+        t.note_number(&tok);
         return Ok(AttributeValue::N(tok));
     }
 
@@ -1634,15 +2589,25 @@ fn parse_item_literal_partiql(
         // Parse key
         let key_tok = t.next_token()?.ok_or("Expected key in item literal")?;
         let key = unquote(&key_tok);
+        t.note_key(&key);
 
         let colon = t.next_token()?.ok_or("Expected ':'")?;
         if colon != ":" {
             return Err(format!("Expected ':' but got '{colon}'"));
         }
 
-        // Parse value (may be a parameter placeholder)
-        let val = parse_item_value_partiql(t, depth)?;
-        item.insert(key, val);
+        // Parse value (may be a parameter placeholder). A top-level attribute's
+        // value is its own `root`, so only a nested entry adds its key to the
+        // path: `{'m': {'x': 1e126}}` fails `under root.x`.
+        let nested = depth > 0;
+        if nested {
+            t.value_path.push(format!(".{key}"));
+        }
+        let val = parse_item_value_partiql(t, depth);
+        if nested {
+            t.value_path.pop();
+        }
+        item.insert(key, val?);
     }
 
     Ok(item)
@@ -1654,6 +2619,7 @@ fn parse_item_value_partiql(t: &mut Tokenizer, depth: usize) -> Result<PartiqlVa
     if depth > MAX_EXPR_DEPTH {
         return Err(TOO_DEEP.to_string());
     }
+    t.note_depth();
     let tok = t.peek_token()?.ok_or("Expected value")?;
 
     if tok == "?" {
@@ -1731,6 +2697,28 @@ struct Tokenizer {
     input: String,
     pos: usize,
     param_counter: usize,
+    /// The clause whose values are being read, so a number DynamoDB would
+    /// refuse is reported from the clause it reports first.
+    clause: LiteralClause,
+    /// Where the value being read sits inside the value it belongs to, as the
+    /// segments after `root`: `.x` for a map entry, `[1]` for a list element.
+    value_path: Vec<String>,
+    /// Every literal DynamoDB would refuse as it reads it (a number it can't
+    /// store, a value nested too deep), in the order written, with the clause
+    /// it was written in and the message, path included.
+    literal_errors: Vec<(LiteralClause, String)>,
+}
+
+/// How deep a literal value may nest: a value 32 levels inside the value it is
+/// part of is refused.
+const LITERAL_NESTING_LIMIT: usize = 32;
+
+/// The clause a literal value was written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiteralClause {
+    Where,
+    Set,
+    Value,
 }
 
 impl Tokenizer {
@@ -1742,6 +2730,67 @@ impl Tokenizer {
             input: input.to_string(),
             pos: 0,
             param_counter: 0,
+            clause: LiteralClause::Where,
+            value_path: Vec::new(),
+            literal_errors: Vec::new(),
+        })
+    }
+
+    /// Note a number literal as it is read. One DynamoDB would refuse is
+    /// recorded with its path, `root` being the value it was written as part
+    /// of, and reported once the statement has parsed.
+    fn note_number(&mut self, text: &str) {
+        if let Err(message) = check_literal_number(text) {
+            let path: String = self.value_path.concat();
+            self.literal_errors
+                .push((self.clause, format!("{message} under root{path}")));
+        }
+    }
+
+    /// Note a map key as it is read. DynamoDB refuses an empty one anywhere in
+    /// a literal, an INSERT's own attribute names included, with no path, in
+    /// the order written against the other literal checks (captured eu-west-2
+    /// and us-east-1, 2026-10-09).
+    fn note_key(&mut self, key: &str) {
+        if key.is_empty() {
+            self.literal_errors.push((
+                self.clause,
+                "Path component cannot be an empty string".to_string(),
+            ));
+        }
+    }
+
+    /// Note a value about to be read. One 32 levels inside the value it
+    /// belongs to is as deep as DynamoDB reads a literal: it refuses it there,
+    /// naming the path to it, whatever lies further in (captured eu-west-2 and
+    /// us-east-1, 2026-10-09: 31 levels are accepted, and 32 and 63 both fail
+    /// at the 32nd).
+    fn note_depth(&mut self) {
+        if self.value_path.len() == LITERAL_NESTING_LIMIT {
+            let path: String = self.value_path.concat();
+            self.literal_errors.push((
+                self.clause,
+                format!("Nesting Levels have exceeded supported limits under root{path}"),
+            ));
+        }
+    }
+
+    /// The first literal DynamoDB would refuse, from the clause it
+    /// reports first: an UPDATE's WHERE clause comes before its SET clause,
+    /// and within a clause the first one written comes first (captured
+    /// eu-west-2 and us-east-1, 2026-10-09).
+    fn first_literal_error(&self) -> Option<String> {
+        [
+            LiteralClause::Where,
+            LiteralClause::Set,
+            LiteralClause::Value,
+        ]
+        .into_iter()
+        .find_map(|clause| {
+            self.literal_errors
+                .iter()
+                .find(|(c, _)| *c == clause)
+                .map(|(_, message)| message.clone())
         })
     }
 
@@ -1856,11 +2905,46 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
             continue;
         }
 
+        // Comments read as whitespace, as DynamoDB reads them: `--` runs to
+        // the end of the line and `/* ... */` to its close. An unterminated
+        // block comment is refused with nothing after the envelope, and so is
+        // `#`, which is not a comment marker here (captured eu-west-2,
+        // 2026-10-09). Strings and quoted names are read whole below, so a
+        // comment marker inside one stays data.
+        if chars[i] == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < len && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            match (i + 2..len.saturating_sub(1)).find(|&j| chars[j] == '*' && chars[j + 1] == '/') {
+                Some(close) => {
+                    i = close + 2;
+                    continue;
+                }
+                None => return Err(String::new()),
+            }
+        }
+        if chars[i] == '#' {
+            return Err(String::new());
+        }
+
         let start = i;
+
+        // A number can start at its point, as `.5` and `.25e1` do (captured
+        // eu-west-2, 2026-10-09). A `.` straight after a name, a quoted name,
+        // `]` or `)` continues a path instead, as in `a.b` or `l[0].x`.
+        let leading_point = chars[i] == '.'
+            && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
+            && !(i > 0
+                && (chars[i - 1].is_ascii_alphanumeric()
+                    || matches!(chars[i - 1], '_' | '"' | ']' | ')')));
 
         // Single-char tokens
         match chars[i] {
-            '{' | '}' | '[' | ']' | '(' | ')' | ',' | ':' | '*' | '?' | '+' | '-' | '.' => {
+            '.' if leading_point => {}
+            '{' | '}' | '[' | ']' | '(' | ')' | ',' | ':' | '*' | '?' | '+' | '-' | '.' | ';' => {
                 // Check for multi-char - or +  as start of number? No, treat as separate.
                 let tok = chars[i].to_string();
                 i += 1;
@@ -1958,12 +3042,61 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
             continue;
         }
 
-        // Number
-        if chars[i].is_ascii_digit() {
+        // Number, with an optional exponent: `1e5`, `1.5E-3`. An `e` that is
+        // not followed by digits (`1e`, `1ex`) is left for the next token.
+        if chars[i].is_ascii_digit() || leading_point {
+            // One point per number: `1.2.3` reads as `1.2` with `.3` left
+            // over, which DynamoDB refuses as a token after the expression
+            // (captured eu-west-2, 2026-10-09, with `.5.5`).
             let mut s = String::new();
-            while i < len && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            let mut seen_point = false;
+            while i < len && (chars[i].is_ascii_digit() || (chars[i] == '.' && !seen_point)) {
+                seen_point |= chars[i] == '.';
                 s.push(chars[i]);
                 i += 1;
+            }
+            if i < len && matches!(chars[i], 'e' | 'E') {
+                let sign = usize::from(i + 1 < len && matches!(chars[i + 1], '+' | '-'));
+                let first_digit = i + 1 + sign;
+                // An exponent marker with no digits and nothing name-like
+                // after it, as in `5e` at the end of a statement, is refused
+                // with nothing after the envelope (captured eu-west-2,
+                // 2026-10-09). One followed by a name (`1ex`) is still left
+                // for the next token.
+                if first_digit >= len
+                    || !(chars[first_digit].is_ascii_alphanumeric() || chars[first_digit] == '_')
+                {
+                    return Err(String::new());
+                }
+                if chars[first_digit].is_ascii_digit() {
+                    let mut end = first_digit;
+                    while end < len && chars[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                    // DynamoDB reads the literal as Java's BigDecimal does,
+                    // and refuses one BigDecimal can't hold as a statement
+                    // that is not well formed, with nothing after the colon.
+                    // That is an exponent outside an i32 (`1e99999999999`,
+                    // captured eu-west-2, 2026-10-08) or a scale outside one,
+                    // the scale being the digits written after the point
+                    // minus the exponent (`1e-2147483648`, `1.50e-2147483646`,
+                    // captured 2026-10-09). A literal that can be held goes on
+                    // to the usual number checks wherever the value is used.
+                    let exponent: String = chars[i + 1..end].iter().collect();
+                    let Ok(exponent) = exponent.parse::<i32>() else {
+                        return Err(String::new());
+                    };
+                    let fraction_digits =
+                        s.split_once('.').map_or(0, |(_, fraction)| fraction.len());
+                    let scale = i64::try_from(fraction_digits)
+                        .unwrap_or(i64::MAX)
+                        .saturating_sub(i64::from(exponent));
+                    if i32::try_from(scale).is_err() {
+                        return Err(String::new());
+                    }
+                    s.extend(&chars[i..end]);
+                    i = end;
+                }
             }
             emit(&mut tokens, &mut spans, s, start, i);
             continue;
@@ -2794,5 +3927,269 @@ mod tests {
                 "A path may contain at most 2 components in the FROM clause".to_string()
             )
         );
+    }
+
+    #[test]
+    fn a_number_with_an_exponent_is_one_token() {
+        for input in ["1e5", "1E5", "1e+5", "1e-5", "1.5e3", "15E-1"] {
+            let (tokens, _) = tokenize(input).unwrap();
+            assert_eq!(tokens, vec![input.to_string()], "{input}");
+        }
+    }
+
+    #[test]
+    fn an_e_without_exponent_digits_is_not_part_of_the_number() {
+        for (input, expected) in [
+            ("1ex", vec!["1", "ex"]),
+            ("1 e5", vec!["1", "e5"]),
+            ("e5", vec!["e5"]),
+        ] {
+            let (tokens, _) = tokenize(input).unwrap();
+            assert_eq!(tokens, expected, "{input}");
+        }
+        // With nothing name-like after it, the marker is refused with nothing
+        // after the envelope, as DynamoDB refuses `5e` (captured eu-west-2,
+        // 2026-10-09).
+        for input in ["1e", "1e+", "1e )"] {
+            assert_eq!(tokenize(input).unwrap_err(), String::new(), "{input}");
+        }
+    }
+
+    #[test]
+    fn an_exponent_too_large_to_read_is_a_syntax_error_with_no_detail() {
+        for input in ["1e99999999999", "1e-99999999999", "2e2147483648"] {
+            assert_eq!(
+                parse(&format!("SELECT * FROM \"T\" WHERE pk = {input}")).unwrap_err(),
+                ParseError::Syntax(String::new()),
+                "{input}"
+            );
+        }
+        // At the edge of what can be read, the literal reads, and is refused as
+        // a number DynamoDB can't store rather than as a syntax error.
+        assert!(matches!(
+            parse("SELECT * FROM \"T\" WHERE pk = 1e2147483647"),
+            Err(ParseError::Validation(message)) if message.starts_with("Number underflow")
+        ));
+    }
+
+    #[test]
+    fn a_token_left_after_a_statement_is_a_syntax_error() {
+        for input in [
+            "SELECT * FROM \"T\" WHERE pk = 1 foo",
+            "DELETE FROM \"T\" WHERE pk = 1 foo",
+            "UPDATE \"T\" SET a = 1 WHERE pk = 1 foo",
+            "INSERT INTO \"T\" VALUE {'pk': 1} foo",
+        ] {
+            assert_eq!(
+                parse(input).unwrap_err(),
+                ParseError::Syntax("Unexpected token after expression".to_string()),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_order_by_clause_on_a_select_is_accepted() {
+        for input in [
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER BY sk",
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER BY sk DESC",
+            "SELECT * FROM \"T\" WHERE pk = 1 order by sk asc",
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER BY sk DESC, other ASC",
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER BY a.b[0]",
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER BY \"sk\"",
+            "SELECT * FROM \"T\" ORDER BY sk",
+        ] {
+            assert!(parse(input).is_ok(), "{input}");
+        }
+        assert!(parse("DELETE FROM \"T\" WHERE pk = 1 ORDER BY sk").is_err());
+    }
+
+    fn order_by_of(input: &str) -> Vec<(String, bool)> {
+        match parse(input).unwrap() {
+            Statement::Select { order_by, .. } => order_by
+                .into_iter()
+                .map(|term| (term.path, term.descending))
+                .collect(),
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_terms_are_carried_on_the_select() {
+        // The executor turns a keyed read round on `ORDER BY sk DESC`, so the
+        // terms have to survive the parse with their direction.
+        assert_eq!(
+            order_by_of("SELECT * FROM \"T\" WHERE pk = 1 ORDER BY sk DESC, other"),
+            vec![("sk".to_string(), true), ("other".to_string(), false)]
+        );
+        assert_eq!(
+            order_by_of("SELECT * FROM \"T\" WHERE pk = 1 order by \"sk\" asc"),
+            vec![("sk".to_string(), false)]
+        );
+        assert!(order_by_of("SELECT * FROM \"T\" WHERE pk = 1").is_empty());
+    }
+
+    fn where_value_of(input: &str) -> PartiqlValue {
+        match parse(input).unwrap() {
+            Statement::Select {
+                where_clause: Some(wc),
+                ..
+            } => match &wc.groups[0][0] {
+                WhereCondition::Comparison(c) => c.value.clone(),
+                other => panic!("expected a comparison, got {other:?}"),
+            },
+            other => panic!("expected a SELECT with a WHERE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_point_starts_a_number_only_where_a_value_can_start() {
+        for (input, expected) in [
+            ("SELECT * FROM \"T\" WHERE pk = .5e1", ".5e1"),
+            ("SELECT * FROM \"T\" WHERE pk=.5", ".5"),
+            ("SELECT * FROM \"T\" WHERE pk = -.5e1", "-.5e1"),
+        ] {
+            assert_eq!(
+                where_value_of(input),
+                PartiqlValue::Literal(AttributeValue::N(expected.to_string())),
+                "{input}"
+            );
+        }
+        // Straight after a name, a quoted name or a closing bracket the point
+        // still continues a path.
+        match parse("SELECT a.b, \"c\".d, l[0].e FROM \"T\"").unwrap() {
+            Statement::Select { projections, .. } => {
+                assert_eq!(projections, vec!["a.b", "c.d", "l[0].e"]);
+            }
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_order_by_clause_must_be_whole_and_last() {
+        // A WHERE written after ORDER BY used to ride through the exemption
+        // for the ORDER BY tail and run as an unfiltered read.
+        for input in [
+            "SELECT * FROM \"T\" ORDER BY sk WHERE pk = 'x'",
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER BY sk DESC junk",
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER BY sk ASC DESC",
+        ] {
+            assert_eq!(
+                parse(input).unwrap_err(),
+                ParseError::Syntax("Unexpected token after expression".to_string()),
+                "{input}"
+            );
+        }
+        for input in [
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER BY",
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER BY sk,",
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER sk",
+            "SELECT * FROM \"T\" WHERE pk = 1 ORDER BY DESC",
+        ] {
+            assert!(
+                matches!(parse(input), Err(ParseError::Syntax(_))),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn comments_are_read_as_whitespace() {
+        // DynamoDB accepts `--` to the end of the line and `/* ... */`
+        // anywhere whitespace can go (captured eu-west-2, 2026-10-09).
+        let plain = format!("{:?}", parse("SELECT * FROM \"T\" WHERE pk = 1").unwrap());
+        for input in [
+            "SELECT * FROM \"T\" WHERE pk = 1 -- note",
+            "SELECT * FROM \"T\" WHERE pk = 1 --",
+            "SELECT * FROM \"T\" -- c\nWHERE pk = 1",
+            "-- lead\nSELECT * FROM \"T\" WHERE pk = 1",
+            "SELECT * FROM \"T\" WHERE pk = 1 /* c */",
+            "SELECT * FROM \"T\" /* c */ WHERE pk = 1",
+            "SELECT/**/* FROM \"T\" WHERE pk = 1",
+        ] {
+            let parsed = parse(input).unwrap_or_else(|e| panic!("{input:?}: {e:?}"));
+            assert_eq!(format!("{parsed:?}"), plain, "{input:?}");
+        }
+        // Inside a string or a quoted name the characters are data.
+        let (tokens, _) = tokenize("'a -- b' \"c /* d */\"").unwrap();
+        assert_eq!(tokens, vec!["'a -- b'", "\"c /* d */\""]);
+    }
+
+    #[test]
+    fn a_hash_or_an_unterminated_block_comment_is_a_syntax_error_with_no_detail() {
+        for input in [
+            "SELECT * FROM \"T\" WHERE pk = 1 # c",
+            "SELECT * FROM \"T\" WHERE pk = 1 /* unterminated",
+            "SELECT * FROM \"T\" WHERE pk = 1 /*/",
+        ] {
+            assert_eq!(
+                parse(input).unwrap_err(),
+                ParseError::Syntax(String::new()),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exponent_whose_scale_does_not_fit_an_i32_is_a_syntax_error_with_no_detail() {
+        // DynamoDB reads a number as Java's BigDecimal does, which refuses a
+        // scale (digits after the point, as written, minus the exponent)
+        // outside an i32 as well as an exponent outside one (captured
+        // eu-west-2, 2026-10-09).
+        for input in [
+            "1e-2147483648",
+            "1.5e-2147483647",
+            "0.1e-2147483647",
+            "1.50e-2147483646",
+            "0e-2147483648",
+        ] {
+            assert_eq!(
+                parse(&format!("SELECT * FROM \"T\" WHERE pk = {input}")).unwrap_err(),
+                ParseError::Syntax(String::new()),
+                "{input}"
+            );
+        }
+        // A scale of exactly i32::MAX still reads.
+        for input in ["1.5e-2147483646", "10e-2147483647"] {
+            let (tokens, _) = tokenize(input).unwrap();
+            assert_eq!(tokens, vec![input.to_string()], "{input}");
+        }
+    }
+
+    #[test]
+    fn an_alias_after_the_table_name_is_refused() {
+        // DynamoDB refuses an alias on SELECT, DELETE and UPDATE with its own
+        // message and no envelope, and an alias on INSERT as a leftover token
+        // (captured eu-west-2, 2026-10-09).
+        for input in [
+            "SELECT * FROM \"T\" t WHERE pk = 1",
+            "SELECT * FROM \"T\" AS t WHERE pk = 1",
+            "SELECT * FROM \"T\" t",
+            "SELECT * FROM \"T\" foo",
+            "SELECT * FROM \"T\" as t",
+            "SELECT t.pk FROM \"T\" t WHERE t.pk = 1",
+            "DELETE FROM \"T\" t WHERE pk = 5",
+            "UPDATE \"T\" t SET a = 3 WHERE pk = 1",
+        ] {
+            assert_eq!(
+                parse(input).unwrap_err(),
+                ParseError::Validation("Aliasing is not supported".to_string()),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            parse("INSERT INTO \"T\" t VALUE {'pk': 8}").unwrap_err(),
+            ParseError::Syntax("Unexpected token after expression".to_string())
+        );
+        // The keywords that follow a table name are not aliases.
+        for input in [
+            "SELECT * FROM \"T\" WHERE pk = 1",
+            "SELECT * FROM \"T\" ORDER BY pk",
+            "DELETE FROM \"T\" WHERE pk = 5",
+            "UPDATE \"T\" SET a = 3 WHERE pk = 1",
+            "UPDATE \"T\" REMOVE a WHERE pk = 1",
+        ] {
+            assert!(parse(input).is_ok(), "{input}");
+        }
     }
 }
