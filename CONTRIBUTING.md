@@ -63,12 +63,16 @@ or behaviour note that motivates the change. Cleaner ergonomics or
 
 ## Benchmarks
 
-The PR benchmark check has two layers. Criterion wall-clock numbers
-run on shared CI runners and are advisory; they can swing by up to
-roughly 3x on a noisy neighbour. iai-callgrind runs on the same PR
-and is deterministic and blocking. If Criterion looks red but
-iai-callgrind is clean, re-run the workflow before worrying.
-`AGENTS.md` has the short version of this.
+The PR benchmark check has two layers, and neither blocks a merge.
+Criterion wall-clock numbers run on shared CI runners and are
+advisory; they can swing by up to roughly 3x on a noisy neighbour.
+iai-callgrind runs on the same PR and is deterministic, but it reports
+instruction counts without a stored baseline, so it does not fail on a
+regression by itself, and CI keeps no counts from `main`. If Criterion
+looks red, run `cargo bench --bench iai_core --features iai-callgrind`
+in `benchmarks/` on `main` and on your branch, on the same Linux
+machine or container; if the counts match, re-run the workflow before
+worrying. `AGENTS.md` has the short version of this.
 
 ## Commit style
 
