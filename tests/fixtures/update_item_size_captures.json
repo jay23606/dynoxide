@@ -1,0 +1,3735 @@
+{
+ "captured": "eu-west-2, 9 October 2026",
+ "cases": [
+  {
+   "id": "C0",
+   "what": "SET b = :pad, no row",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET b = :pad",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409581
+  },
+  {
+   "id": "C1",
+   "what": "SET b = :pad with an untouched 10-byte u",
+   "seed": {
+    "u": {
+     "S": "yyyyyyyyyy"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "u": {
+     "S": "yyyyyyyyyy"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409592
+  },
+  {
+   "id": "P1a",
+   "what": "SET b = :pad, c = big (read-only reference to a 1,000-byte big)",
+   "seed": {
+    "big": {
+     "S": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = big",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "big": {
+     "S": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+    },
+    "c": {
+     "S": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "P1b",
+   "what": "SET b = :pad, c = :copy (same value as big, from the request)",
+   "seed": {
+    "big": {
+     "S": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = :copy",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":copy": {
+      "S": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+     }
+    }
+   },
+   "finished": {
+    "big": {
+     "S": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+    },
+    "c": {
+     "S": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "P2",
+   "what": "SET b = :pad, c = :same (c unchanged, 1,000 bytes)",
+   "seed": {
+    "c": {
+     "S": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = :same",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":same": {
+      "S": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409562
+  },
+  {
+   "id": "P3",
+   "what": "SET b = :pad, c = if_not_exists(c, :v) (c exists, 1,000 bytes)",
+   "seed": {
+    "c": {
+     "S": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :v)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "v"
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "P4",
+   "what": "SET b = :pad REMOVE l[1] (l = [1,000-byte S, 1-byte S])",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll"
+      },
+      {
+       "S": "z"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad REMOVE l[1]",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "P5",
+   "what": "SET b = :pad DELETE ss :one (ss 1,000 bytes, one member removed)",
+   "seed": {
+    "ss": {
+     "SS": [
+      "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+      "q",
+      "r"
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad DELETE ss :one",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "SS": [
+       "q"
+      ]
+     }
+    }
+   },
+   "finished": {
+    "ss": {
+     "SS": [
+      "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+      "r"
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "P6",
+   "what": "SET b = :pad ADD ss :new (ss 1,000 bytes, one member added)",
+   "seed": {
+    "ss": {
+     "SS": [
+      "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+      "q",
+      "r"
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad ADD ss :new",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":new": {
+      "SS": [
+       "s"
+      ]
+     }
+    }
+   },
+   "finished": {
+    "ss": {
+     "SS": [
+      "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+      "q",
+      "r",
+      "s"
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "P7r",
+   "what": "SET b = :pad, n = :two (seed n = 1)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = :two",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":two": {
+      "N": "2"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409562
+  },
+  {
+   "id": "P7a",
+   "what": "SET b = :pad, n = n + :one (seed n = 1)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = n + :one",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409512
+  },
+  {
+   "id": "P7b",
+   "what": "SET b = :pad, m = n + :one (seed n = 1, n untouched)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, m = n + :one",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "1"
+    },
+    "m": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409515
+  },
+  {
+   "id": "P7c",
+   "what": "SET b = :pad, n = :a + :b (seed n = 1)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = :a + :b",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":a": {
+      "N": "1"
+     },
+     ":b": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409526
+  },
+  {
+   "id": "P7d",
+   "what": "SET b = :pad, n = n - :one (seed n = 1)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = n - :one",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "0"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409508
+  },
+  {
+   "id": "P8a",
+   "what": "AttributeUpdates {b: PUT pad}, no row",
+   "seed": null,
+   "request": {
+    "AttributeUpdates": {
+     "b": {
+      "Action": "PUT",
+      "Value": {
+       "S": {
+        "$pad": "x"
+       }
+      }
+     }
+    }
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "P8b",
+   "what": "AttributeUpdates {b: PUT pad} with an untouched 10-byte u",
+   "seed": {
+    "u": {
+     "S": "yyyyyyyyyy"
+    }
+   },
+   "request": {
+    "AttributeUpdates": {
+     "b": {
+      "Action": "PUT",
+      "Value": {
+       "S": {
+        "$pad": "x"
+       }
+      }
+     }
+    }
+   },
+   "finished": {
+    "u": {
+     "S": "yyyyyyyyyy"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "P9",
+   "what": "SET b = :pad, m.x = :x, m.y = :y (m a map of about 1,000 bytes)",
+   "seed": {
+    "m": {
+     "M": {
+      "z": {
+       "S": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, m.x = :x, m.y = :y",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":x": {
+      "S": "1"
+     },
+     ":y": {
+      "S": "1"
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "z": {
+       "S": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+      },
+      "x": {
+       "S": "1"
+      },
+      "y": {
+       "S": "1"
+      }
+     }
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "P3s",
+   "what": "SET b = :pad, c = if_not_exists(c, :v) (c exists, 10 bytes)",
+   "seed": {
+    "c": {
+     "S": "cccccccccc"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :v)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "v"
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "cccccccccc"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409516
+  },
+  {
+   "id": "P3n",
+   "what": "SET b = :pad, c = if_not_exists(c, :v) (c absent, :v 10 bytes)",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :v)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "vvvvvvvvvv"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409507
+  },
+  {
+   "id": "P4s",
+   "what": "SET b = :pad REMOVE l[1] (l = [10-byte S, 1-byte S])",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "llllllllll"
+      },
+      {
+       "S": "z"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad REMOVE l[1]",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "llllllllll"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409589
+  },
+  {
+   "id": "P5s",
+   "what": "SET b = :pad DELETE ss :rm (ss = [5 bytes, 500 bytes], the 500 removed)",
+   "seed": {
+    "ss": {
+     "SS": [
+      "ppppp",
+      "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad DELETE ss :rm",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":rm": {
+      "SS": [
+       "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+      ]
+     }
+    }
+   },
+   "finished": {
+    "ss": {
+     "SS": [
+      "ppppp"
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409585
+  },
+  {
+   "id": "P6s",
+   "what": "SET b = :pad ADD ss :new (ss = [5 bytes], adding a 500-byte member)",
+   "seed": {
+    "ss": {
+     "SS": [
+      "ppppp"
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad ADD ss :new",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":new": {
+      "SS": [
+       "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+      ]
+     }
+    }
+   },
+   "finished": {
+    "ss": {
+     "SS": [
+      "ppppp",
+      "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409567
+  },
+  {
+   "id": "P6n",
+   "what": "SET b = :pad ADD n :one (seed n = 1)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad ADD n :one",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409562
+  },
+  {
+   "id": "P9s",
+   "what": "SET b = :pad, m.x = :x (m = {z: 5 bytes}, x 500 bytes)",
+   "seed": {
+    "m": {
+     "M": {
+      "z": {
+       "S": "mmmmm"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, m.x = :x",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":x": {
+      "S": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "z": {
+       "S": "mmmmm"
+      },
+      "x": {
+       "S": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      }
+     }
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409569
+  },
+  {
+   "id": "P7e",
+   "what": "SET b = :pad, n = :a - :b (seed n = 1)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = :a - :b",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":a": {
+      "N": "3"
+     },
+     ":b": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409523
+  },
+  {
+   "id": "P7f",
+   "what": "SET b = :pad, n = :one + n (seed n = 1)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = :one + n",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409512
+  },
+  {
+   "id": "P7g",
+   "what": "SET b = :pad, n = n + :big (seed n = 1, :big 20 digits)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = n + :big",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":big": {
+      "N": "12345678901234567890"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "12345678901234567891"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409512
+  },
+  {
+   "id": "P7h",
+   "what": "SET b = :pad, n = n + :one (seed n = 20 digits)",
+   "seed": {
+    "n": {
+     "N": "12345678901234567890"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = n + :one",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "12345678901234567891"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409521
+  },
+  {
+   "id": "P7i",
+   "what": "SET b = :pad, n = n + n (seed n = 1)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = n + n",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409498
+  },
+  {
+   "id": "P7j",
+   "what": "SET b = :pad, n = n - :one (seed n = 5, result 4)",
+   "seed": {
+    "n": {
+     "N": "5"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = n - :one",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "4"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409509
+  },
+  {
+   "id": "P1s",
+   "what": "SET b = :pad, c = big (big 10 bytes)",
+   "seed": {
+    "big": {
+     "S": "gggggggggg"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = big",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "big": {
+     "S": "gggggggggg"
+    },
+    "c": {
+     "S": "gggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409567
+  },
+  {
+   "id": "P1t",
+   "what": "SET b = :pad, c = abcdefghij (a ten-character path operand, 10-byte value)",
+   "seed": {
+    "abcdefghij": {
+     "S": "gggggggggg"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = abcdefghij",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "abcdefghij": {
+     "S": "gggggggggg"
+    },
+    "c": {
+     "S": "gggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409567
+  },
+  {
+   "id": "P7k",
+   "what": "SET b = :pad, abcdefghij = abcdefghij + :one (seed 1)",
+   "seed": {
+    "abcdefghij": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, abcdefghij = abcdefghij + :one",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "abcdefghij": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409503
+  },
+  {
+   "id": "P1u",
+   "what": "SET b = :pad, c = m.z (nested path operand, 10-byte value)",
+   "seed": {
+    "m": {
+     "M": {
+      "z": {
+       "S": "gggggggggg"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = m.z",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "z": {
+       "S": "gggggggggg"
+      }
+     }
+    },
+    "c": {
+     "S": "gggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409557
+  },
+  {
+   "id": "N1",
+   "what": "SET b = :pad, c = m.z (m.z 100 bytes)",
+   "seed": {
+    "m": {
+     "M": {
+      "z": {
+       "S": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = m.z",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "z": {
+       "S": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+      }
+     }
+    },
+    "c": {
+     "S": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "N1b",
+   "what": "SET b = :pad, c = m.z (m.z 20 bytes)",
+   "seed": {
+    "m": {
+     "M": {
+      "z": {
+       "S": "gggggggggggggggggggg"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = m.z",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "z": {
+       "S": "gggggggggggggggggggg"
+      }
+     }
+    },
+    "c": {
+     "S": "gggggggggggggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409577
+  },
+  {
+   "id": "N2",
+   "what": "SET b = :pad, c = m.zzzzz (10 bytes)",
+   "seed": {
+    "m": {
+     "M": {
+      "zzzzz": {
+       "S": "gggggggggg"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = m.zzzzz",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "zzzzz": {
+       "S": "gggggggggg"
+      }
+     }
+    },
+    "c": {
+     "S": "gggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409557
+  },
+  {
+   "id": "N3",
+   "what": "SET b = :pad, c = mmmmm.z (10 bytes)",
+   "seed": {
+    "mmmmm": {
+     "M": {
+      "z": {
+       "S": "gggggggggg"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = mmmmm.z",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "mmmmm": {
+     "M": {
+      "z": {
+       "S": "gggggggggg"
+      }
+     }
+    },
+    "c": {
+     "S": "gggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409557
+  },
+  {
+   "id": "N4",
+   "what": "SET b = :pad, c = m.a.z (10 bytes)",
+   "seed": {
+    "m": {
+     "M": {
+      "a": {
+       "M": {
+        "z": {
+         "S": "gggggggggg"
+        }
+       }
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = m.a.z",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "a": {
+       "M": {
+        "z": {
+         "S": "gggggggggg"
+        }
+       }
+      }
+     }
+    },
+    "c": {
+     "S": "gggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409547
+  },
+  {
+   "id": "N5",
+   "what": "SET b = :pad, c = l[0] (10 bytes)",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "gggggggggg"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = l[0]",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "gggggggggg"
+      }
+     ]
+    },
+    "c": {
+     "S": "gggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409556
+  },
+  {
+   "id": "N6",
+   "what": "SET b = :pad, c = l[10] (10 bytes, 11 elements)",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "gggggggggg"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = l[10]",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "gggggggggg"
+      }
+     ]
+    },
+    "c": {
+     "S": "gggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409575
+  },
+  {
+   "id": "T1",
+   "what": "SET b = :pad, l[0] = :v (l = [1 byte], :v 10 bytes)",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, l[0] = :v",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "vvvvvvvvvv"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409561
+  },
+  {
+   "id": "T2",
+   "what": "SET b = :pad, l[10] = :v (11 elements, :v 10 bytes)",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, l[10] = :v",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "vvvvvvvvvv"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409580
+  },
+  {
+   "id": "T3",
+   "what": "SET b = :pad, m.a.x = :v (m = {a: {y: 1 byte}}, :v 10 bytes)",
+   "seed": {
+    "m": {
+     "M": {
+      "a": {
+       "M": {
+        "y": {
+         "S": "e"
+        }
+       }
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, m.a.x = :v",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "a": {
+       "M": {
+        "y": {
+         "S": "e"
+        },
+        "x": {
+         "S": "vvvvvvvvvv"
+        }
+       }
+      }
+     }
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409565
+  },
+  {
+   "id": "T4",
+   "what": "SET b = :pad, mmmmm.xxxxx = :v (mmmmm = {y: 1 byte}, :v 10 bytes)",
+   "seed": {
+    "mmmmm": {
+     "M": {
+      "y": {
+       "S": "e"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, mmmmm.xxxxx = :v",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "mmmmm": {
+     "M": {
+      "y": {
+       "S": "e"
+      },
+      "xxxxx": {
+       "S": "vvvvvvvvvv"
+      }
+     }
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409565
+  },
+  {
+   "id": "T5",
+   "what": "SET b = :pad, l[0].x = :v (l = [{y: 1 byte}], :v 10 bytes)",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "M": {
+        "y": {
+         "S": "e"
+        }
+       }
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, l[0].x = :v",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "M": {
+        "y": {
+         "S": "e"
+        },
+        "x": {
+         "S": "vvvvvvvvvv"
+        }
+       }
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409564
+  },
+  {
+   "id": "RM1",
+   "what": "SET b = :pad REMOVE abcdefghij (5 bytes)",
+   "seed": {
+    "abcdefghij": {
+     "S": "rrrrr"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad REMOVE abcdefghij",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409570
+  },
+  {
+   "id": "RM2",
+   "what": "SET b = :pad REMOVE m.y (m = {x: 10, y: 1})",
+   "seed": {
+    "m": {
+     "M": {
+      "x": {
+       "S": "kkkkkkkkkk"
+      },
+      "y": {
+       "S": "r"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad REMOVE m.y",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "x": {
+       "S": "kkkkkkkkkk"
+      }
+     }
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409590
+  },
+  {
+   "id": "RM3",
+   "what": "SET b = :pad REMOVE m.yyyyyyyyyy (m = {x: 10, yyyyyyyyyy: 1})",
+   "seed": {
+    "m": {
+     "M": {
+      "x": {
+       "S": "kkkkkkkkkk"
+      },
+      "yyyyyyyyyy": {
+       "S": "r"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad REMOVE m.yyyyyyyyyy",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "x": {
+       "S": "kkkkkkkkkk"
+      }
+     }
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409581
+  },
+  {
+   "id": "RM4",
+   "what": "SET b = :pad REMOVE abcdefghij[1] (list [10, 1])",
+   "seed": {
+    "abcdefghij": {
+     "L": [
+      {
+       "S": "kkkkkkkkkk"
+      },
+      {
+       "S": "r"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad REMOVE abcdefghij[1]",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "abcdefghij": {
+     "L": [
+      {
+       "S": "kkkkkkkkkk"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409589
+  },
+  {
+   "id": "RM5",
+   "what": "SET b = :pad REMOVE l[10] (11 one-byte elements)",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad REMOVE l[10]",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409597
+  },
+  {
+   "id": "RM6",
+   "what": "SET b = :pad REMOVE m.a.y (m = {a: {x: 1, y: 1}})",
+   "seed": {
+    "m": {
+     "M": {
+      "a": {
+       "M": {
+        "x": {
+         "S": "k"
+        },
+        "y": {
+         "S": "r"
+        }
+       }
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad REMOVE m.a.y",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "a": {
+       "M": {
+        "x": {
+         "S": "k"
+        }
+       }
+      }
+     }
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409581
+  },
+  {
+   "id": "D1",
+   "what": "SET b = :pad DELETE abcdefghij :rm (SS [5, 20], removes the 20)",
+   "seed": {
+    "abcdefghij": {
+     "SS": [
+      "ppppp",
+      "qqqqqqqqqqqqqqqqqqqq"
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad DELETE abcdefghij :rm",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":rm": {
+      "SS": [
+       "qqqqqqqqqqqqqqqqqqqq"
+      ]
+     }
+    }
+   },
+   "finished": {
+    "abcdefghij": {
+     "SS": [
+      "ppppp"
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409585
+  },
+  {
+   "id": "D2",
+   "what": "SET b = :pad DELETE m.ss :rm (m = {ss: SS [5, 20]}, removes the 20)",
+   "seed": {
+    "m": {
+     "M": {
+      "ss": {
+       "SS": [
+        "ppppp",
+        "qqqqqqqqqqqqqqqqqqqq"
+       ]
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad DELETE m.ss :rm",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":rm": {
+      "SS": [
+       "qqqqqqqqqqqqqqqqqqqq"
+      ]
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "ss": {
+       "SS": [
+        "ppppp"
+       ]
+      }
+     }
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409585
+  },
+  {
+   "id": "D3",
+   "what": "SET b = :pad DELETE ss :rm (SS [5, 20, 30], removes 20 and 30)",
+   "seed": {
+    "ss": {
+     "SS": [
+      "ppppp",
+      "qqqqqqqqqqqqqqqqqqqq",
+      "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad DELETE ss :rm",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":rm": {
+      "SS": [
+       "qqqqqqqqqqqqqqqqqqqq",
+       "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+      ]
+     }
+    }
+   },
+   "finished": {
+    "ss": {
+     "SS": [
+      "ppppp"
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409585
+  },
+  {
+   "id": "G1",
+   "what": "SET b = :pad, n = (n + :one) (seed 1)",
+   "seed": {
+    "n": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, n = (n + :one)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409512
+  },
+  {
+   "id": "A1",
+   "what": "SET b = :pad ADD abcdefghij :one (seed 1)",
+   "seed": {
+    "abcdefghij": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad ADD abcdefghij :one",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "abcdefghij": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409562
+  },
+  {
+   "id": "A2",
+   "what": "SET b = :pad ADD m.n :one (nested ADD, m = {n: 1})",
+   "seed": {
+    "m": {
+     "M": {
+      "n": {
+       "N": "1"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad ADD m.n :one",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "n": {
+       "N": "2"
+      }
+     }
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409562
+  },
+  {
+   "id": "V2",
+   "what": "SET b = :pad, c = if_not_exists(c, :s), d = if_not_exists(d, :s) (c, d 1 byte; :s 100 bytes used twice)",
+   "seed": {
+    "c": {
+     "S": "c"
+    },
+    "d": {
+     "S": "d"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :s), d = if_not_exists(d, :s)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":s": {
+      "S": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "c"
+    },
+    "d": {
+     "S": "d"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409235
+  },
+  {
+   "id": "P8c",
+   "what": "AttributeUpdates: b PUT pad plus ten 1-byte PUTs c0..c9 (no row)",
+   "seed": null,
+   "request": {
+    "AttributeUpdates": {
+     "b": {
+      "Action": "PUT",
+      "Value": {
+       "S": {
+        "$pad": "x"
+       }
+      }
+     },
+     "c0": {
+      "Action": "PUT",
+      "Value": {
+       "S": "v"
+      }
+     },
+     "c1": {
+      "Action": "PUT",
+      "Value": {
+       "S": "v"
+      }
+     },
+     "c2": {
+      "Action": "PUT",
+      "Value": {
+       "S": "v"
+      }
+     },
+     "c3": {
+      "Action": "PUT",
+      "Value": {
+       "S": "v"
+      }
+     },
+     "c4": {
+      "Action": "PUT",
+      "Value": {
+       "S": "v"
+      }
+     },
+     "c5": {
+      "Action": "PUT",
+      "Value": {
+       "S": "v"
+      }
+     },
+     "c6": {
+      "Action": "PUT",
+      "Value": {
+       "S": "v"
+      }
+     },
+     "c7": {
+      "Action": "PUT",
+      "Value": {
+       "S": "v"
+      }
+     },
+     "c8": {
+      "Action": "PUT",
+      "Value": {
+       "S": "v"
+      }
+     },
+     "c9": {
+      "Action": "PUT",
+      "Value": {
+       "S": "v"
+      }
+     }
+    }
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    },
+    "c0": {
+     "S": "v"
+    },
+    "c1": {
+     "S": "v"
+    },
+    "c2": {
+     "S": "v"
+    },
+    "c3": {
+     "S": "v"
+    },
+    "c4": {
+     "S": "v"
+    },
+    "c5": {
+     "S": "v"
+    },
+    "c6": {
+     "S": "v"
+    },
+    "c7": {
+     "S": "v"
+    },
+    "c8": {
+     "S": "v"
+    },
+    "c9": {
+     "S": "v"
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "X2",
+   "what": "SET b = :pad, c0 = :v, ..., c9 = :v (no row)",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET b = :pad, c0 = :v, c1 = :v, c2 = :v, c3 = :v, c4 = :v, c5 = :v, c6 = :v, c7 = :v, c8 = :v, c9 = :v",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "v"
+     }
+    }
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    },
+    "c0": {
+     "S": "v"
+    },
+    "c1": {
+     "S": "v"
+    },
+    "c2": {
+     "S": "v"
+    },
+    "c3": {
+     "S": "v"
+    },
+    "c4": {
+     "S": "v"
+    },
+    "c5": {
+     "S": "v"
+    },
+    "c6": {
+     "S": "v"
+    },
+    "c7": {
+     "S": "v"
+    },
+    "c8": {
+     "S": "v"
+    },
+    "c9": {
+     "S": "v"
+    }
+   },
+   "accepted_finished": 409391
+  },
+  {
+   "id": "TY1",
+   "what": "SET b = :pad, c = if_not_exists(c, :x) (c 1 byte, :x B 100 bytes)",
+   "seed": {
+    "c": {
+     "S": "c"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :x)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":x": {
+      "B": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBw=="
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "c"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409408
+  },
+  {
+   "id": "TY2",
+   "what": "SET b = :pad, c = if_not_exists(c, :x) (c 1 byte, :x BOOL true)",
+   "seed": {
+    "c": {
+     "S": "c"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :x)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":x": {
+      "BOOL": true
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "c"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409507
+  },
+  {
+   "id": "TY3",
+   "what": "SET b = :pad, c = if_not_exists(c, :x) (c 1 byte, :x NULL)",
+   "seed": {
+    "c": {
+     "S": "c"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :x)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":x": {
+      "NULL": true
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "c"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409507
+  },
+  {
+   "id": "TY4",
+   "what": "SET b = :pad, c = if_not_exists(c, :x) (c 1 byte, :x NS ['1', '22', '333'])",
+   "seed": {
+    "c": {
+     "S": "c"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :x)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":x": {
+      "NS": [
+       "1",
+       "22",
+       "333"
+      ]
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "c"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409501
+  },
+  {
+   "id": "TY5",
+   "what": "SET b = :pad, c = if_not_exists(c, :x) (c 1 byte, :x BS [100 bytes, 50 bytes])",
+   "seed": {
+    "c": {
+     "S": "c"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :x)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":x": {
+      "BS": [
+       "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==",
+       "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+      ]
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "c"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409358
+  },
+  {
+   "id": "TY6",
+   "what": "SET b = :pad, l[5] = :v (l = [1 byte]; past the end, so it appends; :v 10 bytes)",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, l[5] = :v",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "vvvvvvvvvv"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409563
+  },
+  {
+   "id": "P8d",
+   "what": "AttributeUpdates: b PUT pad, n ADD 1 (seed n = 1), s DELETE (seed s, 10 bytes)",
+   "seed": {
+    "n": {
+     "N": "1"
+    },
+    "s": {
+     "S": "ssssssssss"
+    }
+   },
+   "request": {
+    "AttributeUpdates": {
+     "b": {
+      "Action": "PUT",
+      "Value": {
+       "S": {
+        "$pad": "x"
+       }
+      }
+     },
+     "n": {
+      "Action": "ADD",
+      "Value": {
+       "N": "1"
+      }
+     },
+     "s": {
+      "Action": "DELETE"
+     }
+    }
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    },
+    "n": {
+     "N": "2"
+    }
+   },
+   "accepted_finished": 409600
+  },
+  {
+   "id": "L1",
+   "what": "SET b = :pad, l = list_append(l, :new) (l = [1], :new = [10])",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, l = list_append(l, :new)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":new": {
+      "L": [
+       {
+        "S": "nnnnnnnnnn"
+       }
+      ]
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "nnnnnnnnnn"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409511
+  },
+  {
+   "id": "L2",
+   "what": "SET b = :pad, l = list_append(:new, l) (l = [1], :new = [10])",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, l = list_append(:new, l)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":new": {
+      "L": [
+       {
+        "S": "nnnnnnnnnn"
+       }
+      ]
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "nnnnnnnnnn"
+      },
+      {
+       "S": "e"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409511
+  },
+  {
+   "id": "L3",
+   "what": "SET b = :pad, l = list_append(:a, :c) (:a = [1], :c = [10])",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET b = :pad, l = list_append(:a, :c)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":a": {
+      "L": [
+       {
+        "S": "e"
+       }
+      ]
+     },
+     ":c": {
+      "L": [
+       {
+        "S": "nnnnnnnnnn"
+       }
+      ]
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "nnnnnnnnnn"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409522
+  },
+  {
+   "id": "L4",
+   "what": "SET b = :pad, c = list_append(l, :new) (l = [1] untouched, :new = [10])",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = list_append(l, :new)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":new": {
+      "L": [
+       {
+        "S": "nnnnnnnnnn"
+       }
+      ]
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      }
+     ]
+    },
+    "c": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "nnnnnnnnnn"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409517
+  },
+  {
+   "id": "L5",
+   "what": "SET b = :pad, l = list_append(if_not_exists(l, :e), :new) (l = [1], :e = [], :new = [10])",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, l = list_append(if_not_exists(l, :e), :new)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":e": {
+      "L": []
+     },
+     ":new": {
+      "L": [
+       {
+        "S": "nnnnnnnnnn"
+       }
+      ]
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "nnnnnnnnnn"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409469
+  },
+  {
+   "id": "M1",
+   "what": "SET b = :pad, c = if_not_exists(c, :m) (c 1 byte, :m = {a: 100})",
+   "seed": {
+    "c": {
+     "S": "c"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :m)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":m": {
+      "M": {
+       "a": {
+        "S": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+       }
+      }
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "c"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409403
+  },
+  {
+   "id": "M2",
+   "what": "SET b = :pad, c = if_not_exists(c, :l) (c 1 byte, :l = [100, N 5])",
+   "seed": {
+    "c": {
+     "S": "c"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :l)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":l": {
+      "L": [
+       {
+        "S": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+       },
+       {
+        "N": "5"
+       }
+      ]
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "c"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409401
+  },
+  {
+   "id": "M3",
+   "what": "SET b = :pad, c = if_not_exists(c, :d) (c 1 byte, :d = {a: [50]})",
+   "seed": {
+    "c": {
+     "S": "c"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :d)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":d": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "S": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "c"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409449
+  },
+  {
+   "id": "M4",
+   "what": "SET b = :pad, c = if_not_exists(c, :s) (c 1 byte, :s 100-byte string)",
+   "seed": {
+    "c": {
+     "S": "c"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = if_not_exists(c, :s)",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":s": {
+      "S": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "c": {
+     "S": "c"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409408
+  },
+  {
+   "id": "X1",
+   "what": "SET b = :pad, c = :v ADD n :one REMOVE r DELETE ss :rm",
+   "seed": {
+    "n": {
+     "N": "1"
+    },
+    "r": {
+     "S": "rrrrr"
+    },
+    "ss": {
+     "SS": [
+      "ppppp",
+      "qqqqqqqqqqqqqqqqqqqq"
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = :v ADD n :one REMOVE r DELETE ss :rm",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     },
+     ":one": {
+      "N": "1"
+     },
+     ":rm": {
+      "SS": [
+       "qqqqqqqqqqqqqqqqqqqq"
+      ]
+     }
+    }
+   },
+   "finished": {
+    "n": {
+     "N": "2"
+    },
+    "ss": {
+     "SS": [
+      "ppppp"
+     ]
+    },
+    "c": {
+     "S": "vvvvvvvvvv"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409545
+  },
+  {
+   "id": "F1",
+   "what": "SET b = :pad (no row), ReturnValues ALL_NEW",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET b = :pad",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    },
+    "ReturnValues": "ALL_NEW"
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409581
+  },
+  {
+   "id": "F2",
+   "what": "SET b = :pad (no row), ConditionExpression attribute_not_exists(zzzzzzzzzz)",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET b = :pad",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    },
+    "ConditionExpression": "attribute_not_exists(zzzzzzzzzz)"
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409581
+  },
+  {
+   "id": "F3",
+   "what": "SET b = :pad (no row), ConditionExpression with a 100-byte value",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET b = :pad",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":c": {
+      "S": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+     }
+    },
+    "ConditionExpression": "attribute_not_exists(x) OR x <> :c"
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409581
+  },
+  {
+   "id": "F4",
+   "what": "SET #b = :pad (no row), #b -> b",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET #b = :pad",
+    "ExpressionAttributeNames": {
+     "#b": "b"
+    },
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409581
+  },
+  {
+   "id": "F5",
+   "what": "SET b = :pad, #t = #t + :one (#t -> abcdefghij, seed 1)",
+   "seed": {
+    "abcdefghij": {
+     "N": "1"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, #t = #t + :one",
+    "ExpressionAttributeNames": {
+     "#t": "abcdefghij"
+    },
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":one": {
+      "N": "1"
+     }
+    }
+   },
+   "finished": {
+    "abcdefghij": {
+     "N": "2"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409503
+  },
+  {
+   "id": "F6",
+   "what": "SET b = :pad, c = #s (#s -> abcdefghij, 10 bytes)",
+   "seed": {
+    "abcdefghij": {
+     "S": "gggggggggg"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = #s",
+    "ExpressionAttributeNames": {
+     "#s": "abcdefghij"
+    },
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "abcdefghij": {
+     "S": "gggggggggg"
+    },
+    "c": {
+     "S": "gggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409567
+  },
+  {
+   "id": "NA1",
+   "what": "SET b = :pad, #e = :v (#e two euro signs, :v 10 bytes, no row)",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET b = :pad, #e = :v",
+    "ExpressionAttributeNames": {
+     "#e": "€€"
+    },
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    },
+    "€€": {
+     "S": "vvvvvvvvvv"
+    }
+   },
+   "accepted_finished": 409562
+  },
+  {
+   "id": "NA2",
+   "what": "SET b = :pad, #e = :v (#e e-acute, :v 10 bytes, no row)",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET b = :pad, #e = :v",
+    "ExpressionAttributeNames": {
+     "#e": "é"
+    },
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    },
+    "é": {
+     "S": "vvvvvvvvvv"
+    }
+   },
+   "accepted_finished": 409562
+  },
+  {
+   "id": "NA3",
+   "what": "SET b = :pad, m.#e = :v (m = {y: 1 byte}, #e two euro signs, :v 10 bytes)",
+   "seed": {
+    "m": {
+     "M": {
+      "y": {
+       "S": "e"
+      }
+     }
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, m.#e = :v",
+    "ExpressionAttributeNames": {
+     "#e": "€€"
+    },
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "m": {
+     "M": {
+      "y": {
+       "S": "e"
+      },
+      "€€": {
+       "S": "vvvvvvvvvv"
+      }
+     }
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409565
+  },
+  {
+   "id": "NA4",
+   "what": "SET b = :pad, c = #e (#e two euro signs holding 10 bytes)",
+   "seed": {
+    "€€": {
+     "S": "gggggggggg"
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, c = #e",
+    "ExpressionAttributeNames": {
+     "#e": "€€"
+    },
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     }
+    }
+   },
+   "finished": {
+    "€€": {
+     "S": "gggggggggg"
+    },
+    "c": {
+     "S": "gggggggggg"
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409567
+  },
+  {
+   "id": "NA5",
+   "what": "SET b = :pad, #e = :v (#e one emoji, :v 10 bytes, no row)",
+   "seed": null,
+   "request": {
+    "UpdateExpression": "SET b = :pad, #e = :v",
+    "ExpressionAttributeNames": {
+     "#e": "😀"
+    },
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    },
+    "😀": {
+     "S": "vvvvvvvvvv"
+    }
+   },
+   "accepted_finished": 409562
+  },
+  {
+   "id": "T6",
+   "what": "SET b = :pad, l[7] = :v (l = 8 x 1 byte, :v 10 bytes)",
+   "seed": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      }
+     ]
+    }
+   },
+   "request": {
+    "UpdateExpression": "SET b = :pad, l[7] = :v",
+    "ExpressionAttributeValues": {
+     ":pad": {
+      "S": {
+       "$pad": "x"
+      }
+     },
+     ":v": {
+      "S": "vvvvvvvvvv"
+     }
+    }
+   },
+   "finished": {
+    "l": {
+     "L": [
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "e"
+      },
+      {
+       "S": "vvvvvvvvvv"
+      }
+     ]
+    },
+    "b": {
+     "S": {
+      "$pad": "x"
+     }
+    }
+   },
+   "accepted_finished": 409575
+  }
+ ]
+}

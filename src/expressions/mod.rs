@@ -456,13 +456,6 @@ pub fn set_path(
     }
 }
 
-/// Extend a list with NULL padding so that `list[target_len - 1]` is valid.
-fn pad_list_to(list: &mut Vec<AttributeValue>, target_len: usize) {
-    while list.len() < target_len {
-        list.push(AttributeValue::NULL(true));
-    }
-}
-
 fn set_nested(
     current: &mut AttributeValue,
     path: &[PathElement],
@@ -470,20 +463,6 @@ fn set_nested(
 ) -> Result<(), String> {
     if path.is_empty() {
         return Err("Empty remaining path".to_string());
-    }
-
-    // Auto-promote NULL to the structure type needed by the next path element.
-    // This handles the case where list padding created NULL placeholders that
-    // need to become Maps or Lists for deeper path navigation.
-    if matches!(current, AttributeValue::NULL(_)) {
-        match &path[0] {
-            PathElement::Attribute(_) => {
-                *current = AttributeValue::M(HashMap::new());
-            }
-            PathElement::Index(_) => {
-                *current = AttributeValue::L(Vec::new());
-            }
-        }
     }
 
     if path.len() == 1 {
@@ -500,9 +479,13 @@ fn set_nested(
                 }
             }
             PathElement::Index(i) => {
+                // An index past the end of the list appends the value rather
+                // than padding the gap (eu-west-2, 9 October 2026).
                 if let AttributeValue::L(list) = current {
-                    pad_list_to(list, *i + 1);
-                    list[*i] = value;
+                    match list.get_mut(*i) {
+                        Some(slot) => *slot = value,
+                        None => list.push(value),
+                    }
                     Ok(())
                 } else {
                     Err(
@@ -533,9 +516,12 @@ fn set_nested(
                 }
             }
             PathElement::Index(i) => {
-                if let AttributeValue::L(list) = current {
-                    pad_list_to(list, *i + 1);
-                    set_nested(&mut list[*i], &path[1..], value)
+                // Stepping through an element past the end is refused, as is
+                // stepping through anything that is not a map or a list.
+                if let AttributeValue::L(list) = current
+                    && let Some(next) = list.get_mut(*i)
+                {
+                    set_nested(next, &path[1..], value)
                 } else {
                     Err(
                         "The document path provided in the update expression is invalid for update"

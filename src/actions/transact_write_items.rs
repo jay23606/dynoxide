@@ -556,8 +556,8 @@ async fn execute_update<S: StorageBackend>(
     helpers::validate_updated_index_keys(&before_item, &item, &meta)?;
 
     // A transacted update is measured flat against the resulting item, unlike the
-    // standalone UpdateItem, which takes the key attributes out and charges per
-    // action. Both were captured against eu-west-2; the two really do differ.
+    // standalone UpdateItem, which is also charged for what its request carries.
+    // Both were captured against eu-west-2; the two really do differ.
     let size = types::item_size(&item);
     if size > types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
