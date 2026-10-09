@@ -163,6 +163,16 @@ pub(crate) fn return_consumed_capacity_rejection(mode: Option<&str>) -> Option<S
     ))
 }
 
+/// [`return_consumed_capacity_rejection`] as an error, in the single-error
+/// envelope a wire client gets. For callers that check the mode outside a
+/// deserialiser, where there is no errors vec to push onto.
+pub(crate) fn reject_bad_capacity_mode(mode: Option<&str>) -> Result<()> {
+    match return_consumed_capacity_rejection(mode) {
+        Some(msg) => Err(DynoxideError::ValidationException(envelope_message(&msg))),
+        None => Ok(()),
+    }
+}
+
 /// Wrap an `EnvelopedValidation` error in the `1 validation error detected: `
 /// envelope, converting it to a plain `ValidationException`. Every other error
 /// passes through unchanged.

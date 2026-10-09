@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stderr. Without the flag the output is unchanged.
 - `server::ServerOptions` and `server::start_with_options` give embedded Rust
   callers the same switch.
+- The MCP tools that wrap a DynamoDB read or write take
+  `return_consumed_capacity` (`TOTAL`, `INDEXES` or `NONE`) and return the
+  `ConsumedCapacity` block the DynamoDB API returns for the same request. That
+  covers the item tools, `query`, `scan`, `search_vectors`, `batch_get_item`,
+  `batch_write_item`, both transaction tools and the three PartiQL tools. Any
+  other value is refused with DynamoDB's validation error.
 
 ### Fixed
 

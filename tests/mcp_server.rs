@@ -183,6 +183,165 @@ fn test_tools_list() {
     let _ = child.wait();
 }
 
+/// The tools that wrap an operation DynamoDB reports consumed capacity for, and
+/// so take `return_consumed_capacity`. Nothing else should.
+const CAPACITY_TOOLS: [&str; 14] = [
+    "batch_execute_partiql",
+    "batch_get_item",
+    "batch_write_item",
+    "delete_item",
+    "execute_partiql",
+    "execute_transaction_partiql",
+    "get_item",
+    "put_item",
+    "query",
+    "scan",
+    "search_vectors",
+    "transact_get_items",
+    "transact_write_items",
+    "update_item",
+];
+
+#[test]
+fn exactly_the_capacity_bearing_tools_take_return_consumed_capacity() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let mut taking: Vec<&str> = tools
+        .iter()
+        .filter(|t| !t["inputSchema"]["properties"]["return_consumed_capacity"].is_null())
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    taking.sort_unstable();
+    assert_eq!(taking, CAPACITY_TOOLS, "out of {} tools", tools.len());
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn the_capacity_parameter_lists_its_values_in_the_schema() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    for name in CAPACITY_TOOLS {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+        let property = &tool["inputSchema"]["properties"]["return_consumed_capacity"];
+        assert_eq!(
+            property["enum"],
+            json!(["INDEXES", "TOTAL", "NONE", null]),
+            "{name}: {property}"
+        );
+        assert_eq!(property["type"], json!(["string", "null"]), "{name}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn a_tool_returns_the_capacity_block_and_refuses_an_unknown_mode() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Capacity",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({
+            "table_name": "Capacity",
+            "item": {"pk": {"S": "a"}},
+            "return_consumed_capacity": "TOTAL"
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    assert_eq!(
+        tool_content(&resp)["ConsumedCapacity"],
+        json!({"TableName": "Capacity", "CapacityUnits": 1.0})
+    );
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "put_item",
+        json!({
+            "table_name": "Capacity",
+            "item": {"pk": {"S": "b"}},
+            "return_consumed_capacity": "INDEXES"
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    assert_eq!(
+        tool_content(&resp)["ConsumedCapacity"],
+        json!({
+            "TableName": "Capacity",
+            "CapacityUnits": 1.0,
+            "Table": {"CapacityUnits": 1.0}
+        })
+    );
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "get_item",
+        json!({
+            "table_name": "Capacity",
+            "key": {"pk": {"S": "a"}},
+            "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert!(is_tool_error(&resp), "{resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ValidationException");
+    assert_eq!(
+        content["message"],
+        "1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to \
+         satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn the_instructions_say_capacity_can_be_requested() {
+    let mut child = spawn_mcp();
+    let resp = init_mcp(&mut child);
+    let instructions = resp["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("`return_consumed_capacity`"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("Vector search: search_vectors"),
+        "{instructions}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn test_get_database_info_empty() {
     let mut child = spawn_mcp();
