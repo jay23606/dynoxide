@@ -111,7 +111,7 @@ self.onmessage = async (event) => {
         result = engineVersion;
         break;
       default: {
-        // The smoke/index/errors harness ops exist only in `--harness` builds.
+        // The smoke/index/errors/legacyGsi harness ops exist only in `--harness` builds.
         // esbuild replaces __DYNOXIDE_HARNESS__ with a literal, so for the
         // shipping build this whole block (and the SMOKE_OPS table) is
         // dead-code-eliminated (#69); build-wasm.sh asserts it is gone.
@@ -123,6 +123,7 @@ self.onmessage = async (event) => {
             smoke: () => engine["smoke_test"]?.(),
             index: () => engine["index_scan_test"]?.(),
             errors: () => engine["error_fidelity_test"]?.(),
+            legacyGsi: () => engine["legacy_multi_attribute_gsi_fixture"]?.(),
           };
           if (op in SMOKE_OPS) {
             const run = SMOKE_OPS[op]();

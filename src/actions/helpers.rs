@@ -321,17 +321,14 @@ fn index_key_entries(meta: &TableMetadata) -> Result<Vec<IndexKeyEntry>> {
     };
 
     let mut entries = Vec::new();
+    // Every attribute of a multi-attribute GSI key is checked, in key-schema
+    // order, partition key attributes first.
     for gsi in super::gsi::parse_gsi_defs(meta)? {
-        entries.push(IndexKeyEntry {
-            declared: declared(&gsi.pk_attr)?,
-            attr: gsi.pk_attr,
-            index_name: gsi.index_name.clone(),
-        });
-        if let Some(sk) = gsi.sk_attr {
+        for attr in gsi.hash_attrs.iter().chain(&gsi.range_attrs) {
             entries.push(IndexKeyEntry {
-                declared: declared(&sk)?,
-                attr: sk,
-                index_name: gsi.index_name,
+                declared: declared(attr)?,
+                attr: attr.clone(),
+                index_name: gsi.index_name.clone(),
             });
         }
     }
@@ -2138,7 +2135,10 @@ fn get_index_key_schema(meta: &TableMetadata, index_name: &str) -> Result<Vec<Ke
 }
 
 /// Check whether an `AttributeValue` matches a `ScalarAttributeType`.
-fn attr_value_matches_scalar_type(val: &AttributeValue, expected: &ScalarAttributeType) -> bool {
+pub(crate) fn attr_value_matches_scalar_type(
+    val: &AttributeValue,
+    expected: &ScalarAttributeType,
+) -> bool {
     matches!(
         (val, expected),
         (AttributeValue::S(_), ScalarAttributeType::S)

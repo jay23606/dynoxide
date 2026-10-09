@@ -359,6 +359,8 @@ mod tests {
             index_name: "gsi-inc".to_string(),
             pk_attr: "gsiPk".to_string(),
             sk_attr: None,
+            hash_attrs: vec!["gsiPk".to_string()],
+            range_attrs: Vec::new(),
             projection_type: ProjectionType::INCLUDE,
             non_key_attributes: Some(vec!["proj".to_string()]),
         }
@@ -369,6 +371,8 @@ mod tests {
             index_name: "gsi-all".to_string(),
             pk_attr: "gsiPk".to_string(),
             sk_attr: None,
+            hash_attrs: vec!["gsiPk".to_string()],
+            range_attrs: Vec::new(),
             projection_type: ProjectionType::ALL,
             non_key_attributes: None,
         }
@@ -379,6 +383,8 @@ mod tests {
             index_name: "gsi-keys".to_string(),
             pk_attr: "gsiPk".to_string(),
             sk_attr: None,
+            hash_attrs: vec!["gsiPk".to_string()],
+            range_attrs: Vec::new(),
             projection_type: ProjectionType::KEYS_ONLY,
             non_key_attributes: None,
         }
@@ -390,6 +396,8 @@ mod tests {
             index_name: "lsi-inc".to_string(),
             pk_attr: "pk".to_string(),
             sk_attr: Some("lsiSk".to_string()),
+            hash_attrs: vec!["pk".to_string()],
+            range_attrs: vec!["lsiSk".to_string()],
             projection_type: ProjectionType::INCLUDE,
             non_key_attributes: Some(vec!["proj".to_string()]),
         }

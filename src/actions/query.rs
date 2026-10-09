@@ -461,7 +461,7 @@ pub async fn execute<S: StorageBackend>(
     };
 
     let (effective_pk, effective_sk) = if let Some(ref index_name) = request.index_name {
-        if let Some(keys) = lsi_keys {
+        if let Some(keys) = lsi_keys.clone() {
             keys
         } else {
             // A vector index is listed by DescribeTable but no Query can read
@@ -477,6 +477,16 @@ pub async fn execute<S: StorageBackend>(
             table_key_schema.partition_key.clone(),
             table_key_schema.sort_key.clone(),
         )
+    };
+
+    // Every partition key and sort key attribute, in key-schema order. Only a
+    // GSI can have more than one of each.
+    let (key_hash, key_range): (Vec<String>, Vec<String>) = match request.index_name {
+        Some(ref index_name) if !is_lsi => super::gsi::parse_gsi_key_attrs(&meta, index_name)?,
+        _ => (
+            vec![effective_pk.clone()],
+            effective_sk.iter().cloned().collect(),
+        ),
     };
 
     // ---- Validate ExclusiveStartKey structure against key schema ----
@@ -498,57 +508,33 @@ pub async fn execute<S: StorageBackend>(
         &request.expression_attribute_values,
     );
 
-    // Parse KeyConditionExpression
+    // Parse KeyConditionExpression and bind it to the key being read
     let key_cond = expressions::key_condition::parse(&key_condition_expression, &tracker)
         .map_err(DynoxideError::ValidationException)?;
-
-    // Validate pk_name matches the effective partition key
-    if key_cond.pk_name != effective_pk {
-        return Err(DynoxideError::ValidationException(format!(
-            "Query condition missed key schema element: {}",
-            effective_pk
-        )));
-    }
-
-    // Resolve values
-    let resolved = expressions::key_condition::resolve_values(&key_cond, &tracker)
-        .map_err(DynoxideError::ValidationException)?;
+    let bound = expressions::key_condition::bind(
+        &key_cond,
+        expressions::key_condition::KeyAttributes {
+            hash: &key_hash,
+            range: &key_range,
+        },
+        &tracker,
+    )
+    .map_err(DynoxideError::ValidationException)?;
+    check_key_condition_types(&bound, &meta)?;
 
     // Get pk string
-    let pk_str = resolved.pk_value.to_key_string().ok_or_else(|| {
+    let pk_str = bound.partition_key_string().ok_or_else(|| {
         DynoxideError::ValidationException(
             "Cannot convert partition key value to string".to_string(),
         )
     })?;
 
     // Build sk SQL conditions
-    let (sk_condition_sql, sk_param_values) = match resolved.sk_condition {
-        Some(ref sk_cond) => {
-            // Validate sk name matches effective sort key
-            if let Some(ref eff_sk) = effective_sk {
-                if sk_cond.sk_name() != eff_sk {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "Query condition missed key schema element: {eff_sk}"
-                    )));
-                }
-            } else {
-                return Err(DynoxideError::ValidationException(
-                    "Query filter contains a sort key condition but the table has no sort key"
-                        .to_string(),
-                ));
-            }
-
-            expressions::key_condition::sk_conditions_to_sql(std::slice::from_ref(sk_cond))
-        }
-        None => (None, Vec::new()),
-    };
+    let (sk_condition_sql, sk_param_values) = bound.sort_key_sql(key_range.len());
 
     // ---- Validate QueryFilter/FilterExpression don't reference primary key attrs ----
     // Collect effective key attribute names
-    let mut effective_key_attrs = vec![effective_pk.clone()];
-    if let Some(ref sk) = effective_sk {
-        effective_key_attrs.push(sk.clone());
-    }
+    let effective_key_attrs: Vec<String> = key_hash.iter().chain(&key_range).cloned().collect();
 
     // Check legacy QueryFilter
     if let Some(ref qf_val) = request.query_filter
@@ -624,8 +610,10 @@ pub async fn execute<S: StorageBackend>(
     // For hash-only GSIs (no sort key), use empty string so the composite
     // cursor (gsi_sk, table_pk, table_sk) can drive pagination.
     let start_sk = if let Some(ref esk) = exclusive_start_key {
-        if let Some(ref sk_name) = effective_sk {
-            esk.get(sk_name).and_then(|v| v.to_key_string())
+        if !key_range.is_empty() {
+            let values: Option<Vec<&AttributeValue>> =
+                key_range.iter().map(|a| esk.get(a)).collect();
+            values.and_then(|v| super::gsi::composite_key_string(&v))
         } else if is_index_query {
             // Hash-only index: gsi_sk / lsi_sk is always ''
             Some(String::new())
@@ -890,7 +878,7 @@ pub async fn execute<S: StorageBackend>(
     let is_gsi_query = request.index_name.is_some() && !is_lsi;
     let last_evaluated_key = if has_more {
         last_evaluated_item.map(|item| {
-            let mut key = build_last_evaluated_key(&item, &effective_pk, effective_sk.as_deref());
+            let mut key = build_last_evaluated_key(&item, &key_hash, &key_range);
             // For LSI queries, add the table sort key if different from the index sort key
             if is_lsi
                 && let Some(tsk) = table_key_schema.sort_key.as_deref()
@@ -979,21 +967,44 @@ pub async fn execute<S: StorageBackend>(
     })
 }
 
+/// The read key's attributes as the item holds them: every partition key and
+/// sort key attribute of the table or index being read.
 fn build_last_evaluated_key(
     item: &Item,
-    pk_name: &str,
-    sk_name: Option<&str>,
+    hash: &[String],
+    range: &[String],
 ) -> HashMap<String, AttributeValue> {
-    let mut key = HashMap::new();
-    if let Some(pk_val) = item.get(pk_name) {
-        key.insert(pk_name.to_string(), pk_val.clone());
+    hash.iter()
+        .chain(range)
+        .filter_map(|name| item.get(name).map(|v| (name.clone(), v.clone())))
+        .collect()
+}
+
+/// Refuse a key condition value whose type is not its key attribute's declared
+/// type. DynamoDB checks this once the condition has bound to the key: a string
+/// compared with a number sort key, or a boolean in an equality, fails here,
+/// while an operand no key type could take (a number in begins_with) fails
+/// earlier as an operand error. Captured eu-west-2, 2026-10-08 and October 2026.
+fn check_key_condition_types(
+    bound: &expressions::key_condition::BoundKeyCondition,
+    meta: &crate::storage::TableMetadata,
+) -> Result<()> {
+    let defs: Vec<crate::types::AttributeDefinition> =
+        serde_json::from_str(&meta.attribute_definitions).map_err(|e| {
+            DynoxideError::InternalServerError(format!("Bad attribute definitions JSON: {e}"))
+        })?;
+    for (attr, value) in bound.compared_values() {
+        if let Some(def) = defs.iter().find(|d| d.attribute_name == attr)
+            && !helpers::attr_value_matches_scalar_type(value, &def.attribute_type)
+        {
+            return Err(DynoxideError::ValidationException(
+                "One or more parameter values were invalid: Condition parameter type does not \
+                 match schema type"
+                    .to_string(),
+            ));
+        }
     }
-    if let Some(sk) = sk_name
-        && let Some(sk_val) = item.get(sk)
-    {
-        key.insert(sk.to_string(), sk_val.clone());
-    }
-    key
+    Ok(())
 }
 
 /// Refuse a read against a vector index by type.

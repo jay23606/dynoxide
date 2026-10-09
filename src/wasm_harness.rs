@@ -245,3 +245,87 @@ async fn run_errors() -> std::result::Result<String, String> {
         "{{\"missing_table_type\":\"{etype}\",\"missing_table_status\":{status}}}"
     ))
 }
+
+/// Leave behind the database an earlier build wrote for a table with a
+/// multi-attribute GSI, for the browser spec to reopen through the engine.
+///
+/// Before schema version 10 such an index was keyed on the first attribute of
+/// each kind, so the item missing `b` was indexed and the rows tied on `a`. The
+/// rows are written that way here, and the version is put back to 9, so opening
+/// the database must rebuild the index for a Query to answer correctly.
+#[wasm_bindgen]
+pub async fn legacy_multi_attribute_gsi_fixture() -> Result<JsValue, JsValue> {
+    run_legacy_gsi()
+        .await
+        .map(|s| JsValue::from_str(&s))
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+async fn run_legacy_gsi() -> std::result::Result<String, String> {
+    const DB: &str = "dynoxide-legacy-gsi.db";
+    const TABLE: &str = "LegacyGsi";
+    const INDEX: &str = "byKey";
+    let be = WasmBridgeBackend::open(DB)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // OPFS persists across runs, so drop anything left by a prior run.
+    let _ = be.drop_gsi_table(TABLE, INDEX).await;
+    let _ = be.drop_data_table(TABLE).await;
+    let _ = be.delete_table_metadata(TABLE).await;
+
+    let gsi_definitions = serde_json::json!([{
+        "IndexName": INDEX,
+        "KeySchema": [
+            {"AttributeName": "h", "KeyType": "HASH"},
+            {"AttributeName": "a", "KeyType": "RANGE"},
+            {"AttributeName": "b", "KeyType": "RANGE"}
+        ],
+        "Projection": {"ProjectionType": "ALL"}
+    }])
+    .to_string();
+    be.insert_table_metadata(&CreateTableMetadata {
+        table_name: TABLE,
+        key_schema: r#"[{"AttributeName":"pk","KeyType":"HASH"}]"#,
+        attribute_definitions: r#"[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"h","AttributeType":"S"},{"AttributeName":"a","AttributeType":"S"},{"AttributeName":"b","AttributeType":"S"}]"#,
+        gsi_definitions: Some(&gsi_definitions),
+        created_at: 0,
+        ..Default::default()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    be.create_data_table(TABLE)
+        .await
+        .map_err(|e| e.to_string())?;
+    be.create_gsi_table(TABLE, INDEX)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut rows = Vec::new();
+    for (pk, b) in [("1", Some("2")), ("2", Some("1")), ("3", None)] {
+        let mut item = serde_json::json!({"pk": {"S": pk}, "h": {"S": "x"}, "a": {"S": "m"}});
+        if let Some(b) = b {
+            item["b"] = serde_json::json!({"S": b});
+        }
+        let item_json = item.to_string();
+        be.put_item(TABLE, &format!("S:{pk}"), "", &item_json, item_json.len())
+            .await
+            .map_err(|e| e.to_string())?;
+        // Keyed the old way: the first HASH and first RANGE attribute only.
+        rows.push(crate::storage_backend::GsiItemRow {
+            gsi_pk: "S:x".to_string(),
+            gsi_sk: "S:m".to_string(),
+            table_pk: format!("S:{pk}"),
+            table_sk: String::new(),
+            item_json,
+        });
+    }
+    be.insert_gsi_items(TABLE, INDEX, &rows)
+        .await
+        .map_err(|e| e.to_string())?;
+    be.record_schema_version("9")
+        .await
+        .map_err(|e| e.to_string())?;
+    be.close().await.map_err(|e| e.to_string())?;
+    Ok(format!("{{\"legacy_rows\":{}}}", rows.len()))
+}

@@ -106,7 +106,7 @@ pub(crate) const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribu
 /// migration chain off it; the wasm backend records it on open (see
 /// [`init_schema_version`]) so future wasm schema changes can migrate
 /// versioned instead of accreting one unconditional ALTER per column.
-pub const SCHEMA_VERSION: &str = "9";
+pub const SCHEMA_VERSION: &str = "10";
 
 /// Add the `vector_index_definitions` column to `_tables`.
 ///
@@ -144,6 +144,18 @@ pub fn init_schema_version(version: &str) -> (String, Vec<SqlParam<'_>>) {
         vec![SqlParam::text(version)],
     )
 }
+
+/// Record `version` as the schema version, replacing any recorded one. A
+/// migration stamps this once it has finished, so an interrupted one runs again.
+pub fn set_schema_version(version: &str) -> (String, Vec<SqlParam<'_>>) {
+    (
+        "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', ?1)".to_string(),
+        vec![SqlParam::text(version)],
+    )
+}
+
+/// The recorded schema version, if any.
+pub const GET_SCHEMA_VERSION: &str = "SELECT value FROM _config WHERE key = 'schema_version'";
 
 /// Idempotent schema bootstrap shared by both backends: the metadata, config,
 /// and stream-record tables at the current schema version. Native
@@ -1724,6 +1736,18 @@ mod tests {
                 "INSERT OR IGNORE INTO _config (key, value) VALUES ('schema_version', ?1)"
                     .to_string(),
                 vec![SqlParam::text("9")],
+            )
+        );
+    }
+
+    #[test]
+    fn set_schema_version_replaces_the_recorded_one() {
+        assert_eq!(
+            set_schema_version("10"),
+            (
+                "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', ?1)"
+                    .to_string(),
+                vec![SqlParam::text("10")],
             )
         );
     }
