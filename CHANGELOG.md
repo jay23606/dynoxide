@@ -267,6 +267,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A PartiQL statement may end with a semicolon, as in DynamoDB; a second
   statement after it is refused with `Unexpected token after semicolon. (Only
   one query is allowed.)`.
+- A PartiQL WHERE clause that stops where a condition should start is refused
+  in DynamoDB's words: `Unexpected term` when nothing follows `WHERE`, `NOT` or
+  an opening parenthesis, `Missing right-hand side expression of infix
+  operator` when nothing follows `AND` or `OR`, and `Unexpected operator` or
+  `Unexpected keyword` when an operator or a clause keyword stands in its
+  place. It used to say `Expected condition in WHERE`.
 - PartiQL refuses a `begins_with` operand that isn't a string or binary, and
   BETWEEN bounds of different types or with the lower above the upper, with
   DynamoDB's messages, `NOT` or not, before the table is looked up.

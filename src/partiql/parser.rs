@@ -617,6 +617,35 @@ const KEYWORDS: &[&str] = &[
     "MISSING",
 ];
 
+/// Keywords that can't start a WHERE condition: the clause and statement
+/// words. The literals and `EXISTS` are left to the condition parser, which
+/// reads or refuses them itself.
+const CLAUSE_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "INSERT",
+    "INTO",
+    "VALUE",
+    "VALUES",
+    "UPDATE",
+    "DELETE",
+    "SET",
+    "REMOVE",
+    "ORDER",
+    "BY",
+    "GROUP",
+    "HAVING",
+    "LIMIT",
+    "AS",
+    "AT",
+    "ON",
+    "RETURNING",
+    "UNION",
+    "ASC",
+    "DESC",
+];
+
 /// The type names `IS` may test for.
 const TYPE_NAMES: &[&str] = &[
     "NULL",
@@ -1704,6 +1733,7 @@ fn parse_or_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     let mut terms = vec![parse_and_expr(t, depth)?];
     while matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("OR")) {
         t.next_token()?;
+        require_right_hand_side(t)?;
         terms.push(parse_and_expr(t, depth)?);
     }
     Ok(if terms.len() == 1 {
@@ -1717,6 +1747,7 @@ fn parse_and_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     let mut terms = vec![parse_not_expr(t, depth)?];
     while matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("AND")) {
         t.next_token()?;
+        require_right_hand_side(t)?;
         terms.push(parse_not_expr(t, depth)?);
     }
     Ok(if terms.len() == 1 {
@@ -1724,6 +1755,16 @@ fn parse_and_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     } else {
         BoolExpr::And(terms)
     })
+}
+
+/// Refuse an `AND` or `OR` with nothing after it, in DynamoDB's words
+/// (captured eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+fn require_right_hand_side(t: &mut Tokenizer) -> Result<(), String> {
+    match t.peek_token()? {
+        None => Err(MISSING_RIGHT_HAND_SIDE.to_string()),
+        Some(ref s) if s == ";" => Err(MISSING_RIGHT_HAND_SIDE.to_string()),
+        Some(_) => Ok(()),
+    }
 }
 
 fn parse_not_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
@@ -1951,7 +1992,22 @@ fn to_dnf(expr: BoolExpr) -> Result<Vec<Vec<WhereCondition>>, String> {
 /// one stack, so a budget each let a clause nested to the limit hold a value
 /// nested to the limit and spend twice the budget in frames.
 fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondition, String> {
-    let tok = t.next_token()?.ok_or("Expected condition in WHERE")?;
+    // Where a condition should start, DynamoDB reports the end of the
+    // statement as an unexpected term, an operator as an unexpected operator
+    // and a clause keyword as an unexpected keyword (captured eu-west-2,
+    // us-east-1, eu-west-1 and us-west-2, 2026-10-09). `NOT` reaches here only
+    // as part of `NOT EXISTS(...)` or `NOT BEGINS_WITH(...)`.
+    let tok = match t.next_token()? {
+        None => return Err(UNEXPECTED_TERM.to_string()),
+        Some(tok) if tok == ";" => return Err(UNEXPECTED_TERM.to_string()),
+        Some(tok) => tok,
+    };
+    if !is_keyword(&tok, "NOT") && is_any(&tok, OPERATOR_WORDS) {
+        return Err(UNEXPECTED_OPERATOR.to_string());
+    }
+    if is_any(&tok, CLAUSE_KEYWORDS) {
+        return Err(UNEXPECTED_KEYWORD.to_string());
+    }
     let tok_upper = tok.to_uppercase();
 
     match tok_upper.as_str() {
