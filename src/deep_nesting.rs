@@ -143,7 +143,9 @@ fn refusal(value: &Value, body: &str) -> String {
 }
 
 /// Run the operation's request decoder, which is where its member checks
-/// (table name, enums, limits) live, and discard the result.
+/// (table name, enums, limits) live, and discard the result. BatchWriteItem
+/// and TransactWriteItems keep theirs in a request check after decoding, so
+/// that runs too.
 fn check_members(operation: &str, body: &str) -> crate::Result<()> {
     use crate::actions::*;
     use crate::serde_errors::deserialize;
@@ -157,12 +159,14 @@ fn check_members(operation: &str, body: &str) -> crate::Result<()> {
         "Query" => deserialize::<query::QueryRequest>(body).map(drop),
         "Scan" => deserialize::<scan::ScanRequest>(body).map(drop),
         "BatchGetItem" => deserialize::<batch_get_item::BatchGetItemRequest>(body).map(drop),
-        "BatchWriteItem" => deserialize::<batch_write_item::BatchWriteItemRequest>(body).map(drop),
+        "BatchWriteItem" => deserialize::<batch_write_item::BatchWriteItemRequest>(body)
+            .and_then(|request| batch_write_item::check_request(&request)),
         "TransactGetItems" => {
             deserialize::<transact_get_items::TransactGetItemsRequest>(body).map(drop)
         }
         "TransactWriteItems" => {
-            deserialize::<transact_write_items::TransactWriteItemsRequest>(body).map(drop)
+            deserialize::<transact_write_items::TransactWriteItemsRequest>(body)
+                .and_then(|request| transact_write_items::check_request(&request))
         }
         _ => Ok(()),
     }

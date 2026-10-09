@@ -525,6 +525,69 @@ async fn a_member_constraint_is_reported_ahead_of_a_deep_value() {
     );
 }
 
+// BatchWriteItem and TransactWriteItems check their members after decoding;
+// those checks still come ahead of a deep value. Captured eu-west-2 and
+// us-east-1, 2026-10-09, with a value nested 100 levels.
+#[tokio::test]
+async fn batch_and_transaction_member_errors_are_reported_ahead_of_a_deep_value() {
+    let url = start().await;
+    create_table(&url, "Deep").await;
+    let v = deep_map(100);
+    let rcc = "1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
+
+    let (status, body) = send(
+        &url,
+        "BatchWriteItem",
+        format!(
+            r#"{{"RequestItems":{{"Deep":[{{"PutRequest":{{"Item":{{"pk":{{"S":"a"}},"data":{v}}}}}}}]}},"ReturnConsumedCapacity":"BOGUS"}}"#
+        ),
+    )
+    .await;
+    assert_validation(status, &body, rcc);
+
+    let (status, body) = send(
+        &url,
+        "TransactWriteItems",
+        format!(
+            r#"{{"TransactItems":[{{"Put":{{"TableName":"Deep","Item":{{"pk":{{"S":"b"}},"data":{v}}}}}}}],"ReturnConsumedCapacity":"BOGUS"}}"#
+        ),
+    )
+    .await;
+    assert_validation(status, &body, rcc);
+
+    let (status, body) = send(
+        &url,
+        "TransactWriteItems",
+        format!(
+            r#"{{"TransactItems":[{{"Put":{{"TableName":"bad!name","Item":{{"pk":{{"S":"b"}},"data":{v}}}}}}}]}}"#
+        ),
+    )
+    .await;
+    assert_validation(
+        status,
+        &body,
+        "1 validation error detected: Value 'bad!name' at 'transactItems.1.member.put.tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
+    );
+
+    let (status, body) = send(
+        &url,
+        "BatchWriteItem",
+        format!(
+            r#"{{"RequestItems":{{"bad!name":[{{"PutRequest":{{"Item":{{"pk":{{"S":"a"}},"data":{v}}}}}}}]}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "expected a 400, got {status}: {body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("1 validation error detected: Value '{bad!name=[WriteRequest(")
+            && message.ends_with(
+                "' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"
+            ),
+        "expected the RequestItems map-key constraint, not the nesting error: {body}"
+    );
+}
+
 // ---- BatchExecuteStatement answers per statement ------------------------------
 
 #[tokio::test]

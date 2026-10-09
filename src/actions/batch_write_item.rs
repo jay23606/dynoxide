@@ -65,12 +65,15 @@ fn accumulate_index_units(
     }
 }
 
-pub async fn execute<S: StorageBackend>(
-    storage: &S,
-    mut request: BatchWriteItemRequest,
-) -> Result<BatchWriteItemResponse> {
-    const MAX_REQUEST_SIZE: usize = 16 * 1024 * 1024; // 16MB
-
+/// The request-level checks, in the order DynamoDB reports them: an empty
+/// `RequestItems`; then the member constraints together (a table's request list
+/// that is empty or pushes the request past 25, ReturnConsumedCapacity and
+/// ReturnItemCollectionMetrics); then a table name that breaks its constraints,
+/// alone.
+///
+/// Also run on the request-parsing path for a body nested too deep to decode,
+/// so a member error there is still reported ahead of the nesting error.
+pub(crate) fn check_request(request: &BatchWriteItemRequest) -> Result<()> {
     // Validate RequestItems is not empty.
     // AWS routes the empty-map case through a separate parameter-required path
     // rather than the standard "N validation errors detected" envelope.
@@ -128,6 +131,17 @@ pub async fn execute<S: StorageBackend>(
             )),
         ));
     }
+
+    Ok(())
+}
+
+pub async fn execute<S: StorageBackend>(
+    storage: &S,
+    mut request: BatchWriteItemRequest,
+) -> Result<BatchWriteItemResponse> {
+    const MAX_REQUEST_SIZE: usize = 16 * 1024 * 1024; // 16MB
+
+    check_request(&request)?;
 
     // --- Pre-table validations ---
     // DynamoDB validates attribute values, item size, and empty write requests
