@@ -208,6 +208,24 @@ jobs:
       - name: Test
         run: python3 -m unittest discover -s benchmarks/scripts -p 'test_*.py' -v
 
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+
+    # crates.io builds the crate from the files `cargo package` ships, not
+    # from the checkout. A build that leans on a file the package leaves out
+    # (anything gitignored, or outside the crate) passes every other job here
+    # and then fails at `cargo publish`, in the release, after the tag and the
+    # GitHub Release already exist. This builds exactly what would be
+    # uploaded, and needs no registry token.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the packaged crate
+        run: cargo package --locked
+
   cargo-deny:
     name: cargo-deny
     runs-on: ubuntu-latest
