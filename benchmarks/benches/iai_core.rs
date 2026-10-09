@@ -90,7 +90,10 @@ fn setup_put_item_vector() -> (Database, PutItemRequest) {
     .unwrap();
     db.create_table(create).unwrap();
     let mut item = HashMap::new();
-    item.insert("pk".to_string(), AttributeValue::S("vec#000000".to_string()));
+    item.insert(
+        "pk".to_string(),
+        AttributeValue::S("vec#000000".to_string()),
+    );
     item.insert(
         "embedding".to_string(),
         AttributeValue::L(

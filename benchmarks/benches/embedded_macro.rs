@@ -27,7 +27,7 @@ fn bench_full_workload(c: &mut Criterion) {
     group.measurement_time(std::time::Duration::from_secs(30));
 
     group.bench_function("full_workload_memory", |b| {
-        b.iter(|| run_workload());
+        b.iter(run_workload);
     });
 
     group.finish();
@@ -268,8 +268,7 @@ fn run_workload() {
     }
 
     // Step 12: DeleteItem -- 500 items
-    for i in 0..500 {
-        let item = &items[i];
+    for item in items.iter().take(500) {
         db.delete_item(DeleteItemRequest {
             table_name: BENCH_TABLE.to_string(),
             key: make_key(item),

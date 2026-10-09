@@ -38,7 +38,10 @@ with AWS DynamoDB's observable behaviour is the headline goal.
   something a new language feature can do quietly.
 - Formatting: `cargo fmt --check` must pass.
 - Linting: `cargo clippy -- -D warnings` must pass. Warnings are
-  errors; fix them rather than silencing.
+  errors; fix them rather than silencing. The separate `benchmarks/`
+  package is linted too: CI runs `cargo fmt --check` and
+  `cargo clippy --all-targets -- -D warnings` there, with and without
+  `--features iai-callgrind`.
 - Testing: `cargo test` on the default feature set. Other feature
   combinations are exercised in CI; if you change feature gates,
   mirror what `.github/workflows/ci.yml` runs.
