@@ -331,3 +331,286 @@ fn a_between_key_condition_keeps_its_own_messages() {
     );
     assert_eq!(query(&db, key_conditions(json!({"S": "a"}), None)), Ok(2));
 }
+
+const AT_MOST_ONE_ROW: &str = "The query can return at most one row and cannot be restarted";
+const OUTSIDE: &str =
+    "The provided starting key is outside query boundaries based on provided conditions";
+const RANGE_PREDICATE: &str = "The provided starting key does not match the range key predicate";
+
+/// `Wide`: pk (S) and sk (S), an LSI on lsk, a GSI on gh and gr, a hash-only
+/// GSI on gh, and a GSI keyed on h1 and h2 then a and b.
+fn wide() -> Database {
+    let db = Database::memory().unwrap();
+    let definitions: Vec<Value> = ["pk", "sk", "lsk", "gh", "gr", "h1", "h2", "a", "b"]
+        .iter()
+        .map(|n| json!({"AttributeName": n, "AttributeType": "S"}))
+        .collect();
+    db.create_table(
+        serde_json::from_value::<CreateTableRequest>(json!({
+            "TableName": "Wide",
+            "AttributeDefinitions": definitions,
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "lsi",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "GlobalSecondaryIndexes": [
+                {
+                    "IndexName": "single",
+                    "KeySchema": [
+                        {"AttributeName": "gh", "KeyType": "HASH"},
+                        {"AttributeName": "gr", "KeyType": "RANGE"}
+                    ],
+                    "Projection": {"ProjectionType": "ALL"}
+                },
+                {
+                    "IndexName": "hashonly",
+                    "KeySchema": [{"AttributeName": "gh", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                },
+                {
+                    "IndexName": "multi",
+                    "KeySchema": [
+                        {"AttributeName": "h1", "KeyType": "HASH"},
+                        {"AttributeName": "h2", "KeyType": "HASH"},
+                        {"AttributeName": "a", "KeyType": "RANGE"},
+                        {"AttributeName": "b", "KeyType": "RANGE"}
+                    ],
+                    "Projection": {"ProjectionType": "ALL"}
+                }
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    db
+}
+
+fn on_wide(index: Option<&str>, condition: &str, values: Value, esk: Value) -> Value {
+    let mut body = json!({
+        "TableName": "Wide",
+        "KeyConditionExpression": condition,
+        "ExpressionAttributeValues": values,
+        "ExclusiveStartKey": esk
+    });
+    if let Some(index) = index {
+        body["IndexName"] = json!(index);
+    }
+    body
+}
+
+fn s(value: &str) -> Value {
+    json!({"S": value})
+}
+
+// Captured in eu-west-2 and us-east-1 on 2026-10-09, identically. The key
+// condition is walked in order: a partition key attribute other than the last
+// that differs ends it with "at most one row"; then any sort key condition the
+// start key breaks; then a different last partition key attribute, which is
+// "at most one row" when a sort key condition follows it and "outside query
+// boundaries" when none does.
+#[test]
+fn a_start_key_from_another_partition_with_a_sort_key_condition_cannot_be_restarted() {
+    let db = wide();
+    let values = json!({":p": s("p1"), ":s": s("m")});
+    assert_eq!(
+        query(
+            &db,
+            on_wide(
+                None,
+                "pk = :p AND sk > :s",
+                values.clone(),
+                json!({"pk": s("p2"), "sk": s("z")})
+            )
+        ),
+        Err(AT_MOST_ONE_ROW.to_string())
+    );
+    // A sort key outside the condition is reported first.
+    assert_eq!(
+        query(
+            &db,
+            on_wide(
+                None,
+                "pk = :p AND sk > :s",
+                values,
+                json!({"pk": s("p2"), "sk": s("a")})
+            )
+        ),
+        Err(RANGE_PREDICATE.to_string())
+    );
+}
+
+#[test]
+fn an_index_start_key_outside_the_key_condition_is_refused() {
+    let db = wide();
+    let base = |extra: Value| {
+        let mut esk = json!({"pk": s("p1"), "sk": s("s1")});
+        for (k, v) in extra.as_object().unwrap() {
+            esk[k] = v.clone();
+        }
+        esk
+    };
+    let single = |condition: &str, values: Value, esk: Value| {
+        query(&db, on_wide(Some("single"), condition, values, base(esk)))
+    };
+    assert_eq!(
+        single(
+            "gh = :h",
+            json!({":h": s("x")}),
+            json!({"gh": s("y"), "gr": s("m")})
+        ),
+        Err(OUTSIDE.to_string())
+    );
+    assert_eq!(
+        single(
+            "gh = :h AND gr > :r",
+            json!({":h": s("x"), ":r": s("m")}),
+            json!({"gh": s("x"), "gr": s("a")})
+        ),
+        Err(RANGE_PREDICATE.to_string())
+    );
+    assert_eq!(
+        single(
+            "gh = :h AND gr > :r",
+            json!({":h": s("x"), ":r": s("m")}),
+            json!({"gh": s("y"), "gr": s("a")})
+        ),
+        Err(RANGE_PREDICATE.to_string())
+    );
+    assert_eq!(
+        single(
+            "gh = :h AND begins_with(gr, :r)",
+            json!({":h": s("x"), ":r": s("ab")}),
+            json!({"gh": s("x"), "gr": s("zz")})
+        ),
+        Err(RANGE_PREDICATE.to_string())
+    );
+    assert_eq!(
+        single(
+            "gh = :h AND gr > :r",
+            json!({":h": s("x"), ":r": s("m")}),
+            json!({"gh": s("x"), "gr": s("z")})
+        ),
+        Ok(0)
+    );
+    // A hash-only index answers "outside", as a table with a sort key does.
+    assert_eq!(
+        query(
+            &db,
+            on_wide(
+                Some("hashonly"),
+                "gh = :h",
+                json!({":h": s("x")}),
+                base(json!({"gh": s("y")}))
+            )
+        ),
+        Err(OUTSIDE.to_string())
+    );
+    // An LSI follows the same rule.
+    let lsi = |condition: &str, values: Value, esk: Value| {
+        query(&db, on_wide(Some("lsi"), condition, values, esk))
+    };
+    assert_eq!(
+        lsi(
+            "pk = :p",
+            json!({":p": s("p1")}),
+            json!({"pk": s("p2"), "sk": s("s1"), "lsk": s("m")})
+        ),
+        Err(OUTSIDE.to_string())
+    );
+    assert_eq!(
+        lsi(
+            "pk = :p AND lsk > :l",
+            json!({":p": s("p1"), ":l": s("m")}),
+            json!({"pk": s("p2"), "sk": s("s1"), "lsk": s("a")})
+        ),
+        Err(RANGE_PREDICATE.to_string())
+    );
+}
+
+#[test]
+fn a_multi_attribute_start_key_is_checked_on_every_key_attribute() {
+    let db = wide();
+    let multi = |condition: &str, values: Value, esk: Value| {
+        let mut full = json!({"pk": s("p1"), "sk": s("s1")});
+        for (k, v) in esk.as_object().unwrap() {
+            full[k] = v.clone();
+        }
+        query(&db, on_wide(Some("multi"), condition, values, full))
+    };
+    let hh = json!({":h1": s("x"), ":h2": s("y")});
+    let hha = json!({":h1": s("x"), ":h2": s("y"), ":a": s("T")});
+    let key = |h1: &str, h2: &str, a: &str, b: &str| json!({"h1": s(h1), "h2": s(h2), "a": s(a), "b": s(b)});
+    // The first partition key attribute differs.
+    assert_eq!(
+        multi("h1 = :h1 AND h2 = :h2", hh.clone(), key("q", "y", "T", "m")),
+        Err(AT_MOST_ONE_ROW.to_string())
+    );
+    assert_eq!(
+        multi(
+            "h1 = :h1 AND h2 = :h2 AND a = :a",
+            hha.clone(),
+            key("q", "y", "F", "m")
+        ),
+        Err(AT_MOST_ONE_ROW.to_string())
+    );
+    // The last partition key attribute differs.
+    assert_eq!(
+        multi("h1 = :h1 AND h2 = :h2", hh.clone(), key("x", "q", "T", "m")),
+        Err(OUTSIDE.to_string())
+    );
+    assert_eq!(
+        multi(
+            "h1 = :h1 AND h2 = :h2 AND a = :a",
+            hha.clone(),
+            key("x", "q", "F", "m")
+        ),
+        Err(RANGE_PREDICATE.to_string())
+    );
+    // Sort key attributes outside the condition.
+    assert_eq!(
+        multi(
+            "h1 = :h1 AND h2 = :h2 AND a = :a",
+            hha.clone(),
+            key("x", "y", "F", "m")
+        ),
+        Err(RANGE_PREDICATE.to_string())
+    );
+    assert_eq!(
+        multi(
+            "h1 = :h1 AND h2 = :h2 AND a = :a AND b > :b",
+            json!({":h1": s("x"), ":h2": s("y"), ":a": s("T"), ":b": s("m")}),
+            key("x", "y", "T", "a")
+        ),
+        Err(RANGE_PREDICATE.to_string())
+    );
+    assert_eq!(
+        multi(
+            "h1 = :h1 AND h2 = :h2 AND a > :a",
+            json!({":h1": s("x"), ":h2": s("y"), ":a": s("M")}),
+            key("x", "y", "A", "m")
+        ),
+        Err(RANGE_PREDICATE.to_string())
+    );
+    // Inside the condition, or no sort key condition at all.
+    assert_eq!(
+        multi(
+            "h1 = :h1 AND h2 = :h2 AND a = :a",
+            hha,
+            key("x", "y", "T", "m")
+        ),
+        Ok(0)
+    );
+    assert_eq!(
+        multi("h1 = :h1 AND h2 = :h2", hh, key("x", "y", "Z", "z")),
+        Ok(0)
+    );
+}

@@ -595,12 +595,10 @@ pub async fn execute<S: StorageBackend>(
     let (sk_condition_sql, sk_param_values) = bound.sort_key_sql(key_range.len());
 
     // A starting key from another partition, or outside the sort key condition,
-    // is refused on a table query. Index queries are left as they were: their
-    // answers haven't been captured.
-    if request.index_name.is_none()
-        && let Some(ref esk) = exclusive_start_key
-    {
-        check_start_key_within_condition(esk, &bound, effective_sk.is_some())?;
+    // is refused, on a table and on an index.
+    if let Some(ref esk) = exclusive_start_key {
+        let table_without_sort_key = request.index_name.is_none() && effective_sk.is_none();
+        check_start_key_within_condition(esk, &bound, table_without_sort_key)?;
     }
 
     // ---- Validate QueryFilter/FilterExpression don't reference primary key attrs ----
@@ -1156,28 +1154,35 @@ fn start_key_value_error(err: DynoxideError) -> DynoxideError {
 
 /// Refuse a starting key that the key condition could never have produced.
 ///
-/// From another partition: "outside query boundaries" on a table with a sort
-/// key, and a plain "exclusive start key is invalid" on one without. A sort key
-/// outside the condition: "does not match the range key predicate". Captured in
-/// eu-west-2, us-east-1, us-west-2 and eu-central-1, 2026-10-09.
+/// DynamoDB walks the key condition in order. A partition key attribute other
+/// than the last that differs from the start key ends the check: "The query can
+/// return at most one row and cannot be restarted". Then a sort key condition
+/// the start key breaks: "does not match the range key predicate". Then a
+/// different last partition key attribute: "at most one row" again when a sort
+/// key condition follows it, "The provided exclusive start key is invalid" on a
+/// table with no sort key, and "outside query boundaries based on provided
+/// conditions" otherwise. The same on a table, an LSI, a GSI and a GSI with a
+/// multi-attribute key. Captured in eu-west-2 and us-east-1, 2026-10-09, and
+/// on tables in us-west-2 and eu-central-1 too.
 fn check_start_key_within_condition(
     esk: &Item,
     bound: &expressions::key_condition::BoundKeyCondition,
-    has_sort_key: bool,
+    table_without_sort_key: bool,
 ) -> Result<()> {
     use crate::expressions::condition::{CompOp, compare_values};
 
+    const AT_MOST_ONE_ROW: &str = "The query can return at most one row and cannot be restarted";
+    let refuse = |message: &str| Err(DynoxideError::ValidationException(message.to_string()));
     let holds = |name: &str, value: &AttributeValue| {
         esk.get(name)
             .is_some_and(|v| compare_values(v, &CompOp::Eq, value))
     };
-    if !bound.hash.iter().all(|(name, value)| holds(name, value)) {
-        let message = if has_sort_key {
-            "The provided starting key is outside query boundaries based on provided conditions"
-        } else {
-            "The provided exclusive start key is invalid"
-        };
-        return Err(DynoxideError::ValidationException(message.to_string()));
+
+    let Some(((last_name, last_value), leading)) = bound.hash.split_last() else {
+        return Ok(());
+    };
+    if leading.iter().any(|(name, value)| !holds(name, value)) {
+        return refuse(AT_MOST_ONE_ROW);
     }
     let outside_equalities = bound
         .range_eq
@@ -1188,9 +1193,18 @@ fn check_start_key_within_condition(
             .is_some_and(|value| !sort_key_satisfies(value, condition))
     });
     if outside_equalities || outside_last {
-        return Err(DynoxideError::ValidationException(
-            "The provided starting key does not match the range key predicate".to_string(),
-        ));
+        return refuse("The provided starting key does not match the range key predicate");
+    }
+    if !holds(last_name, last_value) {
+        if !bound.range_eq.is_empty() || bound.range_last.is_some() {
+            return refuse(AT_MOST_ONE_ROW);
+        }
+        if table_without_sort_key {
+            return refuse("The provided exclusive start key is invalid");
+        }
+        return refuse(
+            "The provided starting key is outside query boundaries based on provided conditions",
+        );
     }
     Ok(())
 }
