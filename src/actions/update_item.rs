@@ -325,6 +325,18 @@ async fn execute_inner<S: StorageBackend>(
     ) {
         return Err(DynoxideError::EnvelopedValidation(msg.to_string()));
     }
+    // A key, AttributeUpdates value or Expected value nested too deep is
+    // refused, inside the envelope, before the key is matched to the schema or
+    // the table looked up.
+    crate::value_nesting::check_key_enveloped(&request.key)?;
+    crate::value_nesting::check_attribute_updates(
+        request
+            .attribute_updates
+            .iter()
+            .flat_map(|updates| updates.values())
+            .map(|update| update.value.as_ref()),
+    )?;
+    crate::value_nesting::check_expected(request.expected.as_ref())?;
 
     // Validate key attribute values (unsupported datatypes, invalid numbers)
     crate::validation::validate_key_attribute_values(&request.key)?;

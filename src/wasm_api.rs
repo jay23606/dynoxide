@@ -157,8 +157,17 @@ pub async fn dispatch_http<S: StorageBackend>(
     auth: crate::auth_material::AuthMaterial<'_>,
 ) -> HttpOutcome {
     // Non-JSON body → bare SerializationException, before the target is read.
-    if !body.is_empty() && serde_json::from_str::<serde_json::Value>(body).is_err() {
-        return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
+    // Valid JSON nested deeper than the parser follows is still read, as
+    // DynamoDB reads it: see `deep_nesting`.
+    let mut too_deep = false;
+    if !body.is_empty()
+        && let Err(e) = serde_json::from_str::<serde_json::Value>(body)
+    {
+        if crate::deep_nesting::is_depth_failure(&e) {
+            too_deep = true;
+        } else {
+            return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
+        }
     }
 
     let Some(target) = target else {
@@ -192,6 +201,24 @@ pub async fn dispatch_http<S: StorageBackend>(
     if !SUPPORTED_OPS.contains(&operation) {
         return HttpOutcome::new(501, unsupported_envelope(operation));
     }
+
+    let rewritten;
+    let body = if too_deep {
+        match crate::deep_nesting::resolve(operation, body) {
+            crate::deep_nesting::DeepBody::Unreadable => {
+                return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
+            }
+            crate::deep_nesting::DeepBody::Refuse(e) => {
+                return HttpOutcome::new(e.status_code(), e.to_json());
+            }
+            crate::deep_nesting::DeepBody::Run(body) => {
+                rewritten = body;
+                rewritten.as_str()
+            }
+        }
+    } else {
+        body
+    };
 
     // `route` keeps the error typed, so the status comes straight from
     // `DynoxideError::status_code` rather than being re-derived from the
@@ -236,9 +263,28 @@ pub async fn dispatch<S: StorageBackend>(
     if !SUPPORTED_OPS.contains(&op) {
         return Err(unsupported_envelope(op));
     }
-    route(backend, ctx, op, request_json)
-        .await
-        .map_err(|e| e.to_json())
+    match route(backend, ctx, op, request_json).await {
+        Ok(json) => Ok(json),
+        // A request nested deeper than the parser follows fails to decode before
+        // anything runs. Give it the answer the HTTP path gives it.
+        Err(DynoxideError::SerializationException(_))
+            if serde_json::from_str::<serde_json::Value>(request_json)
+                .is_err_and(|e| crate::deep_nesting::is_depth_failure(&e)) =>
+        {
+            match crate::deep_nesting::resolve(op, request_json) {
+                crate::deep_nesting::DeepBody::Unreadable => {
+                    Err(SERIALIZATION_EXCEPTION_BARE.to_string())
+                }
+                crate::deep_nesting::DeepBody::Refuse(e) => Err(e.to_json()),
+                crate::deep_nesting::DeepBody::Run(rewritten) => {
+                    route(backend, ctx, op, &rewritten)
+                        .await
+                        .map_err(|e| e.to_json())
+                }
+            }
+        }
+        Err(e) => Err(e.to_json()),
+    }
 }
 
 /// Route one supported operation to its handler, keeping the error typed so a
@@ -1102,6 +1148,64 @@ mod tests {
         assert_eq!(out.status, 200);
         let v: serde_json::Value = serde_json::from_str(&out.body).unwrap();
         assert_eq!(v["TableNames"][0], "Music");
+    }
+
+    /// A Music item whose `data` attribute is a leaf wrapped in `depth` maps.
+    fn deep_music_item(depth: usize) -> String {
+        format!(
+            r#"{{"TableName":"Music","Item":{{"artist":{{"S":"a"}},"song":{{"S":"s"}},"data":{}{{"S":"leaf"}}{}}}}}"#,
+            "{\"M\":{\"n\":".repeat(depth),
+            "}}".repeat(depth)
+        )
+    }
+
+    #[test]
+    fn http_reads_a_value_too_deep_for_the_parser_and_refuses_it() {
+        let backend = Storage::memory().unwrap();
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.CreateTable"),
+            CREATE_MUSIC,
+        );
+        assert_eq!(out.status, 200);
+
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.PutItem"),
+            &deep_music_item(63),
+        );
+        assert_eq!(out.status, 400, "{}", out.body);
+        let v: serde_json::Value = serde_json::from_str(&out.body).unwrap();
+        assert_eq!(
+            v["message"],
+            crate::validation::NESTING_LIMIT_MESSAGE,
+            "{}",
+            out.body
+        );
+
+        // Past where DynamoDB's own parser gives up, a bare SerializationException.
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.PutItem"),
+            &deep_music_item(2001),
+        );
+        assert_eq!(out.status, 400);
+        assert_eq!(out.body, SERIALIZATION_EXCEPTION_BARE);
+    }
+
+    #[test]
+    fn rpc_reads_a_value_too_deep_for_the_parser_and_refuses_it() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        let err = run(&backend, "PutItem", &deep_music_item(63)).unwrap_err();
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(
+            v["message"],
+            crate::validation::NESTING_LIMIT_MESSAGE,
+            "{err}"
+        );
+        let err = run(&backend, "PutItem", &deep_music_item(2001)).unwrap_err();
+        assert_eq!(err, SERIALIZATION_EXCEPTION_BARE);
     }
 
     #[test]

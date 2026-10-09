@@ -81,6 +81,13 @@ pub(crate) mod serde_errors;
 // disagree on requests neither has deserialised yet.
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 pub(crate) mod serialization_checks;
+// Nesting checks for values outside an item or an expression: keys, start
+// keys, legacy conditions and PartiQL parameters.
+pub(crate) mod value_nesting;
+// Bodies nested deeper than the JSON parser follows: still read and answered
+// with DynamoDB's nesting error, on the HTTP server and the wasm engine alike.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) mod deep_nesting;
 #[cfg(feature = "http-server")]
 pub mod server;
 // Lets a TTL sweep hand the native database lock to waiting requests between

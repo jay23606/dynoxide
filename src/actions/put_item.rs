@@ -210,6 +210,8 @@ async fn execute_inner<S: StorageBackend>(
     ) {
         return Err(DynoxideError::EnvelopedValidation(msg.to_string()));
     }
+    // An Expected value nested too deep is refused, inside the envelope.
+    crate::value_nesting::check_expected(request.expected.as_ref())?;
 
     // Validate empty ConditionExpression
     if let Some(ref ce) = request.condition_expression

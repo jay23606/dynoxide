@@ -206,6 +206,11 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // Validate key attribute values (unsupported datatypes, invalid numbers)
+    // A key or Expected value nested too deep is refused, inside the envelope,
+    // before the key is matched to the schema or the table looked up.
+    crate::value_nesting::check_key_enveloped(&request.key)?;
+    crate::value_nesting::check_expected(request.expected.as_ref())?;
+
     crate::validation::validate_key_attribute_values(&request.key)?;
 
     // Validate empty ConditionExpression

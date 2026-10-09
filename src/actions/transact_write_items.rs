@@ -311,6 +311,20 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
 
     // Validate: no duplicate item targets. A key that can't be stringified (non-scalar
     // or missing) is skipped here and reported by the in-loop validation instead (#95).
+    // A Delete, ConditionCheck or Update key nested too deep fails the whole
+    // request at the top level, before any table is looked up.
+    for item in items {
+        let key = item
+            .delete
+            .as_ref()
+            .map(|d| &d.key)
+            .or(item.condition_check.as_ref().map(|c| &c.key))
+            .or(item.update.as_ref().map(|u| &u.key));
+        if let Some(key) = key {
+            crate::value_nesting::check_key(key)?;
+        }
+    }
+
     let mut seen_targets = HashSet::new();
     for item in items {
         if let Some(target) = get_item_target(storage, item).await?

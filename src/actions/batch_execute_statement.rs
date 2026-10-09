@@ -207,16 +207,19 @@ pub async fn execute<S: StorageBackend>(
     for (stmt_req, prepared) in request.statements.iter().zip(prepared) {
         // A statement's parameters are checked before anything else about it,
         // used or not and ahead of a missing table, and a failure is reported
-        // against that statement with the bare message while the rest run
-        // (captured eu-west-2 and us-east-1, 2026-10-09).
+        // against that statement while the rest run (captured eu-west-2 and
+        // us-east-1, 2026-10-09). A parameter nested too deep fails it with the
+        // nesting message ahead of the value checks.
         let rejection = stmt_req.parameter_rejection.clone().or_else(|| {
-            stmt_req.parameters.as_ref().and_then(|parameters| {
-                parameters
-                    .iter()
-                    .try_for_each(partiql::executor::check_parameter_value)
-                    .err()
-                    .map(|e| e.to_string())
-            })
+            let parameters = stmt_req.parameters.as_deref().unwrap_or_default();
+            if crate::value_nesting::parameters_nest_too_deep(parameters) {
+                return Some(crate::value_nesting::deep_parameter_error().to_string());
+            }
+            parameters
+                .iter()
+                .try_for_each(partiql::executor::check_parameter_value)
+                .err()
+                .map(|e| e.to_string())
         });
         if let Some(message) = rejection {
             responses.push(BatchStatementResponse {

@@ -60,6 +60,14 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    // A parameter nested too deep is refused before the statement is parsed or
+    // its table looked up.
+    if crate::value_nesting::parameters_nest_too_deep(
+        request.parameters.as_deref().unwrap_or_default(),
+    ) {
+        return Err(crate::value_nesting::deep_parameter_error());
+    }
+
     // Every parameter's numbers are checked before the statement is read,
     // whether the statement uses the parameter or not, with the message any
     // attribute value gets and no path after it (captured eu-west-2 and

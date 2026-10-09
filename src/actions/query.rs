@@ -243,6 +243,9 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // ---- Validate filter attribute values (before argument counts, matching DynamoDB) ----
+    // A QueryFilter or KeyConditions value nested too deep is refused first.
+    crate::value_nesting::check_query_conditions(request.query_filter.as_ref())?;
+    crate::value_nesting::check_query_conditions(request.key_conditions.as_ref())?;
     helpers::validate_filter_conditions_raw(request.query_filter.as_ref(), "QueryFilter")?;
     helpers::validate_filter_conditions_raw(request.key_conditions.as_ref(), "KeyConditions")?;
 
@@ -257,10 +260,11 @@ pub async fn execute<S: StorageBackend>(
 
     // ---- Parse ExclusiveStartKey from JSON value ----
     let exclusive_start_key = if let Some(ref esk_val) = request.exclusive_start_key_raw {
-        Some(helpers::parse_exclusive_start_key(esk_val)?)
+        Some(helpers::parse_exclusive_start_key(esk_val).map_err(start_key_value_error)?)
     } else {
         request.exclusive_start_key.clone()
     };
+    crate::value_nesting::check_query_start_key(exclusive_start_key.as_ref())?;
 
     // ---- Validate expression syntax BEFORE table existence ----
     // DynamoDB validates KeyConditionExpression, FilterExpression, and
@@ -395,6 +399,7 @@ pub async fn execute<S: StorageBackend>(
             serde_json::from_value::<HashMap<String, helpers::KeyCondition>>(kc_val.clone())
         && !kc.is_empty()
     {
+        check_legacy_key_condition_types(&kc, &meta)?;
         let converted = helpers::convert_key_conditions(&kc, Some(&effective_pk_for_kc))?;
         request.key_condition_expression = Some(converted.expression);
         let expr_values = request
@@ -518,7 +523,13 @@ pub async fn execute<S: StorageBackend>(
             "The provided starting key is invalid",
         )?;
         // Stage 3: table key type check
-        helpers::validate_esk_table_keys(esk, &meta)?;
+        helpers::validate_esk_table_keys(esk, &meta).map_err(bare_start_key_mismatch)?;
+        // Stage 4: an empty string or binary key value has its own message.
+        check_start_key_not_empty(
+            esk,
+            &table_key_schema.partition_key,
+            table_key_schema.sort_key.as_deref(),
+        )?;
     }
 
     // Create tracker for unused expression attribute names/values
@@ -552,6 +563,15 @@ pub async fn execute<S: StorageBackend>(
 
     // Build sk SQL conditions
     let (sk_condition_sql, sk_param_values) = bound.sort_key_sql(key_range.len());
+
+    // A starting key from another partition, or outside the sort key condition,
+    // is refused on a table query. Index queries are left as they were: their
+    // answers haven't been captured.
+    if request.index_name.is_none()
+        && let Some(ref esk) = exclusive_start_key
+    {
+        check_start_key_within_condition(esk, &bound, effective_sk.is_some())?;
+    }
 
     // ---- Validate QueryFilter/FilterExpression don't reference primary key attrs ----
     // Collect effective key attribute names
@@ -1062,4 +1082,183 @@ fn key_condition_error(expr: &str, err: String) -> String {
         Some(syntax) => format!("Invalid KeyConditionExpression: {syntax}"),
         None => err,
     }
+}
+
+/// A Query answers a starting key that doesn't fit the key schema with this
+/// message alone, whatever the shape: a missing or extra attribute, a wrong
+/// type, a map or set, NULL, or an index query missing the table's or the
+/// index's keys. Captured in eu-west-2, us-east-1, us-west-2 and eu-central-1,
+/// 2026-10-09, where a Scan's answer varies by region.
+const START_KEY_INVALID: &str = "The provided starting key is invalid";
+
+/// The schema mismatch the shared starting-key check reports in a Scan's form,
+/// answered in a Query's.
+fn bare_start_key_mismatch(err: DynoxideError) -> DynoxideError {
+    match err {
+        DynoxideError::ValidationException(msg)
+            if msg
+                == "The provided starting key is invalid: \
+                    The provided key element does not match the schema" =>
+        {
+            DynoxideError::ValidationException(START_KEY_INVALID.to_string())
+        }
+        other => other,
+    }
+}
+
+/// A Query reports an invalid attribute value in its starting key (`NULL:
+/// false`, an empty set) without the starting-key prefix a Scan can add. An
+/// empty or multi-typed value keeps the prefix on both. Captured in eu-west-2
+/// and us-east-1, 2026-10-09.
+fn start_key_value_error(err: DynoxideError) -> DynoxideError {
+    match err {
+        DynoxideError::ValidationException(msg) => {
+            match msg.strip_prefix("The provided starting key is invalid: ") {
+                Some(rest) if rest.starts_with("One or more parameter values were invalid:") => {
+                    DynoxideError::ValidationException(rest.to_string())
+                }
+                _ => DynoxideError::ValidationException(msg),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Refuse a starting key that the key condition could never have produced.
+///
+/// From another partition: "outside query boundaries" on a table with a sort
+/// key, and a plain "exclusive start key is invalid" on one without. A sort key
+/// outside the condition: "does not match the range key predicate". Captured in
+/// eu-west-2, us-east-1, us-west-2 and eu-central-1, 2026-10-09.
+fn check_start_key_within_condition(
+    esk: &Item,
+    bound: &expressions::key_condition::BoundKeyCondition,
+    has_sort_key: bool,
+) -> Result<()> {
+    use crate::expressions::condition::{CompOp, compare_values};
+
+    let holds = |name: &str, value: &AttributeValue| {
+        esk.get(name)
+            .is_some_and(|v| compare_values(v, &CompOp::Eq, value))
+    };
+    if !bound.hash.iter().all(|(name, value)| holds(name, value)) {
+        let message = if has_sort_key {
+            "The provided starting key is outside query boundaries based on provided conditions"
+        } else {
+            "The provided exclusive start key is invalid"
+        };
+        return Err(DynoxideError::ValidationException(message.to_string()));
+    }
+    let outside_equalities = bound
+        .range_eq
+        .iter()
+        .any(|(name, value)| esk.contains_key(name) && !holds(name, value));
+    let outside_last = bound.range_last.as_ref().is_some_and(|condition| {
+        esk.get(condition.sk_name())
+            .is_some_and(|value| !sort_key_satisfies(value, condition))
+    });
+    if outside_equalities || outside_last {
+        return Err(DynoxideError::ValidationException(
+            "The provided starting key does not match the range key predicate".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn sort_key_satisfies(
+    value: &AttributeValue,
+    condition: &expressions::key_condition::ResolvedSortKeyCondition,
+) -> bool {
+    use crate::expressions::condition::{CompOp, compare_values};
+    use expressions::key_condition::ResolvedSortKeyCondition as Sk;
+
+    match condition {
+        Sk::Eq(_, v) => compare_values(value, &CompOp::Eq, v),
+        Sk::Lt(_, v) => compare_values(value, &CompOp::Lt, v),
+        Sk::Le(_, v) => compare_values(value, &CompOp::Le, v),
+        Sk::Gt(_, v) => compare_values(value, &CompOp::Gt, v),
+        Sk::Ge(_, v) => compare_values(value, &CompOp::Ge, v),
+        Sk::Between(_, low, high) => {
+            compare_values(value, &CompOp::Ge, low) && compare_values(value, &CompOp::Le, high)
+        }
+        Sk::BeginsWith(_, prefix) => match (value, prefix) {
+            (AttributeValue::S(s), AttributeValue::S(p)) => s.starts_with(p.as_str()),
+            (AttributeValue::B(b), AttributeValue::B(p)) => b.starts_with(p),
+            _ => false,
+        },
+    }
+}
+
+/// A legacy KeyConditions value must be the key's schema type. Any other type
+/// (a map, a list, a set, BOOL, NULL, or the wrong scalar) is refused with one
+/// message, after the check that a BETWEEN's two values share a type. Captured
+/// in eu-west-2, us-east-1, us-west-2 and eu-central-1, 2026-10-09.
+fn check_legacy_key_condition_types(
+    conditions: &HashMap<String, helpers::KeyCondition>,
+    meta: &crate::storage::TableMetadata,
+) -> Result<()> {
+    use crate::types::{AttributeDefinition, ScalarAttributeType};
+
+    let definitions: Vec<AttributeDefinition> = serde_json::from_str(&meta.attribute_definitions)
+        .map_err(|e| {
+        DynoxideError::InternalServerError(format!("Bad attribute definitions JSON: {e}"))
+    })?;
+    for (name, condition) in conditions {
+        let Some(values) = condition.attribute_value_list.as_ref() else {
+            continue;
+        };
+        if values
+            .windows(2)
+            .any(|pair| std::mem::discriminant(&pair[0]) != std::mem::discriminant(&pair[1]))
+        {
+            return Err(DynoxideError::ValidationException(
+                "One or more parameter values were invalid: \
+                 AttributeValues inside AttributeValueList must be of same type"
+                    .to_string(),
+            ));
+        }
+        let Some(definition) = definitions.iter().find(|d| &d.attribute_name == name) else {
+            continue;
+        };
+        let matches = |value: &AttributeValue| {
+            matches!(
+                (value, &definition.attribute_type),
+                (AttributeValue::S(_), ScalarAttributeType::S)
+                    | (AttributeValue::N(_), ScalarAttributeType::N)
+                    | (AttributeValue::B(_), ScalarAttributeType::B)
+            )
+        };
+        if !values.iter().all(matches) {
+            return Err(DynoxideError::ValidationException(
+                "One or more parameter values were invalid: \
+                 Condition parameter type does not match schema type"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A starting key whose table key value is an empty string or empty binary is
+/// refused with the empty key-value message, ahead of the check against the key
+/// condition. Captured for an empty partition key in eu-west-2, us-east-1,
+/// us-west-2 and eu-central-1, 2026-10-09; the binary wording is the one item
+/// keys already use.
+fn check_start_key_not_empty(
+    esk: &Item,
+    partition_key: &str,
+    sort_key: Option<&str>,
+) -> Result<()> {
+    for name in std::iter::once(partition_key).chain(sort_key) {
+        let kind = match esk.get(name) {
+            Some(AttributeValue::S(s)) if s.is_empty() => "string",
+            Some(AttributeValue::B(b)) if b.is_empty() => "binary",
+            _ => continue,
+        };
+        return Err(DynoxideError::KeyEmptyValueValidation(format!(
+            "One or more parameter values are not valid. The AttributeValue for a key \
+             attribute cannot contain an empty {kind} value. Key: {name}"
+        )));
+    }
+    Ok(())
 }

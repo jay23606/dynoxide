@@ -108,6 +108,14 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
     // Parse all statements before executing any, to fail fast on syntax errors
     let mut parsed = Vec::with_capacity(statements.len());
     for (index, stmt) in statements.iter().enumerate() {
+        // A parameter nested too deep fails the whole transaction at the top
+        // level, before this statement is parsed, but after the statements
+        // ahead of it have been checked.
+        if crate::value_nesting::parameters_nest_too_deep(
+            stmt.parameters.as_deref().unwrap_or_default(),
+        ) {
+            return Err(crate::value_nesting::deep_parameter_error());
+        }
         // A COUNT projection is rejected before parsing, at the same top level
         // as a parse error but with the bare message captured on
         // ExecuteStatement, not the wasn't-well-formed wrapper.

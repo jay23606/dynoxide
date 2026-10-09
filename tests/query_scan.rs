@@ -1734,6 +1734,8 @@ fn test_scan_esk_null_false_starting_key_invalid() {
 
 #[test]
 fn test_query_esk_null_false_starting_key_invalid() {
+    // A Query reports {"NULL": false} without the starting-key prefix a Scan
+    // can add (eu-west-2 and us-east-1, 2026-10-09).
     let db = setup_db();
     create_hash_only_table(&db, "Items");
 
@@ -1748,8 +1750,7 @@ fn test_query_esk_null_false_starting_key_invalid() {
     let err = db.query(req).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "The provided starting key is invalid: \
-         One or more parameter values were invalid: \
+        "One or more parameter values were invalid: \
          Null attribute value types must have the value of true"
     );
 }
