@@ -1768,6 +1768,50 @@ fn overlapping_key_conditions_are_refused() {
 }
 
 #[test]
+fn an_or_with_no_key_condition_under_it_is_a_filter_not_a_second_range() {
+    // Captured eu-west-2 and us-east-1, 2026-10-09. An OR under a conjunct
+    // that names no key attribute narrows nothing, so the read stays one key
+    // range and runs. An OR with a key condition anywhere under it splits the
+    // read as before, and is refused when its ranges meet.
+    const OVERLAP: &str =
+        "Overlapping conditions with range keys are not supported in where clause";
+    let db = ordered_table();
+    for (clause, expected) in [
+        ("pk = 'a' AND (a = 30 OR a = 10)", "a1 a2"),
+        ("pk = 'a' AND (a = 30 OR a = 10) AND sk = 1", "a1"),
+        (
+            "(pk = 'a' AND (a = 30 OR a = 10)) OR pk = 'b'",
+            "a1 a2 b1 b2",
+        ),
+        ("pk = 'a' AND NOT (a = 30 AND a = 10)", "a1 a2 a3"),
+        (
+            "pk = 'a' AND (a = 30 OR a = 10) AND (a = 30 OR a = 20)",
+            "a1",
+        ),
+        ("pk IN ['a', 'b'] AND (a = 30 OR a = 5)", "a1 b1"),
+        (
+            "pk = 'a' AND (attribute_exists(nope) OR attribute_exists(a))",
+            "a1 a2 a3",
+        ),
+    ] {
+        let statement = format!("SELECT * FROM \"Ordered\" WHERE {clause}");
+        let resp = run(&db, &statement).unwrap_or_else(|e| panic!("{statement}: {e:?}"));
+        let mut keys = keys_as_returned(resp);
+        keys.sort();
+        assert_eq!(keys.join(" "), expected, "{statement}");
+    }
+    for clause in [
+        "pk = 'a' AND (sk = 1 OR a = 10)",
+        "pk = 'a' AND (a = 30 OR a = 10) OR pk = 'a' AND sk = 3",
+        "pk = 'a' AND (a = 30 OR sk > 2)",
+    ] {
+        let statement = format!("SELECT * FROM \"Ordered\" WHERE {clause}");
+        let err = run(&db, &statement).expect_err(&statement);
+        assert_eq!(message(err), OVERLAP, "{statement}");
+    }
+}
+
+#[test]
 fn parameters_are_number_checked_in_batches_and_transactions() {
     // Captured eu-west-2 and us-east-1, 2026-10-09. In a batch each statement's
     // parameters are checked against that statement, used or not, ahead of a

@@ -123,11 +123,13 @@ fn not_contains_is_the_complement_of_contains() {
 
 #[test]
 fn the_condition_level_negations_still_parse_as_themselves() {
-    // NOT EXISTS and NOT BEGINS_WITH are single conditions with their own
-    // variants, not the boolean operator applied to a function call. The
-    // boolean NOT must not swallow them.
+    // NOT BEGINS_WITH is a single condition with its own variant, not the
+    // boolean operator applied to a function call, and NOT in front of
+    // attribute_exists negates it. The boolean NOT must not swallow either.
+    // (`EXISTS(path)` is a function DynamoDB doesn't recognise in a WHERE
+    // clause, captured eu-west-2 and us-east-1, 2026-10-09.)
     let db = seeded();
-    assert_eq!(selects(&db, "NOT EXISTS(missing)"), "1,2,3");
+    assert_eq!(selects(&db, "NOT attribute_exists(nope)"), "1,2,3");
     assert_eq!(selects(&db, "NOT BEGINS_WITH(a, 'x')"), "2,3");
 }
 

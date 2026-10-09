@@ -530,8 +530,9 @@ fn reject_overlapping_key_conditions(
         Ok(keys)
     };
 
-    let mut branches = Vec::with_capacity(wc.groups.len());
-    for group in &wc.groups {
+    let groups = key_groups(wc, read_pk, read_sk);
+    let mut branches = Vec::with_capacity(groups.len());
+    for group in &groups {
         let mut partitions: Option<Vec<String>> = None;
         let mut narrow = |keys: Vec<String>| {
             partitions = Some(match partitions.take() {
@@ -610,6 +611,62 @@ fn reject_overlapping_key_conditions(
         }
     }
     Ok(())
+}
+
+/// The OR-groups a read's key ranges come from: the clause flattened as
+/// `groups` is, except that an OR with no condition on a key attribute under
+/// it stays whole, as a filter, rather than splitting the read. `pk = 'a' AND
+/// (x = 1 OR x = 2)` is one range, and runs; `pk = 'a' AND (sk = 1 OR x = 2)`
+/// is two that meet, and is refused (captured eu-west-2 and us-east-1,
+/// 2026-10-09).
+fn key_groups(wc: &WhereClause, read_pk: &str, read_sk: Option<&str>) -> Vec<Vec<WhereCondition>> {
+    use crate::partiql::parser::ConditionTree;
+    let is_key = |cond: &WhereCondition| {
+        let root = root_attribute(condition_path(cond));
+        root == read_pk || Some(root) == read_sk
+    };
+    fn mentions_key(tree: &ConditionTree, is_key: &dyn Fn(&WhereCondition) -> bool) -> bool {
+        match tree {
+            ConditionTree::Leaf(cond) => is_key(cond),
+            ConditionTree::And(terms) | ConditionTree::Or(terms) => {
+                terms.iter().any(|t| mentions_key(t, is_key))
+            }
+        }
+    }
+    fn flatten(
+        tree: &ConditionTree,
+        is_key: &dyn Fn(&WhereCondition) -> bool,
+    ) -> Vec<Vec<WhereCondition>> {
+        match tree {
+            ConditionTree::Leaf(cond) => vec![vec![cond.clone()]],
+            // A filter: it narrows no key range, so it contributes nothing.
+            ConditionTree::Or(terms) if !terms.iter().any(|t| mentions_key(t, is_key)) => {
+                vec![Vec::new()]
+            }
+            ConditionTree::Or(terms) => terms.iter().flat_map(|t| flatten(t, is_key)).collect(),
+            ConditionTree::And(terms) => {
+                let mut out = vec![Vec::new()];
+                for term in terms {
+                    let term_groups = flatten(term, is_key);
+                    out = out
+                        .iter()
+                        .flat_map(|held: &Vec<WhereCondition>| {
+                            term_groups.iter().map(move |group| {
+                                let mut joined = held.clone();
+                                joined.extend(group.iter().cloned());
+                                joined
+                            })
+                        })
+                        .collect();
+                }
+                out
+            }
+        }
+    }
+    match &wc.tree {
+        Some(tree) => flatten(tree, &is_key),
+        None => wc.groups.clone(),
+    }
 }
 
 /// Whether some sort key satisfies every atom at once.
@@ -1852,6 +1909,24 @@ fn root_attribute(path: &str) -> &str {
     &path[..end]
 }
 
+/// The path a WHERE condition reads.
+fn condition_path(condition: &WhereCondition) -> &str {
+    match condition {
+        WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => c.path.as_str(),
+        WhereCondition::Exists(p)
+        | WhereCondition::NotExists(p)
+        | WhereCondition::BeginsWith(p, _)
+        | WhereCondition::NotBeginsWith(p, _)
+        | WhereCondition::Between(p, _, _)
+        | WhereCondition::NotBetween(p, _, _)
+        | WhereCondition::In(p, _)
+        | WhereCondition::Contains(p, _)
+        | WhereCondition::NotContains(p, _)
+        | WhereCondition::IsMissing(p)
+        | WhereCondition::IsNotMissing(p) => p.as_str(),
+    }
+}
+
 /// Every attribute a WHERE clause reads.
 fn where_attributes(where_clause: Option<&WhereClause>) -> Vec<String> {
     let Some(wc) = where_clause else {
@@ -1860,21 +1935,7 @@ fn where_attributes(where_clause: Option<&WhereClause>) -> Vec<String> {
     let mut out = Vec::new();
     for group in &wc.groups {
         for condition in group {
-            let path = match condition {
-                WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => c.path.as_str(),
-                WhereCondition::Exists(p)
-                | WhereCondition::NotExists(p)
-                | WhereCondition::BeginsWith(p, _)
-                | WhereCondition::NotBeginsWith(p, _)
-                | WhereCondition::Between(p, _, _)
-                | WhereCondition::NotBetween(p, _, _)
-                | WhereCondition::In(p, _)
-                | WhereCondition::Contains(p, _)
-                | WhereCondition::NotContains(p, _)
-                | WhereCondition::IsMissing(p)
-                | WhereCondition::IsNotMissing(p) => p.as_str(),
-            };
-            let root = root_attribute(path).to_string();
+            let root = root_attribute(condition_path(condition)).to_string();
             if !out.contains(&root) {
                 out.push(root);
             }

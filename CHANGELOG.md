@@ -296,6 +296,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contain a mandatory equality on all key attributes`, and a key given two
   values with `Multiple conditions on same key`. `pk = 'a' AND pk = 'b'` used
   to update the first item it named.
+- A PartiQL WHERE clause takes `attribute_exists(path)` and
+  `attribute_not_exists(path)`, in any case and compared with a boolean, as
+  DynamoDB does; both used to fail with `Unknown operator: (`. An operand that
+  isn't a document path, or the wrong number of operands, is refused with
+  DynamoDB's messages. A call to a function DynamoDB doesn't recognise there,
+  `EXISTS(path)` among them, is refused as `Unrecognized function: <name> at
+  <line>:<column>:<length>` before the table is looked up; `EXISTS(path)` used
+  to run as `attribute_exists`. An OR with no key condition under it no longer
+  counts as a second key range for the overlap check, so `pk = 'a' AND (x = 1
+  OR x = 2)` runs.
 - PartiQL refuses a `begins_with` operand that isn't a string or binary, and
   BETWEEN bounds of different types or with the lower above the upper, with
   DynamoDB's messages, `NOT` or not, before the table is looked up.

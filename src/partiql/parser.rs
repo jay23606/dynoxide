@@ -349,6 +349,33 @@ pub struct WhereClause {
     /// and `pk = 'a' AND (b = 1 OR c = 2)` is accepted (captured eu-west-2 and
     /// us-east-1, 2026-10-09).
     pub(crate) top_level_equalities: Vec<Condition>,
+    /// The clause as written once `NOT` has been pushed down to its
+    /// conditions, before it is flattened into `groups`. The overlap check
+    /// reads it, because DynamoDB splits a read only on an OR with a key
+    /// condition under it (captured eu-west-2 and us-east-1, 2026-10-09).
+    pub(crate) tree: Option<ConditionTree>,
+}
+
+/// A WHERE clause as written, with every `NOT` pushed down to a condition.
+#[derive(Debug, Clone)]
+pub(crate) enum ConditionTree {
+    Leaf(WhereCondition),
+    And(Vec<ConditionTree>),
+    Or(Vec<ConditionTree>),
+}
+
+impl ConditionTree {
+    /// The tree of an expression `push_not_down` has already run over.
+    fn of(expr: &BoolExpr) -> Self {
+        match expr {
+            BoolExpr::Leaf(cond) => ConditionTree::Leaf(cond.clone()),
+            BoolExpr::And(terms) => ConditionTree::And(terms.iter().map(Self::of).collect()),
+            BoolExpr::Or(terms) => ConditionTree::Or(terms.iter().map(Self::of).collect()),
+            BoolExpr::Not(_) => {
+                unreachable!("push_not_down removes every Not before the tree is kept")
+            }
+        }
+    }
 }
 
 impl WhereClause {
@@ -366,6 +393,7 @@ impl WhereClause {
             groups,
             wrote_or,
             top_level_equalities: Vec::new(),
+            tree: None,
         }
     }
 }
@@ -513,6 +541,14 @@ pub(crate) fn parse_statement(input: &str) -> Result<Statement, ParseFailure> {
     // statements). One semicolon may end the statement; anything after it is
     // a second statement (captured eu-west-2 and us-east-1, 2026-10-09).
     end_of_statement(&mut tokenizer)?;
+
+    // A function DynamoDB doesn't recognise, or an operand a condition
+    // function can't take, is refused once the statement has parsed and
+    // before the table is looked up, without the syntax envelope (captured
+    // eu-west-2 and us-east-1, 2026-10-09).
+    if let Some(message) = tokenizer.first_refusal() {
+        return Err(ParseFailure::Statement(ParseError::Validation(message)));
+    }
 
     // A literal DynamoDB can't read is refused once the statement has parsed,
     // before anything is looked up: a missing table, a missing item or an
@@ -1716,9 +1752,10 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
         Some(ref s) if s.eq_ignore_ascii_case("WHERE") => {
             t.next_token()?; // consume WHERE
             t.clause = LiteralClause::Where;
-            let (groups, wrote_or, top_level_equalities) = parse_conditions_with_or(t)?;
-            let mut clause = WhereClause::from_groups_written(groups, wrote_or);
-            clause.top_level_equalities = top_level_equalities;
+            let parsed = parse_conditions_with_or(t)?;
+            let mut clause = WhereClause::from_groups_written(parsed.groups, parsed.wrote_or);
+            clause.top_level_equalities = parsed.top_level_equalities;
+            clause.tree = Some(parsed.tree);
             Ok(Some(clause))
         }
         _ => Ok(None),
@@ -1735,24 +1772,35 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
 fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, String> {
     let expr = parse_or_expr(t, 0)?;
     let wrote_or = contains_or(&expr);
-    let mut equalities = Vec::new();
-    top_level_equalities(&expr, &mut equalities);
+    let mut top_level_equalities = Vec::new();
+    collect_top_level_equalities(&expr, &mut top_level_equalities);
     let expr = push_not_down(expr, false)?;
-    Ok((to_dnf(expr)?, wrote_or, equalities))
+    let tree = ConditionTree::of(&expr);
+    Ok(ParsedConditions {
+        groups: to_dnf(expr)?,
+        wrote_or,
+        top_level_equalities,
+        tree,
+    })
 }
 
-/// A WHERE clause's OR-groups, whether it was written with an `OR`, and the
-/// equalities among its top-level conditions.
-type ParsedConditions = (Vec<Vec<WhereCondition>>, bool, Vec<Condition>);
+/// A WHERE clause as parsed: its OR-groups, whether it was written with an
+/// `OR`, the equalities among its top-level conditions, and its tree.
+struct ParsedConditions {
+    groups: Vec<Vec<WhereCondition>>,
+    wrote_or: bool,
+    top_level_equalities: Vec<Condition>,
+    tree: ConditionTree,
+}
 
 /// Collect the `path = value` conditions joined to the rest of the clause by
 /// `AND` alone. Parentheses leave no node of their own, so a parenthesised
 /// conjunction counts; an `OR` or a `NOT` hides everything under it.
-fn top_level_equalities(expr: &BoolExpr, out: &mut Vec<Condition>) {
+fn collect_top_level_equalities(expr: &BoolExpr, out: &mut Vec<Condition>) {
     match expr {
         BoolExpr::And(terms) => terms
             .iter()
-            .for_each(|term| top_level_equalities(term, out)),
+            .for_each(|term| collect_top_level_equalities(term, out)),
         BoolExpr::Leaf(WhereCondition::Comparison(cond)) if cond.op == CompOp::Eq => {
             out.push(cond.clone())
         }
@@ -1859,8 +1907,204 @@ fn parse_primary(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
             )),
         }
     } else {
-        Ok(BoolExpr::Leaf(parse_single_condition(t, depth)?))
+        parse_condition(t, depth)
     }
+}
+
+/// The functions DynamoDB recognises in a WHERE clause. A call to anything
+/// else is refused as an unrecognised function; `size` and `attribute_type`
+/// are recognised but not supported here, and keep the refusal they had.
+const WHERE_FUNCTIONS: &[&str] = &[
+    "attribute_exists",
+    "attribute_not_exists",
+    "begins_with",
+    "contains",
+    "size",
+    "attribute_type",
+];
+
+/// A comparison operator, as a WHERE clause writes one.
+fn is_comparison_operator(tok: &str) -> bool {
+    matches!(tok, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
+}
+
+/// `attribute_exists(path)` or `attribute_not_exists(path)` as parsed: which
+/// one, and the path (empty when the operand was refused).
+struct ConditionFunction {
+    exists: bool,
+    path: String,
+}
+
+impl ConditionFunction {
+    /// The condition the call is true for, or the one it is false for.
+    fn condition(&self, holds: bool) -> BoolExpr {
+        let path = self.path.clone();
+        BoolExpr::Leaf(if self.exists == holds {
+            WhereCondition::Exists(path)
+        } else {
+            WhereCondition::NotExists(path)
+        })
+    }
+
+    /// The call compared with a value. Equal to a boolean is the call or its
+    /// negation; equal to anything else is never true, and unequal to it
+    /// always (captured eu-west-2 and us-east-1, 2026-10-09, for `= false`,
+    /// `<> true`, `= 1` and `= 'true'`).
+    fn compared(&self, op: &str, value: PartiqlValue) -> Result<BoolExpr, String> {
+        let equal = match op {
+            "=" => true,
+            "<>" | "!=" => false,
+            other => return Err(format!("Unknown operator: {other}")),
+        };
+        match value {
+            PartiqlValue::Literal(AttributeValue::BOOL(b)) => Ok(self.condition(b == equal)),
+            PartiqlValue::Literal(_) => {
+                let both = vec![self.condition(true), self.condition(false)];
+                Ok(if equal {
+                    BoolExpr::And(both)
+                } else {
+                    BoolExpr::Or(both)
+                })
+            }
+            PartiqlValue::Parameter(_) => {
+                Err("Comparing a condition function with a parameter is not supported".into())
+            }
+        }
+    }
+}
+
+/// Which condition function a name calls, by its canonical name.
+fn condition_function_name(tok: &str) -> Option<&'static str> {
+    ["attribute_exists", "attribute_not_exists"]
+        .into_iter()
+        .find(|name| is_keyword(tok, name))
+}
+
+/// One WHERE condition: a condition function, a call DynamoDB doesn't
+/// recognise, or a comparison and the other single conditions.
+fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
+    let Some(tok) = t.peek_token()? else {
+        return Ok(BoolExpr::Leaf(parse_single_condition(t, depth)?));
+    };
+    let calls = |offset: usize, t: &Tokenizer| -> Result<bool, String> {
+        Ok(t.peek_token_at(offset + 1)?.as_deref() == Some("("))
+    };
+
+    // A boolean compared with a condition function, `true = attribute_exists(x)`.
+    if is_any(&tok, &["TRUE", "FALSE"])
+        && t.peek_token_at(1)?
+            .is_some_and(|op| is_comparison_operator(&op))
+        && t.peek_token_at(2)?
+            .is_some_and(|f| condition_function_name(&f).is_some())
+        && calls(2, t)?
+    {
+        let left = parse_value(t, depth)?;
+        let op = t.next_token()?.unwrap_or_default();
+        let function = parse_condition_function(t, depth)?;
+        return function.compared(&op, left);
+    }
+
+    let bare_word = tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
+    if bare_word && calls(0, t)? {
+        if condition_function_name(&tok).is_some() {
+            let function = parse_condition_function(t, depth)?;
+            if let Some(op) = t.peek_token()?
+                && is_comparison_operator(&op)
+            {
+                t.next_token()?;
+                let right = parse_value(t, depth)?;
+                return function.compared(&op, right);
+            }
+            return Ok(function.condition(true));
+        }
+        // `EXISTS (SELECT ...)` keeps the handling it had; `EXISTS(path)` is a
+        // function DynamoDB doesn't recognise in a WHERE clause.
+        let subquery = t
+            .peek_token_at(2)?
+            .is_some_and(|next| is_keyword(&next, "SELECT"));
+        if !is_any(&tok, WHERE_FUNCTIONS) && !subquery {
+            skip_unrecognized_call(t, depth)?;
+            // Never evaluated: the statement is refused once it has parsed.
+            return Ok(BoolExpr::Leaf(WhereCondition::Exists(String::new())));
+        }
+    }
+    Ok(BoolExpr::Leaf(parse_single_condition(t, depth)?))
+}
+
+/// Read `attribute_exists(...)` or `attribute_not_exists(...)`, noting the
+/// refusal of an operand it can't take: anything but one document path.
+fn parse_condition_function(t: &mut Tokenizer, depth: usize) -> Result<ConditionFunction, String> {
+    let name_tok = t.next_token()?.unwrap_or_default();
+    let name = condition_function_name(&name_tok).unwrap_or("attribute_exists");
+    expect_char(t, "(")?;
+    // Each operand, as the path it names or `None` for a value.
+    let mut operands: Vec<Option<String>> = Vec::new();
+    if t.peek_token()?.as_deref() == Some(")") {
+        t.next_token()?;
+    } else {
+        loop {
+            let tok = t.next_token()?.ok_or(UNEXPECTED_TERM)?;
+            if is_name(&tok) {
+                operands.push(Some(parse_dotted_path_from_token(&tok, t)?));
+            } else {
+                t.pos -= 1;
+                parse_value(t, depth)?;
+                operands.push(None);
+            }
+            match t.next_token()?.as_deref() {
+                Some(",") => continue,
+                Some(")") => break,
+                Some(other) => return Err(format!("Expected ')' but got '{other}'")),
+                None => return Err("Expected ')'".to_string()),
+            }
+        }
+    }
+    let path = match operands.as_slice() {
+        [Some(path)] => path.clone(),
+        [None] => {
+            t.note_operand_refusal(format!(
+                "Operator or function requires a document path; operator or function: {name}"
+            ));
+            String::new()
+        }
+        _ => {
+            t.note_operand_refusal(format!(
+                "Incorrect number of operands for operator or function; operator or \
+                 function: {name}, number of operands: {}",
+                operands.len()
+            ));
+            String::new()
+        }
+    };
+    Ok(ConditionFunction {
+        exists: name == "attribute_exists",
+        path,
+    })
+}
+
+/// Read a call to a function DynamoDB doesn't recognise, noting its refusal,
+/// and any comparison it is part of.
+fn skip_unrecognized_call(t: &mut Tokenizer, depth: usize) -> Result<(), String> {
+    let index = t.pos;
+    t.next_token()?;
+    t.note_unrecognized_function(index);
+    let mut open = 0usize;
+    loop {
+        match t.next_token()?.as_deref() {
+            Some("(") => open += 1,
+            Some(")") if open == 1 => break,
+            Some(")") => open -= 1,
+            Some(_) => {}
+            None => return Err("Expected ')'".to_string()),
+        }
+    }
+    if let Some(op) = t.peek_token()?
+        && is_comparison_operator(&op)
+    {
+        t.next_token()?;
+        parse_value(t, depth)?;
+    }
+    Ok(())
 }
 
 /// Drive `NOT` down to the leaves by De Morgan, so the tree that reaches
@@ -2102,7 +2346,19 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
         }
         "NOT" => {
             let func = t.next_token()?.ok_or("Expected function name after NOT")?;
-            if func.eq_ignore_ascii_case("EXISTS") {
+            if func.eq_ignore_ascii_case("EXISTS")
+                && t.peek_token()?.as_deref() == Some("(")
+                && !t
+                    .peek_token_at(1)?
+                    .is_some_and(|next| is_keyword(&next, "SELECT"))
+            {
+                // `EXISTS(path)` is a function DynamoDB doesn't recognise in a
+                // WHERE clause, negated or not (captured eu-west-2 and
+                // us-east-1, 2026-10-09).
+                t.pos -= 1;
+                skip_unrecognized_call(t, depth)?;
+                Ok(WhereCondition::Exists(String::new()))
+            } else if func.eq_ignore_ascii_case("EXISTS") {
                 expect_char(t, "(")?;
                 let path = parse_function_path(t)?;
                 expect_char(t, ")")?;
@@ -2840,6 +3096,14 @@ struct Tokenizer {
     /// store, a value nested too deep), in the order written, with the clause
     /// it was written in and the message, path included.
     literal_errors: Vec<(LiteralClause, String)>,
+    /// The first call to a function DynamoDB doesn't recognise, as its
+    /// refusal. It is reported once the statement has parsed, ahead of any
+    /// operand refusal and of the table lookup (captured eu-west-2 and
+    /// us-east-1, 2026-10-09).
+    unrecognized_function: Option<String>,
+    /// The first operand a condition function can't take, as its refusal:
+    /// reported after an unrecognised function and before the table lookup.
+    operand_refusal: Option<String>,
 }
 
 /// How deep a literal value may nest: a value 32 levels inside the value it is
@@ -2866,7 +3130,33 @@ impl Tokenizer {
             clause: LiteralClause::Where,
             value_path: Vec::new(),
             literal_errors: Vec::new(),
+            unrecognized_function: None,
+            operand_refusal: None,
         })
+    }
+
+    /// Note a call, at the token at `index`, to a function DynamoDB doesn't
+    /// recognise. It names the function in lower case, as written otherwise,
+    /// and where it stands: `Unrecognized function: exists at 1:61:6`.
+    fn note_unrecognized_function(&mut self, index: usize) {
+        if self.unrecognized_function.is_none() {
+            let name = self.tokens[index].to_lowercase();
+            let at = self.position(self.span_at(index));
+            self.unrecognized_function = Some(format!("Unrecognized function: {name} at {at}"));
+        }
+    }
+
+    /// Note an operand a condition function can't take.
+    fn note_operand_refusal(&mut self, message: String) {
+        self.operand_refusal.get_or_insert(message);
+    }
+
+    /// The refusal of a statement that parsed but names a function DynamoDB
+    /// doesn't recognise, or gives one an operand it can't take.
+    fn first_refusal(&self) -> Option<String> {
+        self.unrecognized_function
+            .clone()
+            .or_else(|| self.operand_refusal.clone())
     }
 
     /// Note a number literal as it is read. One DynamoDB would refuse is

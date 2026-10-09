@@ -1912,7 +1912,7 @@ fn test_table_not_found() {
 }
 
 // -----------------------------------------------------------------------
-// EXISTS / BEGINS_WITH functions
+// attribute_exists / BEGINS_WITH functions
 // -----------------------------------------------------------------------
 
 #[test]
@@ -1940,7 +1940,9 @@ fn test_select_where_exists() {
     })
     .unwrap();
 
-    let resp = exec(&db, "SELECT * FROM \"Users\" WHERE EXISTS(email)");
+    // DynamoDB's form; `EXISTS(email)` in a WHERE clause is a function it
+    // doesn't recognise (captured eu-west-2 and us-east-1, 2026-10-09).
+    let resp = exec(&db, "SELECT * FROM \"Users\" WHERE attribute_exists(email)");
     let items = resp.items.unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(
@@ -1974,7 +1976,10 @@ fn test_select_where_not_exists() {
     })
     .unwrap();
 
-    let resp = exec(&db, "SELECT * FROM \"Users\" WHERE NOT EXISTS(email)");
+    let resp = exec(
+        &db,
+        "SELECT * FROM \"Users\" WHERE attribute_not_exists(email)",
+    );
     let items = resp.items.unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(
@@ -2035,10 +2040,10 @@ fn test_select_combined_conditions_with_exists() {
 
     put_test_item(&db, "Users", "u2", "Bob"); // no email
 
-    // Combine pk equality + EXISTS
+    // Combine pk equality + attribute_exists
     let resp = exec(
         &db,
-        "SELECT * FROM \"Users\" WHERE pk = 'u1' AND EXISTS(email)",
+        "SELECT * FROM \"Users\" WHERE pk = 'u1' AND attribute_exists(email)",
     );
     let items = resp.items.unwrap();
     assert_eq!(items.len(), 1);
