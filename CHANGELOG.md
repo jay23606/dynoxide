@@ -9,16 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `--log quiet` suppresses informational startup and shutdown messages on
-  stderr. Without the flag the output is unchanged.
-- `server::ServerOptions` and `server::start_with_options` give embedded Rust
-  callers the same switch.
 - The MCP tools that wrap a DynamoDB read or write take
   `return_consumed_capacity` (`TOTAL`, `INDEXES` or `NONE`) and return the
   `ConsumedCapacity` block the DynamoDB API returns for the same request. That
   covers the item tools, `query`, `scan`, `search_vectors`, `batch_get_item`,
   `batch_write_item`, both transaction tools and the three PartiQL tools. Any
   other value is refused with DynamoDB's validation error.
+- `--log quiet` suppresses informational startup and shutdown messages on
+  stderr. It works on `serve` and the no-subcommand form, `serve --mcp`, `mcp`
+  (stdio and `--http`), and `import --serve` or `--mcp`. Warnings, errors, the
+  first-run MCP token message and the import's own report still print. On
+  `import`, `--log` conflicts with `--output`. Without the flag the output is
+  unchanged.
+- `ServerOptions` (at the crate root, and at `server::ServerOptions`),
+  `server::start_with_options` and `mcp::serve_http_with_options` give embedded
+  Rust callers the same switch for both servers.
 
 ### Fixed
 
@@ -150,23 +155,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it carries on. A sweep reads no more of a table than it held when the sweep
   reached it, so a table that keeps growing cannot keep it running, and an item
   written while the sweep is under way may be left for the next one.
-  stderr. It works on `serve` and the no-subcommand form, `serve --mcp`, `mcp`
-  (stdio and `--http`), and `import --serve` or `--mcp`. Warnings, errors, the
-  first-run MCP token message and the import's own report still print. On
-  `import`, `--log` conflicts with `--output`. Without the flag the output is
-  unchanged.
-- `ServerOptions` (at the crate root, and at `server::ServerOptions`),
-  `server::start_with_options` and `mcp::serve_http_with_options` give embedded
-  Rust callers the same switch for both servers.
-
-### Fixed
-
 - `--help` no longer shows the value of `DYNOXIDE_MCP_AUTH_TOKEN` when it is
   set. It still names the variable. The MCP auth types' debug output no
   longer shows the token either.
-
-### Fixed
-
 - A prerelease tag such as `v1.3.0-rc.1` no longer ships as if it were the
   latest release. Its GitHub Release is flagged as a prerelease, so the GitHub
   Action's default `version: latest` stays on the last stable release, and the
@@ -174,16 +165,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crate version is not published to crates.io from a prerelease tag. npm still
   publishes a prerelease to `next`, and containers still get the exact tag
   only. `docs/versioning.md` has the full list.
-
-### Fixed
-
 - `docs/library.md` no longer tells readers to run
   `cargo add dynoxide-rs --features encryption`, which stops on the
   `native-sqlite` and `encryption` compile guard because the default features
   stay on. It now adds `--no-default-features`, as the rest of the page does.
-
-### Fixed
-
 - PartiQL reads a number written with an exponent as one number, so
   `WHERE pk = 1e5` matches 100000 rather than 1, and `INSERT ... VALUE
   {'pk': 2e3}` parses. A literal whose exponent, or whose scale (the digits
@@ -284,9 +269,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DynamoDB's messages, `NOT` or not, before the table is looked up.
 - A PartiQL INSERT of a key that already exists is reported as a duplicate
   before an item nested to the limit is.
-
-### Fixed
-
 - `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and
   `TransactWriteItems` refuse a `ReturnConsumedCapacity` other than `INDEXES`,
   `TOTAL` or `NONE` with the ValidationException the single-item operations
@@ -364,9 +346,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     envelope once its other members pass, a `TopK` below 1 in the newer
     wording, and a missing `IndexName`, `SearchVector` or `TopK` with
     DynamoDB's own "missing field" message.
-
-### Fixed
-
 - A request carrying an attribute value nested more than about 60 levels is
   read and refused with DynamoDB's nesting `ValidationException`, rather than
   failing to parse with a bare `SerializationException`. As in DynamoDB, an
@@ -400,9 +379,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ExecuteStatement and ExecuteTransaction, where a transaction used to be
   cancelled, and against that statement alone in a BatchExecuteStatement. It
   used to run, or come back as "Invalid key value".
-
-### Fixed
-
 - `UpdateItem` is held to the 400KB limit the way DynamoDB holds it: by a
   charge worked out from the request, alongside the finished item's own size,
   rather than by the finished item less its key. Nothing the table already
@@ -422,9 +398,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DynamoDB's document path error where it used to create a map or a list
   there. This covers `UpdateItem` and `TransactWriteItems` updates; PartiQL
   `UPDATE` already appended. Captured against eu-west-2.
-
-### Fixed
-
 - Set members come back in DynamoDB's order instead of the order they were
   written in. String and binary sets are sorted by their bytes everywhere.
   Number sets are sorted by value from GetItem, BatchGetItem, Query and the
