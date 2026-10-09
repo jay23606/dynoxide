@@ -98,6 +98,14 @@ pub struct GsiItemRow {
     pub item_json: String,
 }
 
+/// The DynamoDB size of one stored index entry, read from its projected JSON.
+/// Both backends size a non-ALL index this way, so they agree on it.
+pub(crate) fn projected_entry_size(item_json: &str) -> Result<i64, BackendError> {
+    let item: crate::types::Item = serde_json::from_str(item_json)
+        .map_err(|e| BackendError::Other(format!("unreadable index entry: {e}")))?;
+    Ok(crate::types::item_size(&item) as i64)
+}
+
 /// One vector shadow-table row for a bulk insert via
 /// [`StorageBackend::insert_vector_items`].
 ///
@@ -737,6 +745,30 @@ pub trait StorageBackend: private::Sealed {
     ) -> Result<Vec<(String, String, String)>, BackendError>;
 
     async fn count_items(&self, table_name: &str) -> Result<i64, BackendError>;
+
+    /// The number of items in a data table and the sum of their stored
+    /// `item_size`, which is the DynamoDB item size each write computed.
+    async fn item_count_and_size(&self, table_name: &str) -> Result<(i64, i64), BackendError>;
+
+    /// The number of entries in a GSI and the total of their projected item
+    /// sizes: its `ItemCount` and `IndexSizeBytes`. `whole_items` is true for
+    /// an ALL projection, where each entry is the base item and the base
+    /// table's stored size is its size; any other projection sizes each
+    /// entry's stored JSON.
+    async fn gsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError>;
+
+    /// [`gsi_item_count_and_size`](Self::gsi_item_count_and_size) for an LSI.
+    async fn lsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError>;
 
     // -----------------------------------------------------------------------
     // Introspection

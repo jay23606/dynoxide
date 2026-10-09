@@ -14,6 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `server::ServerOptions` and `server::start_with_options` give embedded Rust
   callers the same switch.
 
+### Fixed
+
+- `DescribeTable` reports `TableSizeBytes` as the total size of the table's
+  items, where it was always 0, so the MCP server's `size_bytes` is right too.
+  `UpdateTable`'s response carries the same `ItemCount` and `TableSizeBytes`,
+  where both were 0. DynamoDB refreshes these figures about every six hours;
+  Dynoxide reports them live.
+- `DescribeTable` and `UpdateTable` report each GSI's and LSI's `ItemCount` and
+  `IndexSizeBytes`: the number of items the index holds and the total size of
+  what it projects for them, where both were always 0. Vector indexes still
+  report 0.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security

@@ -1095,7 +1095,11 @@ pub async fn execute<S: StorageBackend>(
     // Build response from updated metadata
     let updated_meta = helpers::require_table(storage, &request.table_name).await?;
     let vector_phases = lifecycle.phases_armed_on(storage, &request.table_name);
-    let mut desc = build_table_description(&updated_meta, Some(0), Some(0), &vector_phases);
+    let (item_count, table_size_bytes) =
+        crate::actions::describe_table::item_count_and_size(storage, &request.table_name).await;
+    let mut desc =
+        build_table_description(&updated_meta, item_count, table_size_bytes, &vector_phases);
+    crate::actions::describe_table::fill_index_figures(storage, &mut desc).await;
 
     // The UpdateTable response echoes the merged ceilings with any -1 kept
     // verbatim; only DescribeTable afterwards shows the post-removal state.
