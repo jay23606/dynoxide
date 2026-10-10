@@ -122,10 +122,14 @@ pub fn tokenize(input: &str) -> Result<Vec<(Token, TokenSpan)>, TokenizeError> {
 
     while i < bytes.len() {
         let start = i;
-        let c = bytes[i] as char;
+        // `i` is always on a character boundary: every arm below steps over
+        // ASCII bytes or a whole character.
+        let c = input[i..].chars().next().unwrap_or_default();
 
-        // Skip whitespace
-        if c.is_whitespace() {
+        // Skip ASCII whitespace. DynamoDB reads any other character outside a
+        // string, a no-break space included, as a token it can't read
+        // (eu-west-2 and us-east-1, 2026-10-09).
+        if c.is_ascii() && c.is_whitespace() {
             i += 1;
             continue;
         }
@@ -135,7 +139,7 @@ pub fn tokenize(input: &str) -> Result<Vec<(Token, TokenSpan)>, TokenizeError> {
             '#' => {
                 i += 1;
                 let name_start = i;
-                while i < bytes.len() && is_name_char(bytes[i] as char) {
+                while i < bytes.len() && is_name_byte(bytes[i]) {
                     i += 1;
                 }
                 if i == name_start {
@@ -156,7 +160,7 @@ pub fn tokenize(input: &str) -> Result<Vec<(Token, TokenSpan)>, TokenizeError> {
             ':' => {
                 i += 1;
                 let name_start = i;
-                while i < bytes.len() && is_name_char(bytes[i] as char) {
+                while i < bytes.len() && is_name_byte(bytes[i]) {
                     i += 1;
                 }
                 if i == name_start {
@@ -176,10 +180,10 @@ pub fn tokenize(input: &str) -> Result<Vec<(Token, TokenSpan)>, TokenizeError> {
             // Comparison operators
             '<' => {
                 i += 1;
-                if i < bytes.len() && bytes[i] as char == '>' {
+                if i < bytes.len() && bytes[i] == b'>' {
                     i += 1;
                     tokens.push((Token::Ne, TokenSpan::new(start, 2)));
-                } else if i < bytes.len() && bytes[i] as char == '=' {
+                } else if i < bytes.len() && bytes[i] == b'=' {
                     i += 1;
                     tokens.push((Token::Le, TokenSpan::new(start, 2)));
                 } else {
@@ -189,7 +193,7 @@ pub fn tokenize(input: &str) -> Result<Vec<(Token, TokenSpan)>, TokenizeError> {
 
             '>' => {
                 i += 1;
-                if i < bytes.len() && bytes[i] as char == '=' {
+                if i < bytes.len() && bytes[i] == b'=' {
                     i += 1;
                     tokens.push((Token::Ge, TokenSpan::new(start, 2)));
                 } else {
@@ -230,7 +234,7 @@ pub fn tokenize(input: &str) -> Result<Vec<(Token, TokenSpan)>, TokenizeError> {
                 if i < bytes.len() && bytes[i] == b'0' {
                     i += 1;
                 } else {
-                    while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
                         i += 1;
                     }
                 }
@@ -255,7 +259,7 @@ pub fn tokenize(input: &str) -> Result<Vec<(Token, TokenSpan)>, TokenizeError> {
             // Identifiers and keywords
             c if is_ident_start(c) => {
                 let ident_start = i;
-                while i < bytes.len() && is_name_char(bytes[i] as char) {
+                while i < bytes.len() && is_name_byte(bytes[i]) {
                     i += 1;
                 }
                 let word = &input[ident_start..i];
@@ -291,8 +295,8 @@ fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
-fn is_name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// A cursor over a token stream for parsing.
@@ -431,7 +435,8 @@ pub fn tokenizer_syntax_error(source: &str, err: &TokenizeError) -> String {
 /// The span of the first token, or unreadable character, at or after `from`.
 fn next_lexeme(source: &str, from: usize) -> Option<TokenSpan> {
     let rest = &source[from..];
-    let start = from + (rest.len() - rest.trim_start().len());
+    let skipped = rest.trim_start_matches(|c: char| c.is_ascii() && c.is_whitespace());
+    let start = from + (rest.len() - skipped.len());
     if start >= source.len() {
         return None;
     }
@@ -658,5 +663,31 @@ mod tests {
             r#"Syntax error; token: "!", near: ":v !""#
         );
         assert_eq!(near("a ! b"), r#"Syntax error; token: "!", near: "a ! b""#);
+    }
+
+    /// A character outside ASCII is a token of its own, whatever its width,
+    /// and so is a no-break space. Captured as ConditionExpressions in
+    /// eu-west-2 and us-east-1, 2026-10-09.
+    #[test]
+    fn test_tokenizer_syntax_error_names_a_non_ascii_character() {
+        let near = |source: &str| {
+            let err = tokenize(source).unwrap_err();
+            tokenizer_syntax_error(source, &err)
+        };
+        for c in ["é", "€", "\u{1F600}", "\u{a0}"] {
+            for (source, window) in [
+                (format!("{c}a = :v"), format!("{c}a")),
+                (format!("a {c} = :v"), format!("a {c} =")),
+                (format!("a = :v {c}"), format!(":v {c}")),
+                (format!("a = :v{c}"), format!(":v{c}")),
+                (format!("a{c} = :v"), format!("a{c} =")),
+            ] {
+                assert_eq!(
+                    near(&source),
+                    format!(r#"Syntax error; token: "{c}", near: "{window}""#),
+                    "{source:?}"
+                );
+            }
+        }
     }
 }

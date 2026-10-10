@@ -550,6 +550,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value and an `AttributeUpdates` value are checked as an item's are. A
   PartiQL number set literal with a repeated value is refused naming its
   members and path, in a WHERE clause too.
+- Expressions containing non-ASCII characters are read as DynamoDB reads
+  them. A character such as `é`, `€` or an emoji outside a string is refused
+  with the syntax error naming that character, in every expression and in
+  transactions, and so is a no-break space, which DynamoDB doesn't treat as
+  whitespace. Captured against eu-west-2 and us-east-1.
 
 ## [1.2.1] - 2026-09-20
 
