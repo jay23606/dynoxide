@@ -341,6 +341,96 @@ fn begins_with_accepts_a_string_or_binary_operand() {
     }
 }
 
+/// begins_with compares a binary attribute with a binary prefix by its bytes,
+/// and NOT begins_with keeps everything else: a binary value with another
+/// prefix, a string value (a different type), and an item without the
+/// attribute. A string prefix matches only the string value. The four
+/// statements and the items each returned were captured on eu-west-2 and
+/// us-east-1, 2026-10-09 (the regions agree).
+#[test]
+fn begins_with_matches_a_binary_value_by_its_bytes() {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": "pq_bin",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for (pk, b) in [
+        ("h1", Some(AttributeValue::B(b"abc".to_vec()))),
+        ("h2", Some(AttributeValue::B(b"abd".to_vec()))),
+        ("h3", Some(AttributeValue::B(b"xyz".to_vec()))),
+        ("h4", Some(AttributeValue::S("abc".to_string()))),
+        ("h5", None),
+    ] {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+        if let Some(b) = b {
+            item.insert("b".to_string(), b);
+        }
+        db.put_item(
+            serde_json::from_value(serde_json::json!({"TableName": "pq_bin", "Item": item}))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    let matched = |statement: &str, parameter: serde_json::Value| -> Vec<String> {
+        let response = db
+            .execute_statement(
+                serde_json::from_value(serde_json::json!({
+                    "Statement": statement,
+                    "Parameters": [parameter]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let mut pks: Vec<String> = response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .map(|item| match item.get("pk") {
+                Some(AttributeValue::S(pk)) => pk.clone(),
+                other => panic!("unexpected pk {other:?}"),
+            })
+            .collect();
+        pks.sort();
+        pks
+    };
+    let ab = serde_json::json!({"B": "YWI="});
+    assert_eq!(
+        matched(
+            "SELECT pk FROM \"pq_bin\" WHERE begins_with(b, ?)",
+            ab.clone()
+        ),
+        ["h1", "h2"]
+    );
+    assert_eq!(
+        matched(
+            "SELECT pk FROM \"pq_bin\" WHERE NOT begins_with(b, ?)",
+            ab.clone()
+        ),
+        ["h3", "h4", "h5"]
+    );
+    assert_eq!(
+        matched(
+            "SELECT pk FROM \"pq_bin\" WHERE begins_with(b, ?)",
+            serde_json::json!({"S": "ab"})
+        ),
+        ["h4"]
+    );
+    assert_eq!(
+        matched(
+            "SELECT pk FROM \"pq_bin\" WHERE pk = 'h1' AND begins_with(b, ?)",
+            ab
+        ),
+        ["h1"]
+    );
+}
+
 #[test]
 fn operand_types_are_checked_in_the_order_written() {
     // The first offending operand is the one reported, whichever check it

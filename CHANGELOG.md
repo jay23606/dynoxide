@@ -645,6 +645,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys themselves rather than rely on serde_json to, so a build in which
   another crate turns on serde_json's `preserve_order` feature still resumes
   the page and still replays a same-token retry of an identical request.
+- PartiQL `begins_with` matches a binary attribute against a binary prefix by
+  its bytes, and `NOT begins_with` keeps the rest. A binary prefix matched
+  nothing and its negation everything. A string prefix still matches only a
+  string value. Captured against eu-west-2 and us-east-1.
 
 ## [1.2.1] - 2026-09-20
 

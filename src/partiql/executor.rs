@@ -3179,6 +3179,18 @@ fn find_comparison<'a>(
 }
 
 /// Resolve a PartiqlValue to a concrete AttributeValue.
+/// Whether `value` starts with `prefix`: a string by its characters, a binary
+/// value by its bytes. Values of different types never match, so a binary
+/// prefix doesn't match a string that spells the same bytes (captured
+/// eu-west-2 and us-east-1, 2026-10-09).
+fn begins_with(value: &AttributeValue, prefix: &AttributeValue) -> bool {
+    match (value, prefix) {
+        (AttributeValue::S(s), AttributeValue::S(p)) => s.starts_with(p.as_str()),
+        (AttributeValue::B(b), AttributeValue::B(p)) => b.starts_with(p),
+        _ => false,
+    }
+}
+
 fn resolve_value(val: &PartiqlValue, parameters: &[AttributeValue]) -> Result<AttributeValue> {
     match val {
         PartiqlValue::Literal(av) => Ok(av.clone()),
@@ -3665,28 +3677,21 @@ fn matches_conditions<C: std::borrow::Borrow<WhereCondition>>(
                     Ok(v) => v,
                     Err(_) => return false,
                 };
-                match (item_val, &prefix) {
-                    (AttributeValue::S(s), AttributeValue::S(p)) => {
-                        if !s.starts_with(p.as_str()) {
-                            return false;
-                        }
-                    }
-                    _ => return false,
+                if !begins_with(item_val, &prefix) {
+                    return false;
                 }
             }
             WhereCondition::NotBeginsWith(path, prefix_val) => {
                 // Logical negation of begins_with: the row matches unless the
-                // value is a string that starts with the prefix. A missing or
-                // non-string attribute does not begin with the prefix, so it is
-                // kept.
+                // value starts with the prefix. A missing attribute, or one of
+                // another type than the prefix, does not begin with it, so it
+                // is kept.
                 if let Some(item_val) = resolve_nested_path(item, path) {
                     let prefix = match resolve_value(prefix_val, parameters) {
                         Ok(v) => v,
                         Err(_) => return false,
                     };
-                    if let (AttributeValue::S(s), AttributeValue::S(p)) = (item_val, &prefix)
-                        && s.starts_with(p.as_str())
-                    {
+                    if begins_with(item_val, &prefix) {
                         return false;
                     }
                 }
