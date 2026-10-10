@@ -113,6 +113,27 @@ fn not_over_in_and_between_expands_to_the_right_shape() {
     assert_eq!(selects(&db, "NOT b BETWEEN 'p' AND 'p'"), "2");
 }
 
+/// `a NOT IN [...]` is `NOT a IN [...]`, written the other way round.
+/// DynamoDB runs it and returns the item whose value isn't listed (captured
+/// eu-west-2 and us-east-1, 2026-10-10, `x NOT IN [1, 2]` against `x = 0`);
+/// what it does for an item without the attribute wasn't captured, so here it
+/// follows the leading NOT.
+#[test]
+fn not_in_after_the_path_reads_as_a_leading_not() {
+    let db = seeded();
+    assert_eq!(selects(&db, "a NOT IN ['x','y']"), "3");
+    for (written, leading) in [
+        ("a NOT IN ['x','y']", "NOT a IN ['x','y']"),
+        ("a NOT IN ['x']", "NOT a IN ['x']"),
+        ("nope NOT IN ['x']", "NOT nope IN ['x']"),
+        ("a NOT IN [b]", "NOT a IN [b]"),
+        ("NOT a NOT IN ['x','y']", "a IN ['x','y']"),
+        ("a NOT IN ['x'] AND b = 'p'", "NOT a IN ['x'] AND b = 'p'"),
+    ] {
+        assert_eq!(selects(&db, written), selects(&db, leading), "{written}");
+    }
+}
+
 #[test]
 fn not_contains_is_the_complement_of_contains() {
     let db = seeded();

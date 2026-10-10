@@ -653,11 +653,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eu-west-2 and us-east-1.
 - A PartiQL WHERE clause with more than 300 operators is refused with
   DynamoDB's "The expression contains too many operators" message. AND, OR,
-  NOT, comparison operators and function calls each count, so
-  `AND size(s) > 0` costs three; a bag literal's `<<` and `>>` count
-  nothing. A run of NOTs no longer counts as nesting, so one that was
-  refused as nested too deeply now runs. Captured against eu-west-2 and
-  us-east-1.
+  NOT, comparison operators, function calls, `IN`, `BETWEEN` and `IS` each
+  count, the NOT in `IS NOT` or `NOT IN` on its own, so `AND size(s) > 0`
+  and `AND x IS NOT NULL` cost three; `BETWEEN`'s own AND, an `IN` list's
+  members and a bag literal's `<<` and `>>` count nothing. A run of NOTs no
+  longer counts as nesting, so one that was refused as nested too deeply now
+  runs. Captured against eu-west-2 and us-east-1.
+- PartiQL accepts `x NOT IN [...]`, read as `NOT x IN [...]`; it was refused
+  as an unknown operator. Captured against eu-west-2 and us-east-1.
 - PartiQL `size()` calls nested inside one another, and arithmetic after a
   `size()`, are held to the same depth as nested brackets.
 - A PartiQL `IN` with more than 100 operands, negated or not, written as

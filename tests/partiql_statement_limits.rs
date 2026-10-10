@@ -184,14 +184,16 @@ fn a_where_clause_past_300_operators_is_refused() {
     );
 }
 
-/// AND, OR, NOT, comparison operators and calls to WHERE functions all count
-/// toward the 300: `pk = 'a'` is one, and each copy below adds the operators
-/// it holds. Every row is the last count DynamoDB runs and the first it
-/// refuses (captured eu-west-2 and us-east-1, 2026-10-10), except the
-/// `NOT begins_with` row, which follows from the same counts: its NOT counts
-/// as any other does. A bag literal counts nothing: its `<<` and `>>` are
-/// brackets, not comparisons, so ` AND s = <<'x'>>` costs two like
-/// ` AND x = 1` (captured eu-west-2, 2026-10-10).
+/// AND, OR, NOT, comparison operators, calls to WHERE functions, IN, BETWEEN
+/// and IS all count toward the 300: `pk = 'a'` is one, and each copy below
+/// adds the operators it holds. BETWEEN's own AND doesn't count, an IN list's
+/// members don't, and the NOT in `IS NOT` or `NOT IN` counts on its own. Every
+/// row is the last count DynamoDB runs and the first it refuses (captured
+/// eu-west-2 and us-east-1, 2026-10-10), except the `NOT begins_with` row,
+/// which follows from the same counts: its NOT counts as any other does. A bag
+/// literal counts nothing: its `<<` and `>>` are brackets, not comparisons, so
+/// ` AND s = <<'x'>>` costs two like ` AND x = 1` (captured eu-west-2,
+/// 2026-10-10).
 #[test]
 fn comparisons_and_function_calls_count_toward_the_operator_limit() {
     let db = setup();
@@ -205,6 +207,13 @@ fn comparisons_and_function_calls_count_toward_the_operator_limit() {
         (" OR x = 1", 149),
         (" AND NOT begins_with(s, 'a')", 99),
         (" AND s = <<'x'>>", 149),
+        (" AND x IN [1, 2]", 149),
+        (" AND x BETWEEN 1 AND 2", 149),
+        (" AND x IS MISSING", 149),
+        (" AND x IS NULL", 149),
+        (" AND x IS NOT NULL", 99),
+        (" AND x IS NOT MISSING", 99),
+        (" AND x NOT IN [1, 2]", 99),
     ] {
         let statement = |copies: usize| {
             format!(

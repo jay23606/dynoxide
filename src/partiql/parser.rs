@@ -2529,7 +2529,6 @@ fn parse_not_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
             break;
         }
         t.next_token()?;
-        t.count_operator();
         nots += 1;
     }
     let mut expr = parse_primary(t, depth)?;
@@ -2731,7 +2730,7 @@ fn starts_value(t: &Tokenizer, tok: &str) -> Result<bool, String> {
 /// or a comparison and the other single conditions on a path.
 fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     let Some(tok) = t.peek_token()? else {
-        return Ok(BoolExpr::Leaf(parse_single_condition(t, depth)?));
+        return single_condition(t, depth);
     };
     let calls = |offset: usize, t: &Tokenizer| -> Result<bool, String> {
         Ok(t.peek_token_at(offset + 1)?.as_deref() == Some("("))
@@ -2788,7 +2787,17 @@ fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> 
         let left = parse_operand(t, depth)?;
         return finish_comparison(t, depth, left);
     }
-    Ok(BoolExpr::Leaf(parse_single_condition(t, depth)?))
+    single_condition(t, depth)
+}
+
+/// A condition on a path, or one of the other single conditions. The only
+/// wrapped negation it reads is `x NOT IN [...]`, which becomes the tree
+/// `NOT x IN [...]` builds, so the two forms evaluate alike.
+fn single_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
+    Ok(match parse_single_condition(t, depth)? {
+        WhereCondition::Not(inner) => BoolExpr::Not(Box::new(BoolExpr::Leaf(*inner))),
+        cond => BoolExpr::Leaf(cond),
+    })
 }
 
 /// A condition standing for one the statement is refused for, so it is never
@@ -3432,11 +3441,11 @@ fn condition_bytes(condition: &WhereCondition) -> usize {
 const TOO_DEEP: &str = "Statement is nested too deeply to parse";
 
 /// How many operators a WHERE clause may hold: DynamoDB refuses the 301st,
-/// always as `operator count: 301`. AND, OR, NOT, a comparison operator and a
-/// call to a WHERE function each count one, so `pk = 'a'` followed by 149
-/// `AND x = 1` (299 operators) runs and 150 is refused, and `AND size(s) > 0`
-/// costs three (captured eu-west-2 and us-east-1, 2026-10-10). Whether
-/// BETWEEN, IN and IS count wasn't captured, so they don't here.
+/// always as `operator count: 301`. AND, OR, NOT, a comparison operator, a
+/// call to a WHERE function, IN, BETWEEN and IS each count one, so `pk = 'a'`
+/// followed by 149 `AND x = 1` (299 operators) runs and 150 is refused,
+/// `AND size(s) > 0` costs three, and so do `AND x IS NOT NULL` and
+/// `AND x NOT IN [1, 2]` (captured eu-west-2 and us-east-1, 2026-10-10).
 const MAX_OPERATORS: usize = 300;
 
 /// The OR-of-ANDs a clause flattens to: shared conditions, grouped.
@@ -3578,8 +3587,8 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
             Ok(WhereCondition::Contains(path, value))
         }
         "NOT" => {
-            // The NOT in front of BEGINS_WITH is an operator like any other.
-            t.count_operator();
+            // The NOT in front of BEGINS_WITH is an operator like any other,
+            // counted as it was read.
             let func = t.next_token()?.ok_or("Expected function name after NOT")?;
             if func.eq_ignore_ascii_case("BEGINS_WITH") {
                 expect_char(t, "(")?;
@@ -3627,10 +3636,19 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                 "IN" => {
                     t.next_token()?; // consume IN
                     let members = parse_in_list(t, depth, parse_bound_operand)?;
-                    Ok(match all_values(&members) {
-                        Some(values) => WhereCondition::In(path, values),
-                        None => WhereCondition::CompareIn(Operand::Path(path), members),
-                    })
+                    Ok(path_in(path, members))
+                }
+                // `x NOT IN [...]` reads as `NOT x IN [...]` (DynamoDB runs it:
+                // captured eu-west-2 and us-east-1, 2026-10-10); the caller
+                // turns the wrapper into the same tree the leading NOT builds.
+                "NOT"
+                    if t.peek_token_at(1)?
+                        .is_some_and(|tok| is_keyword(&tok, "IN")) =>
+                {
+                    t.next_token()?; // consume NOT
+                    t.next_token()?; // consume IN
+                    let members = parse_in_list(t, depth, parse_bound_operand)?;
+                    Ok(WhereCondition::Not(Box::new(path_in(path, members))))
                 }
                 "IS" => {
                     t.next_token()?; // consume IS
@@ -3670,6 +3688,16 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                 }
             }
         }
+    }
+}
+
+/// `path IN [...]`: members that are all values keep the form the key
+/// pushdown reads; a path or size among them makes it a comparison of
+/// operands, read item by item.
+fn path_in(path: String, members: Vec<Operand>) -> WhereCondition {
+    match all_values(&members) {
+        Some(values) => WhereCondition::In(path, values),
+        None => WhereCondition::CompareIn(Operand::Path(path), members),
     }
 }
 
@@ -4857,14 +4885,17 @@ impl Tokenizer {
         }
         let tok = self.tokens[self.pos].clone();
         self.pos += 1;
-        // A comparison operator or a call to a WHERE function is an operator
-        // DynamoDB counts, as AND, OR and NOT are, wherever the condition
-        // parser reads it (captured eu-west-2 and us-east-1, 2026-10-10). A
-        // literal's own tokens are not: ` AND s = <<'x'>>` costs two, as
-        // ` AND x = 1` does (captured eu-west-2, 2026-10-10).
+        // A comparison operator, a call to a WHERE function, NOT, IN, BETWEEN
+        // and IS are operators DynamoDB counts, as AND and OR are, wherever
+        // the condition parser reads them: the NOT in `IS NOT` or `NOT IN`
+        // counts on its own, and BETWEEN's AND doesn't count (captured
+        // eu-west-2 and us-east-1, 2026-10-10). A literal's own tokens are
+        // not: ` AND s = <<'x'>>` costs two, as ` AND x = 1` does (captured
+        // eu-west-2, 2026-10-10).
         if self.reading_where && self.reading_literal == 0 {
             let calls = self.tokens.get(self.pos).is_some_and(|next| next == "(");
             if is_comparison_operator(&tok)
+                || is_any(&tok, &["NOT", "IN", "BETWEEN", "IS"])
                 || (calls && WHERE_FUNCTIONS.iter().any(|f| tok.eq_ignore_ascii_case(f)))
             {
                 self.count_operator();
@@ -5250,16 +5281,14 @@ mod tests {
     /// charged twice either.
     ///
     /// Only the first two rows are captured. The function row follows from
-    /// the captured function-call count, and the IN row is inferred: it
-    /// asserts that IN itself costs nothing, and whether DynamoDB counts IN,
-    /// BETWEEN or IS toward the limit has not been captured.
+    /// the captured function-call count, and the IN row from the captured IN
+    /// count: the IN costs one and its bag members nothing.
     #[test]
     fn a_bag_literal_counts_no_operators() {
         assert_eq!(operators_in("pk = 'a' AND s = <<'x'>>"), 3);
         assert_eq!(operators_in("pk = 'a' AND s = <<'x', 'y'>>"), 3);
         assert_eq!(operators_in("pk = 'a' AND attribute_exists(<<'x'>>)"), 3);
-        // Inferred: IN uncounted (uncaptured).
-        assert_eq!(operators_in("pk = 'a' AND s IN [<<'x'>>, <<'y'>>]"), 2);
+        assert_eq!(operators_in("pk = 'a' AND s IN [<<'x'>>, <<'y'>>]"), 3);
     }
 
     /// A NOT run keeps its parity: an odd run negates, an even one doesn't.
