@@ -2798,7 +2798,7 @@ fn condition_function_tail(
     }
     if is_keyword(&next, "IN") {
         t.next_token()?;
-        let values = parse_in_list(t, depth)?;
+        let values = parse_in_list(t, depth, parse_bound)?;
         return function.listed(&values);
     }
     function.condition(true)
@@ -3017,10 +3017,14 @@ fn expect_between_and(t: &mut Tokenizer) -> Result<(), String> {
     }
 }
 
-/// An IN list, `[...]` or `(...)`, its members read as values. The closing
+/// An IN list, `[...]` or `(...)`, each member read by `member`. The closing
 /// token must match the opener. More than `MAX_IN_OPERANDS` members are
 /// refused in DynamoDB's words once the statement has parsed.
-fn parse_in_list(t: &mut Tokenizer, depth: usize) -> Result<Vec<PartiqlValue>, String> {
+fn parse_in_list<T>(
+    t: &mut Tokenizer,
+    depth: usize,
+    member: fn(&mut Tokenizer, usize) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
     let open = t.next_token()?.ok_or("Expected '(' or '[' after IN")?;
     let close = match open.as_str() {
         "(" => ")",
@@ -3044,8 +3048,27 @@ fn parse_in_list(t: &mut Tokenizer, depth: usize) -> Result<Vec<PartiqlValue>, S
             t.next_token()?;
             continue;
         }
-        values.push(parse_bound(t, depth)?);
+        values.push(member(t, depth)?);
     }
+}
+
+/// A BETWEEN bound or IN member beside a path or another operand: a path or a
+/// size as well as a value, so `size(s) IN [n]` names the attribute `n` rather
+/// than the string `'n'` (captured eu-west-2 and us-east-1, 2026-10-09).
+/// `MISSING` is refused here as it is anywhere else an operand can stand.
+fn parse_bound_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
+    parse_operand(t, depth)
+}
+
+/// Every member's value, when each member is one.
+fn all_values(operands: &[Operand]) -> Option<Vec<PartiqlValue>> {
+    operands
+        .iter()
+        .map(|operand| match operand {
+            Operand::Value(value) => Some(value.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Read what follows the left operand of a comparison that isn't on a path:
@@ -3083,11 +3106,8 @@ fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<B
         }
         Some(tok) if is_keyword(tok, "IN") => {
             t.next_token()?;
-            let values = parse_in_list(t, depth)?;
-            Ok(BoolExpr::Leaf(WhereCondition::CompareIn(
-                left,
-                values.into_iter().map(Operand::Value).collect(),
-            )))
+            let members = parse_in_list(t, depth, parse_bound_operand)?;
+            Ok(BoolExpr::Leaf(WhereCondition::CompareIn(left, members)))
         }
         Some(tok) if is_keyword(tok, "IS") && matches!(left, Operand::Size(_)) => {
             t.note_operand_refusal(
@@ -3561,16 +3581,30 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
             let next_upper = next.to_uppercase();
 
             match next_upper.as_str() {
+                // Bounds and members that are all values keep the path forms
+                // the key pushdown reads; a path or size among them makes it a
+                // comparison of operands, read item by item.
                 "BETWEEN" => {
                     t.next_token()?; // consume BETWEEN
-                    let low = parse_bound(t, depth)?;
+                    let low = parse_bound_operand(t, depth)?;
                     expect_between_and(t)?;
-                    let high = parse_bound(t, depth)?;
-                    Ok(WhereCondition::Between(path, low, high))
+                    let high = parse_bound_operand(t, depth)?;
+                    Ok(match (low, high) {
+                        (Operand::Value(low), Operand::Value(high)) => {
+                            WhereCondition::Between(path, low, high)
+                        }
+                        (low, high) => {
+                            WhereCondition::CompareBetween(Operand::Path(path), low, high)
+                        }
+                    })
                 }
                 "IN" => {
                     t.next_token()?; // consume IN
-                    Ok(WhereCondition::In(path, parse_in_list(t, depth)?))
+                    let members = parse_in_list(t, depth, parse_bound_operand)?;
+                    Ok(match all_values(&members) {
+                        Some(values) => WhereCondition::In(path, values),
+                        None => WhereCondition::CompareIn(Operand::Path(path), members),
+                    })
                 }
                 "IS" => {
                     t.next_token()?; // consume IS

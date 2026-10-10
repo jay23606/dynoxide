@@ -376,7 +376,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator is refused, BETWEEN refuses bounds that are out of order, and a
   string compared with a size is simply unequal (captured against eu-west-2
   and us-east-1). BETWEEN also refuses bounds of different types, as it does
-  for a path.
+  for a path. A BETWEEN bound or an IN member can be a path or a size as well
+  as a value: `size(s) IN [n]` compares with the attribute `n`, where it used
+  to compare with the string `'n'`, and `n BETWEEN size(s) AND 10` parses
+  (captured against eu-west-2 and us-east-1 for a size on either side; a
+  path between path bounds follows the same reading, not yet captured).
 - PartiQL refuses a bag it can't store with DynamoDB's messages and positions:
   one that starts with a string at its first member that isn't one, one that
   starts with a number without a position, and a parameter, `null` or Ion

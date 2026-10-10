@@ -752,3 +752,33 @@ fn size_takes_a_numbers_type_checks() {
     assert_eq!(keys_where(&db, "size(s) = 3"), IT1);
     assert_eq!(keys_where(&db, "size(s) BETWEEN 1 AND 10"), IT1);
 }
+
+/// A BETWEEN bound or an IN member can be a path or a size, on either side:
+/// `size(s2) IN [n]` compares the size with the attribute `n`, not with the
+/// string `'n'`, and `n BETWEEN size(s) AND 10` reads its lower bound from the
+/// item (captured eu-west-2 and us-east-1, 2026-10-09: size works against a
+/// path on either side of BETWEEN and IN). Bounds and members that are all
+/// values read as before, keys included.
+#[test]
+fn between_bounds_and_in_members_can_be_operands() {
+    let db = db();
+    // `rich`: s = "str" (size 3), s2 = "héllo" (size 5), n = 5.
+    assert_eq!(keys_where(&db, "size(s2) IN [n]"), IT1);
+    assert_eq!(keys_where(&db, "size(s) IN [n]"), NONE);
+    assert_eq!(keys_where(&db, "n IN [size(s2)]"), IT1);
+    assert_eq!(keys_where(&db, "n BETWEEN size(s) AND 10"), IT1);
+    assert_eq!(keys_where(&db, "n BETWEEN size(s) AND 4"), NONE);
+    assert_eq!(keys_where(&db, "size(s) BETWEEN 1 AND n"), IT1);
+
+    assert_eq!(keys_where(&db, "n BETWEEN 1 AND 10"), IT1);
+    assert_eq!(keys_where(&db, "n IN [5, 6]"), IT1);
+    assert_eq!(keys_where(&db, "n IN [4]"), NONE);
+    assert_eq!(
+        keys(
+            &db,
+            r#"SELECT pk FROM "Things" WHERE pk IN ['it1', 'it2']"#,
+            None
+        ),
+        ["it1", "it2"]
+    );
+}
