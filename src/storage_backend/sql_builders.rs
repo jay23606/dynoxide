@@ -101,12 +101,12 @@ pub(crate) const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribu
      sse_specification, table_class, deletion_protection_enabled, on_demand_throughput, table_id, \
      vector_index_definitions";
 
-/// Current schema version, shared by both backends. The native backend stamps
-/// it in `_config` from `Storage::initialize` and drives its versioned
-/// migration chain off it; the wasm backend records it on open (see
-/// [`init_schema_version`]) so future wasm schema changes can migrate
-/// versioned instead of accreting one unconditional ALTER per column.
-pub const SCHEMA_VERSION: &str = "9";
+/// The schema version this build writes, shared by both backends: the version
+/// its last migration records. Each backend reads the recorded version on
+/// open and runs the migrations it calls for (see
+/// `storage_backend::schema::open_migrations`), then records this one. Every
+/// place that stamps or compares the current version uses this constant.
+pub const SCHEMA_VERSION: u32 = super::schema::VECTOR_BILLED_SIZES;
 
 /// Add the `vector_index_definitions` column to `_tables`.
 ///
@@ -135,15 +135,34 @@ pub fn is_duplicate_column_error(message: &str) -> bool {
     message.contains("duplicate column name")
 }
 
-/// Record the schema version if none is recorded yet (`INSERT OR IGNORE`,
-/// mirroring the native `initialize` step). Never downgrades a version a
-/// newer build has already stamped.
-pub fn init_schema_version(version: &str) -> (String, Vec<SqlParam<'_>>) {
+/// Record the schema version if none is recorded yet (`INSERT OR IGNORE`).
+/// The native open records it only on a database it is creating; the wasm open
+/// records it once its migrations have run. Never downgrades a version a newer
+/// build has already stamped.
+pub fn init_schema_version(version: u32) -> (String, Vec<SqlParam<'static>>) {
     (
         "INSERT OR IGNORE INTO _config (key, value) VALUES ('schema_version', ?1)".to_string(),
-        vec![SqlParam::text(version)],
+        vec![SqlParam::text(version.to_string())],
     )
 }
+
+/// Record `version` as the schema version, replacing any recorded one. A
+/// migration stamps this once it has finished, so an interrupted one runs again.
+pub fn set_schema_version(version: u32) -> (String, Vec<SqlParam<'static>>) {
+    (
+        "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', ?1)".to_string(),
+        vec![SqlParam::text(version.to_string())],
+    )
+}
+
+/// The recorded schema version, if any.
+pub const GET_SCHEMA_VERSION: &str = "SELECT value FROM _config WHERE key = 'schema_version'";
+
+/// Whether the database holds a table named `?1`, as `0` or `1`. An open asks
+/// before it creates anything: whether there is a `_config` to read a version
+/// from, and whether the database is new.
+pub const TABLE_EXISTS: &str =
+    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)";
 
 /// Idempotent schema bootstrap shared by both backends: the metadata, config,
 /// and stream-record tables at the current schema version. Native
@@ -484,6 +503,40 @@ pub fn count_items(table_name: &str) -> (String, Vec<SqlParam<'static>>) {
     )
 }
 
+/// Count all items in a data table and total their stored `item_size`, in one
+/// pass. Returns two integer columns: the count, then the byte total.
+pub fn item_count_and_size(table_name: &str) -> (String, Vec<SqlParam<'static>>) {
+    (
+        format!(
+            "SELECT COUNT(*), COALESCE(SUM(item_size), 0) FROM \"{}\"",
+            escape_table_name(table_name)
+        ),
+        Vec::new(),
+    )
+}
+
+/// Set one stored item's `item_size` in place, leaving the row otherwise as it
+/// is. Used when what an item is billed at changes without the item changing,
+/// such as a vector index being created on or deleted from its table.
+pub fn set_item_size<'a>(
+    table_name: &str,
+    pk: &'a str,
+    sk: &'a str,
+    item_size: usize,
+) -> (String, Vec<SqlParam<'a>>) {
+    (
+        format!(
+            "UPDATE \"{}\" SET item_size = ?3 WHERE pk = ?1 AND sk = ?2",
+            escape_table_name(table_name)
+        ),
+        vec![
+            SqlParam::text(pk),
+            SqlParam::text(sk),
+            SqlParam::Integer(item_size as i64),
+        ],
+    )
+}
+
 // --- Secondary index tables (GSI/LSI) -----------------------------------
 
 /// Create a GSI table plus its base-key index (a two-statement batch).
@@ -776,6 +829,96 @@ pub fn drop_vector_table(table_name: &str, index_name: &str) -> (String, Vec<Sql
     let vix = format!("{table_name}::vector::{index_name}");
     (
         format!("DROP TABLE IF EXISTS \"{}\"", escape_table_name(&vix)),
+        Vec::new(),
+    )
+}
+
+/// Count a GSI's entries and total their sizes, for a GSI that projects ALL.
+/// Each entry is then the whole base item, whose DynamoDB size the base row
+/// already stores, so this joins to the base table rather than reading every
+/// entry's JSON. Returns two integer columns: the count, then the byte total.
+pub fn gsi_count_and_size_from_base(
+    table_name: &str,
+    index_name: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    index_count_and_size_from_base(
+        table_name,
+        &format!("{table_name}::gsi::{index_name}"),
+        "table_pk",
+        "table_sk",
+    )
+}
+
+/// Count a vector index's entries and total the billable size each write
+/// stored with its entry: the index's `ItemCount` and `IndexSizeBytes`.
+pub fn vector_count_and_size(
+    table_name: &str,
+    index_name: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    (
+        format!(
+            "SELECT COUNT(*), COALESCE(SUM(entry_bytes), 0) FROM \"{}\"",
+            escape_table_name(&format!("{table_name}::vector::{index_name}"))
+        ),
+        Vec::new(),
+    )
+}
+
+/// [`gsi_count_and_size_from_base`] for an LSI that projects ALL.
+pub fn lsi_count_and_size_from_base(
+    table_name: &str,
+    index_name: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    index_count_and_size_from_base(
+        table_name,
+        &format!("{table_name}::lsi::{index_name}"),
+        "base_pk",
+        "base_sk",
+    )
+}
+
+fn index_count_and_size_from_base(
+    table_name: &str,
+    index_table: &str,
+    base_pk_col: &str,
+    base_sk_col: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    (
+        format!(
+            "SELECT COUNT(*), COALESCE(SUM(b.item_size), 0) FROM \"{}\" i \
+             JOIN \"{}\" b ON b.pk = i.{base_pk_col} AND b.sk = i.{base_sk_col}",
+            escape_table_name(index_table),
+            escape_table_name(table_name)
+        ),
+        Vec::new(),
+    )
+}
+
+/// The projected item JSON of every entry in a GSI, for sizing an index whose
+/// entries are not whole items.
+pub fn gsi_entries_item_json(
+    table_name: &str,
+    index_name: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    (
+        format!(
+            "SELECT item_json FROM \"{}\"",
+            escape_table_name(&format!("{table_name}::gsi::{index_name}"))
+        ),
+        Vec::new(),
+    )
+}
+
+/// [`gsi_entries_item_json`] for an LSI.
+pub fn lsi_entries_item_json(
+    table_name: &str,
+    index_name: &str,
+) -> (String, Vec<SqlParam<'static>>) {
+    (
+        format!(
+            "SELECT item_json FROM \"{}\"",
+            escape_table_name(&format!("{table_name}::lsi::{index_name}"))
+        ),
         Vec::new(),
     )
 }
@@ -1719,11 +1862,23 @@ mod tests {
     #[test]
     fn init_schema_version_is_pinned() {
         assert_eq!(
-            init_schema_version("9"),
+            init_schema_version(9),
             (
                 "INSERT OR IGNORE INTO _config (key, value) VALUES ('schema_version', ?1)"
                     .to_string(),
                 vec![SqlParam::text("9")],
+            )
+        );
+    }
+
+    #[test]
+    fn set_schema_version_replaces_the_recorded_one() {
+        assert_eq!(
+            set_schema_version(10),
+            (
+                "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', ?1)"
+                    .to_string(),
+                vec![SqlParam::text("10")],
             )
         );
     }

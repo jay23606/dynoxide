@@ -51,15 +51,18 @@ fn test_multiple_inserts_all_succeed() {
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u2', 'name': 'Bob'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u3', 'name': 'Charlie'}"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         client_request_token: None,
@@ -67,8 +70,9 @@ fn test_multiple_inserts_all_succeed() {
     };
 
     let resp = db.execute_transaction(request).unwrap();
-    assert!(resp.responses.is_some());
-    assert_eq!(resp.responses.unwrap().len(), 3);
+    // A transaction of writes answers with an empty Responses list (captured
+    // eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+    assert_eq!(resp.responses.map(|r| r.len()), Some(0));
 
     // Verify all items exist
     let items = select_all(&db, "Users");
@@ -90,17 +94,20 @@ fn test_insert_failure_rolls_back_entire_transaction() {
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 // This fails because the table does not exist
                 statement: "INSERT INTO \"NonExistent\" VALUE {'pk': 'u2', 'name': 'Bob'}"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u3', 'name': 'Charlie'}"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         client_request_token: None,
@@ -151,10 +158,12 @@ fn test_mixed_select_and_insert() {
             ParameterizedStatement {
                 statement: "SELECT * FROM \"Users\" WHERE pk = 'u1'".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u2', 'name': 'Bob'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         client_request_token: None,
@@ -195,10 +204,12 @@ fn test_duplicate_target_rejected() {
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'dup', 'name': 'One'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "UPDATE \"Users\" SET name = 'Two' WHERE pk = 'dup'".to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -230,6 +241,7 @@ fn test_over_100_statements_rejected() {
                 i, i
             ),
             parameters: None,
+            ..Default::default()
         })
         .collect();
 
@@ -288,10 +300,12 @@ fn test_syntax_error_rejected_before_execution() {
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INVALID STATEMENT HERE".to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         client_request_token: None,
@@ -334,10 +348,12 @@ fn test_update_within_transaction() {
                 statement: "UPDATE \"Users\" SET name = 'Alice Updated' WHERE pk = 'u1'"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u2', 'name': 'Bob'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -388,11 +404,13 @@ fn test_delete_within_transaction() {
             ParameterizedStatement {
                 statement: "DELETE FROM \"Users\" WHERE pk = 'u1'".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u3', 'name': 'Charlie'}"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -445,21 +463,21 @@ fn test_parameterised_statements() {
             ParameterizedStatement {
                 statement: "UPDATE \"Users\" SET name = 'Alice V2' WHERE pk = ?".to_string(),
                 parameters: Some(vec![AttributeValue::S("u1".to_string())]),
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "UPDATE \"Users\" SET name = 'Bob V2' WHERE pk = ?".to_string(),
                 parameters: Some(vec![AttributeValue::S("u2".to_string())]),
+                ..Default::default()
             },
         ],
         ..Default::default()
     };
 
     let resp = db.execute_transaction(request).unwrap();
-    let responses = resp.responses.unwrap();
-    assert_eq!(responses.len(), 2);
-
-    // Neither UPDATE carries a RETURNING clause, so neither yields an item.
-    assert!(responses.iter().all(|r| r.item.is_none()));
+    // A transaction of writes answers with an empty Responses list (captured
+    // eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+    assert_eq!(resp.responses.map(|r| r.len()), Some(0));
 
     // Both parameters resolved to the item they named.
     let items = select_all(&db, "Users");
@@ -491,6 +509,7 @@ fn test_empty_string_key_insert_keeps_validation_error_reason() {
         transact_statements: vec![ParameterizedStatement {
             statement: "INSERT INTO \"Users\" VALUE {'pk': ''}".to_string(),
             parameters: None,
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -541,6 +560,7 @@ fn increment_counter(pk: &str) -> Vec<ParameterizedStatement> {
     vec![ParameterizedStatement {
         statement: format!("UPDATE \"Counters\" SET n = n + 1 WHERE pk = '{pk}'"),
         parameters: None,
+        ..Default::default()
     }]
 }
 
@@ -548,6 +568,7 @@ fn stmt(statement: &str) -> ParameterizedStatement {
     ParameterizedStatement {
         statement: statement.to_string(),
         parameters: None,
+        ..Default::default()
     }
 }
 
@@ -651,6 +672,7 @@ fn test_execute_transaction_read_set_reports_read_capacity() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "SELECT * FROM \"Users\" WHERE pk = 'u1'".to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             client_request_token: None,
             return_consumed_capacity: Some("INDEXES".to_string()),
@@ -678,6 +700,7 @@ fn test_execute_transaction_write_set_total_mode() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1'}".to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             client_request_token: None,
             return_consumed_capacity: Some("TOTAL".to_string()),
@@ -703,6 +726,7 @@ fn test_execute_transaction_same_token_different_statements_mismatch() {
         transact_statements: vec![ParameterizedStatement {
             statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1'}".to_string(),
             parameters: None,
+            ..Default::default()
         }],
         client_request_token: Some("mismatch-token".to_string()),
         return_consumed_capacity: None,
@@ -714,6 +738,7 @@ fn test_execute_transaction_same_token_different_statements_mismatch() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u2'}".to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             client_request_token: Some("mismatch-token".to_string()),
             return_consumed_capacity: None,
@@ -754,6 +779,64 @@ fn test_execute_transaction_same_token_differing_only_in_capacity_mode_replays()
         Some(2.0)
     );
     assert_eq!(counter_value(&db, "Counters", "c1"), 1);
+}
+
+/// A statement written out through serde and read back keeps a mode that was
+/// left out as left out, and one that was sent as sent. Only the token match
+/// counts a left-out mode as `NONE`.
+#[test]
+fn a_statement_keeps_its_mode_through_serde() {
+    let left_out = stmt("UPDATE \"Counters\" SET n = n + 1 WHERE pk = 'c1'");
+    let sent = ParameterizedStatement {
+        return_values_on_condition_check_failure: Some("ALL_OLD".to_string()),
+        ..left_out.clone()
+    };
+    for (statement, expected) in [(left_out, None), (sent, Some("ALL_OLD"))] {
+        let read_back: ParameterizedStatement =
+            serde_json::from_value(serde_json::to_value(&statement).unwrap()).unwrap();
+        assert_eq!(read_back.statement, statement.statement);
+        assert!(read_back.parameters.is_none());
+        assert_eq!(
+            read_back
+                .return_values_on_condition_check_failure
+                .as_deref(),
+            expected
+        );
+    }
+}
+
+/// Under one token, a statement whose mode is left out matches the same
+/// statement sending `NONE`, both ways round, and mismatches one sending
+/// `ALL_OLD`.
+#[test]
+fn a_left_out_mode_counts_as_none_in_the_token_match() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Counters");
+    seed_counter(&db, "Counters", "c1");
+    let call = |token: &str, mode: Option<&str>| {
+        db.execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                return_values_on_condition_check_failure: mode.map(str::to_string),
+                ..stmt("UPDATE \"Counters\" SET n = n + 1 WHERE pk = 'c1'")
+            }],
+            client_request_token: Some(token.to_string()),
+            return_consumed_capacity: None,
+        })
+    };
+
+    call("left-out-first", None).unwrap();
+    call("left-out-first", Some("NONE")).unwrap();
+    assert_eq!(counter_value(&db, "Counters", "c1"), 1, "NONE replays");
+    call("none-first", Some("NONE")).unwrap();
+    call("none-first", None).unwrap();
+    assert_eq!(counter_value(&db, "Counters", "c1"), 2, "left out replays");
+
+    let err = call("left-out-first", Some("ALL_OLD")).unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::IdempotentParameterMismatchException(_)),
+        "expected IdempotentParameterMismatchException, got: {err:?}"
+    );
+    assert_eq!(counter_value(&db, "Counters", "c1"), 2);
 }
 
 /// A tokenless transaction is never cached: repeated calls re-execute.
@@ -971,4 +1054,260 @@ fn an_index_qualified_select_is_rejected_inside_a_transaction() {
         ),
         "got {msg}"
     );
+}
+
+// -----------------------------------------------------------------------
+// An UPDATE's item is the one its top-level key equalities name
+// -----------------------------------------------------------------------
+
+/// `(pk = 'b' OR x = 1) AND pk = 'a'` writes item a: the OR group is a
+/// condition on it, not a second key. So the duplicate-item check has to see
+/// item a too: alongside another statement on a the transaction is refused,
+/// and alongside one on b it runs (and is cancelled by the unmet condition on
+/// a). Captured eu-west-2 and us-east-1, 2026-10-10, with items a (x = 0) and
+/// b (x = 1).
+#[test]
+fn test_duplicate_check_takes_the_key_an_update_writes() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "OrGroup");
+    let seed = |db: &Database| {
+        for item in [
+            "{'pk': 'a', 's': 'abc', 'x': 0}",
+            "{'pk': 'b', 's': 'bcd', 'x': 1}",
+        ] {
+            db.execute_statement(ExecuteStatementRequest {
+                statement: format!("INSERT INTO \"OrGroup\" VALUE {item}"),
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("seeding {item}: {e}"));
+        }
+    };
+    seed(&db);
+    let or_group = "UPDATE \"OrGroup\" SET w = 1 WHERE (pk = 'b' OR x = 1) AND pk = 'a'";
+    let cancellation_codes = |result: Result<_, DynoxideError>| match result {
+        Err(DynoxideError::TransactionCanceledException(_, reasons)) => reasons
+            .iter()
+            .map(|r: &dynoxide::errors::CancellationReason| r.code.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("expected TransactionCanceledException, got {other:?}"),
+    };
+
+    let alone = db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: vec![stmt(or_group)],
+        ..Default::default()
+    });
+    assert_eq!(cancellation_codes(alone), ["ConditionalCheckFailed"]);
+
+    let on_a = db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: vec![
+            stmt(or_group),
+            stmt("UPDATE \"OrGroup\" SET v = 2 WHERE pk = 'a'"),
+        ],
+        ..Default::default()
+    });
+    match on_a {
+        Err(DynoxideError::ValidationException(m)) => assert_eq!(
+            m,
+            "Transaction request cannot include multiple operations on one item"
+        ),
+        other => panic!("expected the duplicate-item refusal, got {other:?}"),
+    }
+
+    let on_b = db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: vec![
+            stmt(or_group),
+            stmt("UPDATE \"OrGroup\" SET v = 2 WHERE pk = 'b'"),
+        ],
+        ..Default::default()
+    });
+    assert_eq!(cancellation_codes(on_b), ["ConditionalCheckFailed", "None"]);
+}
+
+// -----------------------------------------------------------------------
+// A cancelled transaction leaves indexes, streams and sizes as they were
+// -----------------------------------------------------------------------
+
+fn from_json<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+    serde_json::from_value(value).unwrap()
+}
+
+/// Everything a write to `Indexed` could reach, read back: the items, each
+/// index's rows, the stream's records, the table's counts and sizes, and the
+/// capacity a read of each is charged.
+fn indexed_state(db: &Database) -> serde_json::Value {
+    use serde_json::json;
+    let scan = db
+        .scan(from_json(json!({
+            "TableName": "Indexed",
+            "ConsistentRead": true,
+            "ReturnConsumedCapacity": "TOTAL"
+        })))
+        .unwrap();
+    let mut items: Vec<serde_json::Value> = scan
+        .items
+        .unwrap_or_default()
+        .iter()
+        .map(|item| serde_json::to_value(item).unwrap())
+        .collect();
+    items.sort_by_key(|item| item.to_string());
+    let by_g: Vec<serde_json::Value> = ["g1", "g2", "g3"]
+        .into_iter()
+        .map(|g| {
+            let page = db
+                .query(from_json(json!({
+                    "TableName": "Indexed",
+                    "IndexName": "byG",
+                    "KeyConditionExpression": "g = :g",
+                    "ExpressionAttributeValues": {":g": {"S": g}},
+                    "ReturnConsumedCapacity": "INDEXES"
+                })))
+                .unwrap();
+            json!([page.items, page.consumed_capacity])
+        })
+        .collect();
+    let by_l: Vec<serde_json::Value> = ["p", "q"]
+        .into_iter()
+        .map(|pk| {
+            let page = db
+                .query(from_json(json!({
+                    "TableName": "Indexed",
+                    "IndexName": "byL",
+                    "KeyConditionExpression": "pk = :pk",
+                    "ExpressionAttributeValues": {":pk": {"S": pk}},
+                    "ConsistentRead": true,
+                    "ReturnConsumedCapacity": "INDEXES"
+                })))
+                .unwrap();
+            json!([page.items, page.consumed_capacity])
+        })
+        .collect();
+    let stream_arn = db
+        .list_streams(from_json(json!({"TableName": "Indexed"})))
+        .unwrap()
+        .streams[0]
+        .stream_arn
+        .clone();
+    let shard_id = db
+        .describe_stream(from_json(json!({"StreamArn": stream_arn})))
+        .unwrap()
+        .stream_description
+        .shards[0]
+        .shard_id
+        .clone();
+    let iterator = db
+        .get_shard_iterator(from_json(json!({
+            "StreamArn": stream_arn,
+            "ShardId": shard_id,
+            "ShardIteratorType": "TRIM_HORIZON"
+        })))
+        .unwrap()
+        .shard_iterator
+        .unwrap();
+    let records = db
+        .get_records(from_json(json!({"ShardIterator": iterator})))
+        .unwrap()
+        .records;
+    let table = serde_json::to_value(
+        db.describe_table(from_json(json!({"TableName": "Indexed"})))
+            .unwrap()
+            .table,
+    )
+    .unwrap();
+    json!({
+        "items": items,
+        "scan_capacity": scan.consumed_capacity,
+        "by_g": by_g,
+        "by_l": by_l,
+        "records": serde_json::to_value(records).unwrap(),
+        "item_count": table["ItemCount"],
+        "table_size": table["TableSizeBytes"],
+        "gsi": table["GlobalSecondaryIndexes"],
+        "lsi": table["LocalSecondaryIndexes"],
+    })
+}
+
+/// A transaction cancelled by its third statement keeps nothing the other
+/// three wrote: not an item, an index row, a stream record, a count or a size.
+/// A retry under the same token runs again, as a cancelled call is not kept
+/// for replay, and is cancelled the same way.
+#[test]
+fn a_cancelled_transaction_leaves_indexes_streams_and_sizes_as_they_were() {
+    use serde_json::json;
+    let db = Database::memory().unwrap();
+    db.create_table(from_json(json!({
+        "TableName": "Indexed",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
+            {"AttributeName": "l", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "byG",
+            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}
+        }],
+        "LocalSecondaryIndexes": [{
+            "IndexName": "byL",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "l", "KeyType": "RANGE"}
+            ],
+            "Projection": {"ProjectionType": "ALL"}
+        }],
+        "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+        "BillingMode": "PAY_PER_REQUEST"
+    })))
+    .unwrap();
+    for (sk, l, n) in [("a", "l1", "1"), ("b", "l2", "2")] {
+        db.put_item(from_json(json!({
+            "TableName": "Indexed",
+            "Item": {
+                "pk": {"S": "p"}, "sk": {"S": sk}, "g": {"S": "g1"},
+                "l": {"S": l}, "n": {"N": n}
+            }
+        })))
+        .unwrap();
+    }
+    let before = indexed_state(&db);
+    assert_eq!(before["item_count"], 2, "{before}");
+    assert_eq!(before["records"].as_array().unwrap().len(), 2, "{before}");
+
+    let request = || ExecuteTransactionRequest {
+        transact_statements: vec![
+            stmt(
+                "INSERT INTO \"Indexed\" VALUE \
+                 {'pk': 'p', 'sk': 'c', 'g': 'g2', 'l': 'l3', 'n': 3}",
+            ),
+            stmt(
+                "UPDATE \"Indexed\" SET g = 'g2', l = 'l9', n = 10 \
+                 WHERE pk = 'p' AND sk = 'a'",
+            ),
+            stmt("UPDATE \"Indexed\" SET n = 20 WHERE pk = 'p' AND sk = 'b' AND n = 999"),
+            stmt(
+                "INSERT INTO \"Indexed\" VALUE \
+                 {'pk': 'q', 'sk': 'a', 'g': 'g3', 'l': 'l1', 'n': 4}",
+            ),
+        ],
+        client_request_token: Some("cancelled-token".to_string()),
+        return_consumed_capacity: Some("INDEXES".to_string()),
+    };
+    let reasons = |result: Result<_, DynoxideError>| match result {
+        Err(DynoxideError::TransactionCanceledException(_, reasons)) => reasons
+            .iter()
+            .map(|r: &dynoxide::errors::CancellationReason| r.code.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("expected TransactionCanceledException, got {other:?}"),
+    };
+    let expected = ["None", "None", "ConditionalCheckFailed", "None"];
+
+    assert_eq!(reasons(db.execute_transaction(request())), expected);
+    assert_eq!(indexed_state(&db), before);
+
+    assert_eq!(reasons(db.execute_transaction(request())), expected);
+    assert_eq!(indexed_state(&db), before);
 }

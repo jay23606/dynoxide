@@ -29,6 +29,8 @@ pub mod error;
 // is not a stable API, hence `#[doc(hidden)]`.
 #[doc(hidden)]
 pub mod sql_builders;
+// Schema versions and the migrations a recorded version calls for on open.
+pub(crate) mod schema;
 // The native rusqlite-backed `Storage` exists whenever either SQLite backend
 // feature is on (the crate refuses to build with neither), and the handlers
 // now consume `StorageBackend` through it, so the impl must track the same
@@ -96,6 +98,14 @@ pub struct GsiItemRow {
     pub table_sk: String,
     /// Projected item JSON.
     pub item_json: String,
+}
+
+/// The DynamoDB size of one stored index entry, read from its projected JSON.
+/// Both backends size a non-ALL index this way, so they agree on it.
+pub(crate) fn projected_entry_size(item_json: &str) -> Result<i64, BackendError> {
+    let item: crate::types::Item = serde_json::from_str(item_json)
+        .map_err(|e| BackendError::Other(format!("unreadable index entry: {e}")))?;
+    Ok(crate::types::item_size(&item) as i64)
 }
 
 /// One vector shadow-table row for a bulk insert via
@@ -657,6 +667,18 @@ pub trait StorageBackend: private::Sealed {
     async fn rollback(&self) -> Result<(), BackendError>;
 
     // -----------------------------------------------------------------------
+    // Schema version
+    // -----------------------------------------------------------------------
+
+    /// The schema version the database records, or `None` when it records
+    /// none, or one that isn't a number.
+    async fn recorded_schema_version(&self) -> Result<Option<u32>, BackendError>;
+
+    /// Record `version` as the database's schema version, replacing any
+    /// recorded one.
+    async fn record_schema_version(&self, version: u32) -> Result<(), BackendError>;
+
+    // -----------------------------------------------------------------------
     // Bulk-loading PRAGMAs
     // -----------------------------------------------------------------------
 
@@ -737,6 +759,46 @@ pub trait StorageBackend: private::Sealed {
     ) -> Result<Vec<(String, String, String)>, BackendError>;
 
     async fn count_items(&self, table_name: &str) -> Result<i64, BackendError>;
+
+    /// The number of items in a data table and the sum of their stored
+    /// `item_size`, which is the DynamoDB item size each write computed.
+    async fn item_count_and_size(&self, table_name: &str) -> Result<(i64, i64), BackendError>;
+
+    /// The number of entries in a GSI and the total of their projected item
+    /// sizes: its `ItemCount` and `IndexSizeBytes`. `whole_items` is true for
+    /// an ALL projection, where each entry is the base item and the base
+    /// table's stored size is its size; any other projection sizes each
+    /// entry's stored JSON.
+    async fn gsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError>;
+
+    /// [`gsi_item_count_and_size`](Self::gsi_item_count_and_size) for an LSI.
+    async fn lsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError>;
+
+    /// The number of entries in a vector index and the total of their stored
+    /// billable sizes: its `ItemCount` and `IndexSizeBytes`.
+    async fn vector_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(i64, i64), BackendError>;
+
+    /// Rewrite the stored `item_size` of the given rows, each a
+    /// `(pk, sk, item_size)`, leaving the rows otherwise unchanged.
+    async fn set_item_sizes(
+        &self,
+        table_name: &str,
+        sizes: &[(String, String, usize)],
+    ) -> Result<(), BackendError>;
 
     // -----------------------------------------------------------------------
     // Introspection

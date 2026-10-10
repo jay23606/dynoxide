@@ -34,6 +34,7 @@ import re
 import statistics
 import subprocess
 import sys
+from typing import NamedTuple, Optional
 
 
 # criterion --output-format bencher writes a result as "test NAME ... " and
@@ -168,16 +169,42 @@ def sanitize(text):
     return re.sub(r"([\\|`\[\]<>])", r"\\\1", text)
 
 
-def build_report(current, baseline, history, threshold):
-    """Render the markdown comparison.
+COMPARED = "compared"
+NEW = "new"
+MISSING = "missing"
 
-    Returns (markdown, regressions, missing), where `missing` names the
-    baselined benchmarks this run produced no result for.
+# The empty cell in the rendered table. Spelt as an escape so the source
+# carries no literal em dash.
+EMPTY_CELL = "\u2014"
+
+
+class Row(NamedTuple):
+    """One benchmark's comparison, as evaluate() decided it.
+
+    `status` is COMPARED when the benchmark has a current result and a
+    baseline, NEW when only this run has it, and MISSING when only the
+    baseline does. The baseline fields are None on a NEW row, and `current` is
+    None on a MISSING one. `ratio` is None when there is nothing to divide by.
     """
-    regressions = []
-    missing = []
-    rows = []
 
+    name: str
+    status: str
+    current: Optional[float] = None
+    median: Optional[float] = None
+    low: Optional[float] = None
+    high: Optional[float] = None
+    count: Optional[int] = None
+    ratio: Optional[float] = None
+    regressed: bool = False
+
+
+def evaluate(current, baseline, threshold):
+    """Decide how each benchmark in this run compares with the baseline.
+
+    Returns a Row per benchmark found in either, sorted by name. Nothing here
+    formats anything, so the rule can be asserted on without rendering.
+    """
+    rows = []
     for name in sorted(set(current) | set(baseline)):
         now = current.get(name)
         stats = baseline.get(name)
@@ -185,41 +212,58 @@ def build_report(current, baseline, history, threshold):
         if now is not None and stats:
             median, low, high, count = stats
             ratio = now / median if median else None
-            if ratio is None:
-                change = "—"
-            else:
-                pct = (ratio - 1) * 100
-                change = "{}{:.1f}%".format("+" if pct >= 0 else "", pct)
-                # A single sample is not a median. Flagging against it is the
-                # same one-run comparison this script exists to replace, so a
-                # benchmark new to the window reports its change without the
-                # warning until a second run backs it up.
-                if ratio > threshold and count > 1:
-                    regressions.append(name)
-                    change += " :warning:"
-            baseline_cell = "{:,}".format(round(median))
-            if count < len(history):
-                baseline_cell += " (n={})".format(count)
-            rows.append((
-                name,
-                baseline_cell,
-                "{:,} - {:,}".format(low, high),
-                "{:,}".format(now),
-                change,
-            ))
+            # A single sample is not a median. Flagging against it is the
+            # same one-run comparison this script exists to replace, so a
+            # benchmark new to the window reports its change without the
+            # warning until a second run backs it up.
+            regressed = ratio is not None and ratio > threshold and count > 1
+            rows.append(Row(name, COMPARED, now, median, low, high, count,
+                            ratio, regressed))
         elif now is not None:
-            rows.append((name, "—", "—", "{:,}".format(now), "new"))
+            rows.append(Row(name, NEW, current=now))
         else:
-            median, low, high, _ = stats
-            missing.append(name)
-            rows.append((
-                name,
-                "{:,}".format(round(median)),
-                "{:,} - {:,}".format(low, high),
-                "—",
-                "removed",
-            ))
+            median, low, high, count = stats
+            rows.append(Row(name, MISSING, median=median, low=low, high=high,
+                            count=count))
+    return rows
 
+
+def regressed_names(rows):
+    """Names of the benchmarks evaluate() flagged, in row order."""
+    return [row.name for row in rows if row.regressed]
+
+
+def missing_names(rows):
+    """Names of the baselined benchmarks this run produced no result for."""
+    return [row.name for row in rows if row.status == MISSING]
+
+
+def _cells(row, window):
+    """The baseline, range, current and change cells for one row."""
+    if row.status == NEW:
+        return EMPTY_CELL, EMPTY_CELL, "{:,}".format(row.current), "new"
+
+    spread = "{:,} - {:,}".format(row.low, row.high)
+    if row.status == MISSING:
+        return "{:,}".format(round(row.median)), spread, EMPTY_CELL, "removed"
+
+    baseline = "{:,}".format(round(row.median))
+    if row.count < window:
+        baseline += " (n={})".format(row.count)
+    if row.ratio is None:
+        change = EMPTY_CELL
+    else:
+        pct = (row.ratio - 1) * 100
+        change = "{}{:.1f}%".format("+" if pct >= 0 else "", pct)
+        if row.regressed:
+            change += " :warning:"
+    return baseline, spread, "{:,}".format(row.current), change
+
+
+def render_markdown(rows, history, threshold):
+    """Render evaluate()'s rows as the markdown comparison."""
+    regressions = regressed_names(rows)
+    missing = missing_names(rows)
     window = len(history)
     lines = ["## Criterion Benchmark Results", ""]
 
@@ -235,9 +279,10 @@ def build_report(current, baseline, history, threshold):
 
     lines.append("| Benchmark | Baseline (ns/iter) | Range | Current | Change |")
     lines.append("|-----------|-------------------:|------:|--------:|--------|")
-    for name, median, spread, now, change in rows:
+    for row in rows:
+        median, spread, now, change = _cells(row, window)
         lines.append("| {} | {} | {} | {} | {} |".format(
-            sanitize(name), median, spread, now, sanitize(change)
+            sanitize(row.name), median, spread, now, sanitize(change)
         ))
     lines.append("")
 
@@ -284,7 +329,21 @@ def build_report(current, baseline, history, threshold):
         lines.append("")
         lines.append("</details>")
 
-    return "\n".join(lines) + "\n", regressions, missing
+    return "\n".join(lines) + "\n"
+
+
+def build_report(current, baseline, history, threshold):
+    """Evaluate the run and render the markdown comparison.
+
+    Returns (markdown, regressions, missing), where `missing` names the
+    baselined benchmarks this run produced no result for.
+    """
+    rows = evaluate(current, baseline, threshold)
+    return (
+        render_markdown(rows, history, threshold),
+        regressed_names(rows),
+        missing_names(rows),
+    )
 
 
 def main():

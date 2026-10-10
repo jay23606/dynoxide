@@ -128,6 +128,62 @@ The search is exact brute-force KNN over the whole index, so the top-k it return
 
 The tools are thin wrappers over the same engine the wire surface uses, so an agent sees the same behaviour and the same error text a DynamoDB client would.
 
+## Consumed capacity
+
+The tools that wrap a DynamoDB read or write take an optional `return_consumed_capacity`, with the values `ReturnConsumedCapacity` takes on the wire: `TOTAL`, `INDEXES` or `NONE`. That covers the item tools, `query`, `scan`, `search_vectors`, `batch_get_item`, `batch_write_item`, both transaction tools and the three PartiQL tools. Leaving it out is the same as `NONE`: the reply is unchanged. Any other value is refused with DynamoDB's validation error.
+
+With `TOTAL` or `INDEXES` the reply gains a `ConsumedCapacity` key, spelt in PascalCase like the rest of the reply, holding the figures the DynamoDB API returns for the same request. `get_item` with `TOTAL`:
+
+```json
+{
+  "Item": {"pk": {"S": "user#1"}, "email": {"S": "alice@example.com"}},
+  "ConsumedCapacity": {"TableName": "Users", "CapacityUnits": 0.5}
+}
+```
+
+`INDEXES` breaks the total down by table and index. A `put_item` on a table with one GSI:
+
+```json
+{
+  "ConsumedCapacity": {
+    "TableName": "Users",
+    "CapacityUnits": 2.0,
+    "Table": {"CapacityUnits": 1.0},
+    "GlobalSecondaryIndexes": {"byEmail": {"CapacityUnits": 1.0}}
+  }
+}
+```
+
+The single-item tools, `query`, `scan` and `execute_partiql` return one object. The batch and transaction tools, `batch_execute_partiql` and `execute_transaction_partiql` return an array with one entry per table, as DynamoDB does: `"ConsumedCapacity": [{"TableName": "Users", "CapacityUnits": 0.5}]`. `search_vectors` reports `VectorSearchRequestBytes` rather than capacity units.
+
+When `--max-items` caps a `query` or `scan`, the figure is for the capped read, because that is the read that ran. On `query`, `scan` and `search_vectors` the block counts towards `--max-size-bytes`, so a page that only just fitted can be refused once capacity is asked for.
+
+## Failed conditions
+
+`put_item`, `update_item`, `delete_item` and `execute_partiql` take an optional `return_values_on_condition_check_failure`, with the values `ReturnValuesOnConditionCheckFailure` takes on the wire: `ALL_OLD` or `NONE`. With `ALL_OLD`, a write whose condition fails comes back as a `ConditionalCheckFailedException` tool error that also carries the item the condition was evaluated against, under `item`:
+
+```json
+{
+  "error_type": "ConditionalCheckFailedException",
+  "message": "The conditional request failed",
+  "retryable": false,
+  "item": {"pk": {"S": "user#1"}, "version": {"N": "3"}}
+}
+```
+
+On `execute_partiql` that covers an UPDATE or DELETE whose WHERE condition is false for an item that exists. Leaving the argument out is the same as `NONE`, and any other value is refused with DynamoDB's validation error.
+
+## Logging
+
+`--log quiet` suppresses the `MCP HTTP server listening on ...` line and the
+`Loaded data model` line, on both transports and on `serve --mcp`. The warning
+printed when authentication is disabled and the message showing a newly
+generated token still print, as do errors.
+
+```sh
+dynoxide mcp --http --log quiet
+```
+
 ## Safety options
 
 ```sh

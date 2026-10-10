@@ -1,0 +1,3605 @@
+{
+ "captured": "eu-west-2 and us-east-1, 9 October 2026",
+ "cases": [
+  {
+   "id": "e2/update/start",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "éSET a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"é\", near: \"éSET\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"é\", near: \"éSET\""
+   }
+  },
+  {
+   "id": "e2/update/between",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET é a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"é\", near: \"SET é a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"é\", near: \"SET é a\""
+   }
+  },
+  {
+   "id": "e2/update/end",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :v é",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"é\", near: \":v é\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"é\", near: \":v é\""
+   }
+  },
+  {
+   "id": "e2/update/glued-to-value",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :vé",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"é\", near: \":vé\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"é\", near: \":vé\""
+   }
+  },
+  {
+   "id": "e2/update/in-name",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET aé = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"é\", near: \"aé =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"é\", near: \"aé =\""
+   }
+  },
+  {
+   "id": "e2/update/value-key",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :vé",
+    "ExpressionAttributeValues": {
+     ":vé": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeValues contains invalid key: Syntax error; key: \":vé\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeValues contains invalid key: Syntax error; key: \":vé\""
+   }
+  },
+  {
+   "id": "e2/update/name-key",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET #né = :v",
+    "ExpressionAttributeNames": {
+     "#né": "a"
+    },
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeNames contains invalid key: Syntax error; key: \"#né\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeNames contains invalid key: Syntax error; key: \"#né\""
+   }
+  },
+  {
+   "id": "e2/condition/start",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "éa = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"é\", near: \"éa\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"é\", near: \"éa\""
+   }
+  },
+  {
+   "id": "e2/condition/between",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a é = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"é\", near: \"a é =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"é\", near: \"a é =\""
+   }
+  },
+  {
+   "id": "e2/condition/end",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a = :v é",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"é\", near: \":v é\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"é\", near: \":v é\""
+   }
+  },
+  {
+   "id": "e2/condition/glued-to-value",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a = :vé",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"é\", near: \":vé\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"é\", near: \":vé\""
+   }
+  },
+  {
+   "id": "e2/condition/in-name",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "aé = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"é\", near: \"aé =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"é\", near: \"aé =\""
+   }
+  },
+  {
+   "id": "e2/filter/start",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "éa = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"é\", near: \"éa\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"é\", near: \"éa\""
+   }
+  },
+  {
+   "id": "e2/filter/between",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a é = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"é\", near: \"a é =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"é\", near: \"a é =\""
+   }
+  },
+  {
+   "id": "e2/filter/end",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a = :v é",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"é\", near: \":v é\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"é\", near: \":v é\""
+   }
+  },
+  {
+   "id": "e2/filter/in-name",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "aé = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"é\", near: \"aé =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"é\", near: \"aé =\""
+   }
+  },
+  {
+   "id": "e2/keyCondition/start",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "épk = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"é\", near: \"épk\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"é\", near: \"épk\""
+   }
+  },
+  {
+   "id": "e2/keyCondition/between",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk é = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"é\", near: \"pk é =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"é\", near: \"pk é =\""
+   }
+  },
+  {
+   "id": "e2/keyCondition/end",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk = :p é",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"é\", near: \":p é\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"é\", near: \":p é\""
+   }
+  },
+  {
+   "id": "e2/keyCondition/in-name",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pké = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"é\", near: \"pké =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"é\", near: \"pké =\""
+   }
+  },
+  {
+   "id": "e2/projection/start",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "éa, b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"é\", near: \"éa\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"é\", near: \"éa\""
+   }
+  },
+  {
+   "id": "e2/projection/between",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a, é b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"é\", near: \", é b\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"é\", near: \", é b\""
+   }
+  },
+  {
+   "id": "e2/projection/end",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a, b é"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"é\", near: \"b é\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"é\", near: \"b é\""
+   }
+  },
+  {
+   "id": "e2/projection/in-name",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "aé, b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"é\", near: \"aé,\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"é\", near: \"aé,\""
+   }
+  },
+  {
+   "id": "e2/partiql/start",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "éSELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e2/partiql/between",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * é FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e2/partiql/end",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x' é"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e2/partiql/in-name",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT aé FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e2/partiql/in-string",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'xé'"
+   },
+   "eu_west_2": {
+    "ok": true
+   },
+   "us_east_1": {
+    "ok": true
+   }
+  },
+  {
+   "id": "e2/transaction/update-start",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "éSET a = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"é\", near: \"éSET\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"é\", near: \"éSET\""
+   }
+  },
+  {
+   "id": "e2/transaction/update-end",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "SET a = :v é",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"é\", near: \":v é\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"é\", near: \":v é\""
+   }
+  },
+  {
+   "id": "e2/transaction/update-in-name",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "SET aé = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"é\", near: \"aé =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"é\", near: \"aé =\""
+   }
+  },
+  {
+   "id": "e2/transaction/check-start",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "éa = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"é\", near: \"éa\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"é\", near: \"éa\""
+   }
+  },
+  {
+   "id": "e2/transaction/check-end",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "a = :v é",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"é\", near: \":v é\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"é\", near: \":v é\""
+   }
+  },
+  {
+   "id": "e2/transaction/check-in-name",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "aé = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"é\", near: \"aé =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"é\", near: \"aé =\""
+   }
+  },
+  {
+   "id": "e3/update/start",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "€SET a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"€\", near: \"€SET\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"€\", near: \"€SET\""
+   }
+  },
+  {
+   "id": "e3/update/between",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET € a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"€\", near: \"SET € a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"€\", near: \"SET € a\""
+   }
+  },
+  {
+   "id": "e3/update/end",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :v €",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"€\", near: \":v €\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"€\", near: \":v €\""
+   }
+  },
+  {
+   "id": "e3/update/glued-to-value",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :v€",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"€\", near: \":v€\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"€\", near: \":v€\""
+   }
+  },
+  {
+   "id": "e3/update/in-name",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a€ = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"€\", near: \"a€ =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"€\", near: \"a€ =\""
+   }
+  },
+  {
+   "id": "e3/update/value-key",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :v€",
+    "ExpressionAttributeValues": {
+     ":v€": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeValues contains invalid key: Syntax error; key: \":v€\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeValues contains invalid key: Syntax error; key: \":v€\""
+   }
+  },
+  {
+   "id": "e3/update/name-key",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET #n€ = :v",
+    "ExpressionAttributeNames": {
+     "#n€": "a"
+    },
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeNames contains invalid key: Syntax error; key: \"#n€\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeNames contains invalid key: Syntax error; key: \"#n€\""
+   }
+  },
+  {
+   "id": "e3/condition/start",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "€a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"€\", near: \"€a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"€\", near: \"€a\""
+   }
+  },
+  {
+   "id": "e3/condition/between",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a € = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"€\", near: \"a € =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"€\", near: \"a € =\""
+   }
+  },
+  {
+   "id": "e3/condition/end",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a = :v €",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"€\", near: \":v €\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"€\", near: \":v €\""
+   }
+  },
+  {
+   "id": "e3/condition/glued-to-value",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a = :v€",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"€\", near: \":v€\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"€\", near: \":v€\""
+   }
+  },
+  {
+   "id": "e3/condition/in-name",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a€ = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"€\", near: \"a€ =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"€\", near: \"a€ =\""
+   }
+  },
+  {
+   "id": "e3/filter/start",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "€a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"€\", near: \"€a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"€\", near: \"€a\""
+   }
+  },
+  {
+   "id": "e3/filter/between",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a € = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"€\", near: \"a € =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"€\", near: \"a € =\""
+   }
+  },
+  {
+   "id": "e3/filter/end",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a = :v €",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"€\", near: \":v €\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"€\", near: \":v €\""
+   }
+  },
+  {
+   "id": "e3/filter/in-name",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a€ = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"€\", near: \"a€ =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"€\", near: \"a€ =\""
+   }
+  },
+  {
+   "id": "e3/keyCondition/start",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "€pk = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"€\", near: \"€pk\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"€\", near: \"€pk\""
+   }
+  },
+  {
+   "id": "e3/keyCondition/between",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk € = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"€\", near: \"pk € =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"€\", near: \"pk € =\""
+   }
+  },
+  {
+   "id": "e3/keyCondition/end",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk = :p €",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"€\", near: \":p €\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"€\", near: \":p €\""
+   }
+  },
+  {
+   "id": "e3/keyCondition/in-name",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk€ = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"€\", near: \"pk€ =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"€\", near: \"pk€ =\""
+   }
+  },
+  {
+   "id": "e3/projection/start",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "€a, b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"€\", near: \"€a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"€\", near: \"€a\""
+   }
+  },
+  {
+   "id": "e3/projection/between",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a, € b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"€\", near: \", € b\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"€\", near: \", € b\""
+   }
+  },
+  {
+   "id": "e3/projection/end",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a, b €"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"€\", near: \"b €\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"€\", near: \"b €\""
+   }
+  },
+  {
+   "id": "e3/projection/in-name",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a€, b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"€\", near: \"a€,\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"€\", near: \"a€,\""
+   }
+  },
+  {
+   "id": "e3/partiql/start",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "€SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e3/partiql/between",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * € FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e3/partiql/end",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x' €"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e3/partiql/in-name",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT a€ FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e3/partiql/in-string",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x€'"
+   },
+   "eu_west_2": {
+    "ok": true
+   },
+   "us_east_1": {
+    "ok": true
+   }
+  },
+  {
+   "id": "e3/transaction/update-start",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "€SET a = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"€\", near: \"€SET\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"€\", near: \"€SET\""
+   }
+  },
+  {
+   "id": "e3/transaction/update-end",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "SET a = :v €",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"€\", near: \":v €\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"€\", near: \":v €\""
+   }
+  },
+  {
+   "id": "e3/transaction/update-in-name",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "SET a€ = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"€\", near: \"a€ =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"€\", near: \"a€ =\""
+   }
+  },
+  {
+   "id": "e3/transaction/check-start",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "€a = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"€\", near: \"€a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"€\", near: \"€a\""
+   }
+  },
+  {
+   "id": "e3/transaction/check-end",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "a = :v €",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"€\", near: \":v €\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"€\", near: \":v €\""
+   }
+  },
+  {
+   "id": "e3/transaction/check-in-name",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "a€ = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"€\", near: \"a€ =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"€\", near: \"a€ =\""
+   }
+  },
+  {
+   "id": "e4/update/start",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "😀SET a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"😀\", near: \"😀SET\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"😀\", near: \"😀SET\""
+   }
+  },
+  {
+   "id": "e4/update/between",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET 😀 a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"😀\", near: \"SET 😀 a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"😀\", near: \"SET 😀 a\""
+   }
+  },
+  {
+   "id": "e4/update/end",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :v 😀",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"😀\", near: \":v 😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"😀\", near: \":v 😀\""
+   }
+  },
+  {
+   "id": "e4/update/glued-to-value",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :v😀",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"😀\", near: \":v😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"😀\", near: \":v😀\""
+   }
+  },
+  {
+   "id": "e4/update/in-name",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a😀 = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"😀\", near: \"a😀 =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"😀\", near: \"a😀 =\""
+   }
+  },
+  {
+   "id": "e4/update/value-key",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :v😀",
+    "ExpressionAttributeValues": {
+     ":v😀": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeValues contains invalid key: Syntax error; key: \":v😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeValues contains invalid key: Syntax error; key: \":v😀\""
+   }
+  },
+  {
+   "id": "e4/update/name-key",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET #n😀 = :v",
+    "ExpressionAttributeNames": {
+     "#n😀": "a"
+    },
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeNames contains invalid key: Syntax error; key: \"#n😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeNames contains invalid key: Syntax error; key: \"#n😀\""
+   }
+  },
+  {
+   "id": "e4/condition/start",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "😀a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"😀\", near: \"😀a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"😀\", near: \"😀a\""
+   }
+  },
+  {
+   "id": "e4/condition/between",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a 😀 = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"😀\", near: \"a 😀 =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"😀\", near: \"a 😀 =\""
+   }
+  },
+  {
+   "id": "e4/condition/end",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a = :v 😀",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"😀\", near: \":v 😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"😀\", near: \":v 😀\""
+   }
+  },
+  {
+   "id": "e4/condition/glued-to-value",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a = :v😀",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"😀\", near: \":v😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"😀\", near: \":v😀\""
+   }
+  },
+  {
+   "id": "e4/condition/in-name",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a😀 = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"😀\", near: \"a😀 =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"😀\", near: \"a😀 =\""
+   }
+  },
+  {
+   "id": "e4/filter/start",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "😀a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"😀\", near: \"😀a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"?\", near: \"😀\""
+   }
+  },
+  {
+   "id": "e4/filter/between",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a 😀 = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"😀\", near: \"a 😀 =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"?\", near: \"a 😀\""
+   }
+  },
+  {
+   "id": "e4/filter/end",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a = :v 😀",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"😀\", near: \":v 😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"?\", near: \":v 😀\""
+   }
+  },
+  {
+   "id": "e4/filter/in-name",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a😀 = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"😀\", near: \"a😀 =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \"?\", near: \"a😀\""
+   }
+  },
+  {
+   "id": "e4/keyCondition/start",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "😀pk = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"😀\", near: \"😀pk\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"😀\", near: \"😀pk\""
+   }
+  },
+  {
+   "id": "e4/keyCondition/between",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk 😀 = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"😀\", near: \"pk 😀 =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"😀\", near: \"pk 😀 =\""
+   }
+  },
+  {
+   "id": "e4/keyCondition/end",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk = :p 😀",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"😀\", near: \":p 😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"😀\", near: \":p 😀\""
+   }
+  },
+  {
+   "id": "e4/keyCondition/in-name",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk😀 = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"😀\", near: \"pk😀 =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \"😀\", near: \"pk😀 =\""
+   }
+  },
+  {
+   "id": "e4/projection/start",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "😀a, b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"😀\", near: \"😀a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"😀\", near: \"😀a\""
+   }
+  },
+  {
+   "id": "e4/projection/between",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a, 😀 b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"😀\", near: \", 😀 b\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"😀\", near: \", 😀 b\""
+   }
+  },
+  {
+   "id": "e4/projection/end",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a, b 😀"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"😀\", near: \"b 😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"😀\", near: \"b 😀\""
+   }
+  },
+  {
+   "id": "e4/projection/in-name",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a😀, b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"😀\", near: \"a😀,\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \"😀\", near: \"a😀,\""
+   }
+  },
+  {
+   "id": "e4/partiql/start",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "😀SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e4/partiql/between",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * 😀 FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e4/partiql/end",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x' 😀"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e4/partiql/in-name",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT a😀 FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "e4/partiql/in-string",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x😀'"
+   },
+   "eu_west_2": {
+    "ok": true
+   },
+   "us_east_1": {
+    "ok": true
+   }
+  },
+  {
+   "id": "e4/transaction/update-start",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "😀SET a = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"😀\", near: \"😀SET\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"?\", near: \"😀\""
+   }
+  },
+  {
+   "id": "e4/transaction/update-end",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "SET a = :v 😀",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"😀\", near: \":v 😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"?\", near: \":v 😀\""
+   }
+  },
+  {
+   "id": "e4/transaction/update-in-name",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "SET a😀 = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"😀\", near: \"a😀 =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \"?\", near: \"a😀\""
+   }
+  },
+  {
+   "id": "e4/transaction/check-start",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "😀a = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"😀\", near: \"😀a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"?\", near: \"😀\""
+   }
+  },
+  {
+   "id": "e4/transaction/check-end",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "a = :v 😀",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"😀\", near: \":v 😀\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"?\", near: \":v 😀\""
+   }
+  },
+  {
+   "id": "e4/transaction/check-in-name",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "a😀 = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"😀\", near: \"a😀 =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \"?\", near: \"a😀\""
+   }
+  },
+  {
+   "id": "nbsp/update/start",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": " SET a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \" \", near: \" SET\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \" \", near: \" SET\""
+   }
+  },
+  {
+   "id": "nbsp/update/between",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET   a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \" \", near: \"SET   a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \" \", near: \"SET   a\""
+   }
+  },
+  {
+   "id": "nbsp/update/end",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :v  ",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \" \", near: \":v  \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \" \", near: \":v  \""
+   }
+  },
+  {
+   "id": "nbsp/update/glued-to-value",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :v ",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \" \", near: \":v \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \" \", near: \":v \""
+   }
+  },
+  {
+   "id": "nbsp/update/in-name",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a  = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \" \", near: \"a  =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \" \", near: \"a  =\""
+   }
+  },
+  {
+   "id": "nbsp/update/value-key",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET a = :v ",
+    "ExpressionAttributeValues": {
+     ":v ": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeValues contains invalid key: Syntax error; key: \":v \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeValues contains invalid key: Syntax error; key: \":v \""
+   }
+  },
+  {
+   "id": "nbsp/update/name-key",
+   "operation": "UpdateItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "UpdateExpression": "SET #n  = :v",
+    "ExpressionAttributeNames": {
+     "#n ": "a"
+    },
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeNames contains invalid key: Syntax error; key: \"#n \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: ExpressionAttributeNames contains invalid key: Syntax error; key: \"#n \""
+   }
+  },
+  {
+   "id": "nbsp/condition/start",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": " a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \" \", near: \" a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \" \", near: \" a\""
+   }
+  },
+  {
+   "id": "nbsp/condition/between",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a   = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \" \", near: \"a   =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \" \", near: \"a   =\""
+   }
+  },
+  {
+   "id": "nbsp/condition/end",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a = :v  ",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \" \", near: \":v  \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \" \", near: \":v  \""
+   }
+  },
+  {
+   "id": "nbsp/condition/glued-to-value",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a = :v ",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \" \", near: \":v \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \" \", near: \":v \""
+   }
+  },
+  {
+   "id": "nbsp/condition/in-name",
+   "operation": "PutItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Item": {
+     "pk": {
+      "S": "y"
+     }
+    },
+    "ConditionExpression": "a  = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \" \", near: \"a  =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \" \", near: \"a  =\""
+   }
+  },
+  {
+   "id": "nbsp/filter/start",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": " a = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \" \", near: \" a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \" \", near: \" a\""
+   }
+  },
+  {
+   "id": "nbsp/filter/between",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a   = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \" \", near: \"a   =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \" \", near: \"a   =\""
+   }
+  },
+  {
+   "id": "nbsp/filter/end",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a = :v  ",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \" \", near: \":v  \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \" \", near: \":v  \""
+   }
+  },
+  {
+   "id": "nbsp/filter/in-name",
+   "operation": "Scan",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "FilterExpression": "a  = :v",
+    "ExpressionAttributeValues": {
+     ":v": {
+      "N": "1"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \" \", near: \"a  =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid FilterExpression: Syntax error; token: \" \", near: \"a  =\""
+   }
+  },
+  {
+   "id": "nbsp/keyCondition/start",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": " pk = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \" \", near: \" pk\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \" \", near: \" pk\""
+   }
+  },
+  {
+   "id": "nbsp/keyCondition/between",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk   = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \" \", near: \"pk   =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \" \", near: \"pk   =\""
+   }
+  },
+  {
+   "id": "nbsp/keyCondition/end",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk = :p  ",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \" \", near: \":p  \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \" \", near: \":p  \""
+   }
+  },
+  {
+   "id": "nbsp/keyCondition/in-name",
+   "operation": "Query",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "KeyConditionExpression": "pk  = :p",
+    "ExpressionAttributeValues": {
+     ":p": {
+      "S": "x"
+     }
+    }
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \" \", near: \"pk  =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid KeyConditionExpression: Syntax error; token: \" \", near: \"pk  =\""
+   }
+  },
+  {
+   "id": "nbsp/projection/start",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": " a, b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \" \", near: \" a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \" \", near: \" a\""
+   }
+  },
+  {
+   "id": "nbsp/projection/between",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a,   b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \" \", near: \",   b\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \" \", near: \",   b\""
+   }
+  },
+  {
+   "id": "nbsp/projection/end",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a, b  "
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \" \", near: \"b  \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \" \", near: \"b  \""
+   }
+  },
+  {
+   "id": "nbsp/projection/in-name",
+   "operation": "GetItem",
+   "body": {
+    "TableName": "_capture_20261009_u8_t",
+    "Key": {
+     "pk": {
+      "S": "x"
+     }
+    },
+    "ProjectionExpression": "a , b"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \" \", near: \"a ,\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ProjectionExpression: Syntax error; token: \" \", near: \"a ,\""
+   }
+  },
+  {
+   "id": "nbsp/partiql/start",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": " SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "nbsp/partiql/between",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT *   FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "nbsp/partiql/end",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'  "
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "nbsp/partiql/in-name",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT a  FROM \"_capture_20261009_u8_t\" WHERE pk = 'x'"
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Statement wasn't well formed, can't be processed: "
+   }
+  },
+  {
+   "id": "nbsp/partiql/in-string",
+   "operation": "ExecuteStatement",
+   "body": {
+    "Statement": "SELECT * FROM \"_capture_20261009_u8_t\" WHERE pk = 'x '"
+   },
+   "eu_west_2": {
+    "ok": true
+   },
+   "us_east_1": {
+    "ok": true
+   }
+  },
+  {
+   "id": "nbsp/transaction/update-start",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": " SET a = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \" \", near: \" SET\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \" \", near: \" SET\""
+   }
+  },
+  {
+   "id": "nbsp/transaction/update-end",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "SET a = :v  ",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \" \", near: \":v  \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \" \", near: \":v  \""
+   }
+  },
+  {
+   "id": "nbsp/transaction/update-in-name",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "Update": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "UpdateExpression": "SET a  = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \" \", near: \"a  =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid UpdateExpression: Syntax error; token: \" \", near: \"a  =\""
+   }
+  },
+  {
+   "id": "nbsp/transaction/check-start",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": " a = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \" \", near: \" a\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \" \", near: \" a\""
+   }
+  },
+  {
+   "id": "nbsp/transaction/check-end",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "a = :v  ",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \" \", near: \":v  \""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \" \", near: \":v  \""
+   }
+  },
+  {
+   "id": "nbsp/transaction/check-in-name",
+   "operation": "TransactWriteItems",
+   "body": {
+    "TransactItems": [
+     {
+      "ConditionCheck": {
+       "TableName": "_capture_20261009_u8_t",
+       "Key": {
+        "pk": {
+         "S": "x"
+        }
+       },
+       "ConditionExpression": "a  = :v",
+       "ExpressionAttributeValues": {
+        ":v": {
+         "N": "1"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "eu_west_2": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \" \", near: \"a  =\""
+   },
+   "us_east_1": {
+    "ok": false,
+    "type": "ValidationException",
+    "message": "Invalid ConditionExpression: Syntax error; token: \" \", near: \"a  =\""
+   }
+  }
+ ]
+}

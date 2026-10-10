@@ -16,9 +16,29 @@ const PARAMETERIZED_TYPE_CAST_ERROR: &str = "class sun.reflect.generics.reflecti
 /// This function inspects the raw JSON and returns the appropriate
 /// SerializationException before serde gets involved.
 pub(crate) fn pre_check_serialization_types(operation: &str, body: &str) -> crate::Result<()> {
+    pre_check_and_read_layer(operation, body).map(drop)
+}
+
+/// [`pre_check_serialization_types`], then the validation layer the request's
+/// values are read on: the operation's own, or the older layer for a request
+/// that holds a boolean member written as a string or a value with more than
+/// one member, whatever the operation (see
+/// [`crate::types::reads_on_older_layer`]). The body is parsed once for both.
+pub(crate) fn pre_check_and_read_layer(
+    operation: &str,
+    body: &str,
+) -> crate::Result<crate::validation::ValueLayer> {
     let json: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| crate::DynoxideError::SerializationException(e.to_string()))?;
+    check_types(operation, &json)?;
+    Ok(if crate::types::reads_on_older_layer(&json) {
+        crate::validation::ValueLayer::Older
+    } else {
+        crate::validation::ValueLayer::for_operation(operation)
+    })
+}
 
+fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
     let obj = match json.as_object() {
         Some(o) => o,
         None => return Ok(()),
@@ -502,7 +522,9 @@ fn check_field_is_string(
     Err(crate::DynoxideError::SerializationException(msg))
 }
 
-/// Check that a field, if present and not null, is a JSON boolean.
+/// Check that a field, if present and not null, reads as a boolean: JSON
+/// `true` or `false`, or a string DynamoDB reads as one, by the rule a `BOOL`
+/// member follows (captured eu-west-2 and us-east-1, 2026-10-10).
 /// Returns SerializationException for wrong types.
 fn check_field_is_bool(
     obj: &serde_json::Map<String, serde_json::Value>,
@@ -513,7 +535,7 @@ fn check_field_is_bool(
         _ => return Ok(()),
     };
 
-    if val.is_boolean() {
+    if val.is_boolean() || val.as_str().is_some_and(crate::types::reads_as_flag) {
         return Ok(());
     }
 

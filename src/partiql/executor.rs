@@ -7,47 +7,14 @@ use crate::errors::{DynoxideError, Result};
 use crate::expressions::condition::compare_values;
 use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
 use crate::partiql::parser::{
-    CompOp, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause, WhereCondition,
+    CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause,
+    WhereCondition,
 };
+use crate::partiql::{PathSegment, names_attribute, split_path_segments};
 use crate::storage_backend::StorageBackend;
-use crate::types::{AttributeValue, Item};
+use crate::types::{AttributeValue, Item, ScalarAttributeType};
 use std::collections::HashMap;
-
-/// Execute a parsed PartiQL statement.
-///
-/// Returns `Some(items)` for SELECT (may be empty) and for a DELETE or UPDATE
-/// carrying a `RETURNING` clause (the deleted item or the requested projection);
-/// `None` for a write with no `RETURNING` clause. An optional `limit` bounds how
-/// many rows a SELECT evaluates (reads), not how many it returns, matching
-/// DynamoDB's `Limit` and the Query/Scan semantics.
-pub async fn execute<S: StorageBackend>(
-    storage: &S,
-    stmt: &Statement,
-    parameters: &[AttributeValue],
-    limit: Option<usize>,
-) -> Result<Option<Vec<Item>>> {
-    Ok(execute_measured(storage, stmt, parameters, limit).await?.0)
-}
-
-/// Like [`execute`], but also returns the total item byte size the statement
-/// touched. SELECT reports the summed size of the rows it walked, which is
-/// before its WHERE clause and its projection narrow them;
-/// INSERT/UPDATE/DELETE report the affected item's size (0 when the statement
-/// was a no-op, e.g. a missing DELETE target).
-///
-/// This size alone no longer describes what the statement costs. A write is
-/// charged on the larger of the images either side of it plus a per-index arm,
-/// which [`execute_page`] carries on `StatementPage::capacity`. Prefer that for
-/// capacity; this remains for callers that only want the byte count.
-pub async fn execute_measured<S: StorageBackend>(
-    storage: &S,
-    stmt: &Statement,
-    parameters: &[AttributeValue],
-    limit: Option<usize>,
-) -> Result<(Option<Vec<Item>>, usize)> {
-    let page = execute_page(storage, stmt, parameters, limit, None, false, None, None).await?;
-    Ok((page.items, page.size))
-}
+use std::sync::Arc;
 
 /// One page of a statement's result.
 ///
@@ -56,8 +23,9 @@ pub async fn execute_measured<S: StorageBackend>(
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct StatementPage {
-    /// The rows this page carries, with the same `Some`/`None` meaning as
-    /// [`execute`].
+    /// The rows this page carries: `Some` for a SELECT (possibly empty) and
+    /// for an UPDATE or DELETE with a `RETURNING` clause (the deleted item or
+    /// the requested projection), `None` for a write without one.
     pub items: Option<Vec<Item>>,
     /// Total item bytes touched, for `ConsumedCapacity`.
     pub size: usize,
@@ -89,11 +57,6 @@ pub struct ReadIndex {
     pub is_lsi: bool,
 }
 
-/// Like [`execute_measured`], but resumable.
-///
-/// `next_token` continues a previous page; the returned token, when present,
-/// continues this one. A statement without a `Limit` returns every matching row
-/// and no token.
 /// The WHERE clause a statement carries, if any. `INSERT` never has one.
 fn statement_where_clause(stmt: &Statement) -> Option<&WhereClause> {
     match stmt {
@@ -104,14 +67,1086 @@ fn statement_where_clause(stmt: &Statement) -> Option<&WhereClause> {
     }
 }
 
-/// Reject an ordering comparison whose operand is a type that has no ordering.
+/// A key value as stored, or DynamoDB's refusal of a value that can't be a key:
+/// `Key value must be of type S, N, or B. Key name: pk, Key type: M` (captured
+/// eu-west-2, 2026-10-09, for a map; other types are named the same way).
+fn key_string(value: &AttributeValue, key_name: &str) -> Result<String> {
+    value.to_key_string().ok_or_else(|| {
+        DynoxideError::ValidationException(format!(
+            "Key value must be of type S, N, or B. Key name: {key_name}, Key type: {}",
+            value.type_name()
+        ))
+    })
+}
+
+/// Why a key value can't be used, in DynamoDB's words (captured eu-west-2 and
+/// us-east-1, 2026-10-09).
+#[derive(Debug)]
+pub(crate) enum KeyFault {
+    /// A type no key can have: a map, a list, a boolean, null or a set.
+    NotAKeyType(String),
+    /// A key type, but not the one the table declares for this key.
+    WrongType(String),
+}
+
+impl From<KeyFault> for DynoxideError {
+    fn from(fault: KeyFault) -> Self {
+        match fault {
+            KeyFault::NotAKeyType(message) | KeyFault::WrongType(message) => {
+                DynoxideError::ValidationException(message)
+            }
+        }
+    }
+}
+
+/// A key value as stored, checked against the type declared for the key: one
+/// no key can have is `Key value must be of type S, N, or B. Key name: pk, Key
+/// type: M`, and one of another key type is `Key attribute's data type should
+/// match its data type in table's schema: Key pk`. With no declared type to
+/// hand, only the first is checked.
+fn typed_key(
+    value: &AttributeValue,
+    key_name: &str,
+    declared: Option<&ScalarAttributeType>,
+) -> std::result::Result<String, KeyFault> {
+    let Some(stored) = value.to_key_string() else {
+        return Err(KeyFault::NotAKeyType(format!(
+            "Key value must be of type S, N, or B. Key name: {key_name}, Key type: {}",
+            value.type_name()
+        )));
+    };
+    let matches = match declared {
+        None => true,
+        Some(ScalarAttributeType::S) => matches!(value, AttributeValue::S(_)),
+        Some(ScalarAttributeType::N) => matches!(value, AttributeValue::N(_)),
+        Some(ScalarAttributeType::B) => matches!(value, AttributeValue::B(_)),
+    };
+    if !matches {
+        return Err(KeyFault::WrongType(format!(
+            "Key attribute's data type should match its data type in table's schema: Key {key_name}"
+        )));
+    }
+    Ok(stored)
+}
+
+/// The type `AttributeDefinitions` declares for an attribute.
+fn declared_attribute_type(
+    meta: &crate::storage::TableMetadata,
+    attr: &str,
+) -> Option<ScalarAttributeType> {
+    let defs: Vec<crate::types::AttributeDefinition> =
+        serde_json::from_str(&meta.attribute_definitions).ok()?;
+    defs.into_iter()
+        .find(|d| d.attribute_name == attr)
+        .map(|d| d.attribute_type)
+}
+
+/// One condition a branch of a WHERE clause puts on a key attribute: what it
+/// does and the values it names, resolved. `=` and `IN` are one kind, so
+/// `pk = 1` and `pk IN [1]` are the same condition.
+struct KeyCondition {
+    op: &'static str,
+    values: Vec<AttributeValue>,
+}
+
+impl PartialEq for KeyCondition {
+    fn eq(&self, other: &Self) -> bool {
+        self.op == other.op
+            && if self.op == "=" {
+                self.values.len() == other.values.len()
+                    && self.values.iter().all(|v| other.values.contains(v))
+            } else {
+                self.values == other.values
+            }
+    }
+}
+
+/// The distinct conditions a branch puts on one key attribute, in the order
+/// written; the same condition written twice counts once. A partition key is
+/// read by `=` and `IN`, a sort key by those, the ordering comparisons,
+/// `BETWEEN` and `begins_with`. `None` when a value can't be resolved, which is
+/// reported elsewhere.
+fn key_conditions(
+    group: &[Arc<WhereCondition>],
+    key: &str,
+    sort_key: bool,
+    parameters: &[AttributeValue],
+) -> Option<Vec<KeyCondition>> {
+    let resolve = |values: &[&PartiqlValue]| -> Option<Vec<AttributeValue>> {
+        values
+            .iter()
+            .map(|v| resolve_value(v, parameters).ok())
+            .collect()
+    };
+    let mut found: Vec<KeyCondition> = Vec::new();
+    for cond in group {
+        let (op, values): (&'static str, Vec<&PartiqlValue>) = match &**cond {
+            WhereCondition::Comparison(c) if names_attribute(&c.path, key) => match c.op {
+                CompOp::Eq => ("=", vec![&c.value]),
+                CompOp::Lt if sort_key => ("<", vec![&c.value]),
+                CompOp::Le if sort_key => ("<=", vec![&c.value]),
+                CompOp::Gt if sort_key => (">", vec![&c.value]),
+                CompOp::Ge if sort_key => (">=", vec![&c.value]),
+                _ => continue,
+            },
+            WhereCondition::In(path, values) if names_attribute(path, key) => {
+                ("=", values.iter().collect())
+            }
+            WhereCondition::Between(path, lo, hi) if sort_key && names_attribute(path, key) => {
+                ("BETWEEN", vec![lo, hi])
+            }
+            WhereCondition::BeginsWith(path, prefix) if sort_key && names_attribute(path, key) => {
+                ("begins_with", vec![prefix])
+            }
+            _ => continue,
+        };
+        let mut resolved = resolve(&values)?;
+        if op == "=" {
+            resolved = first_of_each(resolved, |value| {
+                let mut key = Vec::new();
+                encode_scalar(value, &mut key).then_some(key)
+            });
+        }
+        found.push(KeyCondition {
+            op,
+            values: resolved,
+        });
+    }
+    Some(first_of_each(found, |condition| {
+        let mut encoded = Vec::with_capacity(condition.values.len());
+        for value in &condition.values {
+            let mut one = Vec::new();
+            if !encode_scalar(value, &mut one) {
+                return None;
+            }
+            encoded.push(one);
+        }
+        // An equality's values (an `IN` list) are a set, so the same list in
+        // another order is the same condition; BETWEEN's two are not.
+        if condition.op == "=" {
+            encoded.sort_unstable();
+        }
+        let mut key = condition.op.as_bytes().to_vec();
+        for one in encoded {
+            key.extend_from_slice(&one);
+        }
+        Some(key)
+    }))
+}
+
+/// Keep the first of each repeated item, in the order given. Items `key` can
+/// encode are found through a hash set; any it can't (a non-scalar value,
+/// which no key condition can use) are compared among themselves as before.
+fn first_of_each<T: PartialEq>(
+    items: impl IntoIterator<Item = T>,
+    key: impl Fn(&T) -> Option<Vec<u8>>,
+) -> Vec<T> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<T> = Vec::new();
+    let mut unkeyed: Vec<usize> = Vec::new();
+    for item in items {
+        let fresh = match key(&item) {
+            Some(k) => seen.insert(k),
+            None => !unkeyed.iter().any(|&i| out[i] == item),
+        };
+        if fresh {
+            if key(&item).is_none() {
+                unkeyed.push(out.len());
+            }
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// Append an S, N or B value to `key` as a tag and its length-prefixed bytes,
+/// so two encodings match exactly when the values are equal. `false` for any
+/// other type.
+fn encode_scalar(value: &AttributeValue, key: &mut Vec<u8>) -> bool {
+    let (tag, bytes) = match value {
+        AttributeValue::S(s) => (b'S', s.as_bytes()),
+        AttributeValue::N(n) => (b'N', n.as_bytes()),
+        AttributeValue::B(b) => (b'B', b.as_slice()),
+        _ => return false,
+    };
+    key.push(tag);
+    key.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    key.extend_from_slice(bytes);
+    true
+}
+
+/// Refuse a SELECT key value DynamoDB can't read the key by, as
+/// [`typed_key`] words it (captured eu-west-2 and us-east-1, 2026-10-09).
+///
+/// The OR branches are checked in the order written. A branch that names the
+/// partition key with one `=` or `IN` has its values checked, then the sort
+/// key's, whatever the condition on it. A branch that doesn't name the
+/// partition key, or names it or the sort key two different ways, ends the
+/// checking there, its own values unchecked, and what is left just filters:
+/// `pk = true AND pk = 'x'` returns nothing, and `a = 1 OR pk = true` returns
+/// nothing where `pk = true OR a = 1` is refused. `pk = 1 AND pk IN [1]` is one
+/// condition, as is the same one written twice.
+fn check_read_key_types(
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    read_pk: &str,
+    read_sk: Option<&str>,
+    declared: &dyn Fn(&str) -> Option<ScalarAttributeType>,
+) -> Result<()> {
+    let Some(wc) = where_clause else {
+        return Ok(());
+    };
+    for group in &wc.groups {
+        let Some(pk) = key_conditions(group, read_pk, false, parameters) else {
+            return Ok(());
+        };
+        let pk = match pk.as_slice() {
+            [one] => one,
+            _ => return Ok(()),
+        };
+        let sk = match read_sk {
+            Some(sk_name) => {
+                let Some(conditions) = key_conditions(group, sk_name, true, parameters) else {
+                    return Ok(());
+                };
+                if conditions.len() > 1 {
+                    return Ok(());
+                }
+                conditions.into_iter().next().map(|c| (sk_name, c.values))
+            }
+            None => None,
+        };
+        for (name, values) in std::iter::once((read_pk, pk.values.clone())).chain(sk) {
+            let declared = declared(name);
+            for value in &values {
+                typed_key(value, name, declared.as_ref())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a batch or a transaction makes of a SELECT. Both serve it as a
+/// GetItem, so its WHERE clause may name each key attribute with `=` and
+/// nothing else (captured eu-west-2, 2026-10-09: `WHERE pk = 'a' AND data = ?`
+/// is refused by both, where ExecuteStatement runs it).
+pub(crate) enum KeyedSelect {
+    /// It names exactly the primary key.
+    ByPrimaryKey,
+    /// It names something else as well, or not the whole key.
+    NotByPrimaryKey,
+    /// It names the key, with a value of a type no key can have; the message
+    /// is the one ExecuteStatement gives.
+    KeyType(String),
+}
+
+pub(crate) fn keyed_select(
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    resolved: &ResolvedTable,
+) -> KeyedSelect {
+    let Statement::Select {
+        where_clause: Some(wc),
+        ..
+    } = stmt
+    else {
+        return KeyedSelect::NotByPrimaryKey;
+    };
+    let [group] = wc.groups.as_slice() else {
+        return KeyedSelect::NotByPrimaryKey;
+    };
+    let schema = &resolved.key_schema;
+    let keys: Vec<(&str, Option<&ScalarAttributeType>)> = std::iter::once((
+        schema.partition_key.as_str(),
+        Some(&schema.partition_key_type),
+    ))
+    .chain(
+        schema
+            .sort_key
+            .as_deref()
+            .map(|sk| (sk, schema.sort_key_type.as_ref())),
+    )
+    .collect();
+    // Each condition has to be an `=`, or an `IN` with one value, on a key
+    // attribute; the same one written twice is still one (captured eu-west-2
+    // and us-east-1, 2026-10-09).
+    let names_a_key = |path: &str| keys.iter().any(|(name, _)| names_attribute(path, name));
+    let single = group.iter().all(|cond| match &**cond {
+        WhereCondition::Comparison(c) => c.op == CompOp::Eq && names_a_key(&c.path),
+        WhereCondition::In(path, values) => values.len() == 1 && names_a_key(path),
+        _ => false,
+    });
+    if !single {
+        return KeyedSelect::NotByPrimaryKey;
+    }
+    let mut values = Vec::with_capacity(keys.len());
+    for (name, declared) in &keys {
+        let Some(conditions) = key_conditions(group, name, false, parameters) else {
+            return KeyedSelect::NotByPrimaryKey;
+        };
+        // `pk = 'a' AND pk IN ['a']` names one value (captured eu-west-2 and
+        // us-east-1, 2026-10-09).
+        let [KeyCondition { values: named, .. }] = conditions.as_slice() else {
+            return KeyedSelect::NotByPrimaryKey;
+        };
+        let [value] = named.as_slice() else {
+            return KeyedSelect::NotByPrimaryKey;
+        };
+        values.push((*name, *declared, value.clone()));
+    }
+    for (name, declared, value) in values {
+        if let Err(KeyFault::NotAKeyType(message) | KeyFault::WrongType(message)) =
+            typed_key(&value, name, declared)
+        {
+            return KeyedSelect::KeyType(message);
+        }
+    }
+    KeyedSelect::ByPrimaryKey
+}
+
+/// Refuse a SELECT in a batch or a transaction whose key conditions overlap,
+/// which DynamoDB checks before it checks that the SELECT names one item
+/// (captured eu-west-2 and us-east-1, 2026-10-09: `pk IN ['a', 'a'] AND sk =
+/// 1` is refused for overlapping).
+pub(crate) fn reject_overlapping_select(
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    resolved: &ResolvedTable,
+) -> Result<()> {
+    let Statement::Select { where_clause, .. } = stmt else {
+        return Ok(());
+    };
+    reject_overlapping_key_conditions(
+        where_clause.as_ref(),
+        parameters,
+        &resolved.key_schema.partition_key,
+        resolved.key_schema.sort_key.as_deref(),
+    )
+}
+
+/// Refuse the key value of an UPDATE or DELETE that DynamoDB refuses, as
+/// [`typed_key`] words it: what a transaction checks of a write's key before
+/// it runs anything.
+pub(crate) fn write_key_fault(
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    resolved: &ResolvedTable,
+) -> Option<KeyFault> {
+    let (Statement::Update {
+        where_clause: Some(wc),
+        ..
+    }
+    | Statement::Delete {
+        where_clause: Some(wc),
+        ..
+    }) = stmt
+    else {
+        return None;
+    };
+    let schema = &resolved.key_schema;
+    let keys = std::iter::once((&schema.partition_key, Some(&schema.partition_key_type))).chain(
+        schema
+            .sort_key
+            .as_ref()
+            .map(|sk| (sk, schema.sort_key_type.as_ref())),
+    );
+    let keys: Vec<_> = keys.collect();
+    for group in &wc.groups {
+        for (name, declared) in &keys {
+            let Some(cond) = find_comparison(group, name) else {
+                continue;
+            };
+            let Ok(value) = resolve_value(&cond.value, parameters) else {
+                continue;
+            };
+            if let Err(fault) = typed_key(&value, name, *declared) {
+                return Some(fault);
+            }
+        }
+    }
+    None
+}
+
+/// Check an INSERT's key the way a transaction does, with PutItem's messages:
+/// a key of the wrong type is `One or more parameter values were invalid: Type
+/// mismatch for key pk expected: N actual: M`, where ExecuteStatement and
+/// BatchExecuteStatement give `Key attribute's data type should match its data
+/// type in table's schema` (captured eu-west-2 and us-east-1, 2026-10-09).
+pub(crate) fn check_transaction_insert_keys(
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    resolved: &ResolvedTable,
+) -> Result<()> {
+    let Statement::Insert { item, .. } = stmt else {
+        return Ok(());
+    };
+    let item = resolve_insert_item(item, parameters)?;
+    crate::actions::helpers::validate_item_keys(&item, &resolved.key_schema, &resolved.meta)
+}
+
+/// Whether a DELETE's WHERE clause asks anything of the item beyond naming its
+/// key. A transaction that is cancelled reports such a DELETE of a missing
+/// item as a failed condition, where one naming only the key reports `None`
+/// (captured eu-west-2 and us-east-1, 2026-10-10, for `v = 1` beside the key;
+/// any other condition is inferred to count the same).
+pub(crate) fn delete_has_condition(stmt: &Statement, resolved: &ResolvedTable) -> bool {
+    let Statement::Delete {
+        where_clause: Some(wc),
+        ..
+    } = stmt
+    else {
+        return false;
+    };
+    let schema = &resolved.key_schema;
+    let is_key = |path: &str| {
+        names_attribute(path, &schema.partition_key)
+            || schema
+                .sort_key
+                .as_deref()
+                .is_some_and(|sk| names_attribute(path, sk))
+    };
+    let names_key = |condition: &WhereCondition| match condition {
+        WhereCondition::Comparison(c) => c.op == CompOp::Eq && is_key(&c.path),
+        WhereCondition::In(path, values) => values.len() == 1 && is_key(path),
+        _ => false,
+    };
+    !matches!(wc.groups.as_slice(), [group] if group.iter().all(|c| names_key(c)))
+}
+
+/// Check one statement parameter as any attribute value is checked, with no
+/// path in the message: its numbers, and empty or duplicated sets. DynamoDB
+/// checks a statement's parameters before it reads the statement, whether it
+/// uses them or not, on `ExecuteStatement`, `BatchExecuteStatement` and
+/// `ExecuteTransaction` alike (captured eu-west-2 and us-east-1, 2026-10-09).
+pub(crate) fn check_parameter_value(value: &AttributeValue) -> Result<()> {
+    crate::validation::validate_parameter_value(value)
+}
+
+/// One thing a branch of a WHERE clause says about the sort key, as a stored
+/// key, so values compare in the key's own order.
+#[derive(PartialEq)]
+enum SortKeyAtom {
+    /// Equal to one of these.
+    Points(Vec<String>),
+    /// At least, or more than, this.
+    Above(String, bool),
+    /// At most, or less than, this.
+    Below(String, bool),
+    /// Starting with this.
+    Prefix(String),
+}
+
+/// Refuse a SELECT whose key conditions overlap, as DynamoDB does (captured
+/// eu-west-2 and us-east-1, 2026-10-09).
+///
+/// When every OR branch pins the partition key with `=` or `IN`, DynamoDB
+/// reads the clause as one key range per branch and partition, the sort key
+/// conditions narrowing each, and refuses it when two ranges share a key: the
+/// same partition named twice with no sort key condition between them, sort
+/// key ranges that meet (closed ends touching count), a key repeated in an
+/// `IN` list, or `1` and `1.0`. Other conditions don't narrow a range. A branch
+/// that doesn't pin the partition key makes the read a scan, and nothing is
+/// checked; nor is anything when a branch puts two different conditions on
+/// the sort key (`sk > 0 AND sk < 3`), though the same one twice counts once,
+/// or a `NOT ... BETWEEN` on it.
+fn reject_overlapping_key_conditions(
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Result<()> {
+    let overlap = || {
+        DynoxideError::ValidationException(
+            "Overlapping conditions with range keys are not supported in where clause".to_string(),
+        )
+    };
+    let Some(wc) = where_clause else {
+        return Ok(());
+    };
+    let key = |value: &PartiqlValue| {
+        resolve_value(value, parameters)
+            .ok()
+            .and_then(|av| av.to_key_string())
+    };
+    let keys_of = |values: &[PartiqlValue]| -> Result<Vec<String>> {
+        let keys: Vec<String> = values.iter().filter_map(key).collect();
+        let mut seen = std::collections::HashSet::new();
+        if keys.iter().any(|k| !seen.insert(k)) {
+            return Err(overlap());
+        }
+        Ok(keys)
+    };
+
+    let groups = key_groups(wc, read_pk, read_sk);
+    let mut branches = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let mut partitions: Option<Vec<String>> = None;
+        let mut narrow = |keys: Vec<String>| {
+            partitions = Some(match partitions.take() {
+                None => keys,
+                Some(held) => {
+                    let wanted: std::collections::HashSet<&str> =
+                        keys.iter().map(String::as_str).collect();
+                    held.into_iter()
+                        .filter(|k| wanted.contains(k.as_str()))
+                        .collect()
+                }
+            });
+        };
+        // Each sort key condition as the atoms it stands for.
+        let mut conditions: Vec<Vec<SortKeyAtom>> = Vec::new();
+        let mut seen_conditions = std::collections::HashSet::new();
+        let mut add = |atoms: Vec<SortKeyAtom>| {
+            if seen_conditions.insert(encode_atoms(&atoms)) {
+                conditions.push(atoms);
+            }
+        };
+        for cond in group {
+            match &**cond {
+                WhereCondition::Comparison(c)
+                    if names_attribute(&c.path, read_pk) && c.op == CompOp::Eq =>
+                {
+                    narrow(key(&c.value).into_iter().collect());
+                }
+                WhereCondition::In(path, values) if names_attribute(path, read_pk) => {
+                    narrow(keys_of(values)?)
+                }
+                WhereCondition::Comparison(c)
+                    if read_sk.is_some_and(|sk| names_attribute(&c.path, sk)) =>
+                {
+                    if let Some(v) = key(&c.value) {
+                        match c.op {
+                            CompOp::Eq => add(vec![SortKeyAtom::Points(vec![v])]),
+                            CompOp::Lt => add(vec![SortKeyAtom::Below(v, false)]),
+                            CompOp::Le => add(vec![SortKeyAtom::Below(v, true)]),
+                            CompOp::Gt => add(vec![SortKeyAtom::Above(v, false)]),
+                            CompOp::Ge => add(vec![SortKeyAtom::Above(v, true)]),
+                            // Like a negated sort key condition, below.
+                            CompOp::Ne => return Ok(()),
+                        }
+                    }
+                }
+                WhereCondition::Between(path, lo, hi)
+                    if read_sk.is_some_and(|sk| names_attribute(path, sk)) =>
+                {
+                    if let (Some(lo), Some(hi)) = (key(lo), key(hi)) {
+                        add(vec![
+                            SortKeyAtom::Above(lo, true),
+                            SortKeyAtom::Below(hi, true),
+                        ]);
+                    }
+                }
+                WhereCondition::In(path, values)
+                    if read_sk.is_some_and(|sk| names_attribute(path, sk)) =>
+                {
+                    add(vec![SortKeyAtom::Points(keys_of(values)?)]);
+                }
+                WhereCondition::BeginsWith(path, prefix)
+                    if read_sk.is_some_and(|sk| names_attribute(path, sk)) =>
+                {
+                    if let Some(prefix) = key(prefix) {
+                        add(vec![SortKeyAtom::Prefix(prefix)]);
+                    }
+                }
+                // Captured eu-west-2 and us-east-1, 2026-10-09: `pk = 'a' AND
+                // NOT sk BETWEEN 1 AND 2 OR pk = 'a' AND sk = 3` runs.
+                WhereCondition::NotBetween(path, _, _)
+                    if read_sk.is_some_and(|sk| names_attribute(path, sk)) =>
+                {
+                    return Ok(());
+                }
+                // Captured eu-west-2 and us-east-1, 2026-10-09: a negated or
+                // `<>` sort key condition in any branch stops the check, as
+                // `NOT ... BETWEEN` does: `pk = 'a' AND NOT sk = '1' OR pk =
+                // 'a' AND sk = '2'` and `pk = 'a' OR pk = 'a' AND NOT sk =
+                // '1'` both run.
+                WhereCondition::NotComparison(c)
+                    if read_sk.is_some_and(|sk| names_attribute(&c.path, sk)) =>
+                {
+                    return Ok(());
+                }
+                WhereCondition::NotBeginsWith(path, _)
+                    if read_sk.is_some_and(|sk| names_attribute(path, sk)) =>
+                {
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        if conditions.len() > 1 {
+            return Ok(());
+        }
+        let atoms = conditions.into_iter().next().unwrap_or_default();
+        // A branch that doesn't pin the partition key is a scan, and so is the
+        // read as a whole.
+        let Some(partitions) = partitions else {
+            return Ok(());
+        };
+        branches.push((partitions, atoms));
+    }
+
+    for (i, (partitions, atoms)) in branches.iter().enumerate() {
+        for (other_partitions, other_atoms) in &branches[i + 1..] {
+            let shared = partitions.iter().any(|p| other_partitions.contains(p));
+            let both: Vec<&SortKeyAtom> = atoms.iter().chain(other_atoms).collect();
+            if shared && sort_keys_meet(&both) {
+                return Err(overlap());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The OR-groups a read's key ranges come from: the clause flattened as
+/// `groups` is, except that an OR with no condition on a key attribute under
+/// it stays whole, as a filter, rather than splitting the read. `pk = 'a' AND
+/// (x = 1 OR x = 2)` is one range, and runs; `pk = 'a' AND (sk = 1 OR x = 2)`
+/// is two that meet, and is refused (captured eu-west-2 and us-east-1,
+/// 2026-10-09).
+fn key_groups(
+    wc: &WhereClause,
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Vec<Vec<Arc<WhereCondition>>> {
+    use crate::partiql::parser::ConditionTree;
+    let is_key = |cond: &WhereCondition| {
+        condition_path(cond).is_some_and(|path| {
+            let root = root_attribute(path);
+            root == read_pk || read_sk == Some(&*root)
+        })
+    };
+    fn mentions_key(tree: &ConditionTree, is_key: &dyn Fn(&WhereCondition) -> bool) -> bool {
+        match tree {
+            ConditionTree::Leaf(cond) => is_key(cond),
+            ConditionTree::And(terms) | ConditionTree::Or(terms) => {
+                terms.iter().any(|t| mentions_key(t, is_key))
+            }
+        }
+    }
+    fn flatten(
+        tree: &ConditionTree,
+        is_key: &dyn Fn(&WhereCondition) -> bool,
+    ) -> Vec<Vec<Arc<WhereCondition>>> {
+        match tree {
+            ConditionTree::Leaf(cond) => vec![vec![cond.clone()]],
+            // A filter: it narrows no key range, so it contributes nothing.
+            ConditionTree::Or(terms) if !terms.iter().any(|t| mentions_key(t, is_key)) => {
+                vec![Vec::new()]
+            }
+            ConditionTree::Or(terms) => terms.iter().flat_map(|t| flatten(t, is_key)).collect(),
+            ConditionTree::And(terms) => {
+                let mut out = vec![Vec::new()];
+                for term in terms {
+                    let term_groups = flatten(term, is_key);
+                    out = out
+                        .iter()
+                        .flat_map(|held: &Vec<Arc<WhereCondition>>| {
+                            term_groups.iter().map(move |group| {
+                                let mut joined = held.clone();
+                                joined.extend(group.iter().cloned());
+                                joined
+                            })
+                        })
+                        .collect();
+                }
+                out
+            }
+        }
+    }
+    match &wc.tree {
+        Some(tree) => flatten(tree, &is_key),
+        None => wc.groups.clone(),
+    }
+}
+
+/// The atoms of one sort key condition as bytes, equal exactly when the atoms
+/// are, for finding a repeated condition through a hash set.
+fn encode_atoms(atoms: &[SortKeyAtom]) -> Vec<u8> {
+    fn text(tag: u8, s: &str, key: &mut Vec<u8>) {
+        key.push(tag);
+        key.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        key.extend_from_slice(s.as_bytes());
+    }
+    let mut key = Vec::new();
+    for atom in atoms {
+        match atom {
+            SortKeyAtom::Points(values) => {
+                key.push(b'P');
+                key.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for v in values {
+                    text(b'v', v, &mut key);
+                }
+            }
+            SortKeyAtom::Above(v, inclusive) => {
+                text(b'A', v, &mut key);
+                key.push(u8::from(*inclusive));
+            }
+            SortKeyAtom::Below(v, inclusive) => {
+                text(b'W', v, &mut key);
+                key.push(u8::from(*inclusive));
+            }
+            SortKeyAtom::Prefix(v) => text(b'X', v, &mut key),
+        }
+    }
+    key
+}
+
+/// Whether some sort key satisfies every atom at once.
+fn sort_keys_meet(atoms: &[&SortKeyAtom]) -> bool {
+    let mut low: Option<(&str, bool)> = None;
+    let mut high: Option<(&str, bool)> = None;
+    let mut points: Option<Vec<&str>> = None;
+    let mut prefix: Option<&str> = None;
+    for atom in atoms {
+        match atom {
+            SortKeyAtom::Above(v, inclusive) => {
+                low = Some(match low {
+                    Some((held, held_inclusive)) if held > v.as_str() => (held, held_inclusive),
+                    Some((held, held_inclusive)) if held == v.as_str() => {
+                        (held, held_inclusive && *inclusive)
+                    }
+                    _ => (v.as_str(), *inclusive),
+                });
+            }
+            SortKeyAtom::Below(v, inclusive) => {
+                high = Some(match high {
+                    Some((held, held_inclusive)) if held < v.as_str() => (held, held_inclusive),
+                    Some((held, held_inclusive)) if held == v.as_str() => {
+                        (held, held_inclusive && *inclusive)
+                    }
+                    _ => (v.as_str(), *inclusive),
+                });
+            }
+            SortKeyAtom::Points(values) => {
+                points = Some(match points {
+                    None => values.iter().map(String::as_str).collect(),
+                    Some(held) => {
+                        let wanted: std::collections::HashSet<&str> =
+                            values.iter().map(String::as_str).collect();
+                        held.into_iter().filter(|p| wanted.contains(p)).collect()
+                    }
+                });
+            }
+            SortKeyAtom::Prefix(p) => {
+                prefix = match prefix {
+                    None => Some(p.as_str()),
+                    Some(held) if p.starts_with(held) => Some(p.as_str()),
+                    Some(held) if held.starts_with(p.as_str()) => Some(held),
+                    Some(_) => return false,
+                };
+            }
+        }
+    }
+    let below_high = |v: &str| high.is_none_or(|(h, inclusive)| v < h || (inclusive && v == h));
+    let within = |v: &str| {
+        low.is_none_or(|(l, inclusive)| v > l || (inclusive && v == l))
+            && below_high(v)
+            && prefix.is_none_or(|p| v.starts_with(p))
+    };
+    if let Some(points) = points {
+        return points.into_iter().any(within);
+    }
+    match prefix {
+        // The smallest key that carries the prefix and clears the lower bound,
+        // then whether the upper bound lets it through.
+        Some(p) => {
+            let smallest = match low {
+                None => p.to_string(),
+                Some((l, inclusive)) if l.starts_with(p) => {
+                    if inclusive {
+                        l.to_string()
+                    } else {
+                        format!("{l}\0")
+                    }
+                }
+                Some((l, _)) if l < p => p.to_string(),
+                Some(_) => return false,
+            };
+            below_high(&smallest)
+        }
+        None => match (low, high) {
+            (Some((l, l_inclusive)), Some((h, h_inclusive))) => {
+                l < h || (l == h && l_inclusive && h_inclusive)
+            }
+            _ => true,
+        },
+    }
+}
+
+/// How a SELECT with an `ORDER BY` reads: which partitions, in what order, and
+/// which way through each.
+struct OrderPlan {
+    /// The partition keys to read, as stored, in the order to read them.
+    partitions: Vec<String>,
+    /// Whether each partition is read in ascending sort-key order.
+    forward: bool,
+}
+
+/// Check a SELECT's `ORDER BY` the way DynamoDB does, and work out the read it
+/// asks for (captured eu-west-2 and us-east-1, 2026-10-09).
+///
+/// DynamoDB serves `ORDER BY` as one Query per partition, so the clause can
+/// only name the read's key, and the WHERE clause has to pin the partition
+/// key with `=` or `IN` in every OR branch. The checks run in this order, each
+/// with its own message: a WHERE clause at all; each term in turn, first that
+/// it is a plain name and then that it is a key attribute; the partition key
+/// pinned in every branch, once; and, when more than one partition is named,
+/// the partition key among the terms.
+///
+/// The partitions are read in partition-key order, descending if that term
+/// says so, and each one by the sort key term's direction. With no sort key
+/// term each partition is read descending, whatever direction the partition
+/// key term gives: `ORDER BY pk ASC` returns 3, 2, 1, where `ORDER BY pk, sk`
+/// returns 1, 2, 3.
+fn check_order_terms(
+    order_by: &[OrderByTerm],
+    where_clause: Option<&WhereClause>,
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Result<()> {
+    let reject = |message: String| DynoxideError::ValidationException(message);
+    if where_clause.is_none() {
+        return Err(reject(
+            "Must have WHERE clause in the statement when using ORDER BY clause.".to_string(),
+        ));
+    }
+    for term in order_by {
+        if let Some(rejection) = &term.rejection {
+            return Err(reject(rejection.clone()));
+        }
+        if !names_attribute(&term.path, read_pk)
+            && !read_sk.is_some_and(|sk| names_attribute(&term.path, sk))
+        {
+            return Err(reject(format!(
+                "Attribute {} in ORDER BY clause must be part of the primary key",
+                term.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The rest of [`check_order_terms`]'s checks, once the key values and any
+/// overlap have been checked, and the read the clause asks for.
+fn plan_order(
+    order_by: &[OrderByTerm],
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Result<OrderPlan> {
+    let reject = |message: String| DynoxideError::ValidationException(message);
+    let Some(wc) = where_clause else {
+        return Err(reject(
+            "Must have WHERE clause in the statement when using ORDER BY clause.".to_string(),
+        ));
+    };
+    let mut partition_values = Vec::new();
+    for group in &wc.groups {
+        let pinned: Vec<Vec<&PartiqlValue>> = group
+            .iter()
+            .filter_map(|cond| match &**cond {
+                WhereCondition::Comparison(c)
+                    if names_attribute(&c.path, read_pk) && c.op == CompOp::Eq =>
+                {
+                    Some(vec![&c.value])
+                }
+                WhereCondition::In(path, values) if names_attribute(path, read_pk) => {
+                    Some(values.iter().collect())
+                }
+                _ => None,
+            })
+            .collect();
+        let [values] = pinned.as_slice() else {
+            return Err(reject(
+                "Must have at least one non-optional hash key condition in WHERE clause \
+                 when using ORDER BY clause."
+                    .to_string(),
+            ));
+        };
+        partition_values.extend(values.iter().copied());
+    }
+    let pk_term = order_by
+        .iter()
+        .find(|term| names_attribute(&term.path, read_pk));
+    if partition_values.len() > 1 && pk_term.is_none() {
+        return Err(reject(
+            "Must have hash key in ORDER BY clause when more than one hash key condition \
+             specified in WHERE clause."
+                .to_string(),
+        ));
+    }
+
+    // A stored partition key sorts the way its type orders, so sorting the
+    // stored form is sorting the keys.
+    let mut partitions = Vec::with_capacity(partition_values.len());
+    for value in partition_values {
+        partitions.push(key_string(&resolve_value(value, parameters)?, read_pk)?);
+    }
+    partitions.sort();
+    partitions.dedup();
+    if pk_term.is_some_and(|term| term.descending) {
+        partitions.reverse();
+    }
+
+    let forward = order_by
+        .iter()
+        .find(|term| read_sk.is_some_and(|sk| names_attribute(&term.path, sk)))
+        .is_some_and(|term| !term.descending);
+    Ok(OrderPlan {
+        partitions,
+        forward,
+    })
+}
+
+/// Read the partitions an ordered SELECT names, one Query each, in the plan's
+/// order, starting after `cursor` and stopping once `limit` rows are read.
+///
+/// A continuation resumes in the partition it stopped in and carries on
+/// through the rest, so the pages together hold every row once, in order.
+#[allow(clippy::too_many_arguments)]
+async fn read_in_order<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    index: Option<&ResolvedIndex>,
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    read_sk: Option<&str>,
+    cursor: Option<&Cursor>,
+    limit: Option<usize>,
+    plan: &OrderPlan,
+) -> Result<Vec<(String, String, String)>> {
+    // Sort-key conditions are pushed into each Query only when the clause is a
+    // single AND group, so they hold in every partition the read visits.
+    let sk_conditions = match (read_sk, where_clause) {
+        (Some(sk_name), Some(wc)) if wc.groups.len() == 1 => {
+            translate_sk_conditions(&wc.groups[0], sk_name, parameters)
+        }
+        _ => None,
+    }
+    .unwrap_or_default();
+    let (sk_condition_sql, sk_param_values) = sk_conditions_to_sql(&sk_conditions);
+    let sk_params_refs: Vec<&str> = sk_param_values.iter().map(|s| s.as_str()).collect();
+
+    let first = match cursor {
+        Some(c) => plan
+            .partitions
+            .iter()
+            .position(|pk| *pk == c.pk)
+            .ok_or_else(|| DynoxideError::ValidationException("Invalid NextToken".to_string()))?,
+        None => 0,
+    };
+
+    let mut rows = Vec::new();
+    for (i, pk_str) in plan.partitions.iter().enumerate().skip(first) {
+        let remaining = limit.map(|lim| lim.saturating_sub(rows.len()));
+        if remaining == Some(0) {
+            break;
+        }
+        let resume = cursor.filter(|_| i == first);
+        let params = crate::storage::QueryParams {
+            sk_condition: sk_condition_sql.as_deref(),
+            sk_params: &sk_params_refs,
+            forward: plan.forward,
+            limit: remaining,
+            exclusive_start_sk: resume.map(|c| c.sk.as_str()),
+            exclusive_start_base_pk: resume.and_then(|c| c.base_pk.as_deref()),
+            exclusive_start_base_sk: resume.and_then(|c| c.base_sk.as_deref()),
+        };
+        let page = match index {
+            Some(idx) if idx.is_lsi => {
+                storage
+                    .query_lsi_items(table_name, idx.name(), pk_str, &params)
+                    .await?
+            }
+            Some(idx) => {
+                storage
+                    .query_gsi_items(table_name, idx.name(), pk_str, &params)
+                    .await?
+            }
+            None => storage.query_items(table_name, pk_str, &params).await?,
+        };
+        rows.extend(page);
+    }
+    Ok(rows)
+}
+
+/// Refuse an item nested exactly as deep as DynamoDB allows a value to reach,
+/// with the short message PartiQL gives it. A literal that deep is refused as
+/// the statement is read, so this is a parameter's. One level deeper gets the
+/// usual long message from the item checks (captured eu-west-2 and us-east-1,
+/// 2026-10-09: a parameter 32 levels deep is `Nesting Levels have exceeded
+/// supported limits`, and 33 or more the long form, on INSERT and UPDATE).
+fn reject_item_nested_to_the_limit(item: &Item) -> Result<()> {
+    if item_nested_to_the_limit(item) {
+        return Err(nested_to_the_limit());
+    }
+    Ok(())
+}
+
+/// Whether an item reaches exactly 32 levels, the depth PartiQL refuses with
+/// its short message.
+fn item_nested_to_the_limit(item: &Item) -> bool {
+    fn deepest(value: &AttributeValue) -> usize {
+        let children: Box<dyn Iterator<Item = &AttributeValue>> = match value {
+            AttributeValue::M(map) => Box::new(map.values()),
+            AttributeValue::L(items) => Box::new(items.iter()),
+            _ => return 0,
+        };
+        children.map(|child| 1 + deepest(child)).max().unwrap_or(0)
+    }
+    item.values().map(deepest).max() == Some(32)
+}
+
+fn nested_to_the_limit() -> DynoxideError {
+    DynoxideError::ValidationException("Nesting Levels have exceeded supported limits".to_string())
+}
+
+/// A BETWEEN bound as DynamoDB writes it in a message: `S:x`, `N:3`, `B:[MQ==]`.
+fn bound_operand(value: &AttributeValue) -> String {
+    match value {
+        AttributeValue::S(s) => format!("S:{s}"),
+        AttributeValue::N(n) => format!("N:{n}"),
+        AttributeValue::B(b) => {
+            use base64::Engine;
+            format!(
+                "B:[{}]",
+                base64::engine::general_purpose::STANDARD.encode(b)
+            )
+        }
+        other => other.type_name().to_string(),
+    }
+}
+
+/// Refuse a type given to `attribute_type` as a parameter that isn't the name
+/// of a DynamoDB type.
+fn check_attribute_type_parameter(
+    kind: &PartiqlValue,
+    parameters: &[AttributeValue],
+    reject: fn(&str, &AttributeValue) -> DynoxideError,
+) -> Result<()> {
+    match resolve_value(kind, parameters)? {
+        AttributeValue::S(name) => match crate::partiql::parser::attribute_type_name_refusal(&name)
+        {
+            Some(message) => Err(DynoxideError::ValidationException(message)),
+            None => Ok(()),
+        },
+        other => Err(reject("attribute_type", &other)),
+    }
+}
+
+/// Reject an operand of a type its operator does not take.
 ///
 /// DynamoDB orders `S`, `N` and `B` and nothing else, and it rejects the
 /// statement outright rather than declining to match: the check fires before the
 /// table is resolved, so a statement naming a table that does not exist still
 /// reports this. `=` and `<>` are unaffected, being defined for every type.
 /// Captured eu-west-2 2026-08-15.
-fn validate_ordering_operands(
+///
+/// `begins_with` takes a string or binary, on any attribute, negated or not.
+/// An AND chain is checked in the order written, so its first offending operand
+/// is the one reported, as DynamoDB reports it. Captured eu-west-2, 2026-10-08.
+fn validate_operand_types(
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
 ) -> Result<()> {
@@ -129,45 +1164,165 @@ fn validate_ordering_operands(
         ))
     }
 
+    fn ordering_op(op: &CompOp) -> Option<&'static str> {
+        match op {
+            CompOp::Lt => Some("<"),
+            CompOp::Le => Some("<="),
+            CompOp::Gt => Some(">"),
+            CompOp::Ge => Some(">="),
+            CompOp::Eq | CompOp::Ne => None,
+        }
+    }
+    // Bounds of one type, the lower first (captured eu-west-2 and us-east-1,
+    // 2026-10-09 for a path, and 2026-10-10 for `size()`).
+    fn check_bounds(low: &AttributeValue, high: &AttributeValue) -> Result<()> {
+        for value in [low, high] {
+            if !orderable(value) {
+                return Err(reject("BETWEEN", value));
+            }
+        }
+        let bounds = |rule: &str| {
+            DynoxideError::ValidationException(format!(
+                "The BETWEEN operator requires {rule}; lower bound operand: \
+                 AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+                bound_operand(low),
+                bound_operand(high)
+            ))
+        };
+        if std::mem::discriminant(low) != std::mem::discriminant(high) {
+            return Err(bounds("same data type for lower and upper bounds"));
+        }
+        if compare_values(low, &CompOp::Gt, high) {
+            return Err(bounds(
+                "upper bound to be greater than or equal to lower bound",
+            ));
+        }
+        Ok(())
+    }
+    fn check(condition: &WhereCondition, parameters: &[AttributeValue]) -> Result<()> {
+        match condition {
+            // A negated comparison is checked too: `NOT a < ?` reads the
+            // same operand and DynamoDB rejects it on the same terms.
+            WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => {
+                let Some(op) = ordering_op(&c.op) else {
+                    return Ok(());
+                };
+                let value = resolve_value(&c.value, parameters)?;
+                if !orderable(&value) {
+                    return Err(reject(op, &value));
+                }
+            }
+            WhereCondition::Between(_, low, high) | WhereCondition::NotBetween(_, low, high) => {
+                check_bounds(
+                    &resolve_value(low, parameters)?,
+                    &resolve_value(high, parameters)?,
+                )?;
+            }
+            // A comparison between operands that aren't a path and a value,
+            // `size(s) < true` among them: each side that is a value takes the
+            // check the value of a `path op value` comparison does (captured
+            // eu-west-2 and us-east-1, 2026-10-10, for `size()`). A size is a
+            // number, so a string or boolean against it under `=` or `<>` is
+            // simply unequal rather than refused.
+            WhereCondition::Compare(left, op, right) => {
+                // A condition function compared is checked as it would be on
+                // its own: `attribute_type(a, ?) = b` checks the type.
+                for side in [left, right] {
+                    if let Operand::Condition(inner) = side {
+                        check(inner, parameters)?;
+                    }
+                }
+                let Some(op) = ordering_op(op) else {
+                    return Ok(());
+                };
+                for side in [left, right] {
+                    if let Operand::Value(value) = side {
+                        let value = resolve_value(value, parameters)?;
+                        if !orderable(&value) {
+                            return Err(reject(op, &value));
+                        }
+                    }
+                }
+            }
+            // BETWEEN on an operand that isn't a path checks its bounds as
+            // BETWEEN on a path does, when both are values (captured for
+            // `size()`, 2026-10-10). A bound that isn't a value, such as a path,
+            // can't be checked until an item is read; a value beside it is still
+            // held to the orderable types (inferred, not captured).
+            WhereCondition::CompareBetween(_, low, high) => match (low, high) {
+                (Operand::Value(low), Operand::Value(high)) => check_bounds(
+                    &resolve_value(low, parameters)?,
+                    &resolve_value(high, parameters)?,
+                )?,
+                _ => {
+                    for bound in [low, high] {
+                        if let Operand::Value(value) = bound {
+                            let value = resolve_value(value, parameters)?;
+                            if !orderable(&value) {
+                                return Err(reject("BETWEEN", &value));
+                            }
+                        }
+                    }
+                }
+            },
+            WhereCondition::CompareIn(operand, members) => {
+                for side in std::iter::once(operand).chain(members) {
+                    if let Operand::Condition(inner) = side {
+                        check(inner, parameters)?;
+                    }
+                }
+            }
+            // A type given to `attribute_type` as a parameter is checked
+            // once it is bound, negated or not (captured eu-west-2 and
+            // us-east-1, 2026-10-09).
+            WhereCondition::AttributeType(_, kind @ PartiqlValue::Parameter(_)) => {
+                check_attribute_type_parameter(kind, parameters, reject)?;
+            }
+            // A condition with no negated form of its own is checked as it
+            // would be without the NOT. Inferred, not captured: no capture
+            // holds a refused negated size or BETWEEN.
+            WhereCondition::Not(inner) => check(inner, parameters)?,
+            // `begins_with` takes a string or binary operand (captured
+            // eu-west-2 and us-east-1, 2026-10-09).
+            WhereCondition::BeginsWith(_, prefix) | WhereCondition::NotBeginsWith(_, prefix) => {
+                let value = resolve_value(prefix, parameters)?;
+                if !matches!(value, AttributeValue::S(_) | AttributeValue::B(_)) {
+                    return Err(reject("begins_with", &value));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     let Some(wc) = where_clause else {
         return Ok(());
     };
     for group in &wc.groups {
         for condition in group {
-            match condition {
-                // A negated comparison is checked too: `NOT a < ?` reads the
-                // same operand and DynamoDB rejects it on the same terms.
-                WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => {
-                    let op = match c.op {
-                        CompOp::Lt => "<",
-                        CompOp::Le => "<=",
-                        CompOp::Gt => ">",
-                        CompOp::Ge => ">=",
-                        CompOp::Eq | CompOp::Ne => continue,
-                    };
-                    let value = resolve_value(&c.value, parameters)?;
-                    if !orderable(&value) {
-                        return Err(reject(op, &value));
-                    }
-                }
-                WhereCondition::Between(_, low, high) => {
-                    for operand in [low, high] {
-                        let value = resolve_value(operand, parameters)?;
-                        if !orderable(&value) {
-                            return Err(reject("BETWEEN", &value));
-                        }
-                    }
-                }
-                _ => {}
-            }
+            check(condition, parameters)?;
         }
     }
     Ok(())
 }
 
+/// Run one page of a parsed statement, `written` being its text as the
+/// request carried it. A continuation token is bound to that text exactly as
+/// written, as DynamoDB binds it.
+///
+/// `next_token` continues a previous page; the returned token, when present,
+/// continues this one. A statement without a `limit` returns every matching
+/// row and no token.
+///
+/// `old_on_condition_failure` is `ReturnValuesOnConditionCheckFailure` set to
+/// `ALL_OLD`: an UPDATE or DELETE whose WHERE clause is false on an item that
+/// exists then fails carrying that item, as DynamoDB's does on all three
+/// PartiQL operations. A missing item never carries one (captured eu-west-2
+/// and us-east-1, 2026-10-10).
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_page<S: StorageBackend>(
+pub(crate) async fn execute_written_page<S: StorageBackend>(
     storage: &S,
+    written: &str,
     stmt: &Statement,
     parameters: &[AttributeValue],
     limit: Option<usize>,
@@ -175,13 +1330,48 @@ pub async fn execute_page<S: StorageBackend>(
     consistent_read: bool,
     capacity_mode: Option<&str>,
     resolved: Option<&ResolvedTable>,
+    old_on_condition_failure: bool,
 ) -> Result<StatementPage> {
     if next_token.is_some() && !matches!(stmt, Statement::Select { .. }) {
         return Err(DynoxideError::ValidationException(
             "NextToken is only valid on a SELECT statement".to_string(),
         ));
     }
-    validate_ordering_operands(statement_where_clause(stmt), parameters)?;
+    // A read of an index whose key has more than one attribute on either side
+    // is refused before anything else about the read is checked, its operands
+    // included. The table is loaded for it here and passed on, so the read
+    // resolves it once; a table that cannot be loaded is left to the checks
+    // that report it, in their usual order (captured eu-west-2 and us-east-1,
+    // 2026-10-09).
+    let loaded;
+    let resolved = match (stmt, resolved) {
+        (
+            Statement::Select {
+                table_name,
+                index_name: Some(_),
+                ..
+            },
+            None,
+        ) => {
+            loaded = ResolvedTable::load(storage, table_name).await.ok();
+            loaded.as_ref()
+        }
+        (_, resolved) => resolved,
+    };
+    if let (
+        Statement::Select {
+            table_name,
+            index_name: Some(index_name),
+            ..
+        },
+        Some(table),
+    ) = (stmt, resolved)
+        && table.table_name == *table_name
+    {
+        reject_multi_attribute_index(table, index_name)?;
+    }
+
+    validate_operand_types(statement_where_clause(stmt), parameters)?;
 
     // DynamoDB rejects an index qualifier on a write statement before it
     // resolves the table, so a qualified UPDATE against a table that does not
@@ -211,14 +1401,17 @@ pub async fn execute_page<S: StorageBackend>(
             index_name,
             projections,
             where_clause,
+            order_by,
             ..
         } => {
             let outcome = execute_select(
                 storage,
+                written,
                 table_name,
                 index_name.as_deref(),
                 projections,
                 where_clause.as_ref(),
+                order_by,
                 parameters,
                 limit,
                 next_token,
@@ -280,6 +1473,7 @@ pub async fn execute_page<S: StorageBackend>(
                 *returning,
                 capacity_mode,
                 resolved,
+                old_on_condition_failure,
             )
             .await?;
             // RETURNING surfaces the requested projection of the updated item;
@@ -325,6 +1519,7 @@ pub async fn execute_page<S: StorageBackend>(
                 parameters,
                 capacity_mode,
                 resolved,
+                old_on_condition_failure,
             )
             .await?;
             // RETURNING ALL OLD * always surfaces an Items array: the deleted
@@ -354,19 +1549,42 @@ pub async fn execute_page<S: StorageBackend>(
 /// keyed by the leaf segment name (`c`), not the full path or reconstructed
 /// nested structure. For simple paths and array index paths, the key is used as-is.
 fn insert_nested_projection(result: &mut Item, path: &str, val: AttributeValue) {
-    let parts: Vec<&str> = path.split('.').collect();
-    // Use the leaf segment as the key
-    let key = parts.last().unwrap();
-    result.insert(key.to_string(), val);
+    result.insert(projection_key(path), val);
+}
+
+/// The key a projected path is returned under: its last name, with any list
+/// indexes after it. A quoted name is the name it quotes, so `"a.b"` comes
+/// back as `a.b` (captured eu-west-2 and us-east-1, 2026-10-10).
+fn projection_key(path: &str) -> String {
+    if !path.contains('"') {
+        // Use the leaf segment as the key
+        return path.rsplit('.').next().unwrap_or(path).to_string();
+    }
+    let Some(segments) = split_path_segments(path) else {
+        return path.to_string();
+    };
+    let last_name = segments
+        .iter()
+        .rposition(|segment| matches!(segment, PathSegment::Key(_)))
+        .unwrap_or(0);
+    segments[last_name..]
+        .iter()
+        .map(|segment| match segment {
+            PathSegment::Key(name) => name.to_string(),
+            PathSegment::Index(index) => format!("[{index}]"),
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_select<S: StorageBackend>(
     storage: &S,
+    written: &str,
     table_name: &str,
     index_name: Option<&str>,
     projections: &[String],
     where_clause: Option<&WhereClause>,
+    order_by: &[OrderByTerm],
     parameters: &[AttributeValue],
     limit: Option<usize>,
     next_token: Option<&str>,
@@ -393,6 +1611,46 @@ async fn execute_select<S: StorageBackend>(
     let index = index_name
         .map(|name| resolve_index(meta, name))
         .transpose()?;
+
+    // The keys the row walk is paced by: the index's when one is named, the
+    // table's otherwise. An LSI's partition key is the table's, so only the
+    // sort key moves in that case.
+    let (read_pk, read_sk) = match index.as_ref() {
+        Some(idx) => (idx.pk_attr(), idx.sk_attr()),
+        None => (
+            table_key_schema.partition_key.as_str(),
+            table_key_schema.sort_key.as_deref(),
+        ),
+    };
+
+    // ORDER BY is checked once the table and any index are known, since what
+    // it may name is their key; a missing table or index is reported first.
+    // Its WHERE and term checks come before the key values are checked, which
+    // come before overlapping conditions, which come before the rest of the
+    // ORDER BY checks (captured eu-west-2 and us-east-1, 2026-10-09).
+    if !order_by.is_empty() {
+        check_order_terms(order_by, where_clause, read_pk, read_sk)?;
+    }
+    let declared = |attr: &str| match index.as_ref() {
+        None if attr == table_key_schema.partition_key => {
+            Some(table_key_schema.partition_key_type.clone())
+        }
+        None => table_key_schema.sort_key_type.clone(),
+        Some(_) => declared_attribute_type(meta, attr),
+    };
+    check_read_key_types(where_clause, parameters, read_pk, read_sk, &declared)?;
+    reject_overlapping_key_conditions(where_clause, parameters, read_pk, read_sk)?;
+    let order = if order_by.is_empty() {
+        None
+    } else {
+        Some(plan_order(
+            order_by,
+            where_clause,
+            parameters,
+            read_pk,
+            read_sk,
+        )?)
+    };
 
     // A strongly consistent read cannot be served from a GSI. PartiQL words
     // this differently from Query, which says "Consistent reads are not
@@ -436,7 +1694,7 @@ async fn execute_select<S: StorageBackend>(
             }
         }
 
-        if keys_index(where_clause, idx.pk_attr()) {
+        if keys_index(where_clause, read_pk) {
             let missing: Vec<String> = where_attributes(where_clause)
                 .into_iter()
                 .filter(|attr| !idx.projects(attr, table_key_schema))
@@ -454,21 +1712,20 @@ async fn execute_select<S: StorageBackend>(
         }
     }
 
-    // The keys the row walk is paced by: the index's when one is named, the
-    // table's otherwise. An LSI's partition key is the table's, so only the
-    // sort key moves in that case.
-    let (read_pk, read_sk) = match index.as_ref() {
-        Some(idx) => (idx.pk_attr(), idx.sk_attr()),
-        None => (
-            table_key_schema.partition_key.as_str(),
-            table_key_schema.sort_key.as_deref(),
-        ),
-    };
-
-    let fingerprint = statement_fingerprint(where_clause, parameters, index_name);
+    let fingerprint = statement_fingerprint(written, parameters);
     let cursor = next_token
         .map(|token| decode_next_token(token, table_name, fingerprint))
         .transpose()?;
+    // A statement with a list or map parameter is never resumed, even with
+    // the same parameters sent again unchanged; the first page still hands
+    // out a token (captured eu-west-2 and us-east-1, 2026-10-10).
+    if cursor.is_some()
+        && parameters
+            .iter()
+            .any(|p| matches!(p, AttributeValue::L(_) | AttributeValue::M(_)))
+    {
+        return Err(token_mismatch());
+    }
 
     // An index read's cursor is meaningless without the base table key: the
     // backend falls back to a two-column comparison that cannot advance past
@@ -494,7 +1751,7 @@ async fn execute_select<S: StorageBackend>(
         idx.is_lsi
             && projections
                 .iter()
-                .any(|p| !idx.projects(root_attribute(p), table_key_schema))
+                .any(|p| !idx.projects(&root_attribute(p), table_key_schema))
     });
 
     let window = evaluate_window(
@@ -510,6 +1767,7 @@ async fn execute_select<S: StorageBackend>(
         limit,
         reach_back,
         consistent_read,
+        order.as_ref(),
     )
     .await?;
 
@@ -607,15 +1865,71 @@ async fn evaluate_window<S: StorageBackend>(
     limit: Option<usize>,
     reach_back: bool,
     consistent_read: bool,
+    order: Option<&OrderPlan>,
 ) -> Result<Window> {
+    // A keyed read needs an equality on the partition key. An index whose key
+    // has more than one attribute never gets here: its reads are refused first
+    // (see `reject_multi_attribute_index`).
     let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, read_pk));
+    // A partition key value no key can have only gets this far when the clause
+    // isn't read by key (see `check_read_key_types`), and it matches no row.
+    let pk_key = match pk_condition {
+        Some(value) => {
+            let value = resolve_value(value, parameters)?;
+            // A key read with a key value no key can be is refused as GetItem
+            // and Query refuse it, on the table and on either kind of index:
+            // the partition key first, then each value the sort key's
+            // conditions name, whatever the condition (captured eu-west-2 and
+            // us-east-1, 2026-10-10).
+            if let Some(refusal) = crate::actions::helpers::key_size_refusal(&value, false) {
+                return Err(refusal);
+            }
+            if let (Some(sk_name), Some(wc)) = (read_sk, where_clause) {
+                let sk_conditions =
+                    translate_sk_conditions(&wc.groups[0], sk_name, parameters).unwrap_or_default();
+                for sk_value in sk_conditions.iter().flat_map(|c| c.values()) {
+                    if let Some(refusal) = crate::actions::helpers::key_size_refusal(sk_value, true)
+                    {
+                        return Err(refusal);
+                    }
+                }
+            }
+            Some(value.to_key_string())
+        }
+        None => {
+            // An OR beside the key condition leaves the key in every group the
+            // clause expands to, so the statement still reads one partition
+            // and an oversized key is refused as it is without the OR
+            // (captured eu-west-2 and us-east-1, 2026-10-10:
+            // `pk = <2,049 bytes> AND (x = 1 OR x = 2)` on a table; an index's
+            // key is inferred to follow suit, as its key reads do). The read
+            // itself stays a scan here.
+            if let Some(value) = where_clause.and_then(|wc| pk_in_every_group(wc, read_pk)) {
+                let value = resolve_value(value, parameters)?;
+                if let Some(refusal) = crate::actions::helpers::key_size_refusal(&value, false) {
+                    return Err(refusal);
+                }
+            }
+            None
+        }
+    };
 
-    let rows: Vec<(String, String, String)> = if let Some(pk_cond) = pk_condition {
-        let pk_val = resolve_value(&pk_cond.value, parameters)?;
-        let pk_str = pk_val
-            .to_key_string()
-            .ok_or_else(|| DynoxideError::ValidationException("Invalid key value".to_string()))?;
-
+    let rows: Vec<(String, String, String)> = if let Some(plan) = order {
+        read_in_order(
+            storage,
+            table_name,
+            index,
+            where_clause,
+            parameters,
+            read_sk,
+            cursor,
+            limit,
+            plan,
+        )
+        .await?
+    } else if let Some(None) = pk_key {
+        Vec::new()
+    } else if let Some(Some(pk_str)) = pk_key {
         // Sort-key conditions that a key condition can express are pushed into
         // the SQL, so `limit` counts rows within the key-condition range rather
         // than rows in the whole partition, which is how DynamoDB paces a
@@ -822,6 +2136,45 @@ struct Cursor {
     base_sk: Option<String>,
 }
 
+/// DynamoDB's refusal of a PartiQL read of a global secondary index whose key
+/// has more than one partition key or sort key attribute. It names the table,
+/// but only a read qualified with such an index is refused: the table itself
+/// and its other indexes stay readable and writable (captured eu-west-2 and
+/// us-east-1, 2026-10-09).
+pub(crate) const MULTI_ATTRIBUTE_INDEX_REFUSAL: &str = "PartiQL statements cannot be executed \
+on tables with multi-attribute HASH keys or multi-attribute RANGE keys.";
+
+/// Refuse a read of `index_name` when that index's key has more than one
+/// attribute on either side.
+pub(crate) fn reject_multi_attribute_index(
+    resolved: &ResolvedTable,
+    index_name: &str,
+) -> Result<()> {
+    let multi_attribute = crate::actions::gsi::parse_gsi_defs(&resolved.meta)?
+        .iter()
+        .any(|g| g.index_name == index_name && (g.hash_attrs.len() > 1 || g.range_attrs.len() > 1));
+    if multi_attribute {
+        return Err(DynoxideError::ValidationException(
+            MULTI_ATTRIBUTE_INDEX_REFUSAL.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// [`reject_multi_attribute_index`] for a statement refused before it is
+/// parsed. A table that cannot be loaded is left to the statement's own
+/// rejection.
+pub(crate) async fn reject_multi_attribute_index_by_name<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    index_name: &str,
+) -> Result<()> {
+    match ResolvedTable::load(storage, table_name).await {
+        Ok(resolved) => reject_multi_attribute_index(&resolved, index_name),
+        Err(_) => Ok(()),
+    }
+}
+
 /// Which index a qualified `SELECT` resolved to, and the keys to read it by.
 struct ResolvedIndex {
     /// The index as `actions::gsi` parsed it. Held whole rather than copied
@@ -857,10 +2210,67 @@ impl ResolvedIndex {
 }
 
 /// The attribute a path names, ignoring any document navigation after it.
-/// `address.city` and `tags[0]` are both carried by `address` and `tags`.
-fn root_attribute(path: &str) -> &str {
+/// `address.city` and `tags[0]` are both carried by `address` and `tags`, and
+/// a quoted `"a.b"` by `a.b`.
+fn root_attribute(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.starts_with('"')
+        && let Some(segments) = split_path_segments(path)
+        && let Some(PathSegment::Key(name)) = segments.into_iter().next()
+    {
+        return name;
+    }
     let end = path.find(['.', '[']).unwrap_or(path.len());
-    &path[..end]
+    std::borrow::Cow::Borrowed(&path[..end])
+}
+
+/// The path a WHERE condition on one path reads; `None` for a condition on
+/// other operands, which narrows no key range.
+fn condition_path(condition: &WhereCondition) -> Option<&str> {
+    match condition {
+        WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => Some(c.path.as_str()),
+        WhereCondition::Exists(p)
+        | WhereCondition::NotExists(p)
+        | WhereCondition::BeginsWith(p, _)
+        | WhereCondition::NotBeginsWith(p, _)
+        | WhereCondition::Between(p, _, _)
+        | WhereCondition::NotBetween(p, _, _)
+        | WhereCondition::In(p, _)
+        | WhereCondition::Contains(p, _)
+        | WhereCondition::NotContains(p, _)
+        | WhereCondition::IsMissing(p)
+        | WhereCondition::IsNotMissing(p)
+        | WhereCondition::IsType(p, _)
+        | WhereCondition::IsNotType(p, _) => Some(p.as_str()),
+        _ => None,
+    }
+}
+
+/// Every path a WHERE condition reads.
+fn condition_paths(condition: &WhereCondition) -> Vec<&str> {
+    fn operand_paths(operand: &Operand) -> Vec<&str> {
+        match operand {
+            Operand::Path(path) => vec![path.as_str()],
+            Operand::Size(inner) => operand_paths(inner),
+            Operand::Condition(inner) => condition_paths(inner),
+            _ => Vec::new(),
+        }
+    }
+    match condition {
+        WhereCondition::Compare(left, _, right) => {
+            [left, right].into_iter().flat_map(operand_paths).collect()
+        }
+        WhereCondition::CompareBetween(operand, low, high) => [operand, low, high]
+            .into_iter()
+            .flat_map(operand_paths)
+            .collect(),
+        WhereCondition::CompareIn(operand, list) => std::iter::once(operand)
+            .chain(list)
+            .flat_map(operand_paths)
+            .collect(),
+        WhereCondition::AttributeType(operand, _) => operand_paths(operand),
+        WhereCondition::Not(inner) => condition_paths(inner),
+        other => condition_path(other).into_iter().collect(),
+    }
 }
 
 /// Every attribute a WHERE clause reads.
@@ -871,22 +2281,11 @@ fn where_attributes(where_clause: Option<&WhereClause>) -> Vec<String> {
     let mut out = Vec::new();
     for group in &wc.groups {
         for condition in group {
-            let path = match condition {
-                WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => c.path.as_str(),
-                WhereCondition::Exists(p)
-                | WhereCondition::NotExists(p)
-                | WhereCondition::BeginsWith(p, _)
-                | WhereCondition::NotBeginsWith(p, _)
-                | WhereCondition::Between(p, _, _)
-                | WhereCondition::In(p, _)
-                | WhereCondition::Contains(p, _)
-                | WhereCondition::NotContains(p, _)
-                | WhereCondition::IsMissing(p)
-                | WhereCondition::IsNotMissing(p) => p.as_str(),
-            };
-            let root = root_attribute(path).to_string();
-            if !out.contains(&root) {
-                out.push(root);
+            for path in condition_paths(condition) {
+                let root = root_attribute(path).to_string();
+                if !out.contains(&root) {
+                    out.push(root);
+                }
             }
         }
     }
@@ -936,39 +2335,99 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
     ))
 }
 
-/// A digest of the parts of a SELECT that determine its row walk: the WHERE
-/// clause's groups and the parameters. Projections are left out deliberately,
-/// because they run after the read and do not move the cursor. Tokens are
-/// ephemeral and in-process, so the hash does not need to be stable across
-/// builds.
-///
-/// Whatever is hashed here is part of the continuation token's contract, so the
-/// fields are named one at a time rather than taken off a whole value's `Debug`.
-/// Hashing `WhereClause` wholesale made every field it might ever gain part of
-/// that contract, and adding one that has no bearing on the walk then
-/// invalidated every token already in flight with nothing to say it had.
-fn statement_fingerprint(
-    where_clause: Option<&WhereClause>,
-    parameters: &[AttributeValue],
-    index_name: Option<&str>,
-) -> u64 {
+/// A digest binding a continuation token to its statement and parameters.
+/// DynamoDB binds it to the statement exactly as written, so that is what is
+/// hashed, beside the parameters by value (see `hash_parameters`): a space, a
+/// keyword's case, the projection or a map literal's key order changed between
+/// pages is a different statement, and `0` and `0.0` are different parameters
+/// (captured eu-west-2 and us-east-1, 2026-10-10). Tokens are ephemeral and
+/// in-process, so the hash does not need to be stable across builds.
+fn statement_fingerprint(written: &str, parameters: &[AttributeValue]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // The groups are the walk. `wrote_or` records how the clause was spelled,
-    // which only decides the wording of a write's refusal, and a clause with no
-    // groups at all is not the same as no clause.
-    match where_clause {
-        Some(wc) => format!("{:?}", wc.groups).hash(&mut hasher),
-        None => "no-where".hash(&mut hasher),
-    }
-    // The index is part of the walk, not just of the filter: a token minted
-    // against one index would otherwise resume against another at a position
-    // that means nothing there.
-    index_name.hash(&mut hasher);
-    serde_json::to_string(parameters)
-        .unwrap_or_default()
-        .hash(&mut hasher);
+    written.hash(&mut hasher);
+    hash_parameters(parameters, &mut hasher);
     hasher.finish()
+}
+
+/// Feed a statement's parameters into a hasher as DynamoDB matches them when
+/// a NextToken comes back (captured eu-west-2 and us-east-1, 2026-10-10):
+///
+/// - a number as the same decimal, value and scale both, as Java's
+///   `BigDecimal.equals` compares them. The exponent's case, a `+` in the
+///   exponent or in front, leading zeros and the sign of zero don't matter;
+///   `1.0` is not `1`, `100` is not `1E2`, and `1.5E1` is `15`;
+/// - a set as a set, in any order: a number set's members by value whatever
+///   their scale, a string or binary set's exactly;
+/// - anything else as sent, a map with its keys sorted so its digest doesn't
+///   hang on the order its `HashMap` iterates in. A list or map parameter
+///   never resumes a read anyway (see `execute_select`).
+fn hash_parameters<H: std::hash::Hasher>(parameters: &[AttributeValue], hasher: &mut H) {
+    use std::hash::Hash;
+    parameters.len().hash(hasher);
+    for parameter in parameters {
+        match parameter {
+            AttributeValue::N(n) => {
+                "N".hash(hasher);
+                decimal_identity(n).hash(hasher);
+            }
+            AttributeValue::NS(members) => {
+                let mut values: Vec<String> = members
+                    .iter()
+                    .map(|n| crate::types::normalize_dynamo_number(n))
+                    .collect();
+                values.sort_unstable();
+                "NS".hash(hasher);
+                values.hash(hasher);
+            }
+            AttributeValue::SS(members) => {
+                let mut members: Vec<&String> = members.iter().collect();
+                members.sort_unstable();
+                "SS".hash(hasher);
+                members.hash(hasher);
+            }
+            AttributeValue::BS(members) => {
+                let mut members: Vec<&Vec<u8>> = members.iter().collect();
+                members.sort_unstable();
+                "BS".hash(hasher);
+                members.hash(hasher);
+            }
+            other => crate::canonical_json(other).hash(hasher),
+        }
+    }
+}
+
+/// A number as Java's `BigDecimal` holds it: its sign, its unscaled digits
+/// without leading zeros, and its scale (the digits after the point less the
+/// exponent). Zero has no sign. Text that isn't a number is kept whole, so it
+/// matches only itself.
+fn decimal_identity(n: &str) -> (bool, String, i64) {
+    let negative = n.starts_with('-');
+    let unsigned = n.trim_start_matches(['+', '-']);
+    let (coefficient, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => match unsigned[at + 1..].parse::<i64>() {
+            Ok(exponent) => (&unsigned[..at], exponent),
+            Err(_) => return (false, n.to_string(), i64::MIN),
+        },
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = coefficient.split_once('.').unwrap_or((coefficient, ""));
+    if !whole
+        .chars()
+        .chain(fraction.chars())
+        .all(|c| c.is_ascii_digit())
+    {
+        return (false, n.to_string(), i64::MIN);
+    }
+    let digits: String = whole
+        .chars()
+        .chain(fraction.chars())
+        .skip_while(|&d| d == '0')
+        .collect();
+    let scale = i64::try_from(fraction.len())
+        .unwrap_or(i64::MAX)
+        .saturating_sub(exponent);
+    (negative && !digits.is_empty(), digits, scale)
 }
 
 /// Callers should treat this as opaque, but it is only base64 and anyone can
@@ -1035,14 +2494,14 @@ fn decode_next_token(token: &str, table_name: &str, fingerprint: u64) -> Result<
 /// on every row. Conditions on other attributes are ignored here and keep
 /// filtering post-read.
 fn translate_sk_conditions(
-    group: &[WhereCondition],
+    group: &[Arc<WhereCondition>],
     sk_name: &str,
     parameters: &[AttributeValue],
 ) -> Option<Vec<ResolvedSortKeyCondition>> {
     let mut resolved = Vec::new();
     for cond in group {
-        match cond {
-            WhereCondition::Comparison(c) if c.path == sk_name => {
+        match &**cond {
+            WhereCondition::Comparison(c) if names_attribute(&c.path, sk_name) => {
                 let value = resolve_value(&c.value, parameters).ok()?;
                 value.to_key_string()?;
                 let sk = sk_name.to_string();
@@ -1057,7 +2516,7 @@ fn translate_sk_conditions(
                     CompOp::Ne => return None,
                 });
             }
-            WhereCondition::Between(path, lo, hi) if path == sk_name => {
+            WhereCondition::Between(path, lo, hi) if names_attribute(path, sk_name) => {
                 let lo = resolve_value(lo, parameters).ok()?;
                 let hi = resolve_value(hi, parameters).ok()?;
                 lo.to_key_string()?;
@@ -1068,13 +2527,24 @@ fn translate_sk_conditions(
                     hi,
                 ));
             }
-            WhereCondition::BeginsWith(path, prefix) if path == sk_name => {
+            WhereCondition::BeginsWith(path, prefix) if names_attribute(path, sk_name) => {
                 let prefix = resolve_value(prefix, parameters).ok()?;
                 prefix.to_key_string()?;
                 resolved.push(ResolvedSortKeyCondition::BeginsWith(
                     sk_name.to_string(),
                     prefix,
                 ));
+            }
+            // An IN with one value is read as `=`, as DynamoDB reads it.
+            // Captured eu-west-2 and us-east-1, 2026-10-10, for the sort key
+            // through BatchExecuteStatement and ExecuteTransaction; the
+            // ExecuteStatement charge is inferred from those.
+            WhereCondition::In(path, values)
+                if names_attribute(path, sk_name) && values.len() == 1 =>
+            {
+                let value = resolve_value(&values[0], parameters).ok()?;
+                value.to_key_string()?;
+                resolved.push(ResolvedSortKeyCondition::Eq(sk_name.to_string(), value));
             }
             // Any other condition shape on the sort key (IN, contains, a
             // negated comparison, negated begins_with, the existence checks) has
@@ -1090,7 +2560,9 @@ fn translate_sk_conditions(
             | WhereCondition::NotExists(path)
             | WhereCondition::IsMissing(path)
             | WhereCondition::IsNotMissing(path)
-                if path == sk_name =>
+            | WhereCondition::IsType(path, _)
+            | WhereCondition::IsNotType(path, _)
+                if names_attribute(path, sk_name) =>
             {
                 return None;
             }
@@ -1105,9 +2577,9 @@ fn translate_sk_conditions(
 /// query and a scan and so whether an unprojected filter attribute is rejected.
 ///
 /// Broader than `find_pk_condition` on one axis and identical on the other. An
-/// `IN` on the index partition key counts, even though the read cannot push it
-/// down as a single key and still scans; AWS rejects an unprojected filter
-/// alongside it. An index key reached through OR does not count, and AWS
+/// `IN` on the index partition key counts: one value reads as `=` and queries
+/// the index, while several can't be pushed down as a single key and still
+/// scan; AWS rejects an unprojected filter alongside either. An index key reached through OR does not count, and AWS
 /// accepts an unprojected filter there. Captured eu-west-2 2026-08-15.
 ///
 /// "Reached through OR" is the presence of an alternation, not the absence of
@@ -1123,28 +2595,64 @@ fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
     if wc.groups.len() != 1 {
         return false;
     }
-    wc.groups[0].iter().any(|c| match c {
-        WhereCondition::Comparison(cond) => cond.path == pk_name && cond.op == CompOp::Eq,
-        WhereCondition::In(path, _) => path == pk_name,
+    wc.groups[0].iter().any(|c| match &**c {
+        WhereCondition::Comparison(cond) => {
+            names_attribute(&cond.path, pk_name) && cond.op == CompOp::Eq
+        }
+        WhereCondition::In(path, _) => names_attribute(path, pk_name),
         _ => false,
     })
 }
 
-fn find_pk_condition<'a>(
-    wc: &'a WhereClause,
-    pk_name: &str,
-) -> Option<&'a crate::partiql::parser::Condition> {
+/// The one value a single-group WHERE clause pins the partition key to, when
+/// it pins one: an `=`, or an `IN` with one value, which DynamoDB reads exactly
+/// as `=` (captured eu-west-2 and us-east-1, 2026-10-10: `pk IN ['a']` costs
+/// what `pk = 'a'` costs, where a scan costs more).
+fn find_pk_condition<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a PartiqlValue> {
     // Only optimise to a Query when there is a single OR group
     // (multi-group OR with pk in only one group would need a union approach).
-    if wc.groups.len() == 1 {
-        wc.groups[0].iter().find_map(|c| match c {
-            WhereCondition::Comparison(cond) if cond.path == pk_name && cond.op == CompOp::Eq => {
-                Some(cond)
-            }
-            _ => None,
-        })
-    } else {
-        None
+    // A partition key named by more than one condition isn't a key read either
+    // (captured eu-west-2 and us-east-1, 2026-10-09: `pk = true AND pk = 'x'`
+    // is served as a scan and returns nothing).
+    let [group] = wc.groups.as_slice() else {
+        return None;
+    };
+    group_pk_value(group, pk_name)
+}
+
+/// The one value every group of a clause pins the partition key to, when
+/// they all pin the same one: `pk = 'a' AND (x = 1 OR x = 2)` flattens to two
+/// groups that both name partition `a`.
+fn pk_in_every_group<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a PartiqlValue> {
+    let (first, rest) = wc.groups.split_first()?;
+    let value = group_pk_value(first, pk_name)?;
+    rest.iter()
+        .all(|group| group_pk_value(group, pk_name) == Some(value))
+        .then_some(value)
+}
+
+/// The one value a group pins the partition key to, as `find_pk_condition`
+/// reads it.
+fn group_pk_value<'a>(group: &'a [Arc<WhereCondition>], pk_name: &str) -> Option<&'a PartiqlValue> {
+    let mut pinning = group.iter().filter_map(|c| match &**c {
+        WhereCondition::Comparison(cond)
+            if names_attribute(&cond.path, pk_name) && cond.op == CompOp::Eq =>
+        {
+            Some(std::slice::from_ref(&cond.value))
+        }
+        WhereCondition::In(path, values) if names_attribute(path, pk_name) => {
+            Some(values.as_slice())
+        }
+        _ => None,
+    });
+    let values = pinning.next()?;
+    if pinning.any(|other| other != values) {
+        return None;
+    }
+    // An IN with several values names several partitions; it stays a scan.
+    match values {
+        [value] => Some(value),
+        _ => None,
     }
 }
 
@@ -1165,8 +2673,8 @@ pub struct ResolvedTable {
     pub meta: crate::storage::TableMetadata,
     pub key_schema: crate::actions::helpers::KeySchema,
     /// The table this was resolved from, so a caller handing it to
-    /// [`execute_page`] alongside a statement against another table can be
-    /// spotted rather than obeyed.
+    /// [`execute_written_page`] alongside a statement against another table
+    /// can be spotted rather than obeyed.
     pub table_name: String,
 }
 
@@ -1227,11 +2735,37 @@ fn statement_key(
         Some((pk, sk))
     };
 
+    // A SELECT's key may be pinned by `=` or by an IN with one value, which
+    // DynamoDB treats as the same item (captured eu-west-2 and us-east-1,
+    // 2026-10-10: `pk IN ['a']` twice, or beside `pk = 'a'`, is a duplicate).
     let from_where = |where_clause: &Option<WhereClause>| -> Option<(String, String)> {
         let wc = where_clause.as_ref()?;
         key_of(&|name: &str| {
-            find_comparison_in_groups(&wc.groups, name)
-                .and_then(|cond| resolve_value(&cond.value, parameters).ok())
+            find_key_value_in_groups(&wc.groups, name)
+                .and_then(|value| resolve_value(value, parameters).ok())
+        })
+    };
+
+    // An UPDATE or DELETE writes the item its top-level key equalities name,
+    // so that is the item it holds in the transaction: in
+    // `(pk = 'b' OR x = 1) AND pk = 'a'` the OR group is a condition on item
+    // a, not a second key (captured eu-west-2 and us-east-1, 2026-10-10).
+    // Equalities that disagree name no item here; the statement refuses
+    // itself for them.
+    let from_top_level = |where_clause: &Option<WhereClause>| -> Option<(String, String)> {
+        let wc = where_clause.as_ref()?;
+        key_of(&|name: &str| {
+            let mut values = wc
+                .top_level_equalities
+                .iter()
+                .filter(|cond| names_attribute(&cond.path, name))
+                .map(|cond| resolve_value(&cond.value, parameters).ok());
+            let first = values.next()??;
+            let first_key = first.to_key_string();
+            if values.any(|v| v.and_then(|v| v.to_key_string()) != first_key) {
+                return None;
+            }
+            Some(first)
         })
     };
 
@@ -1240,26 +2774,20 @@ fn statement_key(
             item.get(name)
                 .and_then(|v| resolve_value(v, parameters).ok())
         }),
-        Statement::Update { where_clause, .. }
-        | Statement::Delete { where_clause, .. }
+        Statement::Update { where_clause, .. } | Statement::Delete { where_clause, .. } => {
+            from_top_level(where_clause)
+        }
         // A SELECT resolves only when its WHERE pins every key attribute; one
         // spanning a partition yields nothing and takes no part in the check.
-        | Statement::Select { where_clause, .. } => from_where(where_clause),
+        Statement::Select { where_clause, .. } => from_where(where_clause),
     }
 }
 
-/// Returns what the insert consumed. An `if_not_exists` duplicate makes it a
-/// no-op, which carries no images and no index units.
-async fn execute_insert<S: StorageBackend>(
-    storage: &S,
-    table_name: &str,
+/// An INSERT's item with its parameters filled in.
+fn resolve_insert_item(
     item_template: &HashMap<String, PartiqlValue>,
     parameters: &[AttributeValue],
-    if_not_exists: bool,
-    capacity_mode: Option<&str>,
-    resolved: Option<&ResolvedTable>,
-) -> Result<WriteCapacity> {
-    // Resolve any parameter placeholders in the item
+) -> Result<Item> {
     let mut item = HashMap::new();
     for (k, v) in item_template {
         let resolved = match v {
@@ -1273,6 +2801,21 @@ async fn execute_insert<S: StorageBackend>(
         };
         item.insert(k.clone(), resolved);
     }
+    Ok(item)
+}
+
+/// Returns what the insert consumed. An `if_not_exists` duplicate makes it a
+/// no-op, which carries no images and no index units.
+async fn execute_insert<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    item_template: &HashMap<String, PartiqlValue>,
+    parameters: &[AttributeValue],
+    if_not_exists: bool,
+    capacity_mode: Option<&str>,
+    resolved: Option<&ResolvedTable>,
+) -> Result<WriteCapacity> {
+    let mut item = resolve_insert_item(item_template, parameters)?;
 
     // Resolved by the caller when a preparation pass already did it, which is
     // what stops a batch reading the same table's metadata and parsing the same
@@ -1288,9 +2831,39 @@ async fn execute_insert<S: StorageBackend>(
     let meta = &resolved.meta;
     let key_schema = &resolved.key_schema;
 
+    // A key of the wrong type, or of a type no key can have, is refused in
+    // PartiQL's words ahead of PutItem's key checks (captured eu-west-2 and
+    // us-east-1, 2026-10-09).
+    let keys = std::iter::once((
+        &key_schema.partition_key,
+        Some(&key_schema.partition_key_type),
+    ))
+    .chain(
+        key_schema
+            .sort_key
+            .as_ref()
+            .map(|sk| (sk, key_schema.sort_key_type.as_ref())),
+    );
+    for (name, declared) in keys {
+        if let Some(value) = item.get(name)
+            && typed_key(value, name, declared).is_err()
+        {
+            return Err(DynoxideError::ValidationException(format!(
+                "Key attribute's data type should match its data type in table's schema: Key {name}"
+            )));
+        }
+    }
+
     // Validate keys present
     crate::actions::helpers::validate_item_keys(&item, key_schema, meta)?;
-    crate::validation::validate_item_attribute_values(&item)?;
+    // An item exactly at the nesting limit is a duplicate first when its key
+    // is taken, and otherwise gets PartiQL's short message, so the item checks,
+    // which would give the long one, are held back for it (captured eu-west-2,
+    // 2026-10-09).
+    let at_the_limit = item_nested_to_the_limit(&item);
+    if !at_the_limit {
+        crate::validation::validate_item_attribute_values(&item)?;
+    }
 
     // Deduplicate sets
     crate::validation::normalize_item_sets(&mut item);
@@ -1317,19 +2890,25 @@ async fn execute_insert<S: StorageBackend>(
             "Duplicate primary key exists in table".to_string(),
         ));
     }
+    if at_the_limit {
+        return Err(nested_to_the_limit());
+    }
 
     let item_json = serde_json::to_string(&item)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-    let item_size = crate::types::item_size(&item);
 
     // An INSERT is held to the same flat limit as PutItem, and reports it in the
     // same words. Captured against eu-west-2, where the ceiling is 409,600 on
     // the item itself.
-    if item_size > crate::types::MAX_ITEM_SIZE {
+    if crate::types::item_size(&item) > crate::types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
             "Item size has exceeded the maximum allowed size".to_string(),
         ));
     }
+    // What the row records and the write is charged: the billed size, with a
+    // vector attribute at 4 bytes per dimension.
+    let vector_defs = crate::actions::vector_index::parse_vector_defs(meta)?;
+    let item_size = crate::types::billed_item_size(&item, &vector_defs);
 
     let hash_prefix = item
         .get(&key_schema.partition_key)
@@ -1370,7 +2949,9 @@ async fn execute_insert<S: StorageBackend>(
     // here; `old_item` only ever comes back empty.
     Ok(WriteCapacity::new(
         table_name,
-        old_item.as_ref().map(crate::types::item_size),
+        old_item
+            .as_ref()
+            .map(|old| crate::types::billed_item_size(old, &vector_defs)),
         Some(item_size),
         gsi_units,
         lsi_units,
@@ -1392,6 +2973,7 @@ async fn execute_update<S: StorageBackend>(
     returning: Option<ReturningVariant>,
     capacity_mode: Option<&str>,
     resolved: Option<&ResolvedTable>,
+    old_on_condition_failure: bool,
 ) -> Result<(Option<Item>, WriteCapacity)> {
     // Resolved by the caller when a preparation pass already did it, which is
     // what stops a batch reading the same table's metadata and parsing the same
@@ -1408,14 +2990,28 @@ async fn execute_update<S: StorageBackend>(
     let key_schema = &resolved.key_schema;
 
     // WHERE clause is required for UPDATE to identify the item
-    let wc = where_clause.ok_or_else(|| {
-        DynoxideError::ValidationException("UPDATE requires a WHERE clause".to_string())
-    })?;
+    let wc = where_clause.ok_or_else(mandatory_key_equality)?;
 
-    // An UPDATE addresses one item, so the clause has to name one. Judged on the
-    // flattened groups rather than on the syntax, which was wrong both ways
-    // round: see `single_item_key`.
-    let (pk_str, sk_str) = single_item_key("UPDATE", wc, key_schema, parameters)?;
+    // An UPDATE addresses one item, named by the clause's top-level key
+    // equalities: see `single_item_key`.
+    let (pk_str, sk_str) = single_item_key(wc, key_schema, parameters)?;
+
+    // A key attribute can't be set or removed: the item would be stored under
+    // its old key with another key value in it. Refused in UpdateItem's words
+    // before the item is read, so a missing item or a false condition makes no
+    // difference (captured eu-west-2 and us-east-1, 10 October 2026).
+    let paths = set_clauses
+        .iter()
+        .map(|clause| clause.path.as_str())
+        .chain(remove_paths.iter().map(String::as_str));
+    for path in paths {
+        let key = std::iter::once(key_schema.partition_key.as_str())
+            .chain(key_schema.sort_key.as_deref())
+            .find(|key| names_attribute(path, key));
+        if let Some(key) = key {
+            return Err(crate::actions::helpers::key_attribute_update_refusal(key));
+        }
+    }
 
     // Get existing item
     let existing_json = storage.get_item(table_name, &pk_str, &sk_str).await?;
@@ -1429,11 +3025,18 @@ async fn execute_update<S: StorageBackend>(
     // PartiQL UPDATE is not an upsert: the target item must already exist, so a
     // missing item fails ConditionalCheckFailedException and creates nothing.
     // Non-key WHERE predicates act as a further condition on the existing item;
-    // if that predicate is false the update fails the same way. Neither writes.
-    if existing_json.is_none() || !matches_where(&old_item, where_clause, parameters) {
+    // if that predicate is false the update fails the same way, carrying the
+    // item when it was asked for. Neither writes.
+    if existing_json.is_none() {
         return Err(DynoxideError::ConditionalCheckFailedException(
             "The conditional request failed".to_string(),
             None,
+        ));
+    }
+    if !matches_where(&old_item, where_clause, parameters) {
+        return Err(DynoxideError::ConditionalCheckFailedException(
+            "The conditional request failed".to_string(),
+            old_on_condition_failure.then_some(old_item),
         ));
     }
 
@@ -1441,8 +3044,10 @@ async fn execute_update<S: StorageBackend>(
 
     // Apply SET clauses with nested path support
     for clause in set_clauses {
-        let val = resolve_set_value(&clause.value, &item, parameters)?;
-        set_nested_value(&mut item, &clause.path, val)?;
+        match resolve_set_value(&clause.value, &item, parameters)? {
+            Some(val) => set_nested_value(&mut item, &clause.path, val)?,
+            None => remove_nested_value(&mut item, &clause.path),
+        }
     }
 
     // Apply REMOVE clauses
@@ -1459,6 +3064,7 @@ async fn execute_update<S: StorageBackend>(
     }
 
     // Validate attribute values after SET clauses applied
+    reject_item_nested_to_the_limit(&item)?;
     crate::validation::validate_item_attribute_values(&item)?;
     crate::validation::normalize_item_sets(&mut item);
 
@@ -1467,18 +3073,20 @@ async fn execute_update<S: StorageBackend>(
 
     let item_json = serde_json::to_string(&item)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-    let item_size = crate::types::item_size(&item);
 
     // A PartiQL UPDATE is measured flat against the resulting item, the same as
-    // an INSERT, and unlike the standalone UpdateItem, which takes the key
-    // attributes out and charges per action. Captured against eu-west-2: an
-    // update this surface accepts at 409,600 is refused by UpdateItem at the
-    // same key. Only the wording is shared with UpdateItem.
-    if item_size > crate::types::MAX_ITEM_SIZE {
+    // an INSERT, and unlike the standalone UpdateItem, which is also charged for
+    // what its request carries. Captured against eu-west-2: an update this
+    // surface accepts at 409,600 is refused by UpdateItem at the same key. Only
+    // the wording is shared with UpdateItem.
+    if crate::types::item_size(&item) > crate::types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
             "Item size to update has exceeded the maximum allowed size".to_string(),
         ));
     }
+    // What the row records and the write is charged: the billed size.
+    let vector_defs = crate::actions::vector_index::parse_vector_defs(meta)?;
+    let item_size = crate::types::billed_item_size(&item, &vector_defs);
 
     let hash_prefix = item
         .get(&key_schema.partition_key)
@@ -1541,7 +3149,7 @@ async fn execute_update<S: StorageBackend>(
         projection,
         WriteCapacity::new(
             table_name,
-            old_ref.map(crate::types::item_size),
+            old_ref.map(|old| crate::types::billed_item_size(old, &vector_defs)),
             Some(item_size),
             gsi_units,
             lsi_units,
@@ -1670,6 +3278,7 @@ async fn execute_delete<S: StorageBackend>(
     parameters: &[AttributeValue],
     capacity_mode: Option<&str>,
     resolved: Option<&ResolvedTable>,
+    old_on_condition_failure: bool,
 ) -> Result<(Option<Item>, WriteCapacity)> {
     // Resolved by the caller when a preparation pass already did it, which is
     // what stops a batch reading the same table's metadata and parsing the same
@@ -1685,15 +3294,12 @@ async fn execute_delete<S: StorageBackend>(
     let meta = &resolved.meta;
     let key_schema = &resolved.key_schema;
 
-    let wc = where_clause.ok_or_else(|| {
-        DynoxideError::ValidationException("DELETE requires a WHERE clause".to_string())
-    })?;
+    let wc = where_clause.ok_or_else(mandatory_key_equality)?;
 
-    // A DELETE addresses one item, so the clause has to name one, including the
-    // sort key where the table has one. Judged on the flattened groups rather
-    // than on the syntax, which was wrong both ways round: see
+    // A DELETE addresses one item, named by the clause's top-level key
+    // equalities, the sort key included where the table has one: see
     // `single_item_key`.
-    let (pk_str, sk_str) = single_item_key("DELETE", wc, key_schema, parameters)?;
+    let (pk_str, sk_str) = single_item_key(wc, key_schema, parameters)?;
 
     // Non-key WHERE predicates act as a condition on the existing item, like a
     // conditional write. AWS raises ConditionalCheckFailedException when the item
@@ -1707,7 +3313,7 @@ async fn execute_delete<S: StorageBackend>(
         if !matches_where(&existing, where_clause, parameters) {
             return Err(DynoxideError::ConditionalCheckFailedException(
                 "The conditional request failed".to_string(),
-                None,
+                old_on_condition_failure.then_some(existing),
             ));
         }
     }
@@ -1741,9 +3347,17 @@ async fn execute_delete<S: StorageBackend>(
 
     // A delete is charged on the item it removed, so a no-op delete against a
     // missing target carries no image and falls back to the one-unit minimum.
-    let capacity =
-        WriteCapacity::from_items(table_name, old_item.as_ref(), None, gsi_units, lsi_units)
-            .with_vector_bytes(vector_bytes);
+    let vector_defs = crate::actions::vector_index::parse_vector_defs(meta)?;
+    let capacity = WriteCapacity::new(
+        table_name,
+        old_item
+            .as_ref()
+            .map(|old| crate::types::billed_item_size(old, &vector_defs)),
+        None,
+        gsi_units,
+        lsi_units,
+    )
+    .with_vector_bytes(vector_bytes);
     Ok((old_item, capacity))
 }
 
@@ -1751,113 +3365,134 @@ async fn execute_delete<S: StorageBackend>(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The table a statement names, or DynamoDB's PartiQL answer when there is
+/// none: `Requested resource not found`, with nothing after it, on every
+/// statement kind (captured eu-west-2 and us-east-1, 2026-10-09).
 async fn require_table<S: StorageBackend>(
     storage: &S,
     table_name: &str,
 ) -> Result<crate::storage::TableMetadata> {
-    crate::actions::helpers::require_table(storage, table_name).await
+    crate::actions::helpers::require_table_for_item_op(storage, table_name).await
 }
 
-/// Find a comparison condition matching a given path with Eq operator,
-/// searching across all OR groups.
 /// The single item a write's WHERE clause addresses, as `(pk, sk)` key strings,
 /// or the rejection to give the author.
 ///
-/// UPDATE and DELETE address exactly one item, so their WHERE clause has to name
-/// exactly one. Judging that on what the author wrote is wrong in both
-/// directions once De Morgan is involved. `NOT (NOT pk='a' AND NOT pk='b')`
-/// contains no `OR` and names two items, and it used to be accepted and then
-/// silently write only one of them. `pk='a' AND NOT (v='x' OR v='y')` contains
-/// an `OR` and names one item, and it used to be refused. So the judgement is
-/// made on the flattened clause: every group has to pin the same partition key
-/// equality, and the same sort key equality where the table has one.
-///
-/// `wrote_or` survives only to choose the wording, so an author who wrote an
-/// `OR` still hears about their `OR` rather than about a flattening they never
-/// asked for.
+/// UPDATE and DELETE address exactly one item, and DynamoDB takes it from the
+/// equalities among the clause's top-level conditions, the ones joined to the
+/// rest by `AND` alone. A key named only under an `OR`, a `NOT` or an `IN` is
+/// not pinned, even when every branch names the same item: `pk = 'a' OR pk =
+/// 'a'` and `NOT (NOT pk = 'a')` are both refused, while `pk = 'a' AND (b = 1
+/// OR c = 2)` runs with the `OR` as a condition. A key given two different
+/// values is refused on its own terms (captured eu-west-2 and us-east-1,
+/// 2026-10-09).
 fn single_item_key(
-    verb: &str,
     wc: &WhereClause,
     key_schema: &crate::actions::helpers::KeySchema,
     parameters: &[AttributeValue],
 ) -> Result<(String, String)> {
-    // A clause that never expanded can only fail by leaving a key unpinned, and
-    // that is the message AWS gives for it.
-    let unpinned = || {
-        DynoxideError::ValidationException(
-            "Where clause does not contain a mandatory equality on all key attributes".to_string(),
-        )
-    };
-    let expands = || {
-        DynoxideError::ValidationException(if wc.wrote_or {
-            format!("{verb} does not support OR conditions in WHERE clause")
-        } else {
-            format!("{verb} requires a WHERE clause that identifies a single item")
-        })
-    };
-    // More than one group means the clause is a disjunction, however it was
-    // spelled, so a group that fails is a second item rather than a typo.
-    let refusal = || {
-        if wc.groups.len() > 1 {
-            expands()
-        } else {
-            unpinned()
-        }
-    };
-
-    let mut pinned: Option<(String, String)> = None;
-    for group in &wc.groups {
-        let pk_cond = find_comparison(group, &key_schema.partition_key).ok_or_else(refusal)?;
-        let pk = resolve_value(&pk_cond.value, parameters)?
-            .to_key_string()
-            .ok_or_else(|| DynoxideError::ValidationException("Invalid key value".to_string()))?;
-        let sk = match key_schema.sort_key {
-            Some(ref sk_name) => {
-                let sk_cond = find_comparison(group, sk_name).ok_or_else(refusal)?;
-                resolve_value(&sk_cond.value, parameters)?
-                    .to_key_string()
-                    .unwrap_or_default()
-            }
-            None => String::new(),
-        };
-        let key = (pk, sk);
-        match pinned {
-            // Every group has to name the same item, or the statement addresses
-            // more than one and cannot run as a single write.
-            Some(ref already) => {
-                if *already != key {
-                    return Err(expands());
+    let pinned =
+        |name: &str, declared: Option<&ScalarAttributeType>| -> Result<(String, AttributeValue)> {
+            let mut key: Option<(String, AttributeValue)> = None;
+            for cond in wc
+                .top_level_equalities
+                .iter()
+                .filter(|c| names_attribute(&c.path, name))
+            {
+                let resolved = resolve_value(&cond.value, parameters)?;
+                let value = typed_key(&resolved, name, declared)?;
+                match key {
+                    Some((ref already, _)) if *already != value => {
+                        return Err(DynoxideError::ValidationException(format!(
+                            "Multiple conditions on same key {name}. Only single item \
+                         Update/Insert/Delete are supported"
+                        )));
+                    }
+                    _ => key = Some((value, resolved)),
                 }
             }
-            None => pinned = Some(key),
-        }
+            key.ok_or_else(mandatory_key_equality)
+        };
+    let (pk, pk_value) = pinned(
+        &key_schema.partition_key,
+        Some(&key_schema.partition_key_type),
+    )?;
+    let sk = match key_schema.sort_key {
+        Some(ref sk_name) => Some(pinned(sk_name, key_schema.sort_key_type.as_ref())?),
+        None => None,
+    };
+    // A key too large to be one is refused once the whole key is pinned, the
+    // partition key first (captured eu-west-2 and us-east-1, 2026-10-10: a
+    // missing sort key equality is reported ahead of either).
+    if let Some(refusal) = crate::actions::helpers::key_size_refusal(&pk_value, false) {
+        return Err(refusal);
     }
-    pinned.ok_or_else(unpinned)
+    let sk = match sk {
+        Some((sk, sk_value)) => {
+            if let Some(refusal) = crate::actions::helpers::key_size_refusal(&sk_value, true) {
+                return Err(refusal);
+            }
+            sk
+        }
+        None => String::new(),
+    };
+    Ok((pk, sk))
 }
 
-fn find_comparison_in_groups<'a>(
-    groups: &'a [Vec<WhereCondition>],
+/// DynamoDB's refusal of an UPDATE or DELETE that doesn't pin its key with
+/// top-level equalities, a missing WHERE clause included.
+fn mandatory_key_equality() -> DynoxideError {
+    DynoxideError::ValidationException(
+        "Where clause does not contain a mandatory equality on all key attributes".to_string(),
+    )
+}
+
+/// Find the value a key attribute is pinned to by an `=` or an IN with one
+/// value, searching across all OR groups.
+fn find_key_value_in_groups<'a>(
+    groups: &'a [Vec<Arc<WhereCondition>>],
     path: &str,
-) -> Option<&'a crate::partiql::parser::Condition> {
-    for group in groups {
-        if let Some(cond) = find_comparison(group, path) {
-            return Some(cond);
-        }
-    }
-    None
+) -> Option<&'a PartiqlValue> {
+    groups.iter().find_map(|group| {
+        group.iter().find_map(|c| match &**c {
+            WhereCondition::Comparison(cond)
+                if names_attribute(&cond.path, path) && cond.op == CompOp::Eq =>
+            {
+                Some(&cond.value)
+            }
+            WhereCondition::In(p, values) if names_attribute(p, path) && values.len() == 1 => {
+                Some(&values[0])
+            }
+            _ => None,
+        })
+    })
 }
 
 /// Find a comparison condition matching a given path with Eq operator.
 fn find_comparison<'a>(
-    conditions: &'a [WhereCondition],
+    conditions: &'a [Arc<WhereCondition>],
     path: &str,
 ) -> Option<&'a crate::partiql::parser::Condition> {
-    conditions.iter().find_map(|c| match c {
-        WhereCondition::Comparison(cond) if cond.path == path && cond.op == CompOp::Eq => {
+    conditions.iter().find_map(|c| match &**c {
+        WhereCondition::Comparison(cond)
+            if names_attribute(&cond.path, path) && cond.op == CompOp::Eq =>
+        {
             Some(cond)
         }
         _ => None,
     })
+}
+
+/// Whether `value` starts with `prefix`: a string by its characters, a binary
+/// value by its bytes. Values of different types never match, so a binary
+/// prefix doesn't match a string that spells the same bytes (captured
+/// eu-west-2 and us-east-1, 2026-10-09).
+fn begins_with(value: &AttributeValue, prefix: &AttributeValue) -> bool {
+    match (value, prefix) {
+        (AttributeValue::S(s), AttributeValue::S(p)) => s.starts_with(p.as_str()),
+        (AttributeValue::B(b), AttributeValue::B(p)) => b.starts_with(p),
+        _ => false,
+    }
 }
 
 /// Resolve a PartiqlValue to a concrete AttributeValue.
@@ -1873,13 +3508,120 @@ fn resolve_value(val: &PartiqlValue, parameters: &[AttributeValue]) -> Result<At
     }
 }
 
-/// Resolve a SetValue to a concrete AttributeValue, potentially using the current item.
+/// What a SET assignment leaves at its path: the value to write, or `None`
+/// for a `set_delete` that empties the set or never found one, which leaves
+/// the path absent.
 fn resolve_set_value(
+    val: &SetValue,
+    item: &Item,
+    parameters: &[AttributeValue],
+) -> Result<Option<AttributeValue>> {
+    if let SetValue::SetCall {
+        delete,
+        path,
+        members,
+        refusal_at,
+    } = val
+    {
+        return resolve_set_call(*delete, path, members, refusal_at, item, parameters);
+    }
+    resolve_set_operand(val, item, parameters).map(Some)
+}
+
+/// `set_add` or `set_delete` against the set stored at `path`.
+///
+/// A missing attribute takes the members on `set_add` and stays missing on
+/// `set_delete`, and removing every member removes the attribute. Members of
+/// another type than the stored set, or a stored value that isn't a set, are
+/// an operand of the wrong type; numbers are compared by value. The members
+/// themselves are checked as a parameter is, duplicates included (captured
+/// eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+fn resolve_set_call(
+    delete: bool,
+    path: &str,
+    members: &PartiqlValue,
+    refusal_at: &str,
+    item: &Item,
+    parameters: &[AttributeValue],
+) -> Result<Option<AttributeValue>> {
+    let name = if delete { "SET_DELETE" } else { "SET_ADD" };
+    let members = resolve_value(members, parameters)?;
+    if !matches!(
+        members,
+        AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_)
+    ) {
+        return Err(DynoxideError::ValidationException(format!(
+            "The second argument to {name} must be a value with type SET at {refusal_at}"
+        )));
+    }
+    crate::validation::validate_parameter_value(&members)?;
+    let wrong_type = || {
+        DynoxideError::ValidationException(
+            "An operand in the update expression has an incorrect data type".to_string(),
+        )
+    };
+    let result = match (resolve_nested_path(item, path), &members) {
+        (None, _) => return Ok((!delete).then_some(members)),
+        (Some(AttributeValue::SS(held)), AttributeValue::SS(change)) => {
+            AttributeValue::SS(combine_set_members(held, change, delete, String::clone))
+        }
+        (Some(AttributeValue::NS(held)), AttributeValue::NS(change)) => {
+            AttributeValue::NS(combine_set_members(held, change, delete, |n: &String| {
+                crate::types::normalize_dynamo_number(n)
+            }))
+        }
+        (Some(AttributeValue::BS(held)), AttributeValue::BS(change)) => {
+            AttributeValue::BS(combine_set_members(held, change, delete, Vec::clone))
+        }
+        _ => return Err(wrong_type()),
+    };
+    let empty = match &result {
+        AttributeValue::SS(m) | AttributeValue::NS(m) => m.is_empty(),
+        AttributeValue::BS(m) => m.is_empty(),
+        _ => false,
+    };
+    Ok((!empty).then_some(result))
+}
+
+/// `set_delete` takes the held members `change` names; `set_add` appends the
+/// members of `change` the set doesn't hold, in the order written. Members are
+/// matched by `key`, which for a number set is its normalised value. Each
+/// member's key is worked out once and looked up in a hash set, so the work
+/// grows with the sets' sizes rather than their product.
+fn combine_set_members<T: Clone, K: Eq + std::hash::Hash>(
+    held: &[T],
+    change: &[T],
+    delete: bool,
+    key: impl Fn(&T) -> K,
+) -> Vec<T> {
+    use std::collections::HashSet;
+    if delete {
+        let named: HashSet<K> = change.iter().map(&key).collect();
+        held.iter()
+            .filter(|m| !named.contains(&key(m)))
+            .cloned()
+            .collect()
+    } else {
+        let mut seen: HashSet<K> = held.iter().map(&key).collect();
+        let mut out = held.to_vec();
+        for m in change {
+            if seen.insert(key(m)) {
+                out.push(m.clone());
+            }
+        }
+        out
+    }
+}
+
+/// Resolve a SetValue other than a set call to a concrete AttributeValue,
+/// potentially using the current item.
+fn resolve_set_operand(
     val: &SetValue,
     item: &Item,
     parameters: &[AttributeValue],
 ) -> Result<AttributeValue> {
     match val {
+        SetValue::SetCall { .. } => unreachable!("resolve_set_value handles a set call"),
         SetValue::Simple(pv) => resolve_value(pv, parameters),
         SetValue::Add(attr, pv) => {
             let current = resolve_nested_path(item, attr);
@@ -2062,10 +3804,10 @@ fn remove_nested_value(item: &mut Item, path: &str) {
         return; // the top-level item cannot be indexed
     };
     if rest.is_empty() {
-        item.remove(*key);
+        item.remove(key.as_ref());
         return;
     }
-    if let Some(current) = item.get_mut(*key) {
+    if let Some(current) = item.get_mut(key.as_ref()) {
         remove_from_value(current, rest);
     }
 }
@@ -2078,7 +3820,7 @@ fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) {
         match seg {
             PathSegment::Key(k) => {
                 if let AttributeValue::M(map) = current {
-                    map.remove(*k);
+                    map.remove(k.as_ref());
                 }
             }
             PathSegment::Index(i) => {
@@ -2094,7 +3836,7 @@ fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) {
     match seg {
         PathSegment::Key(k) => {
             if let AttributeValue::M(map) = current
-                && let Some(next) = map.get_mut(*k)
+                && let Some(next) = map.get_mut(k.as_ref())
             {
                 remove_from_value(next, rest);
             }
@@ -2120,23 +3862,82 @@ fn matches_where(
         None => return true,
     };
 
+    // A placeholder with no parameter to fill it decides nothing: several
+    // conditions hold of an item that lacks the attribute (`<>` and the
+    // negated forms), and a statement short of its parameters mustn't read or
+    // delete an item on that account.
+    if wc
+        .groups
+        .iter()
+        .flatten()
+        .any(|condition| has_unbound_parameter(condition, parameters.len()))
+    {
+        return false;
+    }
+
     // OR semantics: any group matching is sufficient
     wc.groups
         .iter()
         .any(|group| matches_conditions(item, group, parameters))
 }
 
+/// Whether `condition` names a parameter at or past `bound`, the number
+/// supplied. Every variant is listed, so a new one has to say how it reads
+/// parameters.
+fn has_unbound_parameter(condition: &WhereCondition, bound: usize) -> bool {
+    fn value(v: &PartiqlValue, bound: usize) -> bool {
+        matches!(v, PartiqlValue::Parameter(i) if *i >= bound)
+    }
+    fn operand(o: &Operand, bound: usize) -> bool {
+        match o {
+            Operand::Path(_) => false,
+            Operand::Value(v) => value(v, bound),
+            Operand::Size(inner) => operand(inner, bound),
+            Operand::Condition(inner) => has_unbound_parameter(inner, bound),
+        }
+    }
+    match condition {
+        WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => value(&c.value, bound),
+        WhereCondition::Exists(_)
+        | WhereCondition::NotExists(_)
+        | WhereCondition::IsMissing(_)
+        | WhereCondition::IsNotMissing(_)
+        | WhereCondition::IsType(..)
+        | WhereCondition::IsNotType(..) => false,
+        WhereCondition::BeginsWith(_, v)
+        | WhereCondition::NotBeginsWith(_, v)
+        | WhereCondition::Contains(_, v)
+        | WhereCondition::NotContains(_, v) => value(v, bound),
+        WhereCondition::Between(_, low, high) | WhereCondition::NotBetween(_, low, high) => {
+            value(low, bound) || value(high, bound)
+        }
+        WhereCondition::In(_, values) => values.iter().any(|v| value(v, bound)),
+        WhereCondition::Compare(left, _, right) => operand(left, bound) || operand(right, bound),
+        WhereCondition::CompareBetween(o, low, high) => {
+            operand(o, bound) || operand(low, bound) || operand(high, bound)
+        }
+        WhereCondition::CompareIn(o, list) => {
+            operand(o, bound) || list.iter().any(|m| operand(m, bound))
+        }
+        WhereCondition::AttributeType(o, kind) => operand(o, bound) || value(kind, bound),
+        WhereCondition::Not(inner) => has_unbound_parameter(inner, bound),
+    }
+}
+
 /// Check if an item matches all conditions in a group (AND semantics).
-fn matches_conditions(
+fn matches_conditions<C: std::borrow::Borrow<WhereCondition>>(
     item: &Item,
-    conditions: &[WhereCondition],
+    conditions: &[C],
     parameters: &[AttributeValue],
 ) -> bool {
     for cond in conditions {
-        match cond {
+        match cond.borrow() {
             WhereCondition::Comparison(c) => {
+                // A missing attribute is unequal to anything, and neither less
+                // nor greater (captured eu-west-2 and us-east-1, 2026-10-09).
                 let item_val = match resolve_nested_path(item, &c.path) {
                     Some(v) => v,
+                    None if c.op == CompOp::Ne => continue,
                     None => return false,
                 };
                 let target = match resolve_value(&c.value, parameters) {
@@ -2160,6 +3961,8 @@ fn matches_conditions(
                     if compare_values(item_val, &c.op, &target) {
                         return false;
                     }
+                } else if c.op == CompOp::Ne {
+                    return false;
                 }
             }
             WhereCondition::Exists(path) | WhereCondition::IsNotMissing(path) => {
@@ -2172,6 +3975,16 @@ fn matches_conditions(
                     return false;
                 }
             }
+            WhereCondition::IsType(path, test) => {
+                if !resolve_nested_path(item, path).is_some_and(|v| test.matches(v)) {
+                    return false;
+                }
+            }
+            WhereCondition::IsNotType(path, test) => {
+                if resolve_nested_path(item, path).is_some_and(|v| test.matches(v)) {
+                    return false;
+                }
+            }
             WhereCondition::BeginsWith(path, prefix_val) => {
                 let item_val = match resolve_nested_path(item, path) {
                     Some(v) => v,
@@ -2181,28 +3994,21 @@ fn matches_conditions(
                     Ok(v) => v,
                     Err(_) => return false,
                 };
-                match (item_val, &prefix) {
-                    (AttributeValue::S(s), AttributeValue::S(p)) => {
-                        if !s.starts_with(p.as_str()) {
-                            return false;
-                        }
-                    }
-                    _ => return false,
+                if !begins_with(item_val, &prefix) {
+                    return false;
                 }
             }
             WhereCondition::NotBeginsWith(path, prefix_val) => {
                 // Logical negation of begins_with: the row matches unless the
-                // value is a string that starts with the prefix. A missing or
-                // non-string attribute does not begin with the prefix, so it is
-                // kept.
+                // value starts with the prefix. A missing attribute, or one of
+                // another type than the prefix, does not begin with it, so it
+                // is kept.
                 if let Some(item_val) = resolve_nested_path(item, path) {
                     let prefix = match resolve_value(prefix_val, parameters) {
                         Ok(v) => v,
                         Err(_) => return false,
                     };
-                    if let (AttributeValue::S(s), AttributeValue::S(p)) = (item_val, &prefix)
-                        && s.starts_with(p.as_str())
-                    {
+                    if begins_with(item_val, &prefix) {
                         return false;
                     }
                 }
@@ -2224,6 +4030,23 @@ fn matches_conditions(
                     || !compare_values(item_val, &CompOp::Le, &high_val)
                 {
                     return false;
+                }
+            }
+            WhereCondition::NotBetween(path, low, high) => {
+                // A row without the attribute matches, as for `NOT` of a
+                // comparison.
+                if let Some(item_val) = resolve_nested_path(item, path) {
+                    let (Ok(low_val), Ok(high_val)) = (
+                        resolve_value(low, parameters),
+                        resolve_value(high, parameters),
+                    ) else {
+                        return false;
+                    };
+                    if compare_values(item_val, &CompOp::Ge, &low_val)
+                        && compare_values(item_val, &CompOp::Le, &high_val)
+                    {
+                        return false;
+                    }
                 }
             }
             WhereCondition::In(path, values) => {
@@ -2250,10 +4073,90 @@ fn matches_conditions(
                     return false;
                 }
             }
+            WhereCondition::Not(inner) => {
+                if matches_conditions(item, std::slice::from_ref(inner), parameters) {
+                    return false;
+                }
+            }
+            other => {
+                if !operand_condition_holds(item, other, parameters) {
+                    return false;
+                }
+            }
         }
     }
 
     true
+}
+
+/// Whether a condition on operands other than a path and a value holds. A
+/// missing value, or the size of one that has none, makes `=`, the ordering
+/// operators, BETWEEN and IN false and `<>` true (captured eu-west-2 and
+/// us-east-1, 2026-10-09).
+fn operand_condition_holds(
+    item: &Item,
+    condition: &WhereCondition,
+    parameters: &[AttributeValue],
+) -> bool {
+    let value = |operand: &Operand| operand_value(item, operand, parameters);
+    match condition {
+        WhereCondition::Compare(left, op, right) => match (value(left), value(right)) {
+            (Some(left), Some(right)) => compare_values(&left, op, &right),
+            _ => *op == CompOp::Ne,
+        },
+        WhereCondition::CompareBetween(operand, low, high) => {
+            match (value(operand), value(low), value(high)) {
+                (Some(v), Some(low), Some(high)) => {
+                    compare_values(&v, &CompOp::Ge, &low) && compare_values(&v, &CompOp::Le, &high)
+                }
+                _ => false,
+            }
+        }
+        WhereCondition::CompareIn(operand, list) => value(operand).is_some_and(|v| {
+            list.iter()
+                .any(|member| value(member).is_some_and(|m| compare_values(&v, &CompOp::Eq, &m)))
+        }),
+        WhereCondition::AttributeType(operand, kind) => {
+            match (value(operand), resolve_value(kind, parameters)) {
+                (Some(v), Ok(AttributeValue::S(kind))) => v.type_name() == kind,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// An operand's value for an item, or `None` when it has none: a missing path,
+/// or the size of a value that has no size. A string's size is its length in
+/// UTF-16 code units, as Java counts it (captured eu-west-2 and us-east-1,
+/// 2026-10-09: `héllo` is 5 and an emoji 2).
+fn operand_value(
+    item: &Item,
+    operand: &Operand,
+    parameters: &[AttributeValue],
+) -> Option<AttributeValue> {
+    match operand {
+        Operand::Path(path) => resolve_nested_path(item, path).cloned(),
+        Operand::Value(value) => resolve_value(value, parameters).ok(),
+        Operand::Condition(condition) => Some(AttributeValue::BOOL(matches_conditions(
+            item,
+            std::slice::from_ref(condition.as_ref()),
+            parameters,
+        ))),
+        Operand::Size(inner) => {
+            let size = match operand_value(item, inner, parameters)? {
+                AttributeValue::S(s) => s.encode_utf16().count(),
+                AttributeValue::B(b) => b.len(),
+                AttributeValue::SS(set) => set.len(),
+                AttributeValue::NS(set) => set.len(),
+                AttributeValue::BS(set) => set.len(),
+                AttributeValue::L(list) => list.len(),
+                AttributeValue::M(map) => map.len(),
+                _ => return None,
+            };
+            Some(AttributeValue::N(size.to_string()))
+        }
+    }
 }
 
 /// Whether `path` holds a value containing `substr_val`: a substring of a
@@ -2287,8 +4190,9 @@ fn contains_value(
 ///
 /// Supports paths like `"a"`, `"a.b.c"`, and `"a[0].b"`.
 fn resolve_nested_path<'a>(item: &'a Item, path: &str) -> Option<&'a AttributeValue> {
-    // Fast path: no dots or brackets means a simple top-level lookup
-    if !path.contains('.') && !path.contains('[') {
+    // Fast path: no dots, brackets or quoted name means a simple top-level
+    // lookup.
+    if !path.contains(['.', '[']) && !path.starts_with('"') {
         return item.get(path);
     }
 
@@ -2299,14 +4203,14 @@ fn resolve_nested_path<'a>(item: &'a Item, path: &str) -> Option<&'a AttributeVa
 
     // First segment must be a map key on the top-level item
     let mut current = match &segments[0] {
-        PathSegment::Key(k) => item.get(*k)?,
+        PathSegment::Key(k) => item.get(k.as_ref())?,
         PathSegment::Index(_) => return None,
     };
 
     for seg in &segments[1..] {
         current = match seg {
             PathSegment::Key(k) => match current {
-                AttributeValue::M(map) => map.get(*k)?,
+                AttributeValue::M(map) => map.get(k.as_ref())?,
                 _ => return None,
             },
             PathSegment::Index(idx) => match current {
@@ -2319,62 +4223,6 @@ fn resolve_nested_path<'a>(item: &'a Item, path: &str) -> Option<&'a AttributeVa
     Some(current)
 }
 
-enum PathSegment<'a> {
-    Key(&'a str),
-    Index(usize),
-}
-
-/// Split a path like `"a.b[0].c"` into segments.
-/// Returns None if the path contains malformed bracket expressions (e.g. `a[xyz]`).
-fn split_path_segments(path: &str) -> Option<Vec<PathSegment<'_>>> {
-    let mut segments = Vec::new();
-    let bytes = path.as_bytes();
-    let mut start = 0;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'.' => {
-                if start < i {
-                    segments.push(PathSegment::Key(&path[start..i]));
-                }
-                i += 1;
-                start = i;
-            }
-            b'[' => {
-                if start < i {
-                    segments.push(PathSegment::Key(&path[start..i]));
-                }
-                i += 1;
-                let idx_start = i;
-                while i < bytes.len() && bytes[i] != b']' {
-                    i += 1;
-                }
-                let idx = path[idx_start..i].parse::<usize>().ok()?;
-                segments.push(PathSegment::Index(idx));
-                if i < bytes.len() {
-                    i += 1; // skip ']'
-                }
-                start = i;
-                // Skip a trailing dot after ']' (e.g. `a[0].b`)
-                if i < bytes.len() && bytes[i] == b'.' {
-                    i += 1;
-                    start = i;
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    if start < bytes.len() {
-        segments.push(PathSegment::Key(&path[start..]));
-    }
-
-    Some(segments)
-}
-
 /// Format a BigDecimal number, stripping unnecessary trailing zeros.
 fn format_bigdecimal(n: &bigdecimal::BigDecimal) -> String {
     let normalized = n.normalized();
@@ -2382,5 +4230,133 @@ fn format_bigdecimal(n: &bigdecimal::BigDecimal) -> String {
         normalized.with_scale(0).to_string()
     } else {
         normalized.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::partiql::parser::parse;
+
+    /// `set_add` appends the members it doesn't hold, in the order written,
+    /// once each; `set_delete` keeps the held members it doesn't name. A
+    /// number set matches by value. Each member's key is worked out once, so a
+    /// large set costs in proportion to its size rather than its square.
+    #[test]
+    fn set_members_combine_once_per_member() {
+        let s = |v: &[&str]| v.iter().map(|m| m.to_string()).collect::<Vec<_>>();
+        let held = s(&["a", "b", "c"]);
+        assert_eq!(
+            combine_set_members(&held, &s(&["c", "d", "d", "e"]), false, String::clone),
+            s(&["a", "b", "c", "d", "e"])
+        );
+        assert_eq!(
+            combine_set_members(&held, &s(&["c", "a", "z"]), true, String::clone),
+            s(&["b"])
+        );
+        let numbers = s(&["1", "2.0", "30"]);
+        let by_value = |n: &String| crate::types::normalize_dynamo_number(n);
+        assert_eq!(
+            combine_set_members(&numbers, &s(&["2", "3e1", "4"]), false, by_value),
+            s(&["1", "2.0", "30", "4"])
+        );
+        assert_eq!(
+            combine_set_members(&numbers, &s(&["1.00", "30"]), true, by_value),
+            s(&["2.0"])
+        );
+
+        let held: Vec<String> = (0..2_000).map(|i| format!("h{i}")).collect();
+        let change: Vec<String> = (0..2_000).map(|i| format!("c{i}")).collect();
+        for delete in [false, true] {
+            let calls = std::cell::Cell::new(0usize);
+            let counted = |m: &String| {
+                calls.set(calls.get() + 1);
+                m.clone()
+            };
+            combine_set_members(&held, &change, delete, counted);
+            assert_eq!(
+                calls.get(),
+                held.len() + change.len(),
+                "set_{} worked out {} keys for {} members",
+                if delete { "delete" } else { "add" },
+                calls.get(),
+                held.len() + change.len()
+            );
+        }
+    }
+
+    fn where_of(statement: &str) -> WhereClause {
+        match parse(statement).unwrap() {
+            Statement::Select {
+                where_clause: Some(wc),
+                ..
+            } => wc,
+            other => panic!("expected a SELECT with WHERE: {other:?}"),
+        }
+    }
+
+    /// The fingerprint gives the same answer for the same statement and
+    /// parameters, and tells apart any change to the text as written or to a
+    /// parameter, so a NextToken resumes only the read it was minted for.
+    #[test]
+    fn a_fingerprint_follows_the_text_as_written() {
+        let fingerprint = |statement: &str| statement_fingerprint(statement, &[]);
+        let a = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#;
+        let b = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 3)"#;
+        let c = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 AND b = 2)"#;
+        let spaced = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR  b = 2)"#;
+        let lower = r#"select * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#;
+        assert_eq!(fingerprint(a), fingerprint(a));
+        for other in [b, c, spaced, lower] {
+            assert_ne!(fingerprint(a), fingerprint(other), "{other}");
+        }
+
+        // Parameters count by value.
+        let with =
+            |p: &[AttributeValue]| statement_fingerprint(r#"SELECT * FROM "t" WHERE pk = ?"#, p);
+        let one = [AttributeValue::S("1".to_string())];
+        let two = [AttributeValue::S("2".to_string())];
+        assert_eq!(with(&one), with(&one));
+        assert_ne!(with(&one), with(&two));
+        assert_ne!(with(&one), with(&[]));
+    }
+
+    /// A placeholder with no parameter to fill it decides nothing, whatever
+    /// the condition: each of these would hold of the item if the missing
+    /// value were simply skipped (a `<>`, a negation, or an IN list whose
+    /// other member matches).
+    #[test]
+    fn a_condition_short_of_its_parameters_never_matches() {
+        let item: Item = [
+            ("pk".to_string(), AttributeValue::S("a".to_string())),
+            ("tag".to_string(), AttributeValue::S("x".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let matched: Vec<&str> = [
+            ("Comparison", "flag <> ?"),
+            ("NotComparison", "NOT flag = ?"),
+            ("In", "tag IN [?, 'x']"),
+            ("Compare", "size(tag) <> ?"),
+            ("Compare, parameter first", "? <> size(tag)"),
+        ]
+        .into_iter()
+        .filter(|(_, clause)| {
+            let wc = where_of(&format!(r#"SELECT * FROM "t" WHERE {clause}"#));
+            matches_where(&item, Some(&wc), &[])
+        })
+        .map(|(kind, _)| kind)
+        .collect();
+        assert!(
+            matched.is_empty(),
+            "matched with no parameters: {matched:?}"
+        );
+        // The same conditions with their parameter supplied are evaluated.
+        let wc = where_of(r#"SELECT * FROM "t" WHERE tag IN [?, 'x']"#);
+        assert!(matches_where(
+            &item,
+            Some(&wc),
+            &[AttributeValue::S("y".to_string())]
+        ));
     }
 }

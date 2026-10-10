@@ -3,9 +3,7 @@
 //! Supports SET, REMOVE, ADD, DELETE clauses.
 
 use crate::expressions::condition::parse_raw_path;
-use crate::expressions::tokenizer::{
-    Token, TokenStream, near_window_parser, near_window_tokenizer, tokenize,
-};
+use crate::expressions::tokenizer::{Token, TokenStream, tokenize, tokenizer_syntax_error};
 use crate::expressions::{
     PathElement, TrackedExpressionAttributes, format_path_for_error, remove_path, resolve_path,
     resolve_path_elements, set_path,
@@ -66,30 +64,139 @@ pub struct DeleteAction {
 }
 
 impl UpdateExpr {
-    /// Bytes DynamoDB adds on top of the resulting item when it measures an
-    /// update against the 400KB limit.
+    /// What DynamoDB charges a standalone `UpdateItem` for this statement when
+    /// it holds the request to the 400KB limit.
     ///
-    /// An update is not sized the way a put is. DynamoDB leaves the key
-    /// attributes out of the figure and charges a fixed amount per action, so
-    /// the same finished item can be small enough to `PutItem` and too large to
-    /// reach by `UpdateItem`. Measured against eu-west-2 by bisecting the gate:
-    /// three bytes for the update itself, nineteen for each action that writes a
-    /// value, and two for each that clears one. The cost does not vary with the
-    /// value written, the attribute name, or the expression text.
+    /// The charge comes from the request alone. Nothing the table already
+    /// stores enters it: an attribute the statement leaves alone, the rest of a
+    /// map or list it writes into, the members a set already holds and the value
+    /// a path operand reads are all free. Each clause is charged for its target
+    /// path and for the operands it is written with, never for the value it
+    /// produces:
     ///
-    /// Two forms cost more than this reports, both of which leave the engine
-    /// accepting a little more than DynamoDB rather than less: assigning through
-    /// a list index costs one byte more, and an arithmetic assignment such as
-    /// `SET n = n + :one` costs fifty more.
-    pub fn size_overhead(&self) -> usize {
-        const UPDATE: usize = 3;
+    /// ```text
+    /// statement              3 + every clause
+    /// SET target = expr      19 + target + expr
+    /// ADD target :v          19 + target + size of :v
+    /// REMOVE target          1 + target
+    /// DELETE target :v       1 + target (the members removed are free)
+    ///
+    /// target                 first element, plus 4 + element for each later one
+    /// path operand           1, plus 14 + element for every element
+    /// element                UTF-8 bytes of the resolved name, or the digits
+    ///                        of a list index
+    ///
+    /// :v                     the value's size, at every use
+    /// a + b                  34 + a + b
+    /// a - b                  37 + a + b
+    /// if_not_exists(p, v)    39 + path operand p + v
+    /// list_append(a, b)      37 + a + b
+    /// ( x )                  x
+    /// ```
+    ///
+    /// Captured against eu-west-2 on 9 October 2026 by bisecting the update
+    /// gate across 86 statements, with every accepted item read back and the
+    /// next byte refused. The ConditionExpression and ReturnValues add nothing,
+    /// and a `#name` placeholder is charged at the length of the name it stands
+    /// for. Names and values must already be validated; one that does not
+    /// resolve is an error.
+    pub fn request_charge(&self, tracker: &TrackedExpressionAttributes) -> Result<usize, String> {
+        const STATEMENT: usize = 3;
         const WRITES_A_VALUE: usize = 19;
-        const CLEARS_A_VALUE: usize = 2;
+        const CLEARS: usize = 1;
 
-        UPDATE
-            + WRITES_A_VALUE * (self.set_actions.len() + self.add_actions.len())
-            + CLEARS_A_VALUE * (self.remove_actions.len() + self.delete_actions.len())
+        let mut charge = STATEMENT;
+        for action in &self.set_actions {
+            charge += WRITES_A_VALUE
+                + target_charge(&action.path, tracker)?
+                + set_value_charge(&action.value, tracker)?;
+        }
+        for action in &self.add_actions {
+            charge += WRITES_A_VALUE
+                + target_charge(&action.path, tracker)?
+                + tracker.resolve_value(&action.value_ref)?.size();
+        }
+        for path in &self.remove_actions {
+            charge += CLEARS + target_charge(path, tracker)?;
+        }
+        for action in &self.delete_actions {
+            charge += CLEARS + target_charge(&action.path, tracker)?;
+        }
+        Ok(charge)
     }
+}
+
+/// The length a path element counts for in the request charge.
+fn element_charge(
+    element: &PathElement,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<usize, String> {
+    Ok(match element {
+        PathElement::Attribute(name) if name.starts_with('#') => tracker.resolve_name(name)?.len(),
+        PathElement::Attribute(name) => name.len(),
+        PathElement::Index(index) => index.to_string().len(),
+    })
+}
+
+/// A path the statement writes to: its first element, then four bytes plus
+/// the element for each step after it.
+fn target_charge(
+    path: &[PathElement],
+    tracker: &TrackedExpressionAttributes,
+) -> Result<usize, String> {
+    const STEP: usize = 4;
+    let mut charge = 0;
+    for (i, element) in path.iter().enumerate() {
+        charge += element_charge(element, tracker)? + if i == 0 { 0 } else { STEP };
+    }
+    Ok(charge)
+}
+
+/// A path the statement reads from. Charged for the path alone; the value it
+/// reads is free.
+fn path_operand_charge(
+    path: &[PathElement],
+    tracker: &TrackedExpressionAttributes,
+) -> Result<usize, String> {
+    const OPERAND: usize = 1;
+    const STEP: usize = 14;
+    let mut charge = OPERAND;
+    for element in path {
+        charge += STEP + element_charge(element, tracker)?;
+    }
+    Ok(charge)
+}
+
+fn set_value_charge(
+    value: &SetValue,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<usize, String> {
+    const PLUS: usize = 34;
+    const MINUS: usize = 37;
+    Ok(match value {
+        SetValue::Operand(operand) => operand_charge(operand, tracker)?,
+        SetValue::Plus(a, b) => PLUS + operand_charge(a, tracker)? + operand_charge(b, tracker)?,
+        SetValue::Minus(a, b) => MINUS + operand_charge(a, tracker)? + operand_charge(b, tracker)?,
+    })
+}
+
+fn operand_charge(
+    operand: &SetOperand,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<usize, String> {
+    const IF_NOT_EXISTS: usize = 39;
+    const LIST_APPEND: usize = 37;
+    Ok(match operand {
+        SetOperand::Path(path) => path_operand_charge(path, tracker)?,
+        SetOperand::ValueRef(name) => tracker.resolve_value(name)?.size(),
+        SetOperand::IfNotExists(path, fallback) => {
+            IF_NOT_EXISTS + path_operand_charge(path, tracker)? + operand_charge(fallback, tracker)?
+        }
+        SetOperand::ListAppend(a, b) => {
+            LIST_APPEND + operand_charge(a, tracker)? + operand_charge(b, tracker)?
+        }
+        SetOperand::Group(inner) => set_value_charge(inner, tracker)?,
+    })
 }
 
 /// Parse an UpdateExpression string.
@@ -98,20 +205,24 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
     // DynamoDB returns "Invalid UpdateExpression: Expression size has exceeded
     // the maximum allowed size". Confirmed against real DynamoDB (eu-west-2).
     super::check_expression_size(expr).map_err(|e| format!("Invalid UpdateExpression: {e}"))?;
-    let tokens = match tokenize(expr) {
-        Ok(t) => t,
-        Err(err) => {
-            // Tokenizer-level syntax error (e.g. stray `!` mid-expression):
-            // emit the same shape as parser-level errors, with a tokenizer-style
-            // near: window (offending byte plus at most one more non-whitespace byte).
-            let bad = &expr[err.position..err.position + err.bad_len];
-            let near = near_window_tokenizer(expr, err.position);
-            return Err(format!(
-                r#"Invalid UpdateExpression: Syntax error; token: "{bad}", near: "{near}""#
-            ));
-        }
-    };
+    let tokens = tokenize(expr).map_err(|err| {
+        // A character the tokenizer can't read (e.g. a stray `!`) is reported
+        // in the same shape as a parser-level syntax error.
+        format!(
+            "Invalid UpdateExpression: {}",
+            tokenizer_syntax_error(expr, &err)
+        )
+    })?;
     let mut stream = TokenStream::new(tokens);
+    // Whitespace alone has no clause, and is refused at its end rather than
+    // read as an update that changes nothing (captured eu-west-2 and
+    // us-east-1, 2026-10-10). The caller refuses an empty string before this.
+    if stream.at_end() {
+        return Err(format!(
+            "Invalid UpdateExpression: {}",
+            stream.syntax_error(expr)
+        ));
+    }
 
     let mut set_actions = Vec::new();
     let mut remove_actions = Vec::new();
@@ -131,7 +242,8 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
                 }
                 seen_set = true;
                 stream.next();
-                parse_set_clause(&mut stream, &mut set_actions).map_err(wrap_syntax_error)?;
+                parse_set_clause(&mut stream, &mut set_actions)
+                    .map_err(|e| clause_error(expr, &stream, e))?;
             }
             Some(Token::Remove) => {
                 if seen_remove {
@@ -139,7 +251,8 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
                 }
                 seen_remove = true;
                 stream.next();
-                parse_remove_clause(&mut stream, &mut remove_actions).map_err(wrap_syntax_error)?;
+                parse_remove_clause(&mut stream, &mut remove_actions)
+                    .map_err(|e| clause_error(expr, &stream, e))?;
             }
             Some(Token::Add) => {
                 if seen_add {
@@ -147,7 +260,8 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
                 }
                 seen_add = true;
                 stream.next();
-                parse_add_clause(&mut stream, &mut add_actions).map_err(wrap_syntax_error)?;
+                parse_add_clause(&mut stream, &mut add_actions)
+                    .map_err(|e| clause_error(expr, &stream, e))?;
             }
             Some(Token::Delete) => {
                 if seen_delete {
@@ -155,21 +269,15 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
                 }
                 seen_delete = true;
                 stream.next();
-                parse_delete_clause(&mut stream, &mut delete_actions).map_err(wrap_syntax_error)?;
+                parse_delete_clause(&mut stream, &mut delete_actions)
+                    .map_err(|e| clause_error(expr, &stream, e))?;
             }
             Some(_) => {
-                // Unexpected leading token where SET/REMOVE/ADD/DELETE was required.
-                // Build the AWS-style "token: \"X\", near: \"X Y\"" window from the
-                // offending token's span and the next token's span (if any).
-                let offending_span = stream
-                    .peek_span()
-                    .expect("peek_span must yield when peek did");
-                let bad = &expr[offending_span.start..offending_span.end()];
-                stream.next();
-                let next_span = stream.peek_span();
-                let near = near_window_parser(expr, offending_span, next_span);
+                // A token where SET, REMOVE, ADD or DELETE was required, at the
+                // start or after a complete clause.
                 return Err(format!(
-                    r#"Invalid UpdateExpression: Syntax error; token: "{bad}", near: "{near}""#
+                    "Invalid UpdateExpression: {}",
+                    stream.syntax_error(expr)
                 ));
             }
             None => break,
@@ -182,6 +290,17 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
         add_actions,
         delete_actions,
     })
+}
+
+/// A clause parser's error as DynamoDB reports it. A grammar failure ("Expected
+/// ...") leaves the stream on the offending token and becomes the
+/// `token: ..., near: ...` form; anything else keeps its own wording.
+fn clause_error(expr: &str, stream: &TokenStream, err: String) -> String {
+    if err.starts_with("Expected ") {
+        format!("Invalid UpdateExpression: {}", stream.syntax_error(expr))
+    } else {
+        wrap_syntax_error(err)
+    }
 }
 
 /// Wrap a sub-parser error with the standard syntax error prefix,
@@ -204,31 +323,24 @@ pub fn track_references(
     expr: &UpdateExpr,
     tracker: &TrackedExpressionAttributes,
 ) -> Result<(), String> {
-    // Collect all target paths for overlap/conflict detection
-    let mut all_target_paths: Vec<Vec<PathElement>> = Vec::new();
-
     for action in &expr.set_actions {
         track_path_refs(&action.path, tracker)?;
         track_set_value_refs(&action.value, tracker)?;
-        all_target_paths.push(resolve_tracked_path(&action.path, tracker));
     }
     for path in &expr.remove_actions {
         track_path_refs(path, tracker)?;
-        all_target_paths.push(resolve_tracked_path(path, tracker));
     }
     for action in &expr.add_actions {
         track_path_refs(&action.path, tracker)?;
         let val = tracker.resolve_value(&action.value_ref)?;
         // Validate ADD operand type statically
         validate_add_type(val)?;
-        all_target_paths.push(resolve_tracked_path(&action.path, tracker));
     }
     for action in &expr.delete_actions {
         track_path_refs(&action.path, tracker)?;
         let val = tracker.resolve_value(&action.value_ref)?;
         // Validate DELETE operand type statically
         validate_delete_type(val)?;
-        all_target_paths.push(resolve_tracked_path(&action.path, tracker));
     }
 
     // Static type validation for SET value expressions
@@ -236,10 +348,26 @@ pub fn track_references(
         validate_set_value_types(&action.value, tracker)?;
     }
 
-    // Check for overlapping/conflicting paths
-    check_path_overlaps(&all_target_paths)?;
+    check_target_overlaps(expr, tracker)
+}
 
-    Ok(())
+/// Refuse an update whose target paths overlap or conflict, as DynamoDB does
+/// on UpdateItem and on a TransactWriteItems Update (captured eu-west-2 and
+/// us-east-1, 2026-10-09). Names resolve through `tracker`; no value is read.
+pub fn check_target_overlaps(
+    expr: &UpdateExpr,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<(), String> {
+    let paths: Vec<Vec<PathElement>> = expr
+        .set_actions
+        .iter()
+        .map(|action| &action.path)
+        .chain(&expr.remove_actions)
+        .chain(expr.add_actions.iter().map(|action| &action.path))
+        .chain(expr.delete_actions.iter().map(|action| &action.path))
+        .map(|path| resolve_tracked_path(path, tracker))
+        .collect();
+    check_path_overlaps(&paths)
 }
 
 /// Validate that an ADD operand has a compatible type.
@@ -390,7 +518,8 @@ fn resolve_tracked_path(
         .collect()
 }
 
-/// Check for overlapping or conflicting document paths.
+/// Check for overlapping or conflicting document paths, naming the two in the
+/// order they were written (captured eu-west-2 and us-east-1, 2026-10-09).
 ///
 /// Two paths overlap if one is a prefix of the other (e.g., `a.b` and `a.b.c`).
 /// Two paths conflict if they share elements but diverge in type at the same
@@ -418,13 +547,12 @@ fn check_path_overlaps(paths: &[Vec<PathElement>]) -> Result<(), String> {
 
             // If one path is a prefix of the other, they overlap
             if common == a.len() || common == b.len() {
-                let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
                 return Err(format!(
                     "Invalid UpdateExpression: Two document paths overlap with each other; \
                      must remove or rewrite one of these paths; \
                      path one: {}, path two: {}",
-                    format_path_for_error(longer),
-                    format_path_for_error(shorter)
+                    format_path_for_error(a),
+                    format_path_for_error(b)
                 ));
             }
 
@@ -507,10 +635,20 @@ pub fn apply(
     // reads see the original snapshot. (Overlapping target paths are rejected by
     // `check_path_overlaps`, so no SET can legitimately read another's output.)
     let snapshot = item.clone();
+    let mut writes = Vec::with_capacity(expr.set_actions.len());
     for action in &expr.set_actions {
         let resolved_path = resolve_path_elements(&action.path, tracker)?;
         let value = evaluate_set_value(&action.value, &snapshot, tracker)?;
-        set_path(item, &resolved_path, value)?;
+        writes.push((resolved_path, value));
+    }
+    // A SET past the end of a list appends, and two of them on the same list
+    // append in the order of their indexes rather than of their clauses
+    // (eu-west-2, 9 October 2026). Every value is already worked out from the
+    // snapshot and no two targets overlap, so writing in path order changes
+    // nothing else.
+    writes.sort_by(|(a, _), (b, _)| compare_paths(a, b));
+    for (path, value) in writes {
+        set_path(item, &path, value)?;
     }
 
     // Process REMOVE actions
@@ -538,6 +676,24 @@ pub fn apply(
     }
 
     Ok(())
+}
+
+/// Order two resolved paths element by element, with list indexes compared as
+/// numbers.
+fn compare_paths(a: &[PathElement], b: &[PathElement]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (x, y) in a.iter().zip(b) {
+        let order = match (x, y) {
+            (PathElement::Attribute(x), PathElement::Attribute(y)) => x.cmp(y),
+            (PathElement::Index(x), PathElement::Index(y)) => x.cmp(y),
+            (PathElement::Attribute(_), PathElement::Index(_)) => Ordering::Less,
+            (PathElement::Index(_), PathElement::Attribute(_)) => Ordering::Greater,
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -923,14 +1079,13 @@ fn parse_add_clause(stream: &mut TokenStream, actions: &mut Vec<AddAction>) -> R
 
 fn parse_add_action(stream: &mut TokenStream) -> Result<AddAction, String> {
     let path = parse_raw_path(stream)?;
-    match stream.next() {
-        Some(Token::ValueRef(name)) => Ok(AddAction {
-            path,
-            value_ref: name.clone(),
-        }),
-        Some(t) => Err(format!("Expected value reference in ADD, got {t}")),
-        None => Err("Expected value reference in ADD, got end of expression".to_string()),
-    }
+    let value_ref = match stream.peek() {
+        Some(Token::ValueRef(name)) => name.clone(),
+        Some(t) => return Err(format!("Expected value reference in ADD, got {t}")),
+        None => return Err("Expected value reference in ADD, got end of expression".to_string()),
+    };
+    stream.next();
+    Ok(AddAction { path, value_ref })
 }
 
 fn parse_delete_clause(
@@ -947,14 +1102,13 @@ fn parse_delete_clause(
 
 fn parse_delete_action(stream: &mut TokenStream) -> Result<DeleteAction, String> {
     let path = parse_raw_path(stream)?;
-    match stream.next() {
-        Some(Token::ValueRef(name)) => Ok(DeleteAction {
-            path,
-            value_ref: name.clone(),
-        }),
-        Some(t) => Err(format!("Expected value reference in DELETE, got {t}")),
-        None => Err("Expected value reference in DELETE, got end of expression".to_string()),
-    }
+    let value_ref = match stream.peek() {
+        Some(Token::ValueRef(name)) => name.clone(),
+        Some(t) => return Err(format!("Expected value reference in DELETE, got {t}")),
+        None => return Err("Expected value reference in DELETE, got end of expression".to_string()),
+    };
+    stream.next();
+    Ok(DeleteAction { path, value_ref })
 }
 
 /// Format a BigDecimal number, stripping unnecessary trailing zeros.
@@ -972,43 +1126,199 @@ fn format_number(n: &bigdecimal::BigDecimal) -> String {
 }
 
 #[cfg(test)]
-mod overhead_tests {
+mod charge_tests {
     use super::parse;
+    use crate::expressions::TrackedExpressionAttributes;
+    use crate::types::AttributeValue;
+    use std::collections::HashMap;
 
-    /// Ground truth measured against eu-west-2 by bisecting the update gate and
-    /// reading the accepted item back, so the figures are the true item sizes
-    /// rather than predicted ones. Each entry is the overhead DynamoDB added on
-    /// top of the resulting item once the key attributes were taken out.
-    #[test]
-    fn size_overhead_matches_dynamodb() {
-        let cases: &[(&str, usize)] = &[
-            ("SET b = :v", 22),
-            ("SET b = :v, c = :w", 41),
-            ("SET b = :v REMOVE r", 24),
-            ("SET b = :v DELETE t :d", 24),
-            ("SET b = :v ADD n :one", 41),
-            ("SET b = :v, m.f = :w", 41),
-            ("REMOVE r", 5),
-            ("REMOVE r, s", 7),
-        ];
-        for (expr, expected) in cases {
-            let parsed = parse(expr).unwrap_or_else(|e| panic!("parse {expr:?}: {e}"));
-            assert_eq!(parsed.size_overhead(), *expected, "overhead of {expr:?}");
-        }
+    fn s(len: usize) -> AttributeValue {
+        AttributeValue::S("x".repeat(len))
     }
 
-    /// The two forms the model knowingly under-charges. Both leave the engine
-    /// accepting a little more than DynamoDB, never less, which is the direction
-    /// to be wrong in. Asserted exactly rather than as a bound, so that dropping
-    /// the per-action charge altogether fails here instead of passing.
+    fn values() -> HashMap<String, AttributeValue> {
+        let list = |items: Vec<AttributeValue>| AttributeValue::L(items);
+        HashMap::from([
+            (":v1".to_string(), s(1)),
+            (":v10".to_string(), s(10)),
+            (":s100".to_string(), s(100)),
+            (":one".to_string(), AttributeValue::N("1".to_string())),
+            (
+                ":big".to_string(),
+                AttributeValue::N("12345678901234567890".to_string()),
+            ),
+            (":lst".to_string(), list(vec![s(10)])),
+            (":empty".to_string(), list(vec![])),
+            (":b100".to_string(), AttributeValue::B(vec![7; 100])),
+            (":true".to_string(), AttributeValue::BOOL(true)),
+            (":null".to_string(), AttributeValue::NULL(true)),
+            (
+                ":ns".to_string(),
+                AttributeValue::NS(vec!["1".to_string(), "22".to_string(), "333".to_string()]),
+            ),
+            (
+                ":bs".to_string(),
+                AttributeValue::BS(vec![vec![1; 100], vec![2; 50]]),
+            ),
+            (
+                ":map".to_string(),
+                AttributeValue::M(HashMap::from([("a".to_string(), s(100))])),
+            ),
+            (
+                ":mixed".to_string(),
+                list(vec![s(100), AttributeValue::N("5".to_string())]),
+            ),
+        ])
+    }
+
+    fn names() -> HashMap<String, String> {
+        HashMap::from([
+            ("#t".to_string(), "abcdefghij".to_string()),
+            ("#b".to_string(), "b".to_string()),
+            ("#e".to_string(), "\u{20ac}\u{20ac}".to_string()),
+            ("#a".to_string(), "\u{e9}".to_string()),
+            ("#m".to_string(), "\u{1f600}".to_string()),
+        ])
+    }
+
+    /// The charge of one statement, resolving only the names and values it uses.
+    fn charge(expr: &str) -> usize {
+        let names = Some(names());
+        let values = Some(values());
+        let tracker = TrackedExpressionAttributes::without_tracking(&names, &values);
+        parse(expr)
+            .unwrap_or_else(|e| panic!("parse {expr:?}: {e}"))
+            .request_charge(&tracker)
+            .unwrap_or_else(|e| panic!("charge {expr:?}: {e}"))
+    }
+
+    /// Every form the UpdateExpression grammar allows, at the cost eu-west-2
+    /// charged for it on 9 October 2026. Each figure is the whole statement:
+    /// three for the statement itself plus its clauses.
     #[test]
-    fn size_overhead_undercharges_the_two_known_forms() {
-        // DynamoDB charges 42 for a list-index assignment and 91 for arithmetic,
-        // against the 41 the model charges for either.
-        assert_eq!(parse("SET b = :v, l[0] = :w").unwrap().size_overhead(), 41);
-        assert_eq!(
-            parse("SET b = :v, n = n + :one").unwrap().size_overhead(),
-            41
+    fn each_form_is_charged_at_its_captured_cost() {
+        let cases: &[(&str, usize)] = &[
+            // Clauses, with a value operand.
+            ("SET b = :v1", 3 + 19 + 1 + 1),
+            ("SET #b = :v1", 3 + 19 + 1 + 1),
+            ("SET b = :v1, c = :v1", 3 + 2 * (19 + 1 + 1)),
+            ("ADD n :one", 3 + 19 + 1 + 2),
+            ("ADD abcdefghij :one", 3 + 19 + 10 + 2),
+            ("ADD m.n :one", 3 + 19 + 6 + 2),
+            ("REMOVE r", 3 + 1 + 1),
+            ("REMOVE abcdefghij", 3 + 1 + 10),
+            ("DELETE ss :v10", 3 + 1 + 2),
+            ("DELETE abcdefghij :v10", 3 + 1 + 10),
+            ("DELETE m.ss :v10", 3 + 1 + 7),
+            // Targets: the first element, then 4 plus each later element.
+            ("SET l[0] = :v10", 3 + 19 + 6 + 10),
+            ("SET l[10] = :v10", 3 + 19 + 7 + 10),
+            ("SET m.a.x = :v10", 3 + 19 + 11 + 10),
+            ("SET mmmmm.xxxxx = :v10", 3 + 19 + 14 + 10),
+            ("SET l[0].x = :v10", 3 + 19 + 11 + 10),
+            ("REMOVE l[1]", 3 + 1 + 6),
+            ("REMOVE l[10]", 3 + 1 + 7),
+            ("REMOVE m.y", 3 + 1 + 6),
+            ("REMOVE m.a.y", 3 + 1 + 11),
+            ("REMOVE abcdefghij[1]", 3 + 1 + 15),
+            // A name counts its UTF-8 bytes.
+            ("SET #e = :v10", 3 + 19 + 6 + 10),
+            ("SET #a = :v10", 3 + 19 + 2 + 10),
+            ("SET #m = :v10", 3 + 19 + 4 + 10),
+            ("SET m.#e = :v10", 3 + 19 + 11 + 10),
+            // Path operands: 1, then 14 plus each element; the value read is free.
+            ("SET c = big", 3 + 19 + 1 + 18),
+            ("SET c = abcdefghij", 3 + 19 + 1 + 25),
+            ("SET c = #t", 3 + 19 + 1 + 25),
+            ("SET c = #e", 3 + 19 + 1 + 21),
+            ("SET c = m.z", 3 + 19 + 1 + 31),
+            ("SET c = m.a.z", 3 + 19 + 1 + 46),
+            ("SET c = l[0]", 3 + 19 + 1 + 31),
+            ("SET c = l[10]", 3 + 19 + 1 + 32),
+            // Arithmetic, and parentheses, which cost nothing.
+            ("SET n = n + :one", 3 + 19 + 1 + 34 + 16 + 2),
+            ("SET n = :one + n", 3 + 19 + 1 + 34 + 16 + 2),
+            ("SET n = (n + :one)", 3 + 19 + 1 + 34 + 16 + 2),
+            ("SET n = n + :big", 3 + 19 + 1 + 34 + 16 + 11),
+            ("SET n = n + n", 3 + 19 + 1 + 34 + 16 + 16),
+            ("SET n = :v1 + :v10", 3 + 19 + 1 + 34 + 1 + 10),
+            ("SET n = n - :one", 3 + 19 + 1 + 37 + 16 + 2),
+            ("SET n = :v1 - :v10", 3 + 19 + 1 + 37 + 1 + 10),
+            ("SET #t = #t + :one", 3 + 19 + 10 + 34 + 25 + 2),
+            // if_not_exists and list_append.
+            ("SET c = if_not_exists(c, :v1)", 3 + 19 + 1 + 39 + 16 + 1),
+            ("SET l = list_append(l, :lst)", 3 + 19 + 1 + 37 + 16 + 14),
+            ("SET l = list_append(:lst, l)", 3 + 19 + 1 + 37 + 14 + 16),
+            (
+                "SET l = list_append(:empty, :lst)",
+                3 + 19 + 1 + 37 + 3 + 14,
+            ),
+            (
+                "SET l = list_append(if_not_exists(l, :empty), :lst)",
+                3 + 19 + 1 + 37 + (39 + 16 + 3) + 14,
+            ),
+            // Every value type costs its size, at every use.
+            (
+                "SET c = if_not_exists(c, :s100)",
+                3 + 19 + 1 + 39 + 16 + 100,
+            ),
+            (
+                "SET c = if_not_exists(c, :b100)",
+                3 + 19 + 1 + 39 + 16 + 100,
+            ),
+            ("SET c = if_not_exists(c, :true)", 3 + 19 + 1 + 39 + 16 + 1),
+            ("SET c = if_not_exists(c, :null)", 3 + 19 + 1 + 39 + 16 + 1),
+            ("SET c = if_not_exists(c, :ns)", 3 + 19 + 1 + 39 + 16 + 7),
+            ("SET c = if_not_exists(c, :bs)", 3 + 19 + 1 + 39 + 16 + 150),
+            ("SET c = if_not_exists(c, :map)", 3 + 19 + 1 + 39 + 16 + 105),
+            (
+                "SET c = if_not_exists(c, :mixed)",
+                3 + 19 + 1 + 39 + 16 + 107,
+            ),
+            (
+                "SET c = if_not_exists(c, :s100), d = if_not_exists(d, :s100)",
+                3 + 2 * (19 + 1 + 39 + 16 + 100),
+            ),
+            // Clauses add up.
+            (
+                "SET c = :v10 ADD n :one REMOVE r DELETE ss :v1",
+                3 + (19 + 1 + 10) + (19 + 1 + 2) + (1 + 1) + (1 + 2),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (expr, expected) in cases {
+            let got = charge(expr);
+            if got != *expected {
+                wrong.push(format!(
+                    "{expr:?}: charged {got}, eu-west-2 charges {expected}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} forms charged wrongly:\n{}",
+            wrong.len(),
+            cases.len(),
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn an_unresolved_name_or_value_is_an_error_rather_than_free() {
+        let names = None;
+        let values = None;
+        let tracker = TrackedExpressionAttributes::without_tracking(&names, &values);
+        assert!(
+            parse("SET b = :v")
+                .unwrap()
+                .request_charge(&tracker)
+                .is_err()
+        );
+        assert!(
+            parse("SET #b = b")
+                .unwrap()
+                .request_charge(&tracker)
+                .is_err()
         );
     }
 }
@@ -1266,5 +1576,16 @@ mod tests {
         let tracker = make_tracker(&no_names, &av);
         apply(&mut item, &expr, &tracker).unwrap();
         assert_eq!(item["c"], AttributeValue::N("100000000000000000001".into()));
+    }
+
+    #[test]
+    fn update_expression_syntax_error_includes_quoted_token_and_near_window() {
+        // The conformance suite pins the AWS string for "INVALID SYNTAX HERE":
+        //   Invalid UpdateExpression: Syntax error; token: "INVALID", near: "INVALID SYNTAX"
+        let err = parse("INVALID SYNTAX HERE").unwrap_err();
+        assert_eq!(
+            err,
+            r#"Invalid UpdateExpression: Syntax error; token: "INVALID", near: "INVALID SYNTAX""#
+        );
     }
 }

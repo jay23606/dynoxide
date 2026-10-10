@@ -13,7 +13,7 @@ use dynoxide::actions::put_item::PutItemRequest;
 use dynoxide::actions::transact_write_items::{
     TransactPut, TransactUpdate, TransactWriteItem, TransactWriteItemsRequest,
 };
-use dynoxide::actions::update_item::UpdateItemRequest;
+use dynoxide::actions::update_item::{AttributeValueUpdate, UpdateItemRequest};
 use dynoxide::types::*;
 use std::collections::HashMap;
 
@@ -168,11 +168,12 @@ fn set_blob(db: &Database, pk: &str, blob_len: usize) -> Result<(), String> {
 
 #[test]
 fn update_item_is_measured_against_a_lower_ceiling_than_put_item() {
-    // Captured against eu-west-2. An update is not sized the way a put is: the
-    // key attributes come out of the figure and each action adds a fixed cost,
-    // three bytes for the update plus nineteen for a SET. With a one-character
+    // Captured against eu-west-2. An update is not sized the way a put is: it
+    // is charged for what its request carries, three bytes for the statement
+    // plus nineteen, the target and the value for a SET. With a one-character
     // key the resulting item may reach 409,581, where PutItem accepts 409,600.
     //
+    //   charge         = 3 + 19 + "b" (1) + blob
     //   resulting item = pk (2 + 1) + "b" (1) + blob
     let db = make_db();
     let ceiling = 409_581 - 4;
@@ -199,7 +200,8 @@ fn update_item_is_measured_against_a_lower_ceiling_than_put_item() {
 
 #[test]
 fn each_update_action_adds_to_what_the_gate_measures() {
-    // A second SET costs nineteen more, so the ceiling drops by nineteen.
+    // A second SET costs nineteen plus its target and value, so the ceiling
+    // drops by twenty-one.
     let db = make_db();
     let two_set_ceiling = 409_581 - 19 - 4 - 2; // second attribute is name + 1 byte
 
@@ -287,9 +289,9 @@ fn a_transacted_write_reports_an_oversized_item_the_way_dynamodb_does() {
 
 #[test]
 fn a_transacted_update_is_not_charged_the_standalone_update_overhead() {
-    // The standalone UpdateItem takes the key attributes out and charges per
-    // action; a transacted one is measured flat against the resulting item. So
-    // an item that UpdateItem refuses goes through inside a transaction.
+    // The standalone UpdateItem is charged for what its request carries; a
+    // transacted one is measured flat against the resulting item. So an item
+    // that UpdateItem refuses goes through inside a transaction.
     let db = make_db();
     let just_over_update_ceiling = 409_581 - 4 + 1;
 
@@ -316,12 +318,12 @@ fn a_transacted_update_is_not_charged_the_standalone_update_overhead() {
 
 #[test]
 fn an_update_can_never_store_an_item_over_the_hard_limit() {
-    // The update measure is `max(item, item - key + overhead)`, so taking the key
-    // out never buys back more than the actions cost. Past a 20-byte key the
-    // item's own size binds and the ceiling is flat at 400KB however long the key
-    // gets, which was measured out to 1024 bytes. Without the second half of that
-    // max, a long key would let an over-limit item through and its size would
-    // then feed table statistics.
+    // An update is held both to its request charge and to the finished item's
+    // own size. The key never enters the charge, so past a 20-byte key the
+    // item's own size binds and the ceiling is flat at 400KB however long the
+    // key gets, which was measured out to 1024 bytes. Without the item check, a
+    // long key would let an over-limit item through and its size would then
+    // feed table statistics.
     let db = Database::memory().unwrap();
     db.create_table(CreateTableRequest {
         table_name: "Big".to_string(),
@@ -361,10 +363,11 @@ fn an_update_can_never_store_an_item_over_the_hard_limit() {
     let big = stats.iter().find(|s| s.table_name == "Big").unwrap();
     assert_eq!(big.item_count, 0, "nothing over the limit was stored");
 
-    // The crossover, captured against eu-west-2: a 20-byte key makes the key
-    // attributes 22 bytes, exactly the cost of a single SET, so the two halves
-    // of the max meet and the ceiling lands on 400KB itself. Below this the key
-    // exclusion binds; above it the item's own size does.
+    // The crossover, captured against eu-west-2: with a 20-byte key the finished
+    // item (22 bytes of key, then "b" and the blob) is exactly as large as the
+    // charge (3 + 19 + "b" + the blob), so the two checks meet and the ceiling
+    // lands on 400KB itself. Below this the charge binds; above it the item's
+    // own size does.
     let key = "k".repeat(20);
     let at_ceiling = MAX_ITEM_SIZE - 2 - 20 - 1;
     db.update_item(UpdateItemRequest {
@@ -396,8 +399,20 @@ fn an_update_can_never_store_an_item_over_the_hard_limit() {
 
 /// Run a PartiQL statement, returning the error text if it was refused.
 fn partiql(db: &Database, statement: String) -> Result<(), String> {
+    partiql_with(db, statement, Vec::new())
+}
+
+/// Run a PartiQL statement with `?` parameters. A value near 400KB has to
+/// travel as a parameter: DynamoDB refuses a statement over 8,192 characters
+/// before it reads it, so a literal that size never reaches the size check.
+fn partiql_with(
+    db: &Database,
+    statement: String,
+    parameters: Vec<AttributeValue>,
+) -> Result<(), String> {
     db.execute_statement(ExecuteStatementRequest {
         statement,
+        parameters: (!parameters.is_empty()).then_some(parameters),
         ..Default::default()
     })
     .map(|_| ())
@@ -412,17 +427,19 @@ fn the_partiql_write_paths_hold_the_item_size_limit() {
     let db = make_db();
     let over = "x".repeat(MAX_ITEM_SIZE + 1);
 
-    let err = partiql(
+    let err = partiql_with(
         &db,
-        format!("INSERT INTO \"Items\" VALUE {{'pk': 'k1', 'b': '{over}'}}"),
+        "INSERT INTO \"Items\" VALUE {'pk': 'k1', 'b': ?}".to_string(),
+        vec![AttributeValue::S(over.clone())],
     )
     .expect_err("INSERT over the limit");
     assert_eq!(err, "Item size has exceeded the maximum allowed size");
 
     partiql(&db, "INSERT INTO \"Items\" VALUE {'pk': 'k2'}".to_string()).unwrap();
-    let err = partiql(
+    let err = partiql_with(
         &db,
-        format!("UPDATE \"Items\" SET b = '{over}' WHERE pk = 'k2'"),
+        "UPDATE \"Items\" SET b = ? WHERE pk = 'k2'".to_string(),
+        vec![AttributeValue::S(over)],
     )
     .expect_err("UPDATE over the limit");
     assert_eq!(
@@ -442,18 +459,385 @@ fn the_partiql_write_paths_hold_the_item_size_limit() {
 fn a_partiql_update_is_measured_flat_like_an_insert() {
     // Captured against eu-west-2: a PartiQL UPDATE accepts a resulting item of
     // 409,600, which the standalone UpdateItem refuses at the same key because
-    // it takes the key attributes out and charges per action. Of the write
-    // surfaces, only UpdateItem carries that rule.
+    // it charges the request rather than the item. Of the write surfaces, only
+    // UpdateItem carries that rule.
     let db = make_db();
     partiql(&db, "INSERT INTO \"Items\" VALUE {'pk': 'k'}".to_string()).unwrap();
 
     // resulting item = pk (2 + 1) + "b" (1) + blob, landing exactly on the limit
     let blob = "x".repeat(MAX_ITEM_SIZE - 4);
-    partiql(
+    partiql_with(
         &db,
-        format!("UPDATE \"Items\" SET b = '{blob}' WHERE pk = 'k'"),
+        "UPDATE \"Items\" SET b = ? WHERE pk = 'k'".to_string(),
+        vec![AttributeValue::S(blob)],
     )
     .expect("PartiQL UPDATE accepts an item at the flat limit");
 
     set_blob(&db, "k2", MAX_ITEM_SIZE - 4).expect_err("UpdateItem refuses the same item");
+}
+
+/// Store `item` at key `pk`, replacing whatever was there.
+fn seed(db: &Database, pk: &str, mut item: HashMap<String, AttributeValue>) {
+    item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+    db.put_item(PutItemRequest {
+        table_name: "Items".to_string(),
+        item,
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+/// An UpdateItem on `Items` at key `pk`, returning the error text if refused.
+fn update(
+    db: &Database,
+    pk: &str,
+    expression: &str,
+    values: Vec<(&str, AttributeValue)>,
+) -> Result<(), String> {
+    db.update_item(UpdateItemRequest {
+        table_name: "Items".to_string(),
+        key: HashMap::from([("pk".to_string(), AttributeValue::S(pk.to_string()))]),
+        update_expression: Some(expression.to_string()),
+        expression_attribute_values: Some(
+            values
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        ),
+        ..Default::default()
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+const UPDATE_REFUSAL: &str = "Item size to update has exceeded the maximum allowed size";
+
+#[test]
+fn an_update_does_not_charge_an_attribute_it_leaves_alone() {
+    // Captured against eu-west-2 on 9 October 2026, and pinned by the Parity
+    // Suite: an untouched 10-byte attribute lifts the accepted finished item by
+    // its own 11 bytes, from 409,581 to 409,592, because the update is charged
+    // for what its request carries and the stored item never enters the charge.
+    //
+    //   charge   = 3 + SET (19 + "b" 1 + blob)
+    //   finished = pk (2 + 1) + "u" (1 + 10) + "b" (1) + blob
+    let db = make_db();
+    let untouched = || HashMap::from([("u".to_string(), AttributeValue::S("y".repeat(10)))]);
+    let ceiling = 409_577;
+
+    seed(&db, "k", untouched());
+    set_blob(&db, "k", ceiling).expect("accepted at a finished item of 409,592");
+    seed(&db, "k", untouched());
+    let err = set_blob(&db, "k", ceiling + 1).expect_err("one byte over the charge");
+    assert_eq!(err, UPDATE_REFUSAL);
+}
+
+#[test]
+fn a_set_through_a_list_index_costs_one_byte_more_than_a_plain_set() {
+    // Pinned by the Parity Suite and captured against eu-west-2: writing the
+    // same finished list through `d[0]` rather than as a whole costs one byte
+    // more, because the target `d[0]` charges 1 + 4 + 1 where `d` charges 1,
+    // and the value it writes is the bare string rather than the list around it.
+    //
+    //   SET d = :whole   3 + 19 + 1 + list (3 + 1 + blob)
+    //   SET d[0] = :pad  3 + 19 + 6 + blob
+    let db = make_db();
+    let one_element = || {
+        HashMap::from([(
+            "d".to_string(),
+            AttributeValue::L(vec![AttributeValue::S("x".to_string())]),
+        )])
+    };
+    let whole = |len: usize| AttributeValue::L(vec![AttributeValue::S("x".repeat(len))]);
+    let ceiling = 409_573;
+
+    seed(&db, "k", one_element());
+    update(&db, "k", "SET d = :whole", vec![(":whole", whole(ceiling))])
+        .expect("the plain SET reaches the ceiling");
+    seed(&db, "k", one_element());
+    let err = update(
+        &db,
+        "k",
+        "SET d = :whole",
+        vec![(":whole", whole(ceiling + 1))],
+    )
+    .expect_err("the plain SET one byte over");
+    assert_eq!(err, UPDATE_REFUSAL);
+
+    seed(&db, "k", one_element());
+    let err = update(
+        &db,
+        "k",
+        "SET d[0] = :pad",
+        vec![(":pad", AttributeValue::S("x".repeat(ceiling)))],
+    )
+    .expect_err("the list-index SET is refused where the plain SET is accepted");
+    assert_eq!(err, UPDATE_REFUSAL);
+    seed(&db, "k", one_element());
+    update(
+        &db,
+        "k",
+        "SET d[0] = :pad",
+        vec![(":pad", AttributeValue::S("x".repeat(ceiling - 1)))],
+    )
+    .expect("and accepted one byte lower");
+}
+
+#[test]
+fn an_over_limit_charge_is_refused_before_the_condition_is_evaluated() {
+    // Captured against eu-west-2 on 9 October 2026: an update whose request
+    // charge is over the limit is refused for its size whether its condition
+    // would fail, would pass, or is absent. The charge needs nothing from the
+    // stored item, so it is checked before the item is read.
+    let db = make_db();
+    let huge = || AttributeValue::S("h".repeat(409_700));
+    for condition in [
+        Some("attribute_exists(nope)"),
+        Some("attribute_exists(c)"),
+        None,
+    ] {
+        seed(
+            &db,
+            "k",
+            HashMap::from([("c".to_string(), AttributeValue::S("x".to_string()))]),
+        );
+        let err = db
+            .update_item(UpdateItemRequest {
+                table_name: "Items".to_string(),
+                key: HashMap::from([("pk".to_string(), AttributeValue::S("k".to_string()))]),
+                update_expression: Some("SET c = if_not_exists(c, :huge)".to_string()),
+                condition_expression: condition.map(str::to_string),
+                expression_attribute_values: Some(HashMap::from([(":huge".to_string(), huge())])),
+                ..Default::default()
+            })
+            .expect_err("over the limit");
+        assert!(
+            matches!(&err, dynoxide::errors::DynoxideError::ValidationException(m) if m == UPDATE_REFUSAL),
+            "condition {condition:?}: expected a top-level size refusal, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn the_charge_is_checked_after_request_validation_and_before_the_update_applies() {
+    // Captured against eu-west-2 on 9 October 2026, pairing an over-limit
+    // charge with one other problem. Request validation still answers first:
+    // unused and undefined names and values, a missing table, a key that does
+    // not match the schema, a malformed or undefined condition, and an invalid
+    // ReturnValues. The charge answers ahead of everything that happens once the
+    // update is under way: a SET on a key attribute, a path or type the stored
+    // item cannot take, and a condition that fails.
+    let db = make_db();
+    let huge = || AttributeValue::S("h".repeat(409_700));
+    let base = |expression: &str| UpdateItemRequest {
+        table_name: "Items".to_string(),
+        key: HashMap::from([("pk".to_string(), AttributeValue::S("k".to_string()))]),
+        update_expression: Some(expression.to_string()),
+        expression_attribute_values: Some(HashMap::from([(":v".to_string(), huge())])),
+        ..Default::default()
+    };
+    let with_value = |mut r: UpdateItemRequest, name: &str, v: AttributeValue| {
+        r.expression_attribute_values
+            .as_mut()
+            .unwrap()
+            .insert(name.to_string(), v);
+        r
+    };
+    let small = || AttributeValue::S("s".to_string());
+
+    let validation_first: Vec<(&str, UpdateItemRequest, &str)> = vec![
+        (
+            "unused value",
+            with_value(base("SET c = :v"), ":unused", small()),
+            "unused in expressions: keys: {:unused}",
+        ),
+        (
+            "unused name",
+            UpdateItemRequest {
+                expression_attribute_names: Some(HashMap::from([(
+                    "#u".to_string(),
+                    "u".to_string(),
+                )])),
+                ..base("SET c = :v")
+            },
+            "unused in expressions: keys: {#u}",
+        ),
+        (
+            "undefined value",
+            base("SET c = :v, d = :nope"),
+            "attribute value: :nope",
+        ),
+        (
+            "undefined name",
+            with_value(base("SET c = :v, #nope = :w"), ":w", small()),
+            "attribute name: #nope",
+        ),
+        (
+            "missing table",
+            UpdateItemRequest {
+                table_name: "Missing".to_string(),
+                ..base("SET c = :v")
+            },
+            "Requested resource not found",
+        ),
+        (
+            "key attribute name wrong",
+            UpdateItemRequest {
+                key: HashMap::from([("pk2".to_string(), AttributeValue::S("k".to_string()))]),
+                ..base("SET c = :v")
+            },
+            "The provided key element does not match the schema",
+        ),
+        (
+            "key attribute type wrong",
+            UpdateItemRequest {
+                key: HashMap::from([("pk".to_string(), AttributeValue::N("1".to_string()))]),
+                ..base("SET c = :v")
+            },
+            "The provided key element does not match the schema",
+        ),
+        (
+            "condition syntax error",
+            UpdateItemRequest {
+                condition_expression: Some("attribute_exists(".to_string()),
+                ..base("SET c = :v")
+            },
+            "Invalid ConditionExpression",
+        ),
+        (
+            "condition undefined value",
+            UpdateItemRequest {
+                condition_expression: Some("c = :nope".to_string()),
+                ..base("SET c = :v")
+            },
+            "attribute value: :nope",
+        ),
+        (
+            "invalid ReturnValues",
+            UpdateItemRequest {
+                return_values: Some("BOGUS".to_string()),
+                ..base("SET c = :v")
+            },
+            // The generic form, captured with this ordering run (eu-west-2,
+            // 2026-10-09).
+            "Member must satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]",
+        ),
+    ];
+    let charge_first: Vec<(&str, UpdateItemRequest)> = vec![
+        (
+            "SET on the key attribute",
+            with_value(base("SET pk = :k, c = :v"), ":k", small()),
+        ),
+        (
+            "SET through a string",
+            with_value(base("SET c = :v, s.x = :w"), ":w", small()),
+        ),
+        (
+            "ADD to a string",
+            with_value(
+                base("SET c = :v ADD s :one"),
+                ":one",
+                AttributeValue::N("1".to_string()),
+            ),
+        ),
+        (
+            "list index on a missing list",
+            with_value(base("SET c = :v, nolist[0] = :w"), ":w", small()),
+        ),
+        (
+            "condition fails",
+            UpdateItemRequest {
+                condition_expression: Some("attribute_exists(nope)".to_string()),
+                ..base("SET c = :v")
+            },
+        ),
+    ];
+
+    let reseed = || {
+        seed(
+            &db,
+            "k",
+            HashMap::from([
+                ("c".to_string(), AttributeValue::S("x".to_string())),
+                ("s".to_string(), AttributeValue::S("str".to_string())),
+            ]),
+        )
+    };
+    for (what, request, expected) in validation_first {
+        reseed();
+        let err = db.update_item(request).expect_err(what).to_string();
+        assert!(
+            err.contains(expected),
+            "{what}: request validation should answer first, got: {err}"
+        );
+    }
+    for (what, request) in charge_first {
+        reseed();
+        let err = db.update_item(request).expect_err(what).to_string();
+        assert_eq!(
+            err, UPDATE_REFUSAL,
+            "{what}: the charge should answer first"
+        );
+    }
+}
+
+#[test]
+fn attribute_updates_are_measured_by_the_finished_item_alone() {
+    // Captured against eu-west-2 on 9 October 2026: the legacy AttributeUpdates
+    // parameter carries no per-action charge. With a one-byte key it reaches a
+    // finished item of exactly 409,600 with one PUT, with ten more PUTs beside
+    // it, and with PUT, ADD and DELETE together.
+    let db = make_db();
+    let put_blob = |pk: &str, len: usize, extra: Vec<(&str, &str, Option<AttributeValue>)>| {
+        let mut updates = HashMap::from([(
+            "b".to_string(),
+            AttributeValueUpdate {
+                action: "PUT".to_string(),
+                value: Some(AttributeValue::S("x".repeat(len))),
+            },
+        )]);
+        for (name, action, value) in extra {
+            updates.insert(
+                name.to_string(),
+                AttributeValueUpdate {
+                    action: action.to_string(),
+                    value,
+                },
+            );
+        }
+        db.update_item(UpdateItemRequest {
+            table_name: "Items".to_string(),
+            key: HashMap::from([("pk".to_string(), AttributeValue::S(pk.to_string()))]),
+            attribute_updates: Some(updates),
+            ..Default::default()
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    };
+
+    // pk (2 + 1) + "b" (1) + blob
+    put_blob("k", MAX_ITEM_SIZE - 4, vec![]).expect("a single PUT reaches 409,600");
+    let err = put_blob("k2", MAX_ITEM_SIZE - 3, vec![]).expect_err("409,601");
+    assert_eq!(err, UPDATE_REFUSAL);
+
+    // A DELETE that removes a whole attribute frees its bytes for the finished
+    // item and adds nothing of its own.
+    seed(
+        &db,
+        "k3",
+        HashMap::from([
+            ("n".to_string(), AttributeValue::N("1".to_string())),
+            ("s".to_string(), AttributeValue::S("y".repeat(10))),
+        ]),
+    );
+    // pk (2 + 2) + "n" (1 + 2) + "b" (1) + blob, with "s" deleted
+    put_blob(
+        "k3",
+        MAX_ITEM_SIZE - 8,
+        vec![
+            ("n", "ADD", Some(AttributeValue::N("1".to_string()))),
+            ("s", "DELETE", None),
+        ],
+    )
+    .expect("PUT, ADD and DELETE together reach 409,600");
 }

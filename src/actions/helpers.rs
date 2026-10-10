@@ -14,6 +14,10 @@ use std::future::Future;
 /// failure rather than leaving the connection stuck mid-transaction (a leftover
 /// open transaction makes the next `begin_transaction` fail). On any error from
 /// `body`, rolls back; if that rollback also fails, surfaces a combined error.
+/// A rollback that fails only because SQLite has already ended the transaction
+/// itself (it rolls the whole transaction back on a full disk, among other
+/// errors) adds nothing, and the error that stopped the write is returned as
+/// it is.
 ///
 /// This is the single place the write-transaction lifecycle policy lives, so
 /// every write path handles a failed commit or rollback identically.
@@ -26,26 +30,35 @@ where
     match body.await {
         Ok(value) => match storage.commit().await {
             Ok(()) => Ok(value),
-            Err(commit_err) => {
-                if let Err(rb_err) = storage.rollback().await {
+            Err(commit_err) => match storage.rollback().await {
+                Err(rb_err) if !rollback_found_no_transaction(&rb_err) => {
                     Err(DynoxideError::InternalServerError(format!(
                         "commit failed ({commit_err}) and rollback also failed ({rb_err})"
                     )))
-                } else {
-                    Err(commit_err.into())
                 }
-            }
+                _ => Err(commit_err.into()),
+            },
         },
-        Err(e) => {
-            if let Err(rb_err) = storage.rollback().await {
+        Err(e) => match storage.rollback().await {
+            Err(rb_err) if !rollback_found_no_transaction(&rb_err) => {
                 Err(DynoxideError::InternalServerError(format!(
                     "operation failed ({e}) and rollback also failed ({rb_err})"
                 )))
-            } else {
-                Err(e)
             }
-        }
+            _ => Err(e),
+        },
     }
+}
+
+/// Whether a rollback failed only because no transaction was active: SQLite's
+/// `cannot rollback - no transaction is active`, which both backends pass on
+/// in SQLite's own words.
+fn rollback_found_no_transaction(err: &crate::storage_backend::BackendError) -> bool {
+    matches!(
+        err,
+        crate::storage_backend::BackendError::Other(message)
+            if message.contains("no transaction is active")
+    )
 }
 
 /// Parsed key schema for convenient access.
@@ -213,9 +226,7 @@ fn validate_item_keys_inner(
     let pk_size = key_attribute_size(pk_val);
     if pk_size > 2048 {
         return Err(DynoxideError::ValidationException(
-            "One or more parameter values were invalid: \
-             Size of hashkey has exceeded the maximum size limit of2048 bytes"
-                .to_string(),
+            HASH_KEY_TOO_LARGE.to_string(),
         ));
     }
 
@@ -235,9 +246,7 @@ fn validate_item_keys_inner(
         let sk_size = key_attribute_size(sk_val);
         if sk_size > 1024 {
             return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: \
-                 Aggregated size of all range keys has exceeded the size limit of 1024 bytes"
-                    .to_string(),
+                RANGE_KEY_TOO_LARGE.to_string(),
             ));
         }
     }
@@ -321,17 +330,14 @@ fn index_key_entries(meta: &TableMetadata) -> Result<Vec<IndexKeyEntry>> {
     };
 
     let mut entries = Vec::new();
+    // Every attribute of a multi-attribute GSI key is checked, in key-schema
+    // order, partition key attributes first.
     for gsi in super::gsi::parse_gsi_defs(meta)? {
-        entries.push(IndexKeyEntry {
-            declared: declared(&gsi.pk_attr)?,
-            attr: gsi.pk_attr,
-            index_name: gsi.index_name.clone(),
-        });
-        if let Some(sk) = gsi.sk_attr {
+        for attr in gsi.hash_attrs.iter().chain(&gsi.range_attrs) {
             entries.push(IndexKeyEntry {
-                declared: declared(&sk)?,
-                attr: sk,
-                index_name: gsi.index_name,
+                declared: declared(attr)?,
+                attr: attr.clone(),
+                index_name: gsi.index_name.clone(),
             });
         }
     }
@@ -396,9 +402,13 @@ fn run_index_key_validation(
             continue; // absent -> sparse, not an error
         };
         if let Some(before) = before
-            && before.get(&entry.attr) == Some(val)
+            && before
+                .get(&entry.attr)
+                .is_some_and(|old| super::index_capacity::value_unchanged(old, val))
         {
-            continue; // unchanged by this update
+            // Unchanged by this update. Sets compare as sets: a row stored
+            // before sets were sorted holds the same set in another order.
+            continue;
         }
         if let Some(violation) = check_index_key_value(val, &entry.declared) {
             violations.push((entry.index_name.clone(), entry.attr.clone(), violation));
@@ -485,9 +495,7 @@ pub fn validate_key_only(key: &HashMap<String, AttributeValue>, schema: &KeySche
     let pk_size = key_attribute_size(pk_val);
     if pk_size > 2048 {
         return Err(DynoxideError::ValidationException(
-            "One or more parameter values were invalid: \
-             Size of hashkey has exceeded the maximum size limit of2048 bytes"
-                .to_string(),
+            HASH_KEY_TOO_LARGE.to_string(),
         ));
     }
 
@@ -506,9 +514,7 @@ pub fn validate_key_only(key: &HashMap<String, AttributeValue>, schema: &KeySche
         let sk_size = key_attribute_size(sk_val);
         if sk_size > 1024 {
             return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: \
-                 Aggregated size of all range keys has exceeded the size limit of 1024 bytes"
-                    .to_string(),
+                RANGE_KEY_TOO_LARGE.to_string(),
             ));
         }
     }
@@ -631,8 +637,43 @@ fn validate_key_type_for_key_op(
     Ok(())
 }
 
+/// DynamoDB's refusal of a partition key value over 2,048 bytes, spelled as
+/// it spells it (no space before the figure).
+pub(crate) const HASH_KEY_TOO_LARGE: &str = "One or more parameter values were invalid: \
+     Size of hashkey has exceeded the maximum size limit of2048 bytes";
+
+/// DynamoDB's refusal of a sort key value over 1,024 bytes.
+pub(crate) const RANGE_KEY_TOO_LARGE: &str = "One or more parameter values were invalid: \
+     Aggregated size of all range keys has exceeded the size limit of 1024 bytes";
+
+/// The start of DynamoDB's refusal of an update that sets or removes a key
+/// attribute, which goes on to name the attribute: see
+/// [`key_attribute_update_refusal`].
+pub(crate) const KEY_ATTRIBUTE_UPDATE: &str =
+    "One or more parameter values were invalid: Cannot update attribute ";
+
+/// DynamoDB's refusal of an update that sets or removes the key attribute
+/// `attribute`, on UpdateItem and a PartiQL UPDATE alike.
+pub(crate) fn key_attribute_update_refusal(attribute: &str) -> DynoxideError {
+    DynoxideError::ValidationException(format!(
+        "{KEY_ATTRIBUTE_UPDATE}{attribute}. This attribute is part of the key"
+    ))
+}
+
+/// The refusal for a key value larger than a key can be, if it is: over
+/// 2,048 bytes for a partition key, over 1,024 for a sort key.
+pub(crate) fn key_size_refusal(value: &AttributeValue, sort_key: bool) -> Option<DynoxideError> {
+    let (limit, message) = if sort_key {
+        (1024, RANGE_KEY_TOO_LARGE)
+    } else {
+        (2048, HASH_KEY_TOO_LARGE)
+    };
+    (key_attribute_size(value) > limit)
+        .then(|| DynoxideError::ValidationException(message.to_string()))
+}
+
 /// Return the byte size of a key attribute value for size limit checks.
-fn key_attribute_size(val: &AttributeValue) -> usize {
+pub(crate) fn key_attribute_size(val: &AttributeValue) -> usize {
     match val {
         AttributeValue::S(s) => s.len(),
         AttributeValue::N(n) => n.len(),
@@ -659,6 +700,27 @@ pub struct ExpressionParamContext<'a> {
     /// Raw JSON for ExpressionAttributeValues: when present, used for key
     /// validation and parsed with key-specific error messages.
     pub expression_attribute_values_raw: &'a Option<serde_json::Value>,
+    /// The validation layer the operation runs on, which decides how a bad
+    /// number or a duplicated set member in a value is worded.
+    pub layer: crate::validation::ValueLayer,
+}
+
+/// Refuse a placeholder whose name holds a character outside ASCII before the
+/// expression is read: DynamoDB reports the map's key, not the expression
+/// (`:vé`, `#n€`, an emoji or a no-break space; captured on UpdateItem in
+/// eu-west-2 and us-east-1, 2026-10-09, inside the request-validation
+/// envelope). The family is enveloped like the others here, so operations that
+/// don't wrap it propagate the plain message.
+fn reject_non_ascii_placeholder(
+    map: &str,
+    key: &str,
+) -> std::result::Result<(), ClassifiedValidationError> {
+    if key.is_ascii() {
+        return Ok(());
+    }
+    Err(ClassifiedValidationError::enveloped(format!(
+        "{map} contains invalid key: Syntax error; key: \"{key}\""
+    )))
 }
 
 /// Validate expression vs non-expression parameter conflicts and basic
@@ -671,11 +733,12 @@ pub struct ExpressionParamContext<'a> {
 /// and successfully parsed, so the caller can store it on the request.
 ///
 /// The error is classified: the families DynamoDB wraps in the
-/// request-validation envelope on PutItem and UpdateItem (mixing expression
-/// and non-expression parameters, ExpressionAttributeValues without an
-/// expression, and empty or duplicate sets inside ExpressionAttributeValues)
-/// are marked as enveloped. Callers other than those two operations propagate
-/// with `?`, which converts back to the plain error unchanged.
+/// request-validation envelope on PutItem, UpdateItem and DeleteItem (mixing
+/// expression and non-expression parameters, ExpressionAttributeValues or
+/// ExpressionAttributeNames without an expression, either map empty, and empty
+/// or duplicate sets inside ExpressionAttributeValues) are marked as
+/// enveloped. Callers other than those three operations propagate with `?`,
+/// which converts back to the plain error unchanged.
 pub fn validate_expression_params(
     ctx: &ExpressionParamContext<'_>,
 ) -> std::result::Result<Option<HashMap<String, AttributeValue>>, ClassifiedValidationError> {
@@ -698,7 +761,7 @@ pub fn validate_expression_params(
 
     // ExpressionAttributeNames without any expression
     if has_names && !has_expressions {
-        return Err(ClassifiedValidationError::bare(
+        return Err(ClassifiedValidationError::enveloped(
             "ExpressionAttributeNames can only be specified when using expressions",
         ));
     }
@@ -723,7 +786,7 @@ pub fn validate_expression_params(
     // Empty ExpressionAttributeNames
     if let Some(names) = ctx.expression_attribute_names {
         if names.is_empty() {
-            return Err(ClassifiedValidationError::bare(
+            return Err(ClassifiedValidationError::enveloped(
                 "ExpressionAttributeNames must not be empty",
             ));
         }
@@ -734,6 +797,7 @@ pub fn validate_expression_params(
                     "ExpressionAttributeNames contains invalid key: Syntax error; key: \"{key}\""
                 )));
             }
+            reject_non_ascii_placeholder("ExpressionAttributeNames", key)?;
         }
     }
 
@@ -741,7 +805,7 @@ pub fn validate_expression_params(
     if let Some(raw_val) = ctx.expression_attribute_values_raw {
         if let Some(obj) = raw_val.as_object() {
             if obj.is_empty() {
-                return Err(ClassifiedValidationError::bare(
+                return Err(ClassifiedValidationError::enveloped(
                     "ExpressionAttributeValues must not be empty",
                 ));
             }
@@ -752,19 +816,26 @@ pub fn validate_expression_params(
                         "ExpressionAttributeValues contains invalid key: Syntax error; key: \"{key}\""
                     )));
                 }
+                reject_non_ascii_placeholder("ExpressionAttributeValues", key)?;
             }
             // Parse and validate values with key context
-            let parsed = parse_expression_attribute_values_raw(raw_val)?;
+            let parsed =
+                parse_expression_attribute_values_raw(raw_val, ctx.layer).map_err(|e| match e {
+                    DynoxideError::EnvelopedValidation(msg) => {
+                        ClassifiedValidationError::enveloped(msg)
+                    }
+                    other => other.into(),
+                })?;
             // Validate parsed values (NULL:false, empty sets, duplicates, numbers)
             for (key, value) in &parsed {
-                validate_expression_attribute_value(key, value)?;
+                validate_expression_attribute_value(key, value, ctx.layer)?;
             }
             return Ok(Some(parsed));
         }
     } else if let Some(values) = ctx.expression_attribute_values {
         // Pre-parsed EAV (e.g. from MCP/library usage)
         if values.is_empty() {
-            return Err(ClassifiedValidationError::bare(
+            return Err(ClassifiedValidationError::enveloped(
                 "ExpressionAttributeValues must not be empty",
             ));
         }
@@ -774,9 +845,10 @@ pub fn validate_expression_params(
                     "ExpressionAttributeValues contains invalid key: Syntax error; key: \"{key}\""
                 )));
             }
+            reject_non_ascii_placeholder("ExpressionAttributeValues", key)?;
         }
         for (key, value) in values {
-            validate_expression_attribute_value(key, value)?;
+            validate_expression_attribute_value(key, value, ctx.layer)?;
         }
     }
 
@@ -784,13 +856,35 @@ pub fn validate_expression_params(
 }
 
 /// Validate a single ExpressionAttributeValues entry.
+///
+/// On the current layer a duplicated set member or a number it can't store is
+/// refused in that layer's words with no `ExpressionAttributeValues contains
+/// invalid value` wrapper, marked for the envelope; the older layer keeps the
+/// wrapper naming the key (eu-west-2, us-east-1, eu-west-1 and us-west-2,
+/// 2026-10-09).
 fn validate_expression_attribute_value(
     key: &str,
     value: &AttributeValue,
+    layer: crate::validation::ValueLayer,
 ) -> std::result::Result<(), ClassifiedValidationError> {
+    use crate::validation::ValueLayer;
     // Over-deep expression values are rejected up front, before evaluation, with the
-    // bare nesting message real DynamoDB uses (no "contains invalid value" wrapper).
-    crate::validation::validate_nesting_depth(value)?;
+    // nesting message real DynamoDB uses (no "contains invalid value" wrapper).
+    // PutItem, UpdateItem and DeleteItem wrap it in the envelope (us-east-1 and
+    // eu-west-2, 2026-10-09); the reads send it bare.
+    // From 63 levels a second check refuses the value naming its key, bare
+    // (us-east-1 and eu-west-2, 2026-10-09).
+    if crate::validation::validate_nesting_depth(value).is_err() {
+        if crate::validation::nesting_depth(value) > crate::validation::SECOND_NESTING_LIMIT {
+            return Err(ClassifiedValidationError::bare(format!(
+                "ExpressionAttributeValues contains invalid value: {} for key {key}",
+                crate::validation::NESTING_LIMIT_MESSAGE
+            )));
+        }
+        return Err(ClassifiedValidationError::enveloped(
+            crate::validation::NESTING_LIMIT_MESSAGE,
+        ));
+    }
     // Check for empty/unsupported datatypes
     match value {
         // Unreachable from PutItem and UpdateItem, whose execute paths reject
@@ -798,11 +892,9 @@ fn validate_expression_attribute_value(
         // tagged for the envelope; this arm serves the other operations'
         // pre-parsed in-process EAV paths.
         AttributeValue::NULL(b) if !b => {
-            return Err(ClassifiedValidationError::bare(format!(
-                "ExpressionAttributeValues contains invalid value: \
-                 One or more parameter values were invalid: \
-                 Null attribute value types must have the value of true for key {key}"
-            )));
+            return Err(ClassifiedValidationError::bare(
+                crate::serde_errors::named_value_refusal(crate::serde_errors::NULL_NOT_TRUE, key),
+            ));
         }
         AttributeValue::SS(set) if set.is_empty() => {
             return Err(ClassifiedValidationError::enveloped(format!(
@@ -825,71 +917,43 @@ fn validate_expression_attribute_value(
                  Binary sets should not be empty for key {key}"
             )));
         }
-        AttributeValue::SS(set) => {
-            let mut seen = std::collections::HashSet::new();
-            for s in set {
-                if !seen.insert(s.clone()) {
-                    let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                    return Err(ClassifiedValidationError::enveloped(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         One or more parameter values were invalid: \
-                         Input collection [{}] contains duplicates. for key {key}",
-                        display.join(", ")
-                    )));
-                }
+        AttributeValue::SS(_) | AttributeValue::BS(_) => {
+            if let Some(message) = crate::validation::duplicate_set_message(value, layer) {
+                return Err(ClassifiedValidationError::enveloped(match layer {
+                    ValueLayer::Current => message,
+                    ValueLayer::Older => format!(
+                        "ExpressionAttributeValues contains invalid value: {message} for key {key}"
+                    ),
+                }));
             }
         }
-        AttributeValue::BS(set) => {
-            let mut seen = std::collections::HashSet::new();
-            for b in set {
-                if !seen.insert(b.clone()) {
-                    use base64::Engine;
-                    let display: Vec<String> = set
-                        .iter()
-                        .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
-                        .collect();
-                    return Err(ClassifiedValidationError::enveloped(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         One or more parameter values were invalid: \
-                         Input collection [{}]of type BS contains duplicates. for key {key}",
-                        display.join(", ")
-                    )));
-                }
-            }
-        }
-        AttributeValue::N(n) => {
-            crate::types::validate_dynamo_number(n).map_err(|e| {
-                let inner = match &e {
-                    DynoxideError::ValidationException(m) => m.clone(),
-                    _ => e.to_string(),
-                };
-                DynoxideError::ValidationException(format!(
-                    "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
-                ))
-            })?;
-        }
-        AttributeValue::NS(set) if !set.is_empty() => {
-            for n in set {
-                crate::types::validate_dynamo_number(n).map_err(|e| {
-                    let inner = match &e {
-                        DynoxideError::ValidationException(m) => m.clone(),
-                        _ => e.to_string(),
-                    };
-                    DynoxideError::ValidationException(format!(
-                        "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
-                    ))
+        AttributeValue::N(_) | AttributeValue::NS(_) => {
+            let numbers: Vec<&String> = match value {
+                AttributeValue::N(n) => vec![n],
+                AttributeValue::NS(set) => set.iter().collect(),
+                _ => Vec::new(),
+            };
+            for n in numbers {
+                layer.check_number(n).map_err(|e| match layer {
+                    ValueLayer::Current => layer.classify_number_error(e),
+                    ValueLayer::Older => {
+                        let inner = match &e {
+                            DynoxideError::ValidationException(m) => m.clone(),
+                            _ => e.to_string(),
+                        };
+                        ClassifiedValidationError::bare(format!(
+                            "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
+                        ))
+                    }
                 })?;
             }
-            // Check for duplicates
-            let mut seen = std::collections::HashSet::new();
-            for n in set {
-                let normalized = crate::types::normalize_dynamo_number(n);
-                if !seen.insert(normalized) {
-                    return Err(ClassifiedValidationError::enveloped(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         Input collection contains duplicates for key {key}"
-                    )));
-                }
+            if let Some(message) = crate::validation::duplicate_set_message(value, layer) {
+                return Err(ClassifiedValidationError::enveloped(match layer {
+                    ValueLayer::Current => message,
+                    ValueLayer::Older => format!(
+                        "ExpressionAttributeValues contains invalid value: {message} for key {key}"
+                    ),
+                }));
             }
         }
         _ => {}
@@ -918,9 +982,7 @@ pub fn validate_no_null_false(values: &HashMap<String, AttributeValue>) -> Resul
 pub(crate) fn validate_no_null_false_value(value: &AttributeValue) -> Result<()> {
     match value {
         AttributeValue::NULL(b) if !b => Err(DynoxideError::EnvelopedValidation(
-            "One or more parameter values were invalid: \
-             Null attribute value types must have the value of true"
-                .to_string(),
+            crate::serde_errors::NULL_NOT_TRUE.to_string(),
         )),
         AttributeValue::L(list) => {
             for v in list {
@@ -947,6 +1009,7 @@ pub(crate) fn validate_no_null_false_value(value: &AttributeValue) -> Result<()>
 /// format that DynamoDB uses.
 pub fn parse_expression_attribute_values_raw(
     raw: &serde_json::Value,
+    layer: crate::validation::ValueLayer,
 ) -> Result<HashMap<String, AttributeValue>> {
     let obj = raw.as_object().ok_or_else(|| {
         DynoxideError::SerializationException(
@@ -956,54 +1019,130 @@ pub fn parse_expression_attribute_values_raw(
 
     let mut result = HashMap::new();
     for (key, value) in obj {
-        match serde_json::from_value::<AttributeValue>(value.clone()) {
+        match crate::types::with_value_layer(layer, || {
+            serde_json::from_value::<AttributeValue>(value.clone())
+        }) {
             Ok(av) => {
                 result.insert(key.clone(), av);
             }
             Err(e) => {
+                use crate::serde_errors::{
+                    EMPTY_VALUE, MORE_THAN_ONE_TYPE, ValueRefusal, named_value_refusal,
+                    value_refusal,
+                };
                 let msg = e.to_string();
-                // Strip the serde position suffix and any internal marker
-                let inner = crate::serde_errors::clean_serde_message(&msg);
-
-                if inner.contains("empty AttributeValue")
-                    || (inner.contains("Supplied AttributeValue") && inner.contains("empty"))
-                {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         Supplied AttributeValue is empty, must contain exactly one of the \
-                         supported datatypes for key {key}"
-                    )));
-                } else if inner.contains("more than one datatypes") {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         Supplied AttributeValue has more than one datatypes set, \
-                         must contain exactly one of the supported datatypes for key {key}"
-                    )));
-                } else if inner.contains("cannot be converted to a numeric value")
-                    || inner.contains("significant digits")
-                    || inner.contains("Number overflow")
-                    || inner.contains("Number underflow")
-                {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         {inner} for key {key}"
-                    )));
-                } else if inner.contains("Null attribute value types must have the value of true") {
-                    // A rejected {"NULL": false} fails to deserialise here with a
-                    // marker-prefixed message. Real DynamoDB rejects it with the
-                    // bare validation message, without the per-key "contains invalid
-                    // value" wrapper it uses for empty or malformed values, so surface
-                    // the cleaned inner message directly rather than leaking a
-                    // SerializationException with the raw prefix. Confirmed against
-                    // real DynamoDB (eu-west-2).
-                    return Err(DynoxideError::ValidationException(inner.to_string()));
-                } else {
-                    return Err(DynoxideError::SerializationException(msg));
+                // A malformed value fails the request as it is read, before
+                // any key is named.
+                if let Some(error) = crate::serde_errors::marked_serialization_error(&msg) {
+                    return Err(error);
                 }
+                return Err(match value_refusal(&msg) {
+                    ValueRefusal::Empty => {
+                        DynoxideError::ValidationException(named_value_refusal(EMPTY_VALUE, key))
+                    }
+                    ValueRefusal::MoreThanOneType => DynoxideError::ValidationException(
+                        named_value_refusal(MORE_THAN_ONE_TYPE, key),
+                    ),
+                    // Only a value with more than one member is refused for an
+                    // empty set as it is read, on the older layer, which names
+                    // the key (captured eu-west-2 and us-east-1, 2026-10-10).
+                    ValueRefusal::EmptySet(inner) => {
+                        DynoxideError::ValidationException(named_value_refusal(inner, key))
+                    }
+                    // The current layer refuses it with no wrapper, in the
+                    // envelope on DeleteItem; the older layer names the key.
+                    ValueRefusal::Number(inner) => match layer {
+                        crate::validation::ValueLayer::Current => {
+                            DynoxideError::EnvelopedValidation(inner.to_string())
+                        }
+                        crate::validation::ValueLayer::Older => {
+                            DynoxideError::ValidationException(named_value_refusal(inner, key))
+                        }
+                    },
+                    // A NULL refused as it was parsed (a string that reads as
+                    // false, or false beside another member) is named by key,
+                    // as an empty value is (captured eu-west-2 and us-east-1,
+                    // 2026-10-10, on UpdateItem, DeleteItem and Query).
+                    ValueRefusal::ParsedNull(inner) => {
+                        DynoxideError::ValidationException(named_value_refusal(inner, key))
+                    }
+                    // A rejected {"NULL": false} is refused with the bare
+                    // validation message, without the per-key wrapper DynamoDB
+                    // uses for empty or malformed values (eu-west-2). It is the
+                    // request-validation family DeleteItem wraps in the
+                    // envelope (eu-west-2 and us-east-1, 2026-10-09), so it is
+                    // tagged; a read that reports it bare strips the tag.
+                    ValueRefusal::RequestNull(inner) => {
+                        DynoxideError::EnvelopedValidation(inner.to_string())
+                    }
+                    ValueRefusal::Other => DynoxideError::SerializationException(msg),
+                });
             }
         }
     }
     Ok(result)
+}
+
+/// Read the legacy `Expected` map of PutItem, UpdateItem or DeleteItem.
+///
+/// A value in it that DynamoDB refuses (`{"NULL": false}`, a number it can't
+/// read or store) is refused here, tagged for the request-validation envelope,
+/// as DynamoDB refuses it (eu-west-2 and us-east-1, 2026-10-09). A map that
+/// doesn't read as conditions is refused too, classified as a request body
+/// would be, and never dropped: dropping it ran the write with no condition
+/// at all. An empty attribute value gets DynamoDB's bare "Supplied
+/// AttributeValue is empty" (eu-west-2 and us-east-1, 2026-10-10).
+pub(crate) fn read_expected(
+    expected: &serde_json::Value,
+) -> Result<Option<HashMap<String, ExpectedCondition>>> {
+    match serde_json::from_value::<HashMap<String, ExpectedCondition>>(expected.clone()) {
+        Ok(map) => {
+            // Each value is checked as an item's would be: empty and duplicated
+            // sets and numbers, in the envelope (eu-west-2, us-east-1,
+            // eu-west-1 and us-west-2, 2026-10-09).
+            let mut names: Vec<&String> = map.keys().collect();
+            names.sort();
+            for name in names {
+                let condition = &map[name];
+                let values = condition
+                    .value
+                    .iter()
+                    .chain(condition.attribute_value_list.iter().flatten());
+                for value in values {
+                    crate::validation::validate_value_classified(
+                        value,
+                        crate::validation::ValueLayer::Current,
+                    )
+                    .map_err(ClassifiedValidationError::into_tagged)?;
+                }
+            }
+            Ok(Some(map))
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let marked = msg.starts_with(crate::serde_errors::REQUEST_VALIDATION_MARKER)
+                || msg.starts_with(crate::serde_errors::VALIDATION_MARKER);
+            if marked {
+                Err(DynoxideError::EnvelopedValidation(
+                    crate::serde_errors::clean_serde_message(&msg).to_string(),
+                ))
+            } else {
+                // Classified as the request body's own errors are, in every
+                // build, so a library caller gets the same words as the wire.
+                let refused =
+                    crate::serde_errors::deserialize::<HashMap<String, ExpectedCondition>>(
+                        &expected.to_string(),
+                    )
+                    .err()
+                    .unwrap_or_else(|| {
+                        DynoxideError::ValidationException(
+                            crate::serde_errors::clean_serde_message(&msg).to_string(),
+                        )
+                    });
+                Err(refused)
+            }
+        }
+    }
 }
 
 /// Validate that AttributesToGet has no duplicate values.
@@ -1113,15 +1252,22 @@ pub async fn build_item_collection_metrics<S: StorageBackend>(
         }
     }
 
-    let size_gb = partition_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-
     let mut key_map = HashMap::new();
     key_map.insert(pk_attr.to_string(), pk_value.clone());
 
     Ok(Some(crate::types::ItemCollectionMetrics {
         item_collection_key: key_map,
-        size_estimate_range_gb: vec![size_gb, size_gb],
+        size_estimate_range_gb: size_estimate_range_gb(partition_bytes),
     }))
+}
+
+/// The `SizeEstimateRangeGB` DynamoDB reports for an item collection of
+/// `bytes`: a lower and an upper bound in whole gigabytes, the size rounded
+/// down and one more. A small collection reads `[0.0, 1.0]` (captured
+/// eu-west-2 and us-east-1, 2026-10-09).
+fn size_estimate_range_gb(bytes: i64) -> Vec<f64> {
+    let lower = (bytes as f64 / (1024.0 * 1024.0 * 1024.0)).floor();
+    vec![lower, lower + 1.0]
 }
 
 /// Convert legacy `AttributesToGet` list to a `ProjectionExpr`.
@@ -1138,22 +1284,30 @@ pub fn attributes_to_get_to_projection(
 }
 
 /// Convert legacy `Expected` parameter to a `ConditionExpression` string
-/// and matching `ExpressionAttributeValues`.
-///
-/// Returns `(condition_expression, expression_attribute_values)` or an error.
+/// with the `ExpressionAttributeNames` and `ExpressionAttributeValues` it
+/// uses. Each attribute is named through a placeholder by its position,
+/// `#expected_0`, never by its own name, which may hold a character the
+/// expression reader stops at (`-`, `.`, anything outside ASCII).
 pub fn convert_expected_to_condition(
     expected: &HashMap<String, ExpectedCondition>,
     conditional_operator: Option<&str>,
-) -> Result<(String, HashMap<String, crate::types::AttributeValue>)> {
+) -> Result<ConvertedCondition> {
     let joiner = match conditional_operator {
         Some(op) if op.eq_ignore_ascii_case("OR") => " OR ",
         _ => " AND ",
     };
     let mut parts = Vec::new();
     let mut values = HashMap::new();
+    let mut names = HashMap::new();
     let mut val_idx = 0u32;
 
-    for (attr_name, cond) in expected {
+    // In name order, so the placeholders and the expression are the same
+    // for the same request.
+    let mut ordered: Vec<(&String, &ExpectedCondition)> = expected.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    for (index, (attr_name, cond)) in ordered.into_iter().enumerate() {
+        let name_ref = format!("#expected_{index}");
+        names.insert(name_ref.clone(), attr_name.clone());
         // Validate conflicting options
         if cond.exists.is_some() && cond.comparison_operator.is_some() {
             return Err(DynoxideError::ValidationException(format!(
@@ -1177,16 +1331,16 @@ pub fn convert_expected_to_condition(
 
             match comp_upper.as_str() {
                 "NULL" => {
-                    parts.push(format!("attribute_not_exists(#expected_{attr_name})"));
+                    parts.push(format!("attribute_not_exists({name_ref})"));
                 }
                 "NOT_NULL" => {
-                    parts.push(format!("attribute_exists(#expected_{attr_name})"));
+                    parts.push(format!("attribute_exists({name_ref})"));
                 }
                 "EQ" => {
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} = {val_name}"));
+                        parts.push(format!("{name_ref} = {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1198,7 +1352,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} <> {val_name}"));
+                        parts.push(format!("{name_ref} <> {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1210,7 +1364,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} <= {val_name}"));
+                        parts.push(format!("{name_ref} <= {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1222,7 +1376,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} < {val_name}"));
+                        parts.push(format!("{name_ref} < {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1234,7 +1388,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} >= {val_name}"));
+                        parts.push(format!("{name_ref} >= {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1246,7 +1400,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} > {val_name}"));
+                        parts.push(format!("{name_ref} > {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1261,7 +1415,7 @@ pub fn convert_expected_to_condition(
                         val_idx += 1;
                         let v2 = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} BETWEEN {v1} AND {v2}"));
+                        parts.push(format!("{name_ref} BETWEEN {v1} AND {v2}"));
                         values.insert(v1, list[0].clone());
                         values.insert(v2, list[1].clone());
                     } else {
@@ -1274,7 +1428,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("begins_with(#expected_{attr_name}, {val_name})"));
+                        parts.push(format!("begins_with({name_ref}, {val_name})"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1286,7 +1440,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("contains(#expected_{attr_name}, {val_name})"));
+                        parts.push(format!("contains({name_ref}, {val_name})"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1298,7 +1452,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("NOT contains(#expected_{attr_name}, {val_name})"));
+                        parts.push(format!("NOT contains({name_ref}, {val_name})"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1318,10 +1472,7 @@ pub fn convert_expected_to_condition(
                                 name
                             })
                             .collect();
-                        parts.push(format!(
-                            "#expected_{attr_name} IN ({})",
-                            val_names.join(", ")
-                        ));
+                        parts.push(format!("{name_ref} IN ({})", val_names.join(", ")));
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
                             "One or more parameter values were invalid: Value or AttributeValueList must be used with ComparisonOperator: IN for Attribute: {attr_name}"
@@ -1336,37 +1487,24 @@ pub fn convert_expected_to_condition(
             }
         } else if let Some(false) = cond.exists {
             // { Exists: false } => attribute_not_exists
-            parts.push(format!("attribute_not_exists(#expected_{attr_name})"));
+            parts.push(format!("attribute_not_exists({name_ref})"));
         } else if let Some(ref value) = cond.value {
             // { Value: ... } (with Exists: true or Exists omitted) => attr = value
             let val_name = format!(":expected_v{val_idx}");
             val_idx += 1;
-            parts.push(format!("#expected_{attr_name} = {val_name}"));
+            parts.push(format!("{name_ref} = {val_name}"));
             values.insert(val_name, value.clone());
         } else {
             // { Exists: true } without Value => attribute_exists
-            parts.push(format!("attribute_exists(#expected_{attr_name})"));
+            parts.push(format!("attribute_exists({name_ref})"));
         }
     }
 
-    if parts.is_empty() {
-        return Ok((String::new(), values));
-    }
-
-    // Sort parts for deterministic output (attribute names are unordered in HashMap)
-    parts.sort();
-    Ok((parts.join(joiner), values))
-}
-
-/// Build ExpressionAttributeNames for the Expected conversion.
-/// Maps `#expected_<attr>` to `<attr>` for each attribute in the Expected map.
-pub fn expected_attr_names(
-    expected: &HashMap<String, ExpectedCondition>,
-) -> HashMap<String, String> {
-    expected
-        .keys()
-        .map(|attr| (format!("#expected_{attr}"), attr.clone()))
-        .collect()
+    Ok(ConvertedCondition {
+        expression: parts.join(joiner),
+        attribute_values: values,
+        attribute_names: names,
+    })
 }
 
 /// Legacy `Expected` condition for a single attribute.
@@ -1374,7 +1512,11 @@ pub fn expected_attr_names(
 pub struct ExpectedCondition {
     #[serde(rename = "Value", default)]
     pub value: Option<crate::types::AttributeValue>,
-    #[serde(rename = "Exists", default)]
+    #[serde(
+        rename = "Exists",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
     pub exists: Option<bool>,
     #[serde(rename = "ComparisonOperator", default)]
     pub comparison_operator: Option<String>,
@@ -1441,7 +1583,10 @@ pub fn validate_expected_conditions(expected: &HashMap<String, ExpectedCondition
                 "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "CONTAINS" | "NOT_CONTAINS"
                 | "BEGINS_WITH" => {
                     if arg_count != 1 {
-                        if arg_count == 0 {
+                        // An AttributeValueList that is there but empty is a
+                        // wrong count, not a missing value (EQ captured
+                        // eu-west-2 and us-east-1, 2026-10-10).
+                        if arg_count == 0 && !has_avl {
                             return Err(DynoxideError::ValidationException(format!(
                                 "One or more parameter values were invalid: \
                                  Value or AttributeValueList must be used with ComparisonOperator: {op} for Attribute: {attr_name}"
@@ -1476,12 +1621,23 @@ pub fn validate_expected_conditions(expected: &HashMap<String, ExpectedCondition
                     }
                 }
                 _ => {
-                    if arg_count == 0 && !has_value {
-                        return Err(DynoxideError::ValidationException(format!(
-                            "One or more parameter values were invalid: \
-                             Value or AttributeValueList must be used with ComparisonOperator: {op} for Attribute: {attr_name}"
-                        )));
-                    }
+                    // An operator DynamoDB doesn't have is refused as such,
+                    // ahead of its arguments (captured eu-west-2 and
+                    // us-east-1, 2026-10-10).
+                    return Err(DynoxideError::ValidationException(
+                        INVALID_COMPARISON_OPERATOR.to_string(),
+                    ));
+                }
+            }
+
+            // IN takes only a string, number or binary value, and names the
+            // first value in its list of any other type, ahead of the list's
+            // types disagreeing (captured eu-west-2 and us-east-1, 2026-10-10).
+            if op == "IN"
+                && let Some(ref avl) = cond.attribute_value_list
+            {
+                for value in avl {
+                    validate_comparison_type_compat(op, value.type_name())?;
                 }
             }
 
@@ -1595,92 +1751,39 @@ pub fn convert_key_conditions(
         ordered_keys.insert(0, removed);
     }
 
-    for attr_name in ordered_keys {
+    // Each attribute is named through a placeholder by its position, never by
+    // its own name, which may hold a character the expression reader stops at
+    // (`-`, `.`, anything outside ASCII).
+    for (index, attr_name) in ordered_keys.into_iter().enumerate() {
         let cond = &key_conditions[attr_name];
-        let name_ref = format!("#kc_{attr_name}");
+        let name_ref = format!("#kc_{index}");
         names.insert(name_ref.clone(), attr_name.clone());
 
-        let comp_op = cond.comparison_operator.to_uppercase();
-        match comp_op.as_str() {
-            "EQ" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} = {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "LE" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} <= {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "LT" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} < {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "GE" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} >= {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "GT" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} > {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "BETWEEN" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 2
-                {
-                    let v1 = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    let v2 = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} BETWEEN {v1} AND {v2}"));
-                    values.insert(v1, list[0].clone());
-                    values.insert(v2, list[1].clone());
-                }
-            }
-            "BEGINS_WITH" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("begins_with({name_ref}, {val_name})"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            _ => {
+        // Operators are matched as written: DynamoDB refuses `eq`.
+        let op = cond.comparison_operator.as_str();
+        let count = match op {
+            "EQ" | "LE" | "LT" | "GE" | "GT" | "BEGINS_WITH" => 1,
+            "BETWEEN" => 2,
+            "NE" | "IN" | "NULL" | "NOT_NULL" | "CONTAINS" | "NOT_CONTAINS" => {
                 return Err(DynoxideError::ValidationException(format!(
-                    "Unsupported KeyConditions ComparisonOperator: {comp_op}"
+                    "Unsupported KeyConditions ComparisonOperator: {op}"
                 )));
             }
-        }
+            _ => {
+                return Err(DynoxideError::ValidationException(
+                    INVALID_COMPARISON_OPERATOR.to_string(),
+                ));
+            }
+        };
+        let refs = legacy_value_refs(
+            cond.attribute_value_list.as_deref(),
+            op,
+            count..=count,
+            "kc",
+            &mut val_idx,
+            &mut values,
+        )?;
+        parts.push(legacy_condition_text(op, &name_ref, &refs));
     }
 
     Ok(ConvertedCondition {
@@ -1722,106 +1825,98 @@ pub fn convert_filter_conditions(
     let mut names = HashMap::new();
     let mut val_idx = 0u32;
 
-    for (attr_name, cond) in conditions {
-        let name_ref = format!("#qf_{attr_name}");
+    // In name order, each attribute named through a placeholder by its
+    // position, never by its own name, which may hold a character the
+    // expression reader stops at (`-`, `.`, anything outside ASCII).
+    let mut ordered: Vec<(&String, &FilterCondition)> = conditions.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    for (index, (attr_name, cond)) in ordered.into_iter().enumerate() {
+        let name_ref = format!("#qf_{index}");
         names.insert(name_ref.clone(), attr_name.clone());
 
-        let comp_op = cond.comparison_operator.to_uppercase();
-        match comp_op.as_str() {
-            "NULL" => {
-                parts.push(format!("attribute_not_exists({name_ref})"));
+        // Operators are matched as written: DynamoDB refuses `eq`. An unknown
+        // one is refused rather than skipped, which ran the read without it.
+        let op = cond.comparison_operator.as_str();
+        let counts = match op {
+            "NULL" | "NOT_NULL" => 0..=0,
+            "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "BEGINS_WITH" | "CONTAINS"
+            | "NOT_CONTAINS" => 1..=1,
+            "BETWEEN" => 2..=2,
+            "IN" => 1..=usize::MAX,
+            _ => {
+                return Err(DynoxideError::ValidationException(
+                    INVALID_COMPARISON_OPERATOR.to_string(),
+                ));
             }
-            "NOT_NULL" => {
-                parts.push(format!("attribute_exists({name_ref})"));
-            }
-            "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" => {
-                let op_str = match comp_op.as_str() {
-                    "EQ" => "=",
-                    "NE" => "<>",
-                    "LE" => "<=",
-                    "LT" => "<",
-                    "GE" => ">=",
-                    "GT" => ">",
-                    _ => unreachable!(),
-                };
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} {op_str} {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "BETWEEN" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 2
-                {
-                    let v1 = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    let v2 = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} BETWEEN {v1} AND {v2}"));
-                    values.insert(v1, list[0].clone());
-                    values.insert(v2, list[1].clone());
-                }
-            }
-            "BEGINS_WITH" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("begins_with({name_ref}, {val_name})"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "CONTAINS" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("contains({name_ref}, {val_name})"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "NOT_CONTAINS" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("NOT contains({name_ref}, {val_name})"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "IN" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && !list.is_empty()
-                {
-                    let val_names: Vec<String> = list
-                        .iter()
-                        .map(|v| {
-                            let name = format!(":qf_v{val_idx}");
-                            val_idx += 1;
-                            values.insert(name.clone(), v.clone());
-                            name
-                        })
-                        .collect();
-                    parts.push(format!("{name_ref} IN ({})", val_names.join(", ")));
-                }
-            }
-            _ => {}
-        }
+        };
+        let refs = legacy_value_refs(
+            cond.attribute_value_list.as_deref(),
+            op,
+            counts,
+            "qf",
+            &mut val_idx,
+            &mut values,
+        )?;
+        parts.push(legacy_condition_text(op, &name_ref, &refs));
     }
 
-    parts.sort();
     Ok(ConvertedCondition {
         expression: parts.join(joiner),
         attribute_values: values,
         attribute_names: names,
     })
+}
+
+/// Name each value of a legacy condition as an expression value,
+/// `:<prefix>_v<n>`, adding it to `values`. A list the operator can't take is
+/// refused with the argument count message, never dropped; the request's
+/// validation has already refused it, so this only guards against a caller
+/// that skipped it.
+fn legacy_value_refs(
+    list: Option<&[crate::types::AttributeValue]>,
+    op: &str,
+    counts: std::ops::RangeInclusive<usize>,
+    prefix: &str,
+    val_idx: &mut u32,
+    values: &mut HashMap<String, crate::types::AttributeValue>,
+) -> Result<Vec<String>> {
+    let list = list.unwrap_or_default();
+    if !counts.contains(&list.len()) {
+        return Err(DynoxideError::ValidationException(format!(
+            "One or more parameter values were invalid: Invalid number of argument(s) for the {op} ComparisonOperator"
+        )));
+    }
+    Ok(list
+        .iter()
+        .map(|value| {
+            let name = format!(":{prefix}_v{val_idx}");
+            *val_idx += 1;
+            values.insert(name.clone(), value.clone());
+            name
+        })
+        .collect())
+}
+
+/// A legacy condition as expression text over `name` and its value names,
+/// for an operator already checked to be one DynamoDB has.
+fn legacy_condition_text(op: &str, name: &str, refs: &[String]) -> String {
+    let comparison = |symbol: &str| format!("{name} {symbol} {}", refs[0]);
+    match op {
+        "NULL" => format!("attribute_not_exists({name})"),
+        "NOT_NULL" => format!("attribute_exists({name})"),
+        "EQ" => comparison("="),
+        "NE" => comparison("<>"),
+        "LE" => comparison("<="),
+        "LT" => comparison("<"),
+        "GE" => comparison(">="),
+        "GT" => comparison(">"),
+        "BETWEEN" => format!("{name} BETWEEN {} AND {}", refs[0], refs[1]),
+        "BEGINS_WITH" => format!("begins_with({name}, {})", refs[0]),
+        "CONTAINS" => format!("contains({name}, {})", refs[0]),
+        "NOT_CONTAINS" => format!("NOT contains({name}, {})", refs[0]),
+        // IN, the only operator left.
+        _ => format!("{name} IN ({})", refs.join(", ")),
+    }
 }
 
 /// Extract pk and sk strings from an item's key attributes.
@@ -1860,12 +1955,20 @@ pub fn extract_key_strings(
 /// - Number errors: raw error (no prefix)
 pub fn parse_exclusive_start_key(
     value: &serde_json::Value,
+    layer: crate::validation::ValueLayer,
 ) -> Result<HashMap<String, AttributeValue>> {
     // First, try to deserialise: this catches multi-type and number errors
-    let parsed = match serde_json::from_value::<HashMap<String, AttributeValue>>(value.clone()) {
+    let parsed = match crate::types::with_value_layer(layer, || {
+        serde_json::from_value::<HashMap<String, AttributeValue>>(value.clone())
+    }) {
         Ok(map) => map,
         Err(e) => {
             let msg = e.to_string();
+            // A malformed value fails the request as it is read, as it does
+            // in an expression value (not captured for a starting key).
+            if let Some(error) = crate::serde_errors::marked_serialization_error(&msg) {
+                return Err(error);
+            }
             // Strip the serde position suffix and any internal marker
             let inner = crate::serde_errors::clean_serde_message(&msg);
 
@@ -1904,12 +2007,10 @@ pub fn parse_exclusive_start_key(
         match av {
             // These get "The provided starting key is invalid: One or more..." prefix
             AttributeValue::NULL(b) if !b => {
-                return Err(DynoxideError::ValidationException(
-                    "The provided starting key is invalid: \
-                     One or more parameter values were invalid: \
-                     Null attribute value types must have the value of true"
-                        .to_string(),
-                ));
+                return Err(DynoxideError::ValidationException(format!(
+                    "The provided starting key is invalid: {}",
+                    crate::serde_errors::NULL_NOT_TRUE
+                )));
             }
             AttributeValue::SS(set) if set.is_empty() => {
                 return Err(DynoxideError::ValidationException(
@@ -1935,51 +2036,20 @@ pub fn parse_exclusive_start_key(
                         .to_string(),
                 ));
             }
-            AttributeValue::SS(set) => {
-                let mut seen = std::collections::HashSet::new();
-                for s in set {
-                    if !seen.insert(s.clone()) {
-                        let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                        return Err(DynoxideError::ValidationException(format!(
-                            "One or more parameter values were invalid: \
-                             Input collection [{}] contains duplicates.",
-                            display.join(", ")
-                        )));
-                    }
-                }
-            }
-            AttributeValue::BS(set) => {
-                let mut seen = std::collections::HashSet::new();
-                for b in set {
-                    if !seen.insert(b.clone()) {
-                        use base64::Engine;
-                        let display: Vec<String> = set
-                            .iter()
-                            .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
-                            .collect();
-                        return Err(DynoxideError::ValidationException(format!(
-                            "One or more parameter values were invalid: \
-                             Input collection [{}]of type BS contains duplicates.",
-                            display.join(", ")
-                        )));
-                    }
+            AttributeValue::SS(_) | AttributeValue::BS(_) => {
+                if let Some(message) = crate::validation::duplicate_set_message(av, layer) {
+                    return Err(DynoxideError::ValidationException(message));
                 }
             }
             AttributeValue::N(n) => {
-                crate::types::validate_dynamo_number(n)?;
+                layer.check_number(n)?;
             }
-            AttributeValue::NS(set) if !set.is_empty() => {
+            AttributeValue::NS(set) => {
                 for n in set {
-                    crate::types::validate_dynamo_number(n)?;
+                    layer.check_number(n)?;
                 }
-                let mut seen = std::collections::HashSet::new();
-                for n in set {
-                    let normalized = crate::types::normalize_dynamo_number(n);
-                    if !seen.insert(normalized) {
-                        return Err(DynoxideError::ValidationException(
-                            "Input collection contains duplicates".to_string(),
-                        ));
-                    }
+                if let Some(message) = crate::validation::duplicate_set_message(av, layer) {
+                    return Err(DynoxideError::ValidationException(message));
                 }
             }
             _ => {}
@@ -2138,7 +2208,10 @@ fn get_index_key_schema(meta: &TableMetadata, index_name: &str) -> Result<Vec<Ke
 }
 
 /// Check whether an `AttributeValue` matches a `ScalarAttributeType`.
-fn attr_value_matches_scalar_type(val: &AttributeValue, expected: &ScalarAttributeType) -> bool {
+pub(crate) fn attr_value_matches_scalar_type(
+    val: &AttributeValue,
+    expected: &ScalarAttributeType,
+) -> bool {
     matches!(
         (val, expected),
         (AttributeValue::S(_), ScalarAttributeType::S)
@@ -2147,11 +2220,70 @@ fn attr_value_matches_scalar_type(val: &AttributeValue, expected: &ScalarAttribu
     )
 }
 
+/// DynamoDB's refusal of a legacy condition's `ComparisonOperator` that isn't
+/// one of its own. Operators are case-sensitive, so `eq` is refused too.
+/// Captured on ScanFilter and QueryFilter in eu-west-2, ap-southeast-2 and
+/// eu-central-1 (2026-10-10), and on Expected in eu-west-2 and us-east-1.
+/// us-east-1 answers a ScanFilter's with the member's enum constraint instead,
+/// `1 validation error detected: Value 'FOO' at
+/// 'scanFilter.a.member.comparisonOperator' failed to satisfy constraint:
+/// Member must satisfy enum value set: [IN, NULL, BETWEEN, ...]`; the majority
+/// is followed.
+pub(crate) const INVALID_COMPARISON_OPERATOR: &str =
+    "One or more parameter values were invalid: Invalid comparison operator";
+
+/// The member error for every condition in a legacy `QueryFilter`,
+/// `ScanFilter` or `KeyConditions` map with no `ComparisonOperator`, or a
+/// JSON null one, under `member` (`scanFilter`, `queryFilter`,
+/// `keyConditions`): `Value null at 'scanFilter.a.member.comparisonOperator'
+/// failed to satisfy constraint: Member must not be null` (ScanFilter captured
+/// in four regions, 2026-10-10; the other two inferred). An operator of
+/// another JSON type is left to the request's reader, which refuses it.
+pub(crate) fn missing_comparison_operators(
+    conditions: Option<&serde_json::Value>,
+    member: &str,
+) -> Vec<String> {
+    let Some(conditions) = conditions.and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    conditions
+        .iter()
+        .filter(|(_, condition)| {
+            condition.as_object().is_some_and(|condition| {
+                condition
+                    .get("ComparisonOperator")
+                    .is_none_or(serde_json::Value::is_null)
+            })
+        })
+        .map(|(name, _)| {
+            format!(
+                "Value null at '{member}.{name}.member.comparisonOperator' failed to satisfy \
+                 constraint: Member must not be null"
+            )
+        })
+        .collect()
+}
+
 /// Validate argument counts and type compatibility for each `ComparisonOperator`
-/// in a raw `QueryFilter`, `ScanFilter`, or `KeyConditions` JSON map.
+/// in a raw `QueryFilter`, `ScanFilter`, or `KeyConditions` JSON map, named by
+/// `member` as its errors name it (`scanFilter`, `queryFilter`,
+/// `keyConditions`).
+///
+/// A missing operator is a member error the request's reader reports with the
+/// request's others; it is refused here too for a request built in code. An
+/// operator DynamoDB doesn't have is refused, never skipped: skipping it ran
+/// the read without that condition.
 ///
 /// DynamoDB validates these BEFORE ExclusiveStartKey and expression syntax.
-pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Result<()> {
+pub fn validate_filter_condition_args(
+    value: Option<&serde_json::Value>,
+    member: &str,
+) -> Result<()> {
+    if let Some(message) =
+        crate::validation::format_validation_errors(&missing_comparison_operators(value, member))
+    {
+        return Err(DynoxideError::ValidationException(message));
+    }
     let val = match value {
         Some(v) if v.is_object() => v,
         _ => return Ok(()),
@@ -2164,6 +2296,7 @@ pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Resu
             None => continue,
         };
 
+        // Not a string: the request's reader refuses it.
         let comp_op = match cond_obj.get("ComparisonOperator").and_then(|v| v.as_str()) {
             Some(op) => op,
             None => continue,
@@ -2181,7 +2314,11 @@ pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Resu
             | "BEGINS_WITH" => (1, 1),
             "BETWEEN" => (2, 2),
             "IN" => (1, usize::MAX),
-            _ => continue,
+            _ => {
+                return Err(DynoxideError::ValidationException(
+                    INVALID_COMPARISON_OPERATOR.to_string(),
+                ));
+            }
         };
 
         if avl_len < min || avl_len > max {
@@ -2191,13 +2328,17 @@ pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Resu
             )));
         }
 
-        // Type compatibility validation
+        // Type compatibility validation. IN checks every value in its list,
+        // naming the first whose type it can't take (captured eu-west-2 and
+        // us-east-1, 2026-10-10); the other operators check their first.
         if let Some(arr) = avl
             && !arr.is_empty()
         {
-            let first_type = attr_value_type_name_from_json(&arr[0]);
-            if let Some(type_name) = first_type {
-                validate_comparison_type_compat(comp_op, type_name)?;
+            let checked = if comp_op == "IN" { &arr[..] } else { &arr[..1] };
+            for value in checked {
+                if let Some(type_name) = attr_value_type_name_from_json(value) {
+                    validate_comparison_type_compat(comp_op, type_name)?;
+                }
             }
         }
     }
@@ -2206,15 +2347,13 @@ pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Resu
 }
 
 /// Extract the DynamoDB type name (S, N, B, BOOL, NULL, SS, NS, BS, M, L)
-/// from a raw JSON AttributeValue object.
+/// from a raw JSON AttributeValue object. A member set to JSON null counts as
+/// absent, as it does when the value is read.
 fn attr_value_type_name_from_json(val: &serde_json::Value) -> Option<&str> {
     val.as_object().and_then(|obj| {
-        for key in &["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS", "M", "L"] {
-            if obj.contains_key(*key) {
-                return Some(*key);
-            }
-        }
-        None
+        ["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS", "M", "L"]
+            .into_iter()
+            .find(|key| obj.get(*key).is_some_and(|member| !member.is_null()))
     })
 }
 
@@ -2248,6 +2387,8 @@ fn validate_comparison_type_compat(comp_op: &str, type_name: &str) -> Result<()>
 pub fn validate_filter_conditions_raw(
     value: Option<&serde_json::Value>,
     _param_name: &str,
+
+    layer: crate::validation::ValueLayer,
 ) -> Result<()> {
     let val = match value {
         Some(v) if v.is_object() => v,
@@ -2267,37 +2408,16 @@ pub fn validate_filter_conditions_raw(
         {
             for av_val in arr {
                 // Try to deserialize each AttributeValue to trigger validation
-                match serde_json::from_value::<AttributeValue>(av_val.clone()) {
-                    Err(e) => {
-                        let msg = e.to_string();
-                        // Strip the serde position suffix and any internal marker
-                        let inner = crate::serde_errors::clean_serde_message(&msg);
-
-                        if inner.contains("empty AttributeValue")
-                            || (inner.contains("Supplied AttributeValue")
-                                && inner.contains("empty"))
-                        {
-                            return Err(DynoxideError::ValidationException(
-                                    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes".to_string()
-                                ));
-                        } else if inner.contains("more than one datatypes") {
-                            return Err(DynoxideError::ValidationException(
-                                "Supplied AttributeValue has more than one datatypes set, \
-                                     must contain exactly one of the supported datatypes"
-                                    .to_string(),
-                            ));
-                        } else if inner.contains("cannot be converted to a numeric value")
-                            || inner.contains("significant digits")
-                            || inner.contains("Number overflow")
-                            || inner.contains("Number underflow")
-                        {
-                            return Err(DynoxideError::ValidationException(inner.to_string()));
-                        }
-                        // Let other errors pass through for now
-                    }
+                match crate::types::with_value_layer(layer, || {
+                    serde_json::from_value::<AttributeValue>(av_val.clone())
+                }) {
+                    // A value that doesn't read is refused, never skipped:
+                    // skipping it dropped the condition and ran the read
+                    // without it.
+                    Err(e) => return Err(legacy_value_refusal(&e.to_string(), av_val, layer)),
                     Ok(av) => {
                         // Validate parsed value (NULL:false, empty sets, duplicates, numbers)
-                        validate_filter_attribute_value(&av)?;
+                        validate_filter_attribute_value(&av, layer)?;
                     }
                 }
             }
@@ -2307,15 +2427,68 @@ pub fn validate_filter_conditions_raw(
     Ok(())
 }
 
+/// The error a value in a legacy condition that doesn't read is refused with,
+/// bare, as DynamoDB refuses it in a QueryFilter, ScanFilter or KeyConditions:
+/// a BOOL or NULL that doesn't read as a boolean fails the whole request as
+/// malformed, and a NULL that reads as false is refused ahead of the
+/// condition's operator checks (captured eu-west-2 and us-east-1, 2026-10-10).
+/// Anything else is classified as the request body's own values are.
+fn legacy_value_refusal(
+    msg: &str,
+    value: &serde_json::Value,
+    layer: crate::validation::ValueLayer,
+) -> DynoxideError {
+    use crate::serde_errors::{EMPTY_VALUE, MORE_THAN_ONE_TYPE, ValueRefusal, value_refusal};
+    if let Some(error) = crate::serde_errors::marked_serialization_error(msg) {
+        return error;
+    }
+    let refusal = |message: &str| DynoxideError::ValidationException(message.to_string());
+    match value_refusal(msg) {
+        ValueRefusal::Empty => refusal(EMPTY_VALUE),
+        ValueRefusal::MoreThanOneType => refusal(MORE_THAN_ONE_TYPE),
+        ValueRefusal::EmptySet(inner)
+        | ValueRefusal::Number(inner)
+        | ValueRefusal::ParsedNull(inner)
+        | ValueRefusal::RequestNull(inner) => refusal(inner),
+        ValueRefusal::Other => match crate::types::with_value_layer(layer, || {
+            crate::serde_errors::deserialize::<AttributeValue>(&value.to_string())
+        }) {
+            Err(DynoxideError::EnvelopedValidation(message)) => {
+                DynoxideError::ValidationException(message)
+            }
+            Err(error) => error,
+            Ok(_) => refusal(crate::serde_errors::clean_serde_message(msg)),
+        },
+    }
+}
+
+/// Read a legacy condition map (`QueryFilter`, `ScanFilter`, `KeyConditions`)
+/// into its conditions, refusing one that doesn't read in the words the
+/// request body's own errors take. It is never dropped: dropping it ran the
+/// read with no condition at all.
+pub(crate) fn read_legacy_conditions<T: serde::de::DeserializeOwned>(
+    conditions: &serde_json::Value,
+    layer: crate::validation::ValueLayer,
+) -> Result<T> {
+    crate::types::with_value_layer(layer, || {
+        crate::serde_errors::deserialize::<T>(&conditions.to_string())
+    })
+    .map_err(|e| match e {
+        DynoxideError::EnvelopedValidation(message) => DynoxideError::ValidationException(message),
+        other => other,
+    })
+}
+
 /// Validate a single attribute value inside a filter condition (QueryFilter,
 /// ScanFilter, KeyConditions). Error messages use the
 /// "One or more parameter values were invalid: " prefix.
-fn validate_filter_attribute_value(value: &AttributeValue) -> Result<()> {
+fn validate_filter_attribute_value(
+    value: &AttributeValue,
+    layer: crate::validation::ValueLayer,
+) -> Result<()> {
     match value {
         AttributeValue::NULL(b) if !b => Err(DynoxideError::ValidationException(
-            "One or more parameter values were invalid: \
-             Null attribute value types must have the value of true"
-                .to_string(),
+            crate::serde_errors::NULL_NOT_TRUE.to_string(),
         )),
         AttributeValue::SS(set) if set.is_empty() => Err(DynoxideError::ValidationException(
             "One or more parameter values were invalid: An string set  may not be empty"
@@ -2329,57 +2502,66 @@ fn validate_filter_attribute_value(value: &AttributeValue) -> Result<()> {
             "One or more parameter values were invalid: Binary sets should not be empty"
                 .to_string(),
         )),
-        AttributeValue::SS(set) => {
-            let mut seen = std::collections::HashSet::new();
-            for s in set {
-                if !seen.insert(s.clone()) {
-                    let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                    return Err(DynoxideError::ValidationException(format!(
-                        "One or more parameter values were invalid: \
-                         Input collection [{}] contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
+        AttributeValue::SS(_) | AttributeValue::BS(_) => {
+            match crate::validation::duplicate_set_message(value, layer) {
+                Some(message) => Err(DynoxideError::ValidationException(message)),
+                None => Ok(()),
             }
-            Ok(())
         }
-        AttributeValue::BS(set) => {
-            let mut seen = std::collections::HashSet::new();
-            for b in set {
-                if !seen.insert(b.clone()) {
-                    use base64::Engine;
-                    let display: Vec<String> = set
-                        .iter()
-                        .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
-                        .collect();
-                    return Err(DynoxideError::ValidationException(format!(
-                        "One or more parameter values were invalid: \
-                         Input collection [{}]of type BS contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
-            }
-            Ok(())
-        }
-        AttributeValue::N(n) => {
-            crate::types::validate_dynamo_number(n)?;
-            Ok(())
-        }
-        AttributeValue::NS(set) if !set.is_empty() => {
+        AttributeValue::N(n) => layer.check_number(n),
+        AttributeValue::NS(set) => {
             for n in set {
-                crate::types::validate_dynamo_number(n)?;
+                layer.check_number(n)?;
             }
-            let mut seen = std::collections::HashSet::new();
-            for n in set {
-                let normalized = crate::types::normalize_dynamo_number(n);
-                if !seen.insert(normalized) {
-                    return Err(DynoxideError::ValidationException(
-                        "Input collection contains duplicates".to_string(),
-                    ));
-                }
+            match crate::validation::duplicate_set_message(value, layer) {
+                Some(message) => Err(DynoxideError::ValidationException(message)),
+                None => Ok(()),
             }
-            Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_rollback_that_found_no_transaction_is_told_apart() {
+        use crate::storage_backend::BackendError;
+        let found_none = |message: &str| {
+            super::rollback_found_no_transaction(&BackendError::Other(message.to_string()))
+        };
+        // As the native backend and the wasm one pass SQLite's message on.
+        assert!(found_none("cannot rollback - no transaction is active"));
+        assert!(found_none(
+            "sqlite-wasm: SQLITE_ERROR: sqlite3 result code 1: cannot rollback - no transaction is active"
+        ));
+        assert!(!found_none("disk I/O error"));
+        assert!(!super::rollback_found_no_transaction(&BackendError::Locked));
+    }
+
+    #[test]
+    fn size_estimate_range_is_whole_gigabytes_around_the_size() {
+        const GB: i64 = 1024 * 1024 * 1024;
+        assert_eq!(super::size_estimate_range_gb(0), vec![0.0, 1.0]);
+        assert_eq!(super::size_estimate_range_gb(1_000), vec![0.0, 1.0]);
+        assert_eq!(super::size_estimate_range_gb(GB - 1), vec![0.0, 1.0]);
+        assert_eq!(super::size_estimate_range_gb(GB), vec![1.0, 2.0]);
+        assert_eq!(super::size_estimate_range_gb(GB * 3 / 2), vec![1.0, 2.0]);
+        assert_eq!(super::size_estimate_range_gb(10 * GB), vec![10.0, 11.0]);
+    }
+
+    /// A legacy `Expected` that doesn't read as conditions is refused in
+    /// DynamoDB's words in every build, a library-only one included: the
+    /// classification no longer depends on the server features.
+    #[test]
+    fn an_unreadable_expected_is_refused_in_dynamodbs_words() {
+        let err = super::read_expected(&serde_json::json!({"guard": {"Value": {}}})).unwrap_err();
+        match err {
+            crate::DynoxideError::ValidationException(message) => assert_eq!(
+                message,
+                "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
+            ),
+            other => panic!("expected a ValidationException, got {other:?}"),
+        }
     }
 }

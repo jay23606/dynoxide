@@ -30,7 +30,11 @@ struct UpdateItemRequestRaw {
     condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_named_null_refusals"
+    )]
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValues", default)]
     return_values: Option<String>,
@@ -65,36 +69,39 @@ pub struct UpdateItemRequest {
     pub conditional_operator: Option<String>,
 }
 
-/// First invalid `Return*` enum for UpdateItem, ReturnValues first, or `None` if
-/// all valid. UpdateItem stops at the first; PutItem aggregates.
-fn first_invalid_return_enum(
+/// UpdateItem's first invalid enum member, or `None` if all are valid, and
+/// whether DynamoDB wraps it in the `1 validation error detected: ` envelope.
+/// UpdateItem reports one, where PutItem reports them all. In the newer
+/// validation layer (five of seven regions, 2026-10-09) the order is
+/// ReturnValues, ReturnValuesOnConditionCheckFailure,
+/// ReturnItemCollectionMetrics, ReturnConsumedCapacity, and the second and
+/// fourth come back without the envelope.
+fn first_invalid_member_enum(
     return_values: Option<&str>,
-    return_consumed_capacity: Option<&str>,
+    return_values_on_condition_check_failure: Option<&str>,
     return_item_collection_metrics: Option<&str>,
-) -> Option<String> {
+    return_consumed_capacity: Option<&str>,
+) -> Option<(String, bool)> {
     if let Some(rv) = return_values
         && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv)
     {
-        return Some(format!(
-            "Value '{}' at 'returnValues' failed to satisfy constraint: \
-                 Member must satisfy enum value set: \
-                 [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]",
-            rv
-        ));
+        return Some((crate::validation::RETURN_VALUES_REJECTION.to_string(), true));
+    }
+    if let Some(msg) = crate::validation::return_values_on_condition_check_failure_rejection(
+        return_values_on_condition_check_failure,
+        "returnValuesOnConditionCheckFailure",
+    ) {
+        return Some((msg, false));
+    }
+    if let Some(msg) =
+        crate::validation::return_item_collection_metrics_rejection(return_item_collection_metrics)
+    {
+        return Some((msg, true));
     }
     if let Some(msg) =
         crate::validation::return_consumed_capacity_rejection(return_consumed_capacity)
     {
-        return Some(msg);
-    }
-    if let Some(ricm) = return_item_collection_metrics
-        && !["SIZE", "NONE"].contains(&ricm)
-    {
-        return Some(format!(
-            "Value '{}' at 'returnItemCollectionMetrics' failed to satisfy constraint: \
-                 Member must satisfy enum value set: [SIZE, NONE]",
-            ricm
-        ));
+        return Some((msg, false));
     }
     None
 }
@@ -104,14 +111,57 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = UpdateItemRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        use crate::validation::format_validation_errors;
 
-        // AWS reports an invalid table name on its own, before the key and
-        // Return* enum checks (eu-west-2).
+        // A BOOL or NULL in a legacy condition, or its `Exists`, that doesn't
+        // read as a boolean makes the whole request malformed, ahead of
+        // everything else.
+        if let Some(message) = crate::types::malformed_condition_boolean(raw.expected.as_ref()) {
+            return Err(serde::de::Error::custom(message));
+        }
+
+        // Without its key, UpdateItem falls back to the older layer in all seven
+        // regions captured on 2026-10-09: every enum error in the older
+        // per-value wording, then the key, and no table name error beside
+        // them. The enums' order is the older layer's (ReturnConsumedCapacity,
+        // ReturnValues, ReturnValuesOnConditionCheckFailure,
+        // ReturnItemCollectionMetrics). An empty name is still checked first.
+        if raw.key.is_none() && raw.table_name.as_deref() != Some("") {
+            let mut errors: Vec<String> = Vec::new();
+            if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+                raw.return_consumed_capacity.as_deref(),
+            ) {
+                errors.push(msg);
+            }
+            if let Some(rv) = raw.return_values.as_deref()
+                && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv)
+            {
+                errors.push(crate::validation::return_values_value_rejection(rv));
+            }
+            if let Some(msg) = crate::validation::return_values_on_condition_check_failure_rejection(
+                raw.return_values_on_condition_check_failure.as_deref(),
+                "returnValuesOnConditionCheckFailure",
+            ) {
+                errors.push(msg);
+            }
+            if let Some(msg) = crate::validation::return_item_collection_metrics_rejection(
+                raw.return_item_collection_metrics.as_deref(),
+            ) {
+                errors.push(msg);
+            }
+            errors.push(
+                "Value null at 'key' failed to satisfy constraint: Member must not be null"
+                    .to_string(),
+            );
+            if let Some(msg) = format_validation_errors(&errors) {
+                return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+            }
+        }
+
+        // UpdateItem reports a table name error on its own, before the key and
+        // the enums (captured 2026-10-09, five of seven regions).
         let table_name_errors =
-            table_name_constraint_errors(raw.table_name.as_deref(), TableNameContext::ReadWrite);
+            crate::validation::update_item_table_name_errors(raw.table_name.as_deref());
         if let Some(msg) = format_validation_errors(&table_name_errors) {
             return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
         }
@@ -128,14 +178,21 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             );
         }
 
-        // UpdateItem stops at the first invalid enum (ReturnValues first) and
-        // reports one error, where PutItem aggregates all of them. Keep separate.
-        if let Some(enum_err) = first_invalid_return_enum(
+        // UpdateItem stops at the first invalid enum and reports one error,
+        // where PutItem aggregates all of them. One reported without the
+        // envelope stands alone; beside a missing key it is left for later,
+        // since that pairing is uncaptured.
+        match first_invalid_member_enum(
             raw.return_values.as_deref(),
-            raw.return_consumed_capacity.as_deref(),
+            raw.return_values_on_condition_check_failure.as_deref(),
             raw.return_item_collection_metrics.as_deref(),
+            raw.return_consumed_capacity.as_deref(),
         ) {
-            errors.push(enum_err);
+            Some((msg, true)) => errors.push(msg),
+            Some((msg, false)) if errors.is_empty() => {
+                return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
+            }
+            _ => {}
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -169,6 +226,12 @@ pub struct AttributeValueUpdate {
     pub value: Option<AttributeValue>,
 }
 
+/// DynamoDB's refusal of an `AttributeUpdates` action other than `ADD`,
+/// `DELETE` or `PUT`, written exactly. Tagged for the envelope, which adds
+/// `1 validation error detected: `.
+const ATTRIBUTE_UPDATE_ACTION_REJECTION: &str =
+    "Member must satisfy enum value set: [ADD, DELETE, PUT]' for Action";
+
 fn default_put_action() -> String {
     "PUT".to_string()
 }
@@ -176,6 +239,8 @@ fn default_put_action() -> String {
 #[derive(Debug, Default, Serialize)]
 pub struct UpdateItemResponse {
     #[serde(rename = "Attributes", skip_serializing_if = "Option::is_none")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub attributes: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
     pub consumed_capacity: Option<types::ConsumedCapacity>,
@@ -207,18 +272,45 @@ pub async fn execute<S: StorageBackend>(
 ) -> Result<UpdateItemResponse> {
     // Apply the request-validation envelope exactly once at the operation
     // boundary, so every early return inside is covered and the tagged
-    // variant never escapes.
-    execute_inner(storage, request)
+    // variant never escapes. A request read on the older layer never gets it.
+    let layer = crate::validation::single_write_layer(request.expected.as_ref());
+    execute_inner(storage, request, layer)
         .await
-        .map_err(crate::validation::envelope_request_validation)
+        .map_err(|e| crate::validation::resolve_for_layer(layer, e))
 }
 
 async fn execute_inner<S: StorageBackend>(
     storage: &S,
     mut request: UpdateItemRequest,
+    layer: crate::validation::ValueLayer,
 ) -> Result<UpdateItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    if let Some(msg) = crate::validation::format_validation_errors(
+        &crate::validation::update_item_table_name_errors(Some(&request.table_name)),
+    ) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
+    // An empty attribute name is refused as the request is read, ahead of every
+    // other value check, the expressions and the table lookup (captured in ten
+    // regions).
+    let updates_empty = request.attribute_updates.as_ref().is_some_and(|updates| {
+        updates.iter().any(|(name, update)| {
+            name.is_empty()
+                || update
+                    .value
+                    .as_ref()
+                    .is_some_and(crate::empty_names::value_has_empty_name)
+        })
+    });
+    crate::empty_names::check_single_item_write(
+        &request.key,
+        updates_empty,
+        request.expected.as_ref(),
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+        None,
+    )?;
 
     // Reject {NULL: false} up front. The HTTP path rejects it during request
     // deserialisation; this keeps the in-process API in agreement (eu-west-2).
@@ -244,6 +336,9 @@ async fn execute_inner<S: StorageBackend>(
         if request.expected.is_some() {
             non_expr.push("Expected");
         }
+        if request.conditional_operator.is_some() {
+            non_expr.push("ConditionalOperator");
+        }
         if request.update_expression.is_some() {
             expr_params.push("UpdateExpression");
         }
@@ -254,25 +349,80 @@ async fn execute_inner<S: StorageBackend>(
         let ctx = helpers::ExpressionParamContext {
             non_expression_params: non_expr,
             expression_params: expr_params,
-            all_expression_param_names: vec!["UpdateExpression", "ConditionExpression"],
+            // DynamoDB names no expression after its "can only be specified
+            // when using expressions" message on the single-item writes
+            // (eu-west-2 and us-east-1, 2026-10-09).
+            all_expression_param_names: vec![],
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
+            layer,
         };
         // Enveloped families are tagged for the request-validation envelope.
         helpers::validate_expression_params(&ctx)
             .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
     }
 
-    // Validate key attribute values (unsupported datatypes, invalid numbers)
-    crate::validation::validate_key_attribute_values(&request.key)?;
+    // ConditionalOperator only joins legacy Expected conditions, so it is
+    // refused without two of them, whatever its value (captured 2026-10-09).
+    if let Some(msg) = crate::validation::conditional_operator_misuse(
+        request.conditional_operator.as_deref(),
+        crate::validation::legacy_condition_count(request.expected.as_ref()),
+    ) {
+        return Err(DynoxideError::EnvelopedValidation(msg.to_string()));
+    }
+    // A key, AttributeUpdates value or Expected value nested too deep is
+    // refused, inside the envelope, before the key is matched to the schema or
+    // the table looked up.
+    crate::value_nesting::check_key_enveloped(&request.key)?;
+    crate::value_nesting::check_attribute_updates(
+        request
+            .attribute_updates
+            .iter()
+            .flat_map(|updates| updates.values())
+            .map(|update| update.value.as_ref()),
+    )?;
+    crate::value_nesting::check_expected(request.expected.as_ref())?;
+
+    // Validate key attribute values (unsupported datatypes, invalid numbers).
+    // A duplicated set member or a number it can't store comes back in the
+    // envelope (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+    crate::validation::validate_key_values(&request.key, layer)
+        .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
+
+    // A legacy AttributeUpdates value with a repeated set member is refused in
+    // the envelope, in the current layer's wording (same capture).
+    if let Some(ref updates) = request.attribute_updates {
+        let mut names: Vec<&String> = updates.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(value) = updates[name].value.as_ref()
+                && let Some(message) = crate::validation::find_duplicate_set(value, layer)
+            {
+                return Err(DynoxideError::EnvelopedValidation(message));
+            }
+        }
+    }
 
     // Validate legacy AttributeUpdates parameters
     if request.update_expression.is_none()
         && let Some(ref updates) = request.attribute_updates
     {
+        // The action is matched exactly: `put` or `Delete` is refused before
+        // the table is looked up (eu-west-2 and us-east-1, 2026-10-10). The
+        // stray quote is DynamoDB's own. Every action is checked before any
+        // other update's own checks, so the answer doesn't depend on the
+        // order the map happens to iterate in.
+        if updates
+            .values()
+            .any(|update| !["ADD", "DELETE", "PUT"].contains(&update.action.as_str()))
+        {
+            return Err(DynoxideError::EnvelopedValidation(
+                ATTRIBUTE_UPDATE_ACTION_REJECTION.to_string(),
+            ));
+        }
         for update in updates.values() {
-            let action = update.action.to_uppercase();
+            let action = update.action.as_str();
             if update.value.is_none() && action != "DELETE" {
                 return Err(DynoxideError::ValidationException(
                     "One or more parameter values were invalid: \
@@ -324,20 +474,18 @@ async fn execute_inner<S: StorageBackend>(
     // no UpdateExpression, conversion does not, so that guard stays on the
     // validation rather than moving up here.
     let expected: Option<HashMap<String, helpers::ExpectedCondition>> =
-        if request.condition_expression.is_none() {
-            request
-                .expected
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-        } else {
-            None
+        match request.expected.as_ref() {
+            Some(v) if request.condition_expression.is_none() => helpers::read_expected(v)?,
+            _ => None,
         };
 
-    // Validate legacy Expected parameter
+    // Validate legacy Expected parameter. Every family comes back in the
+    // envelope (eu-west-2 and us-east-1, 2026-10-09).
     if request.update_expression.is_none()
         && let Some(ref expected) = expected
     {
-        helpers::validate_expected_conditions(expected)?;
+        helpers::validate_expected_conditions(expected)
+            .map_err(crate::validation::tag_for_envelope)?;
     }
 
     // Validate empty UpdateExpression
@@ -349,11 +497,12 @@ async fn execute_inner<S: StorageBackend>(
         ));
     }
 
-    // Validate empty ConditionExpression
+    // Validate empty ConditionExpression, inside the envelope (eu-west-2 and
+    // us-east-1, 2026-10-09).
     if let Some(ref ce) = request.condition_expression
         && ce.is_empty()
     {
-        return Err(DynoxideError::ValidationException(
+        return Err(DynoxideError::EnvelopedValidation(
             "Invalid ConditionExpression: The expression can not be empty;".to_string(),
         ));
     }
@@ -376,16 +525,23 @@ async fn execute_inner<S: StorageBackend>(
         crate::expressions::update::track_references(&parsed, &tracker)
             .map_err(|e| DynoxideError::EnvelopedValidation(wrap_invalid_update_expression(e)))?;
 
-        // Also walk the ConditionExpression to track its attribute usage
-        if let Some(ref ce) = request.condition_expression
-            && let Ok(cond_parsed) = crate::expressions::condition::parse(ce)
-        {
-            crate::expressions::condition::track_references(&cond_parsed, &tracker)
-                .map_err(DynoxideError::EnvelopedValidation)?;
+        // Also walk the ConditionExpression to track its attribute usage. One
+        // that doesn't parse is reported here, ahead of any unused value
+        // (us-east-1 and eu-west-2, 2026-10-09).
+        if let Some(ref ce) = request.condition_expression {
+            let cond_parsed = crate::expressions::condition::parse(ce).map_err(|e| {
+                DynoxideError::EnvelopedValidation(format!("Invalid ConditionExpression: {e}"))
+            })?;
+            crate::expressions::condition::track_references(&cond_parsed, &tracker).map_err(
+                |e| DynoxideError::EnvelopedValidation(format!("Invalid ConditionExpression: {e}")),
+            )?;
         }
 
-        // Check for unused expression attribute names/values
-        tracker.check_unused()?;
+        // Check for unused expression attribute names/values. Enveloped, and
+        // ahead of the table lookup (us-east-1 and eu-west-2, 2026-10-09).
+        tracker
+            .check_unused()
+            .map_err(crate::validation::tag_for_envelope)?;
     }
 
     // Statically validate ConditionExpression (syntax + BETWEEN bounds, etc.)
@@ -413,21 +569,20 @@ async fn execute_inner<S: StorageBackend>(
     if let Some(ref expected) = expected
         && !expected.is_empty()
     {
-        let (cond_expr, values) = helpers::convert_expected_to_condition(
+        let converted = helpers::convert_expected_to_condition(
             expected,
             request.conditional_operator.as_deref(),
         )?;
-        if !cond_expr.is_empty() {
-            let names = helpers::expected_attr_names(expected);
-            request.condition_expression = Some(cond_expr);
+        if !converted.expression.is_empty() {
+            request.condition_expression = Some(converted.expression);
             let expr_values = request
                 .expression_attribute_values
                 .get_or_insert_with(HashMap::new);
-            expr_values.extend(values);
+            expr_values.extend(converted.attribute_values);
             let expr_names = request
                 .expression_attribute_names
                 .get_or_insert_with(HashMap::new);
-            expr_names.extend(names);
+            expr_names.extend(converted.attribute_names);
         }
     }
 
@@ -436,18 +591,16 @@ async fn execute_inner<S: StorageBackend>(
 
     // Validate ReturnValues parameter. The constraint text is tagged without
     // the envelope prefix; the operation boundary applies it, so the prefix
-    // has a single producer. The enum list mirrors first_invalid_return_enum's
-    // ordering so the in-process message matches the request deserialiser.
+    // has a single producer. It is the same text first_invalid_return_enum
+    // gives, so the in-process message matches the request deserialiser.
     if let Some(ref rv) = request.return_values {
         let rv_upper = rv.to_uppercase();
         if !["NONE", "ALL_OLD", "ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"]
             .contains(&rv_upper.as_str())
         {
-            return Err(DynoxideError::EnvelopedValidation(format!(
-                "Value '{rv}' at 'returnValues' failed to satisfy constraint: \
-                 Member must satisfy enum value set: \
-                 [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]"
-            )));
+            return Err(DynoxideError::EnvelopedValidation(
+                crate::validation::RETURN_VALUES_REJECTION.to_string(),
+            ));
         }
     }
 
@@ -472,6 +625,27 @@ async fn execute_inner<S: StorageBackend>(
         &request.expression_attribute_names,
         &request.expression_attribute_values,
     );
+
+    // Hold the request to the 400KB limit before the item is read. DynamoDB
+    // charges a standalone update for what its request carries, worked out from
+    // the statement alone, so the charge needs nothing from the stored item and
+    // is refused ahead of the condition, a SET on a key attribute and anything
+    // else that only shows once the update is applied. Request validation above
+    // still answers first. Captured against eu-west-2 on 9 October 2026; see
+    // `UpdateExpr::request_charge` for the costs. The legacy AttributeUpdates
+    // parameter carries no charge of its own.
+    if let Some(ref update_expr) = request.update_expression {
+        let parsed = crate::expressions::update::parse(update_expr)
+            .map_err(DynoxideError::ValidationException)?;
+        let charge = parsed
+            .request_charge(&tracker)
+            .map_err(DynoxideError::ValidationException)?;
+        if charge > types::MAX_ITEM_SIZE {
+            return Err(DynoxideError::ValidationException(
+                "Item size to update has exceeded the maximum allowed size".to_string(),
+            ));
+        }
+    }
 
     // Wrap the condition check, base write and the GSI/LSI fan-out in a single
     // transaction so a mid-fan-out failure rolls the whole update back, leaving
@@ -534,7 +708,6 @@ async fn execute_inner<S: StorageBackend>(
         let old_item = item.clone();
 
         // Apply UpdateExpression
-        let mut size_overhead = 0usize;
         if let Some(ref update_expr) = request.update_expression {
             let parsed = crate::expressions::update::parse(update_expr)
                 .map_err(DynoxideError::ValidationException)?;
@@ -578,7 +751,6 @@ async fn execute_inner<S: StorageBackend>(
 
             crate::expressions::update::apply(&mut item, &parsed, &tracker)
                 .map_err(DynoxideError::ValidationException)?;
-            size_overhead = parsed.size_overhead();
         }
 
         // Apply legacy AttributeUpdates (if no UpdateExpression was provided)
@@ -586,12 +758,18 @@ async fn execute_inner<S: StorageBackend>(
             && let Some(ref updates) = request.attribute_updates
         {
             apply_attribute_updates(&mut item, updates, &key_schema)?;
-            size_overhead = attribute_updates_size_overhead(updates);
         }
 
         // Note: unused expression attribute validation already done in pre-validation
         // block (Tracker 1). Not repeated here: runtime evaluation may skip branches
         // (e.g., if_not_exists short-circuits) which would cause false positives.
+
+        // An UpdateExpression that leaves the item nested too deep (a value
+        // written far down an existing path) gets the short nesting message,
+        // bare. Captured us-east-1 and eu-west-2, 2026-10-09.
+        if request.update_expression.is_some() {
+            crate::validation::validate_updated_item_nesting(&item)?;
+        }
 
         // Validate attribute values after update expression applied. This
         // checks the post-update item, not the request, so its errors stay
@@ -605,25 +783,21 @@ async fn execute_inner<S: StorageBackend>(
         // error surfaces. Checks only what this update changed (see the helper).
         helpers::validate_updated_index_keys(&old_item, &item, &meta)?;
 
-        // Validate updated item size. An update is measured against the limit
-        // differently from a put: the key attributes come out of the figure and
-        // each action adds a fixed cost, so an item can be reachable by PutItem
-        // and out of reach by UpdateItem. See `UpdateExpr::size_overhead`.
-        //
-        // The item itself is held to the limit as well, so the pair of checks is
-        // `max(item, item - key + overhead) <= 400KB`. Taking the key out of the
-        // measure only ever buys back what the actions cost, never more: once
-        // the key attributes reach the overhead, the item's own size binds and
-        // the ceiling sits flat at 400KB however long the key gets. Measured
-        // across key lengths from 1 to 1024 bytes, the finished item never
-        // exceeds 409,600 on any of them.
-        let size = types::item_size(&item);
-        let measured = size.saturating_sub(key_attributes_size(&item, &key_schema)) + size_overhead;
-        if measured > types::MAX_ITEM_SIZE || size > types::MAX_ITEM_SIZE {
+        // The finished item is held to the limit as well as the request charge
+        // checked before the transaction. The charge binds while the statement
+        // carries more than it adds to the item; once the stored item holds
+        // enough besides, the item's own size does.
+        if types::item_size(&item) > types::MAX_ITEM_SIZE {
             return Err(DynoxideError::ValidationException(
                 "Item size to update has exceeded the maximum allowed size".to_string(),
             ));
         }
+
+        // What the row records and the write is charged: the billed size, with
+        // a vector attribute at 4 bytes per dimension. The limit above sizes it
+        // by its numbers, as DynamoDB does.
+        let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+        let size = types::billed_item_size(&item, &vector_defs);
 
         // Serialize and store
         let item_json = serde_json::to_string(&item)
@@ -649,7 +823,7 @@ async fn execute_inner<S: StorageBackend>(
         // rather than an absent one. The index delta has to see genuine absence,
         // so gate on whether a row was actually read back.
         let prior_image = existing_json.is_some().then_some(&old_item);
-        let old_size = prior_image.map(types::item_size);
+        let old_size = prior_image.map(|old| types::billed_item_size(old, &vector_defs));
 
         let target = super::gsi::IndexWrite {
             table_name: &request.table_name,
@@ -776,37 +950,6 @@ async fn execute_inner<S: StorageBackend>(
     })
 }
 
-/// Size of the key attributes, which DynamoDB leaves out of the figure it
-/// measures an update against.
-fn key_attributes_size(
-    item: &HashMap<String, AttributeValue>,
-    key_schema: &helpers::KeySchema,
-) -> usize {
-    let mut size = 0;
-    for name in std::iter::once(&key_schema.partition_key).chain(key_schema.sort_key.iter()) {
-        if let Some(value) = item.get(name) {
-            size += name.len() + value.size();
-        }
-    }
-    size
-}
-
-/// The `UpdateExpr::size_overhead` equivalent for the legacy `AttributeUpdates`
-/// parameter, whose actions map onto the same three shapes. Inferred from the
-/// expression form rather than captured separately, so it is deliberately no
-/// stricter: an action that is not recognised is charged nothing.
-fn attribute_updates_size_overhead(updates: &HashMap<String, AttributeValueUpdate>) -> usize {
-    let mut overhead = 3;
-    for update in updates.values() {
-        overhead += match update.action.to_uppercase().as_str() {
-            "PUT" | "ADD" => 19,
-            "DELETE" => 2,
-            _ => 0,
-        };
-    }
-    overhead
-}
-
 /// Apply legacy `AttributeUpdates` to the item, mutating it in place.
 ///
 /// Each entry maps an attribute name to an action:
@@ -826,14 +969,10 @@ fn apply_attribute_updates(
                 .as_ref()
                 .is_some_and(|sk| sk == attr_name)
         {
-            return Err(DynoxideError::ValidationException(format!(
-                "One or more parameter values were invalid: \
-                 Cannot update attribute {attr_name}. This attribute is part of the key"
-            )));
+            return Err(helpers::key_attribute_update_refusal(attr_name));
         }
 
-        let action = update.action.to_uppercase();
-        match action.as_str() {
+        match update.action.as_str() {
             "PUT" => {
                 if let Some(ref value) = update.value {
                     item.insert(attr_name.clone(), value.clone());
@@ -862,10 +1001,9 @@ fn apply_attribute_updates(
                 }
             }
             _ => {
-                return Err(DynoxideError::ValidationException(format!(
-                    "1 validation error detected: Value '{action}' at 'attributeUpdates.{attr_name}.member.action' \
-                     failed to satisfy constraint: Member must satisfy enum value set: [ADD, PUT, DELETE]"
-                )));
+                return Err(DynoxideError::EnvelopedValidation(
+                    ATTRIBUTE_UPDATE_ACTION_REJECTION.to_string(),
+                ));
             }
         }
     }
@@ -970,9 +1108,7 @@ fn validate_not_key_attr(
                 .as_ref()
                 .is_some_and(|sk| sk == &resolved_name)
         {
-            return Err(DynoxideError::ValidationException(format!(
-                "One or more parameter values were invalid: Cannot update attribute {resolved_name}. This attribute is part of the key"
-            )));
+            return Err(helpers::key_attribute_update_refusal(&resolved_name));
         }
     }
     Ok(())
@@ -998,7 +1134,12 @@ mod tests {
         .to_string();
         assert!(err.contains("1 validation error detected"), "got: {err}");
         assert!(err.contains("enum value set"), "got: {err}");
-        assert!(err.contains("returnValues"), "got: {err}");
+        // The generic form names neither the value nor the member (captured
+        // 2026-10-08): the enum list is what identifies ReturnValues.
+        assert!(
+            err.contains("[ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]"),
+            "got: {err}"
+        );
         assert!(!err.contains("returnConsumedCapacity"), "got: {err}");
     }
 

@@ -13,7 +13,7 @@ inputs:
     required: false
     default: "8000"
   version:
-    description: "Dynoxide version to install (e.g., v0.9.1). Defaults to latest."
+    description: "Dynoxide version to install (e.g., v0.9.1). Defaults to the latest stable release; name a prerelease (e.g., v1.3.0-rc.1) to install one."
     required: false
     default: "latest"
   mode:

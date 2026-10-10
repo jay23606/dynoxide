@@ -31,6 +31,81 @@ pub fn parse_vector_defs(meta: &TableMetadata) -> Result<Vec<VectorIndex>> {
     }
 }
 
+/// Rewrite the stored `item_size` of every item in `table_name` to its billed
+/// size under `vector_indexes`, returning how many rows were rewritten.
+///
+/// What an item is billed at depends on the table's vector indexes as well as
+/// on the item (see [`crate::types::billed_item_size`]), so this runs whenever
+/// that set changes: when UpdateTable creates or deletes a vector index, and
+/// when a database written before vector attributes were billed is opened.
+pub(crate) async fn recompute_billed_sizes<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    vector_indexes: &[VectorIndex],
+) -> Result<usize> {
+    const BATCH_SIZE: usize = 1000;
+    let mut last_pk: Option<String> = None;
+    let mut last_sk: Option<String> = None;
+    let mut rewritten = 0;
+
+    loop {
+        let items = storage
+            .scan_items(
+                table_name,
+                &crate::storage::ScanParams {
+                    limit: Some(BATCH_SIZE),
+                    exclusive_start_pk: last_pk.as_deref(),
+                    exclusive_start_sk: last_sk.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if items.is_empty() {
+            break;
+        }
+
+        let mut sizes = Vec::with_capacity(items.len());
+        for (pk, sk, item_json) in &items {
+            let item: Item = serde_json::from_str(item_json)
+                .map_err(|e| DynoxideError::InternalServerError(format!("Bad item JSON: {e}")))?;
+            let size = crate::types::billed_item_size(&item, vector_indexes);
+            sizes.push((pk.clone(), sk.clone(), size));
+        }
+        storage.set_item_sizes(table_name, &sizes).await?;
+        rewritten += sizes.len();
+
+        let last = &items[items.len() - 1];
+        last_pk = Some(last.0.clone());
+        last_sk = Some(last.1.clone());
+        if items.len() < BATCH_SIZE {
+            break;
+        }
+    }
+    Ok(rewritten)
+}
+
+/// Recompute the stored sizes of every table that has a vector index, for a
+/// database recorded before
+/// [`VECTOR_BILLED_SIZES`](crate::storage_backend::schema::VECTOR_BILLED_SIZES).
+/// Tables without one are billed as they always were and are left alone. Both
+/// backends run this on open, through
+/// [`run_open_migrations`](super::schema_migrations::run_open_migrations).
+pub(crate) async fn recompute_vector_table_sizes<S: StorageBackend>(storage: &S) -> Result<usize> {
+    let mut tables = 0;
+    for table_name in storage.list_table_names().await? {
+        let Some(meta) = storage.get_table_metadata(&table_name).await? else {
+            continue;
+        };
+        let vector_indexes = parse_vector_defs(&meta)?;
+        if vector_indexes.is_empty() {
+            continue;
+        }
+        recompute_billed_sizes(storage, &table_name, &vector_indexes).await?;
+        tables += 1;
+    }
+    Ok(tables)
+}
+
 /// The SearchSchema HASH attribute of an index, when the schema declares one.
 /// Shared with the SearchVectors handler, which scopes candidate loads and
 /// the mandatory-condition check on the same attribute the write path keys.
@@ -151,7 +226,11 @@ fn run_vector_write_validation(
 
     let changed = |attr: &str, val: &AttributeValue| -> bool {
         match before {
-            Some(b) => b.get(attr) != Some(val),
+            // Sets compare as sets, so a set stored in another order before
+            // sets were sorted doesn't count as changed.
+            Some(b) => !b
+                .get(attr)
+                .is_some_and(|old| super::index_capacity::value_unchanged(old, val)),
             None => true,
         }
     };
@@ -470,7 +549,7 @@ pub(crate) fn vector_entry_bytes(projected: &Item, vix: &VectorIndex) -> usize {
         .filter(|(name, _)| name.as_str() != vector_attr)
         .map(|(name, value)| name.len() + value.size())
         .sum();
-    4 * vix.dimensions as usize + vector_attr.len() + rest
+    crate::types::vector_billed_bytes(vix.dimensions) + vector_attr.len() + rest
 }
 
 /// Whether two derived entries hold the same stored view, so an overwrite that

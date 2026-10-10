@@ -12,6 +12,12 @@ name: Release
 #
 # Flow: validate -> build (5 targets) -> github-release -> publish-crate
 # (review gate) -> publish-homebrew + publish-npm + publish-docker in parallel.
+#
+# A prerelease tag (v1.3.0-rc.1) ships only where someone has to ask for it:
+# the GitHub Release is flagged as a prerelease, npm publishes to `next` and
+# the image gets its exact tag alone. The Homebrew tap, the MCP registry and
+# the site rebuild are skipped. validate resolves the answer once, from
+# scripts/is-prerelease.sh. See docs/versioning.md.
 
 on:
   push:
@@ -47,6 +53,7 @@ jobs:
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
 
     steps:
       - uses: actions/checkout@v5
@@ -63,9 +70,20 @@ jobs:
             echo "::error::Invalid tag format: $TAG (expected vX.Y.Z or vX.Y.Z-pre.N)"
             exit 1
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Resolved tag=$TAG version=$VERSION"
+          # Every job that treats a prerelease differently reads this one
+          # answer. The jobs compare it with 'false', so a value that went
+          # missing would hold the stable-only surfaces back rather than
+          # move them.
+          PRERELEASE=$(scripts/is-prerelease.sh "$VERSION")
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=$TAG version=$VERSION prerelease=$PRERELEASE"
+          if [ "$PRERELEASE" = true ]; then
+            echo "::notice::$TAG is a prerelease: the GitHub Release is flagged as one, npm publishes to next, and the Homebrew tap, MCP registry and site rebuild are skipped."
+          fi
 
 
       # The tag carries the product version. The crate is a separate stream:
@@ -196,11 +214,16 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: scripts/extract-changelog.sh "$VERSION" CHANGELOG.md > /tmp/release_body.md
 
+      # GitHub never makes a prerelease the Latest release, and Latest is what
+      # the composite action's `version: latest` downloads from, so the flag
+      # keeps unpinned workflows on the newest stable binary. Compared with
+      # 'false' so a missing answer errs towards a prerelease.
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.validate.outputs.tag }}
           name: ${{ needs.validate.outputs.tag }}
+          prerelease: ${{ needs.validate.outputs.prerelease != 'false' }}
           body_path: /tmp/release_body.md
           files: |
             artifacts/*.tar.gz
@@ -237,25 +260,38 @@ jobs:
       # must not fail this job: four publishers depend on it, and failing here
       # would strand the product release with no npm, container, Homebrew or
       # registry update.
-      # The probe is a script shared with publish-crate.yml, so the two paths
-      # cannot answer the same question differently. It retries anything that
-      # is not a 200 or a 404 and refuses to guess if that persists.
-      - name: Is this crate version already published
+      # The decision is a script shared with publish-crate.yml, so the two
+      # paths cannot answer it differently. It skips a stable crate on a
+      # prerelease tag without asking crates.io, and otherwise asks through a
+      # probe that retries anything other than a 200 or a 404 and refuses to
+      # guess if that persists. A skip is a warning here, not a failure: the
+      # npm, container and later jobs all wait on this one.
+      - name: Decide whether to publish the crate
         id: published
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           CRATE=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           echo "crate version: $CRATE"
-          ALREADY=$(scripts/is-crate-published.sh dynoxide-rs "$CRATE") || {
-            echo "::error::could not determine whether dynoxide-rs $CRATE is published. Refusing to guess."
+          DECISION=$(scripts/crate-publish-decision.sh dynoxide-rs "$CRATE" "$VERSION") || {
+            echo "::error::could not decide whether to publish dynoxide-rs $CRATE for $VERSION. Refusing to guess."
             exit 1
           }
-          echo "already=$ALREADY" >> "$GITHUB_OUTPUT"
-          if [ "$ALREADY" = true ]; then
-            echo "::warning::dynoxide-rs $CRATE is already on crates.io, so the crate is not republished. If src/ changed since it was published, Cargo.toml needed a bump."
-            echo "dynoxide-rs $CRATE is already on crates.io; skipping publication"
-          else
-            echo "dynoxide-rs $CRATE is not on crates.io; publishing"
-          fi
+          case "$DECISION" in
+            publish)
+              echo "dynoxide-rs $CRATE is not on crates.io; publishing"
+              PUBLISH=true ;;
+            already-published)
+              echo "::warning::dynoxide-rs $CRATE is already on crates.io, so the crate is not republished. If src/ changed since it was published, Cargo.toml needed a bump."
+              PUBLISH=false ;;
+            stable-crate-on-prerelease)
+              echo "::warning::$VERSION is a prerelease and dynoxide-rs $CRATE is not, so the crate is not published. The stable product release will publish it."
+              PUBLISH=false ;;
+            *)
+              echo "::error::unexpected crate publish decision '$DECISION'"
+              exit 1 ;;
+          esac
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
 
       # Trusted Publishing. The OIDC token this job is granted is exchanged
       # for a crates.io token that lasts 30 minutes and is revoked when the
@@ -266,17 +302,17 @@ jobs:
       # Minted only when there is something to publish.
       - name: Authenticate with crates.io
         id: auth
-        if: steps.published.outputs.already == 'false'
+        if: steps.published.outputs.publish == 'true'
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: cargo publish --dry-run
-        if: steps.published.outputs.already == 'false'
+        if: steps.published.outputs.publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --dry-run
 
       - name: cargo publish
-        if: steps.published.outputs.already == 'false'
+        if: steps.published.outputs.publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish
@@ -284,10 +320,14 @@ jobs:
   # -------------------------------------------------------------------
   # Update the Homebrew tap formula. Runs after the crate job, which succeeds
   # whether it published or found the crate version already there.
+  #
+  # Skipped for a prerelease. The tap holds one formula at one version, so
+  # an rc there reaches everyone on their next `brew upgrade`.
   # -------------------------------------------------------------------
   publish-homebrew:
     name: Update Homebrew tap
     needs: [validate, publish-crate]
+    if: needs.validate.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -481,6 +521,9 @@ jobs:
         with:
           registry-type: public
 
+      # A prerelease gets its exact tag and nothing else: for a semver
+      # prerelease this action renders only {{version}} and leaves `latest`
+      # off, so `dynoxide:1`, `dynoxide:1.3` and `dynoxide:latest` stay put.
       - name: Compute image tags and labels
         id: meta
         uses: docker/metadata-action@v6
@@ -633,10 +676,14 @@ jobs:
   # package (its mcpName field) and the GHCR image (its OCI label). The
   # GitHub MCP Registry ingests from the official registry, so this single
   # publish covers that surface too.
+  #
+  # Skipped for a prerelease. The registry marks whichever version is highest
+  # by semver as latest, and 1.3.0-rc.1 sorts above 1.2.1.
   # -------------------------------------------------------------------
   publish-mcp-registry:
     name: Publish to MCP registry
     needs: [validate, publish-npm, publish-docker]
+    if: needs.validate.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     # Two packages are waited on in turn, up to ten minutes each, before the
     # registry steps run.
@@ -682,9 +729,7 @@ jobs:
           done
 
       - name: Install mcp-publisher
-        run: |
-          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
-            | tar xz mcp-publisher
+        run: scripts/install-mcp-publisher.sh
 
       - name: Stamp release version into server.json
         env:
@@ -714,10 +759,14 @@ jobs:
   # the actual publish to finish asynchronously. Without the wait below the
   # site would rebuild against the previous version and nothing would
   # re-trigger it. Same poll as publish-mcp-registry, for the same reason.
+  #
+  # Skipped for a prerelease, which the site would not show anyway: it reads
+  # the version from `latest`, and a prerelease never moves that tag.
   # -------------------------------------------------------------------
   notify-site:
     name: Trigger dynoxide.dev rebuild
     needs: [validate, publish-crate, publish-homebrew, publish-npm]
+    if: needs.validate.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     # Covers the 20-minute poll below plus the dispatch itself.
     timeout-minutes: 25
@@ -740,9 +789,9 @@ jobs:
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          # A prerelease publishes to `next`, never `latest`, so waiting on
-          # `latest` would sit here for twenty minutes and then fail a release
-          # that had in fact succeeded. The rule is the one the publishers use.
+          # The job does not run for a prerelease, so this resolves to
+          # `latest` today. It still asks the rule the publishers use, so the
+          # wait and the publish cannot disagree if that ever changes.
           DIST_TAG=$(scripts/npm-dist-tag.sh "$VERSION")
           echo "waiting on dist-tags.$DIST_TAG"
           DEADLINE=$(( $(date +%s) + 1200 ))

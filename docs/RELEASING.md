@@ -35,6 +35,14 @@ and its artefacts are downloadable as soon as it exists, which is how the
 composite action resolves `version: latest`. Aborting at the gate leaves the
 GitHub Release in place; delete or mark it a draft if that matters.
 
+A prerelease tag such as `v1.3.0-rc.1` runs the same pipeline, but only
+reaches people who ask for it. Its GitHub Release is flagged as a prerelease,
+so `version: latest` keeps resolving to the last stable release. npm publishes
+it to `next`, and the image gets its exact tag and no other. A stable crate
+version is not published from it. The Homebrew tap, the MCP registry and the
+site are left alone. `docs/versioning.md` lists what every surface does with
+one.
+
 ## Verifying a release
 
 - **sha256sums.txt** is attached to every GitHub Release. Download it
@@ -72,7 +80,7 @@ Public workflows a contributor may see when opening a PR:
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
 | `ci.yml` | Pull request, manual | Build, test, and lint. Required for merge. |
-| `benchmark-regression.yml` | Pull request | Runs Criterion and iai-callgrind benchmarks and posts a comparison comment. Wall-clock numbers are advisory because shared runners are noisy; iai-callgrind instruction-count regressions block the PR. |
+| `benchmark-regression.yml` | Pull request | Runs Criterion and iai-callgrind benchmarks and posts a comparison comment. Wall-clock numbers are advisory because shared runners are noisy. iai-callgrind instruction counts are deterministic but informational: the job has no stored baseline, so it does not fail on a regression. |
 | `release.yml` | `v*` tag push | Primary release pipeline. Runs only on releases; contributors should not see it fire on PRs. |
 
 Additional workflows in `.github/workflows/` (`benchmark-refresh.yml`,

@@ -267,6 +267,8 @@ impl StorageBackend for Storage {
         index_name: &str,
         rows: &[GsiItemRow],
     ) -> Result<(), BackendError> {
+        #[cfg(test)]
+        self.check_gsi_insert_fault().map_err(dyno_to_backend)?;
         Storage::insert_gsi_items(self, table_name, index_name, rows).map_err(dyno_to_backend)
     }
 
@@ -359,6 +361,14 @@ impl StorageBackend for Storage {
         Storage::rollback(self).map_err(dyno_to_backend)
     }
 
+    async fn recorded_schema_version(&self) -> Result<Option<u32>, BackendError> {
+        Storage::recorded_schema_version(self).map_err(dyno_to_backend)
+    }
+
+    async fn record_schema_version(&self, version: u32) -> Result<(), BackendError> {
+        Storage::record_schema_version(self, version).map_err(dyno_to_backend)
+    }
+
     async fn enable_bulk_loading(&self) -> Result<(), BackendError> {
         Storage::enable_bulk_loading(self).map_err(dyno_to_backend)
     }
@@ -449,6 +459,46 @@ impl StorageBackend for Storage {
 
     async fn count_items(&self, table_name: &str) -> Result<i64, BackendError> {
         Storage::count_items(self, table_name).map_err(dyno_to_backend)
+    }
+
+    async fn item_count_and_size(&self, table_name: &str) -> Result<(i64, i64), BackendError> {
+        Storage::item_count_and_size(self, table_name).map_err(dyno_to_backend)
+    }
+
+    async fn gsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError> {
+        Storage::gsi_item_count_and_size(self, table_name, index_name, whole_items)
+            .map_err(dyno_to_backend)
+    }
+
+    async fn lsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError> {
+        Storage::lsi_item_count_and_size(self, table_name, index_name, whole_items)
+            .map_err(dyno_to_backend)
+    }
+
+    async fn vector_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(i64, i64), BackendError> {
+        Storage::vector_item_count_and_size(self, table_name, index_name).map_err(dyno_to_backend)
+    }
+
+    async fn set_item_sizes(
+        &self,
+        table_name: &str,
+        sizes: &[(String, String, usize)],
+    ) -> Result<(), BackendError> {
+        Storage::set_item_sizes(self, table_name, sizes).map_err(dyno_to_backend)
     }
 
     async fn db_size_bytes(&self) -> Result<u64, BackendError> {

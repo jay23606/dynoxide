@@ -20,7 +20,11 @@ struct ScanRequestRaw {
     projection_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_older_expression_values"
+    )]
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "Limit", default)]
     limit: Option<usize>,
@@ -28,7 +32,11 @@ struct ScanRequestRaw {
     exclusive_start_key: Option<serde_json::Value>,
     #[serde(rename = "Select", default)]
     select: Option<String>,
-    #[serde(rename = "ConsistentRead", default)]
+    #[serde(
+        rename = "ConsistentRead",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
     consistent_read: Option<bool>,
     #[serde(rename = "IndexName", default)]
     index_name: Option<String>,
@@ -77,23 +85,21 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = ScanRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        use crate::validation::format_validation_errors;
 
-        let mut errors = Vec::new();
-        errors.extend(table_name_constraint_errors(
-            raw.table_name.as_deref(),
-            TableNameContext::ReadWrite,
-        ));
-        let table_name = raw.table_name.unwrap_or_default();
-
-        // ReturnConsumedCapacity enum
-        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-            raw.return_consumed_capacity.as_deref(),
-        ) {
-            errors.push(msg);
+        // A BOOL or NULL in a legacy condition, or its `Exists`, that doesn't
+        // read as a boolean makes the whole request malformed, ahead of
+        // everything else.
+        if let Some(message) = crate::types::malformed_condition_boolean(raw.scan_filter.as_ref()) {
+            return Err(serde::de::Error::custom(message));
         }
+
+        // Scan still runs on the older validation layer in most regions (six
+        // of seven, 2026-10-09). Its member errors come back together in the
+        // order Select, ReturnConsumedCapacity, ConditionalOperator, Limit,
+        // Segment, with a missing or empty table name last. Any other table
+        // name error is reported only when none of those fired.
+        let mut errors = Vec::new();
 
         // Select enum
         if let Some(ref sel) = raw.select
@@ -106,10 +112,24 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             .contains(&sel.as_str())
         {
             errors.push(format!(
-                    "Value '{}' at 'select' failed to satisfy constraint: \
-                     Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
-                    sel
-                ));
+                "Value '{}' at 'select' failed to satisfy constraint: \
+                 Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
+                sel
+            ));
+        }
+
+        // ReturnConsumedCapacity enum
+        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+            raw.return_consumed_capacity.as_deref(),
+        ) {
+            errors.push(msg);
+        }
+
+        // ConditionalOperator enum, which only this layer checks.
+        if let Some(msg) =
+            crate::validation::conditional_operator_rejection(raw.conditional_operator.as_deref())
+        {
+            errors.push(msg);
         }
 
         // Limit must be >= 1.
@@ -138,9 +158,33 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             ));
         }
 
+        // A ScanFilter condition with no ComparisonOperator. Captured alone
+        // in four regions (2026-10-10); its place among the other member
+        // errors is inferred.
+        errors.extend(helpers::missing_comparison_operators(
+            raw.scan_filter.as_ref(),
+            "scanFilter",
+        ));
+
+        match raw.table_name.as_deref() {
+            None | Some("") => errors.extend(crate::validation::table_name_constraint_errors(
+                raw.table_name.as_deref(),
+                crate::validation::TableNameContext::ReadWrite,
+            )),
+            Some(_) => {}
+        }
+
         if let Some(msg) = format_validation_errors(&errors) {
             return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
         }
+
+        if let Some(name) = raw.table_name.as_deref()
+            && let Some(msg) =
+                format_validation_errors(&crate::validation::scan_table_name_errors(name))
+        {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+        }
+        let table_name = raw.table_name.unwrap_or_default();
 
         Ok(ScanRequest {
             table_name,
@@ -166,7 +210,13 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
 
 #[derive(Debug, Default, Serialize)]
 pub struct ScanResponse {
-    #[serde(rename = "Items", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Items",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::items_in_hash_order"
+    )]
+    // Number sets in Java hash-set order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub items: Option<Vec<Item>>,
     #[serde(rename = "Count")]
     pub count: usize,
@@ -183,7 +233,52 @@ pub async fn execute<S: StorageBackend>(
     mut request: ScanRequest,
 ) -> Result<ScanResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    crate::validation::validate_scan_table_name(&request.table_name)?;
+
+    // ConditionalOperator outside its enum is a member check, reported ahead of
+    // the value checks. The wire path refuses it as the request is read; this
+    // covers a request an embedded caller builds (captured 2026-10-09, six of
+    // seven regions).
+    if let Some(msg) =
+        crate::validation::conditional_operator_rejection(request.conditional_operator.as_deref())
+    {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        ));
+    }
+
+    // An empty attribute name is refused ahead of the table lookup and the
+    // expressions (captured in ten regions). AttributesToGet and a ScanFilter
+    // value answer bare; the ExclusiveStartKey and the expression values name
+    // what they are, as seven of the ten regions do (eu-west-2, eu-central-1 and
+    // ap-southeast-2 answer bare). An empty name in ScanFilter itself is accepted.
+    if crate::empty_names::names_include_empty(request.attributes_to_get.as_ref())
+        || crate::empty_names::filter_values_have_empty_name(request.scan_filter.as_ref())
+    {
+        return Err(crate::empty_names::bare());
+    }
+    if request
+        .exclusive_start_key
+        .as_ref()
+        .is_some_and(crate::empty_names::map_has_empty_name)
+        || request
+            .exclusive_start_key_raw
+            .as_ref()
+            .is_some_and(crate::empty_names::json_map_has_empty_name)
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "The provided starting key is invalid: {}",
+            crate::empty_names::MESSAGE
+        )));
+    }
+    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
+    if let Some(key) =
+        crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
+    {
+        return Err(DynoxideError::ValidationException(
+            crate::empty_names::value_placeholder_message(key),
+        ));
+    }
 
     // ---- Expression vs non-expression mixing validation ----
     {
@@ -214,15 +309,32 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
+            layer: crate::validation::ValueLayer::Older,
         };
         helpers::validate_expression_params(&ctx)?;
     }
 
+    // ---- ConditionalOperator only joins legacy ScanFilter conditions, so a
+    // valid one is refused without two of them; Scan reports it without the
+    // envelope (captured 2026-10-09, all seven regions). ----
+    if let Some(msg) = crate::validation::conditional_operator_misuse(
+        request.conditional_operator.as_deref(),
+        crate::validation::legacy_condition_count(request.scan_filter.as_ref()),
+    ) {
+        return Err(DynoxideError::ValidationException(msg.to_string()));
+    }
+    // ---- A ScanFilter value nested too deep is refused first ----
+    crate::value_nesting::check_scan_filter(request.scan_filter.as_ref())?;
+
     // ---- Validate ScanFilter attribute values (before argument counts, matching DynamoDB) ----
-    helpers::validate_filter_conditions_raw(request.scan_filter.as_ref(), "ScanFilter")?;
+    helpers::validate_filter_conditions_raw(
+        request.scan_filter.as_ref(),
+        "ScanFilter",
+        crate::validation::ValueLayer::Older,
+    )?;
 
     // ---- Validate filter argument counts and type compatibility ----
-    helpers::validate_filter_condition_args(request.scan_filter.as_ref())?;
+    helpers::validate_filter_condition_args(request.scan_filter.as_ref(), "scanFilter")?;
 
     // ---- Validate duplicate AttributesToGet ----
     if let Some(ref attrs) = request.attributes_to_get {
@@ -231,16 +343,24 @@ pub async fn execute<S: StorageBackend>(
 
     // ---- Parse ExclusiveStartKey from JSON value ----
     let exclusive_start_key = if let Some(ref esk_val) = request.exclusive_start_key_raw {
-        Some(helpers::parse_exclusive_start_key(esk_val)?)
+        Some(helpers::parse_exclusive_start_key(
+            esk_val,
+            crate::validation::ValueLayer::Older,
+        )?)
     } else {
         request.exclusive_start_key.clone()
     };
+    crate::value_nesting::check_scan_start_key(exclusive_start_key.as_ref())?;
 
     // Convert legacy ScanFilter to FilterExpression if no expression is set
-    if request.filter_expression.is_none()
-        && let Some(ref sf_val) = request.scan_filter
-        && let Ok(sf) =
-            serde_json::from_value::<HashMap<String, helpers::FilterCondition>>(sf_val.clone())
+    let scan_filter: Option<HashMap<String, helpers::FilterCondition>> =
+        match request.scan_filter.as_ref() {
+            Some(sf_val) if request.filter_expression.is_none() && !sf_val.is_null() => Some(
+                helpers::read_legacy_conditions(sf_val, crate::validation::ValueLayer::Older)?,
+            ),
+            _ => None,
+        };
+    if let Some(sf) = scan_filter
         && !sf.is_empty()
     {
         let converted =
@@ -299,6 +419,11 @@ pub async fn execute<S: StorageBackend>(
                 ));
             }
         } else {
+            // A Scan is the one FilterExpression whose size message still
+            // carries the figure in us-east-1, so it is checked here first.
+            expressions::check_expression_size_with_figure(filter_expr_str).map_err(|e| {
+                DynoxideError::ValidationException(format!("Invalid FilterExpression: {e}"))
+            })?;
             // Try parsing the expression to catch syntax errors early
             let parsed_fe = expressions::condition::parse(filter_expr_str).map_err(|e| {
                 DynoxideError::ValidationException(format!("Invalid FilterExpression: {e}"))
@@ -415,6 +540,16 @@ pub async fn execute<S: StorageBackend>(
         )
     };
 
+    // Every partition key and sort key attribute, in key-schema order. Only a
+    // GSI can have more than one of each.
+    let (key_hash, key_range): (Vec<String>, Vec<String>) = match request.index_name {
+        Some(ref index_name) if !is_lsi => super::gsi::parse_gsi_key_attrs(&meta, index_name)?,
+        _ => (
+            vec![effective_pk.clone()],
+            effective_sk.iter().cloned().collect(),
+        ),
+    };
+
     // ---- Validate ExclusiveStartKey structure against key schema ----
     // Stage 1+2: count check + index key type check
     if let Some(ref esk) = exclusive_start_key {
@@ -458,11 +593,15 @@ pub async fn execute<S: StorageBackend>(
 
     // Extract ExclusiveStartKey pk/sk using effective key names
     let (start_pk, start_sk) = if let Some(ref esk) = exclusive_start_key {
-        let pk = esk.get(&effective_pk).and_then(|v| v.to_key_string());
-        let sk = if let Some(ref sk_name) = effective_sk {
-            esk.get(sk_name).and_then(|v| v.to_key_string())
-        } else {
+        let key_string = |attrs: &[String]| {
+            let values: Option<Vec<&AttributeValue>> = attrs.iter().map(|a| esk.get(a)).collect();
+            values.and_then(|v| super::gsi::composite_key_string(&v))
+        };
+        let pk = key_string(&key_hash);
+        let sk = if key_range.is_empty() {
             Some(String::new())
+        } else {
+            key_string(&key_range)
         };
         (pk, sk)
     } else {
@@ -548,13 +687,10 @@ pub async fn execute<S: StorageBackend>(
         }
         let mut index_key_attrs = Vec::new();
         if request.index_name.is_some() {
-            if !base_key_attrs.contains(&effective_pk) {
-                index_key_attrs.push(effective_pk.clone());
-            }
-            if let Some(ref sk) = effective_sk
-                && !base_key_attrs.contains(sk)
-            {
-                index_key_attrs.push(sk.clone());
+            for attr in key_hash.iter().chain(&key_range) {
+                if !base_key_attrs.contains(attr) {
+                    index_key_attrs.push(attr.clone());
+                }
             }
         }
         if let Some((attr, is_index)) = expressions::condition::check_non_scalar_key_access(
@@ -693,15 +829,11 @@ pub async fn execute<S: StorageBackend>(
     let is_gsi_scan = request.index_name.is_some() && !is_lsi;
     let last_evaluated_key = if has_more {
         last_evaluated_item.map(|item| {
-            let mut key = HashMap::new();
-            if let Some(pk_val) = item.get(&effective_pk) {
-                key.insert(effective_pk.clone(), pk_val.clone());
-            }
-            if let Some(ref sk_name) = effective_sk
-                && let Some(sk_val) = item.get(sk_name)
-            {
-                key.insert(sk_name.clone(), sk_val.clone());
-            }
+            let mut key: HashMap<String, AttributeValue> = key_hash
+                .iter()
+                .chain(&key_range)
+                .filter_map(|name| item.get(name).map(|v| (name.clone(), v.clone())))
+                .collect();
             // For LSI scans, add the table sort key if different from the index sort key
             if is_lsi
                 && let Some(tsk) = table_key_schema.sort_key.as_deref()

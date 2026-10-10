@@ -334,6 +334,14 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn recorded_schema_version(&self) -> Result<Option<u32>, BackendError> {
+        unimplemented!()
+    }
+
+    async fn record_schema_version(&self, _version: u32) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
     async fn enable_bulk_loading(&self) -> Result<(), BackendError> {
         unimplemented!()
     }
@@ -413,6 +421,44 @@ impl StorageBackend for TestBackend {
     }
 
     async fn count_items(&self, _table_name: &str) -> Result<i64, BackendError> {
+        unimplemented!()
+    }
+
+    async fn item_count_and_size(&self, _table_name: &str) -> Result<(i64, i64), BackendError> {
+        unimplemented!()
+    }
+
+    async fn gsi_item_count_and_size(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _whole_items: bool,
+    ) -> Result<(i64, i64), BackendError> {
+        unimplemented!()
+    }
+
+    async fn lsi_item_count_and_size(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+        _whole_items: bool,
+    ) -> Result<(i64, i64), BackendError> {
+        unimplemented!()
+    }
+
+    async fn vector_item_count_and_size(
+        &self,
+        _table_name: &str,
+        _index_name: &str,
+    ) -> Result<(i64, i64), BackendError> {
+        unimplemented!()
+    }
+
+    async fn set_item_sizes(
+        &self,
+        _table_name: &str,
+        _sizes: &[(String, String, usize)],
+    ) -> Result<(), BackendError> {
         unimplemented!()
     }
 

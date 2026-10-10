@@ -1068,3 +1068,43 @@ test("a repeated ClientRequestToken does not apply the transaction twice", async
   expect(result.control).toMatch(/TransactionCanceledException$/);
   expect(result.rows).toBe(1);
 });
+
+test("a multi-attribute GSI an earlier version wrote is rebuilt when the database opens (OPFS)", async ({ page }) => {
+  // The fixture (a --harness op) writes the index the way versions before
+  // schema 10 did: keyed on its first sort key attribute, with the item that has
+  // no `b` included, and the database marked as schema 9. Opening it through the
+  // engine must rebuild the index, so the Query sorts on `a` then `b` and leaves
+  // item 3 out. Without the rebuild it returns 1, 2, 3.
+  //
+  // The shipping bundle strips harness ops, so this runs against a harness build
+  // (npm run build:wasm:harness) and skips against the shipping one CI builds.
+  // The rebuild itself is shared with the native backend, whose migration test
+  // runs everywhere; what this adds is the wasm open path that triggers it.
+  const result = await page.evaluate(async () => {
+    const raw = globalThis.dynoxide.makeRawWorker();
+    let fixture;
+    try {
+      fixture = JSON.parse(await raw.call("legacyGsi"));
+    } catch (e) {
+      raw.terminate();
+      if (/UnsupportedOperation/.test(e.message)) return { skipped: true };
+      throw e;
+    }
+    raw.terminate();
+
+    const client = globalThis.dynoxide.makeClient({ name: "dynoxide-legacy-gsi.db" });
+    await client.ready();
+    const query = await client.execute("Query", {
+      TableName: "LegacyGsi",
+      IndexName: "byKey",
+      KeyConditionExpression: "h = :h",
+      ExpressionAttributeValues: { ":h": { S: "x" } },
+    });
+    client.terminate();
+    return { fixture, pks: query.Items.map((i) => i.pk.S) };
+  });
+
+  test.skip(result.skipped === true, "needs a --harness build (npm run build:wasm:harness)");
+  expect(result.fixture.legacy_rows).toBe(3);
+  expect(result.pks).toEqual(["2", "1"]);
+});

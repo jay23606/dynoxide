@@ -2,7 +2,9 @@
 //!
 //! Both use identical syntax: comparisons, functions, BETWEEN, IN, AND/OR/NOT.
 
-use crate::expressions::tokenizer::{Token, TokenStream, check_redundant_parens, tokenize};
+use crate::expressions::tokenizer::{
+    Token, TokenStream, check_redundant_parens, tokenize, tokenizer_syntax_error,
+};
 use crate::expressions::{
     PathElement, TrackedExpressionAttributes, resolve_path, resolve_path_elements,
 };
@@ -78,15 +80,47 @@ pub enum Operand {
 /// prefix: callers must add the appropriate prefix for their expression type.
 pub fn parse(expr: &str) -> Result<ConditionExpr, String> {
     super::check_expression_size(expr)?;
-    let tokens = tokenize(expr).map_err(|e| e.to_string())?;
+    let tokens = tokenize(expr).map_err(|e| tokenizer_syntax_error(expr, &e))?;
     check_redundant_parens(&tokens)?;
+    parse_tokens(expr, tokens)
+}
+
+/// The grammar error DynamoDB would report for `expr`, if it has one: a
+/// `Syntax error; token: ..., near: ...` or an unknown function name. Size,
+/// redundant parentheses, reserved words and everything that needs the
+/// expression's values are left to the caller.
+///
+/// KeyConditionExpression is read with the same grammar before its own rules
+/// apply, so its parser asks here when it fails, to report a syntax error the
+/// way DynamoDB does.
+pub(crate) fn syntax_error(expr: &str) -> Option<String> {
+    let result = match tokenize(expr) {
+        Ok(tokens) => parse_tokens(expr, tokens).map(|_| ()),
+        Err(e) => Err(tokenizer_syntax_error(expr, &e)),
+    };
+    result
+        .err()
+        .filter(|e| e.starts_with("Syntax error; ") || e.starts_with("Invalid function name;"))
+}
+
+fn parse_tokens(
+    expr: &str,
+    tokens: Vec<(Token, crate::expressions::tokenizer::TokenSpan)>,
+) -> Result<ConditionExpr, String> {
     let mut stream = TokenStream::new(tokens);
-    let result = parse_or(&mut stream)?;
+    // Every grammar failure below leaves the stream on the token it stopped at
+    // and says "Expected ..."; that becomes DynamoDB's token and near window.
+    // Other failures (reserved words, unknown functions) pass through as they
+    // are.
+    let result = parse_or(&mut stream).map_err(|e| {
+        if e.starts_with("Expected ") {
+            stream.syntax_error(expr)
+        } else {
+            e
+        }
+    })?;
     if !stream.at_end() {
-        return Err(format!(
-            "Syntax error; token: \"{}\"",
-            stream.peek().unwrap()
-        ));
+        return Err(stream.syntax_error(expr));
     }
     Ok(result)
 }
@@ -288,14 +322,14 @@ fn parse_primary(stream: &mut TokenStream) -> Result<ConditionExpr, String> {
                     stream.next();
                     stream.expect(&Token::LParen)?;
                     let path = parse_raw_path(stream)?;
-                    stream.expect(&Token::RParen)?;
+                    expect_function_close(stream)?;
                     return Ok(ConditionExpr::AttributeExists(path));
                 }
                 "attribute_not_exists" => {
                     stream.next();
                     stream.expect(&Token::LParen)?;
                     let path = parse_raw_path(stream)?;
-                    stream.expect(&Token::RParen)?;
+                    expect_function_close(stream)?;
                     return Ok(ConditionExpr::AttributeNotExists(path));
                 }
                 "attribute_type" => {
@@ -304,7 +338,7 @@ fn parse_primary(stream: &mut TokenStream) -> Result<ConditionExpr, String> {
                     let path = parse_raw_path(stream)?;
                     stream.expect(&Token::Comma)?;
                     let type_val = parse_operand(stream)?;
-                    stream.expect(&Token::RParen)?;
+                    expect_function_close(stream)?;
                     return Ok(ConditionExpr::AttributeType(path, type_val));
                 }
                 "begins_with" => {
@@ -313,7 +347,7 @@ fn parse_primary(stream: &mut TokenStream) -> Result<ConditionExpr, String> {
                     let path_op = parse_operand(stream)?;
                     stream.expect(&Token::Comma)?;
                     let prefix_op = parse_operand(stream)?;
-                    stream.expect(&Token::RParen)?;
+                    expect_function_close(stream)?;
                     return Ok(ConditionExpr::BeginsWith(path_op, prefix_op));
                 }
                 "contains" => {
@@ -322,7 +356,7 @@ fn parse_primary(stream: &mut TokenStream) -> Result<ConditionExpr, String> {
                     let path_op = parse_operand(stream)?;
                     stream.expect(&Token::Comma)?;
                     let search_op = parse_operand(stream)?;
-                    stream.expect(&Token::RParen)?;
+                    expect_function_close(stream)?;
                     return Ok(ConditionExpr::Contains(path_op, search_op));
                 }
                 "size" => {
@@ -427,6 +461,19 @@ fn parse_primary(stream: &mut TokenStream) -> Result<ConditionExpr, String> {
     }
 }
 
+/// Close a function's argument list. DynamoDB reads the arguments as a list,
+/// so a trailing comma fails where it expects one more operand, at the `)`:
+/// `attribute_exists(pk,)` is `token: ")", near: ",)"`.
+fn expect_function_close(stream: &mut TokenStream) -> Result<(), String> {
+    if matches!(stream.peek(), Some(Token::Comma))
+        && matches!(stream.peek_at(1), Some(Token::RParen))
+    {
+        stream.next();
+        return Err("Expected operand, got )".to_string());
+    }
+    stream.expect(&Token::RParen)
+}
+
 /// Parse an operand (path, value ref, or size function).
 fn parse_operand(stream: &mut TokenStream) -> Result<Operand, String> {
     // Check for size() function
@@ -436,7 +483,7 @@ fn parse_operand(stream: &mut TokenStream) -> Result<Operand, String> {
         stream.next();
         stream.expect(&Token::LParen)?;
         let path = parse_raw_path(stream)?;
-        stream.expect(&Token::RParen)?;
+        expect_function_close(stream)?;
         return Ok(Operand::Size(path));
     }
 
@@ -459,8 +506,43 @@ fn parse_operand(stream: &mut TokenStream) -> Result<Operand, String> {
 
 /// Parse a raw document path (not resolving #names yet).
 /// Path format: `ident(.ident | [n])*`
+///
+/// A token that doesn't fit is left unconsumed, so a caller building a
+/// `token: ..., near: ...` error finds the stream on it.
 pub fn parse_raw_path(stream: &mut TokenStream) -> Result<Vec<PathElement>, String> {
-    let first = match stream.next() {
+    let first = path_name(stream, "Expected attribute name")?;
+    let mut path = vec![first];
+
+    loop {
+        match stream.peek() {
+            Some(Token::Dot) => {
+                stream.next();
+                path.push(path_name(stream, "Expected attribute name after '.'")?);
+            }
+            Some(Token::LBracket) => {
+                stream.next();
+                let idx = match stream.peek() {
+                    Some(Token::Number(n)) => {
+                        n.parse().map_err(|_| format!("Invalid index: {n}"))?
+                    }
+                    Some(t) => return Err(format!("Expected number in brackets, got {t}")),
+                    None => return Err("Expected number in brackets".to_string()),
+                };
+                stream.next();
+                path.push(PathElement::Index(idx));
+                stream.expect(&Token::RBracket)?;
+            }
+            _ => break,
+        }
+    }
+
+    Ok(path)
+}
+
+/// One name in a document path: an identifier that isn't a reserved word, or
+/// a `#name`.
+fn path_name(stream: &mut TokenStream, expected: &str) -> Result<PathElement, String> {
+    let element = match stream.peek() {
         Some(Token::Identifier(name)) => {
             if super::reserved::is_reserved_keyword(name) {
                 return Err(format!(
@@ -470,49 +552,11 @@ pub fn parse_raw_path(stream: &mut TokenStream) -> Result<Vec<PathElement>, Stri
             PathElement::Attribute(name.clone())
         }
         Some(Token::NameRef(name)) => PathElement::Attribute(name.clone()),
-        Some(t) => return Err(format!("Expected attribute name, got {t}")),
-        None => return Err("Expected attribute name, got end of expression".to_string()),
+        Some(t) => return Err(format!("{expected}, got {t}")),
+        None => return Err(format!("{expected}, got end of expression")),
     };
-
-    let mut path = vec![first];
-
-    loop {
-        match stream.peek() {
-            Some(Token::Dot) => {
-                stream.next();
-                match stream.next() {
-                    Some(Token::Identifier(name)) => {
-                        if super::reserved::is_reserved_keyword(name) {
-                            return Err(format!(
-                                "Attribute name is a reserved keyword; reserved keyword: {name}"
-                            ));
-                        }
-                        path.push(PathElement::Attribute(name.clone()));
-                    }
-                    Some(Token::NameRef(name)) => {
-                        path.push(PathElement::Attribute(name.clone()));
-                    }
-                    Some(t) => return Err(format!("Expected attribute name after '.', got {t}")),
-                    None => return Err("Expected attribute name after '.'".to_string()),
-                }
-            }
-            Some(Token::LBracket) => {
-                stream.next();
-                match stream.next() {
-                    Some(Token::Number(n)) => {
-                        let idx: usize = n.parse().map_err(|_| format!("Invalid index: {n}"))?;
-                        path.push(PathElement::Index(idx));
-                    }
-                    Some(t) => return Err(format!("Expected number in brackets, got {t}")),
-                    None => return Err("Expected number in brackets".to_string()),
-                }
-                stream.expect(&Token::RBracket)?;
-            }
-            _ => break,
-        }
-    }
-
-    Ok(path)
+    stream.next();
+    Ok(element)
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1073,8 @@ fn check_path_non_scalar(
 
 /// Extract the `:name` value references in a condition expression, sorted and
 /// deduplicated, so a caller can check them against the values it holds.
+/// The import rules are the only caller outside tests.
+#[cfg(any(feature = "import", test))]
 pub fn extract_value_refs(expr: &ConditionExpr) -> Vec<String> {
     let mut refs = Vec::new();
     collect_value_refs(expr, &mut refs);
@@ -1037,6 +1083,7 @@ pub fn extract_value_refs(expr: &ConditionExpr) -> Vec<String> {
     refs
 }
 
+#[cfg(any(feature = "import", test))]
 fn collect_value_refs(expr: &ConditionExpr, out: &mut Vec<String>) {
     match expr {
         ConditionExpr::Comparison { left, right, .. } => {
@@ -1068,6 +1115,7 @@ fn collect_value_refs(expr: &ConditionExpr, out: &mut Vec<String>) {
     }
 }
 
+#[cfg(any(feature = "import", test))]
 fn collect_operand_value_ref(operand: &Operand, out: &mut Vec<String>) {
     if let Operand::ValueRef(name) = operand {
         out.push(name.clone());
@@ -1175,7 +1223,8 @@ fn resolve_top_level_path(
 }
 
 /// Extract the `#alias` name references in a condition expression, sorted
-/// and deduplicated.
+/// and deduplicated. The import rules are the only caller outside tests.
+#[cfg(any(feature = "import", test))]
 pub fn extract_name_refs(expr: &ConditionExpr) -> Vec<String> {
     let mut refs = Vec::new();
     collect_undefined_name_refs(expr, &None, &mut refs);

@@ -60,12 +60,13 @@ fn test_ss_duplicate_rejected() {
             ..Default::default()
         })
         .unwrap_err();
-    // PutItem wraps the duplicate rejection in the request-validation envelope
-    // (eu-west-2).
+    // PutItem wraps the duplicate rejection in the request-validation envelope,
+    // in the current layer's wording: members quoted, the sorted set read
+    // before the repeat, then the repeat (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
     assert_eq!(
         err.to_string(),
         "1 validation error detected: One or more parameter values were invalid: \
-         Input collection [a, b, a] contains duplicates."
+         Input collection [\"a\", \"b\", \"a\"] contains duplicates."
     );
 }
 
@@ -85,9 +86,12 @@ fn test_ns_numeric_duplicate_rejected() {
             ..Default::default()
         })
         .unwrap_err();
+    // The current layer names no members of a number set, with the prefix and
+    // the full stop (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
     assert_eq!(
         err.to_string(),
-        "1 validation error detected: Input collection contains duplicates"
+        "1 validation error detected: One or more parameter values were invalid: \
+         Input collection contains duplicates."
     );
 }
 
@@ -110,7 +114,7 @@ fn test_bs_duplicate_rejected() {
     assert_eq!(
         err.to_string(),
         "1 validation error detected: One or more parameter values were invalid: \
-         Input collection [AQI=, AwQ=, AQI=]of type BS contains duplicates."
+         Input collection [\"AQI=\",\"AwQ=\",\"AQI=\"]of type BS contains duplicates."
     );
 }
 
@@ -178,7 +182,7 @@ fn test_nested_set_in_map_duplicate_rejected() {
     assert_eq!(
         err.to_string(),
         "1 validation error detected: One or more parameter values were invalid: \
-         Input collection [x, y, x] contains duplicates."
+         Input collection [\"x\", \"y\", \"x\"] contains duplicates."
     );
 }
 
@@ -206,7 +210,7 @@ fn test_duplicate_value_matching_bare_message_still_enveloped() {
         err.to_string(),
         format!(
             "1 validation error detected: One or more parameter values were invalid: \
-             Input collection [{sneaky}, {sneaky}] contains duplicates."
+             Input collection [\"{sneaky}\", \"{sneaky}\"] contains duplicates."
         )
     );
 }

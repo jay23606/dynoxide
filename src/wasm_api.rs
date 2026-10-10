@@ -157,8 +157,17 @@ pub async fn dispatch_http<S: StorageBackend>(
     auth: crate::auth_material::AuthMaterial<'_>,
 ) -> HttpOutcome {
     // Non-JSON body → bare SerializationException, before the target is read.
-    if !body.is_empty() && serde_json::from_str::<serde_json::Value>(body).is_err() {
-        return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
+    // Valid JSON nested deeper than the parser follows is still read, as
+    // DynamoDB reads it: see `deep_nesting`.
+    let mut too_deep = false;
+    if !body.is_empty()
+        && let Err(e) = serde_json::from_str::<serde_json::Value>(body)
+    {
+        if crate::deep_nesting::is_depth_failure(&e) {
+            too_deep = true;
+        } else {
+            return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
+        }
     }
 
     let Some(target) = target else {
@@ -192,6 +201,24 @@ pub async fn dispatch_http<S: StorageBackend>(
     if !SUPPORTED_OPS.contains(&operation) {
         return HttpOutcome::new(501, unsupported_envelope(operation));
     }
+
+    let rewritten;
+    let body = if too_deep {
+        match crate::deep_nesting::resolve(operation, body) {
+            crate::deep_nesting::DeepBody::Unreadable => {
+                return HttpOutcome::new(400, SERIALIZATION_EXCEPTION_BARE);
+            }
+            crate::deep_nesting::DeepBody::Refuse(e) => {
+                return HttpOutcome::new(e.status_code(), e.to_json());
+            }
+            crate::deep_nesting::DeepBody::Run(body) => {
+                rewritten = body;
+                rewritten.as_str()
+            }
+        }
+    } else {
+        body
+    };
 
     // `route` keeps the error typed, so the status comes straight from
     // `DynoxideError::status_code` rather than being re-derived from the
@@ -236,9 +263,28 @@ pub async fn dispatch<S: StorageBackend>(
     if !SUPPORTED_OPS.contains(&op) {
         return Err(unsupported_envelope(op));
     }
-    route(backend, ctx, op, request_json)
-        .await
-        .map_err(|e| e.to_json())
+    match route(backend, ctx, op, request_json).await {
+        Ok(json) => Ok(json),
+        // A request nested deeper than the parser follows fails to decode before
+        // anything runs. Give it the answer the HTTP path gives it.
+        Err(DynoxideError::SerializationException(_))
+            if serde_json::from_str::<serde_json::Value>(request_json)
+                .is_err_and(|e| crate::deep_nesting::is_depth_failure(&e)) =>
+        {
+            match crate::deep_nesting::resolve(op, request_json) {
+                crate::deep_nesting::DeepBody::Unreadable => {
+                    Err(SERIALIZATION_EXCEPTION_BARE.to_string())
+                }
+                crate::deep_nesting::DeepBody::Refuse(e) => Err(e.to_json()),
+                crate::deep_nesting::DeepBody::Run(rewritten) => {
+                    route(backend, ctx, op, &rewritten)
+                        .await
+                        .map_err(|e| e.to_json())
+                }
+            }
+        }
+        Err(e) => Err(e.to_json()),
+    }
 }
 
 /// Route one supported operation to its handler, keeping the error typed so a
@@ -254,10 +300,40 @@ async fn route<S: StorageBackend>(
     // Each arm: deserialise the request through the shared decoder (so a parse
     // failure classifies exactly as it does over HTTP), run the shared handler,
     // then serialise the response.
+    //
+    // A number given for a boolean is named by how it was written, which
+    // serde_json forgets for `-0` and integers past 64 bits.
+    let request_json = crate::serde_errors::boolean_numbers_as_written(request_json);
+    let request_json = request_json.as_ref();
+    // The same pre-deserialisation type checks the HTTP server runs. Request
+    // structs hold several fields as `serde_json::Value`, which accepts any
+    // JSON type, so without this a mistyped field reaches serde and comes back
+    // as raw serde text here while the server answers with the captured
+    // SerializationException. Both surfaces read one implementation so they
+    // cannot drift. They also say which validation layer the request's values
+    // are read on: the operation's own, or the older layer for a request that
+    // holds a boolean written as a string or a value with more than one
+    // member. The layer is set around the read and around every poll of the
+    // handler, as the HTTP server holds it for the whole call.
+    let checked = crate::serialization_checks::pre_check_and_read_layer(op, request_json);
+    let layer = checked
+        .as_ref()
+        .map_or_else(|_| crate::validation::ValueLayer::for_operation(op), |l| *l);
+    fn read<T: serde::de::DeserializeOwned>(
+        layer: crate::validation::ValueLayer,
+        json: &str,
+    ) -> crate::Result<T> {
+        crate::types::with_value_layer(layer, || crate::serde_errors::deserialize(json))
+    }
     macro_rules! run {
         ($module:ident) => {{
-            match crate::serde_errors::deserialize(request_json) {
-                Ok(request) => match actions::$module::execute(backend, request).await {
+            match read(layer, request_json) {
+                Ok(request) => match crate::types::with_value_layer_async(
+                    layer,
+                    actions::$module::execute(backend, request),
+                )
+                .await
+                {
                     Ok(response) => serde_json::to_string(&response)
                         .map_err(|e| DynoxideError::InternalServerError(e.to_string())),
                     Err(e) => Err(e),
@@ -272,9 +348,14 @@ async fn route<S: StorageBackend>(
     // window a wire client does.
     macro_rules! run_lifecycle {
         ($module:ident) => {{
-            match crate::serde_errors::deserialize(request_json) {
+            match read(layer, request_json) {
                 Ok(request) => {
-                    match actions::$module::execute(backend, request, ctx.vector_lifecycle).await {
+                    match crate::types::with_value_layer_async(
+                        layer,
+                        actions::$module::execute(backend, request, ctx.vector_lifecycle),
+                    )
+                    .await
+                    {
                         Ok(response) => serde_json::to_string(&response)
                             .map_err(|e| DynoxideError::InternalServerError(e.to_string())),
                         Err(e) => Err(e),
@@ -285,43 +366,48 @@ async fn route<S: StorageBackend>(
         }};
     }
 
-    // The same pre-deserialisation type checks the HTTP server runs. Request
-    // structs hold several fields as `serde_json::Value`, which accepts any
-    // JSON type, so without this a mistyped field reaches serde and comes back
-    // as raw serde text here while the server answers with the captured
-    // SerializationException. Both surfaces read one implementation so they
-    // cannot drift.
-    let result: crate::Result<String> =
-        match crate::serialization_checks::pre_check_serialization_types(op, request_json) {
-            Err(e) => Err(e),
-            Ok(()) => match op {
-                "CreateTable" => run!(create_table),
-                "DeleteTable" => run_lifecycle!(delete_table),
-                "DescribeTable" => run_lifecycle!(describe_table),
-                "UpdateTable" => run_lifecycle!(update_table),
-                "ListTables" => run!(list_tables),
-                "PutItem" => run!(put_item),
-                "GetItem" => run!(get_item),
-                "DeleteItem" => run!(delete_item),
-                "UpdateItem" => run!(update_item),
-                "Query" => run!(query),
-                "Scan" => run!(scan),
-                "BatchGetItem" => run!(batch_get_item),
-                "BatchWriteItem" => run!(batch_write_item),
-                "TransactGetItems" => run!(transact_get_items),
-                "ExecuteStatement" => run!(execute_statement),
-                "BatchExecuteStatement" => run!(batch_execute_statement),
-                "ExecuteTransaction" => execute_transaction(backend, ctx, request_json).await,
-                "SearchVectors" => run_lifecycle!(search_vectors),
-                other => Err(DynoxideError::InternalServerError(format!(
-                    "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
-                ))),
-            },
-        };
+    let result: crate::Result<String> = match checked {
+        Err(e) => Err(e),
+        Ok(_) => match op {
+            "CreateTable" => run!(create_table),
+            "DeleteTable" => run_lifecycle!(delete_table),
+            "DescribeTable" => run_lifecycle!(describe_table),
+            "UpdateTable" => run_lifecycle!(update_table),
+            "ListTables" => run!(list_tables),
+            "PutItem" => run!(put_item),
+            "GetItem" => run!(get_item),
+            "DeleteItem" => run!(delete_item),
+            "UpdateItem" => run!(update_item),
+            "Query" => run!(query),
+            "Scan" => run!(scan),
+            "BatchGetItem" => run!(batch_get_item),
+            "BatchWriteItem" => run!(batch_write_item),
+            "TransactGetItems" => run!(transact_get_items),
+            "ExecuteStatement" => run!(execute_statement),
+            "BatchExecuteStatement" => run!(batch_execute_statement),
+            "ExecuteTransaction" => execute_transaction(backend, ctx, request_json).await,
+            "SearchVectors" => run_lifecycle!(search_vectors),
+            other => Err(DynoxideError::InternalServerError(format!(
+                "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
+            ))),
+        },
+    };
 
     // Same seam as the HTTP dispatch: resolve the wire-invisible
-    // EnvelopedValidation tag for the operation before serialising.
-    result.map_err(|e| crate::validation::resolve_request_validation_tag(op, e))
+    // EnvelopedValidation tag for the operation and the layer before
+    // serialising, and give ExecuteStatement's condition failure carrying an
+    // item its own shape.
+    result.map_err(|e| {
+        let resolved = match layer {
+            crate::validation::ValueLayer::Older => {
+                crate::validation::strip_request_validation_tag(e)
+            }
+            crate::validation::ValueLayer::Current => {
+                crate::validation::resolve_request_validation_tag(op, e)
+            }
+        };
+        crate::errors::for_operation(op, resolved)
+    })
 }
 
 /// `ExecuteTransaction`, which cannot use the `run!` macro because it needs the
@@ -343,13 +429,14 @@ async fn execute_transaction<S: StorageBackend>(
     let capacity_mode = request.return_consumed_capacity.clone();
     // Ahead of the cache, not only inside the work: a replayed token skips the
     // work entirely, and the token is keyed on the statements alone, so a replay
-    // may carry a capacity mode the first call never did.
-    actions::execute_transaction::reject_bad_capacity_mode(capacity_mode.as_deref())?;
+    // may carry a capacity mode or token the first call never did. The token,
+    // statements and mode are refused together, listed.
+    actions::execute_transaction::check_members(&request)?;
 
     let response = crate::run_idempotent_async(
         ctx.tokens.execute_transaction(),
         token.as_deref(),
-        &statements,
+        &actions::execute_transaction::token_statements(&statements),
         actions::execute_transaction::execute_cached(backend, request),
         |cached| actions::execute_transaction::replay_response(cached, &capacity_mode),
     )
@@ -1104,6 +1191,64 @@ mod tests {
         assert_eq!(v["TableNames"][0], "Music");
     }
 
+    /// A Music item whose `data` attribute is a leaf wrapped in `depth` maps.
+    fn deep_music_item(depth: usize) -> String {
+        format!(
+            r#"{{"TableName":"Music","Item":{{"artist":{{"S":"a"}},"song":{{"S":"s"}},"data":{}{{"S":"leaf"}}{}}}}}"#,
+            "{\"M\":{\"n\":".repeat(depth),
+            "}}".repeat(depth)
+        )
+    }
+
+    #[test]
+    fn http_reads_a_value_too_deep_for_the_parser_and_refuses_it() {
+        let backend = Storage::memory().unwrap();
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.CreateTable"),
+            CREATE_MUSIC,
+        );
+        assert_eq!(out.status, 200);
+
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.PutItem"),
+            &deep_music_item(63),
+        );
+        assert_eq!(out.status, 400, "{}", out.body);
+        let v: serde_json::Value = serde_json::from_str(&out.body).unwrap();
+        assert_eq!(
+            v["message"],
+            crate::validation::NESTING_LIMIT_MESSAGE,
+            "{}",
+            out.body
+        );
+
+        // Past where DynamoDB's own parser gives up, a bare SerializationException.
+        let out = http(
+            &backend,
+            Some("DynamoDB_20120810.PutItem"),
+            &deep_music_item(2001),
+        );
+        assert_eq!(out.status, 400);
+        assert_eq!(out.body, SERIALIZATION_EXCEPTION_BARE);
+    }
+
+    #[test]
+    fn rpc_reads_a_value_too_deep_for_the_parser_and_refuses_it() {
+        let backend = Storage::memory().unwrap();
+        run(&backend, "CreateTable", CREATE_MUSIC).unwrap();
+        let err = run(&backend, "PutItem", &deep_music_item(63)).unwrap_err();
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(
+            v["message"],
+            crate::validation::NESTING_LIMIT_MESSAGE,
+            "{err}"
+        );
+        let err = run(&backend, "PutItem", &deep_music_item(2001)).unwrap_err();
+        assert_eq!(err, SERIALIZATION_EXCEPTION_BARE);
+    }
+
     #[test]
     fn http_rejects_a_non_json_body_as_bare_serialization_exception() {
         let backend = Storage::memory().unwrap();
@@ -1648,6 +1793,28 @@ mod tests {
         let backend = Storage::memory().unwrap();
         let err = run(&backend, "ExecuteTransaction", &transaction(&[], None)).unwrap_err();
         assert!(error_type(&err).ends_with("ValidationException"), "{err}");
+    }
+
+    /// The token, the statements and ReturnConsumedCapacity are listed
+    /// together, in that order, as on every other surface (captured eu-west-2
+    /// and us-east-1, 2026-10-10).
+    #[test]
+    fn execute_transaction_lists_its_token_and_capacity_mode_with_its_statements() {
+        let backend = Storage::memory().unwrap();
+        let request = serde_json::json!({
+            "TransactStatements": [{"Statement": format!("SELECT * FROM \"Music\" WHERE artist = '{}'", "x".repeat(9_000))}],
+            "ReturnConsumedCapacity": "BOGUS",
+            "ClientRequestToken": "t".repeat(40),
+        })
+        .to_string();
+        let err = run(&backend, "ExecuteTransaction", &request).unwrap_err();
+        assert!(err.contains("3 validation errors detected: "), "{err}");
+        let token = err.find("at 'clientRequestToken'").expect("the token");
+        let statement = err
+            .find("at 'transactStatements.1.member.statement'")
+            .expect("the statement");
+        let mode = err.find("at 'returnConsumedCapacity'").expect("the mode");
+        assert!(token < statement && statement < mode, "{err}");
     }
 
     #[test]

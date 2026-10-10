@@ -186,8 +186,7 @@ fn run_workload(db_path: &str) {
     }
 
     // Step 10: DeleteItem -- 500
-    for i in 0..500 {
-        let item = &items[i];
+    for item in items.iter().take(500) {
         db.delete_item(DeleteItemRequest {
             table_name: BENCH_TABLE.to_string(),
             key: make_key(item),

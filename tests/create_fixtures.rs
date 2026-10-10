@@ -1,6 +1,6 @@
 //! One-shot helper to create test fixture databases.
 //!
-//! Run with: cargo test --features encryption --test create_fixtures -- --ignored
+//! Run with: cargo test --no-default-features --features encryption --test create_fixtures -- --ignored
 //!
 //! This creates:
 //! - tests/fixtures/option-a-unencrypted.db: Created by SQLCipher-linked build without a key

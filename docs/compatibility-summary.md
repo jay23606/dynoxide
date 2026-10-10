@@ -115,6 +115,7 @@ the ones worth knowing.
 | GSI add/remove via UpdateTable | Supported (with backfill) |
 | GSI projection ALL / KEYS_ONLY / INCLUDE | Supported |
 | Sparse GSI (items without GSI keys excluded) | Supported |
+| Multi-attribute GSI keys (up to four HASH and four RANGE attributes) | Supported |
 | Per-GSI ConsumedCapacity (INDEXES mode) | Supported |
 | **LSI on CreateTable** | Supported |
 | **LSI projection ALL / KEYS_ONLY / INCLUDE** | Supported |
@@ -282,6 +283,16 @@ axis is the captured one: a write's
 plus the item size of the rest of the projected entry, held to a 1KB floor, and
 matches eu-west-2 byte for byte across fixtures from 3 to 512 dimensions.
 
+The base table charges the vector the same way. On a table with a vector index,
+an attribute an index reads costs its name plus `4 * dimensions` in a write's
+units and in `TableSizeBytes`, whatever numbers it holds, while read units and
+the 400 KB item limit size it as the list of numbers it is. Both rules are
+DynamoDB's, captured in eu-west-2 and us-east-1 at 1, 3, 6, 8, 256 and 1,024
+dimensions. A GSI's or LSI's share of the write is sized by the number rule even
+when the index projects the vector, so their `IndexSizeBytes` is too. A vector
+index's `ItemCount` and `IndexSizeBytes` count its entries and total their write
+figure without the floor.
+
 A vector index is not reachable through PartiQL, matching AWS: naming one in a
 `"table"."index"` qualifier answers `Scan operation not supported on this index
 type`. PartiQL reads of the base table return the vector attribute like any
@@ -326,13 +337,13 @@ Supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` with full WHERE clause support:
 - **Range/membership:** `BETWEEN`, `IN`
 - **Functions:** `EXISTS`, `NOT EXISTS`, `BEGINS_WITH`, `CONTAINS`
 - **Existence:** `IS MISSING`, `IS NOT MISSING`
-- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping up to 64 levels deep. `AND` binds tighter than `OR`, and a `NOT` over a group is applied by De Morgan, so `NOT (a=1 OR b=2)` selects what `a<>1 AND b<>2` does. The clause is flattened to an OR of ANDs internally; a clause whose flattened form exceeds 256 alternatives is rejected as too complex
+- **Logical:** `AND`, `OR`, `NOT`, parenthesised grouping up to 64 levels deep. `AND` binds tighter than `OR`, and a `NOT` over a group is applied by De Morgan, so `NOT (a=1 OR b=2)` selects what `a<>1 AND b<>2` does. The clause is flattened to an OR of ANDs internally, under three limits of Dynoxide's own: at most 256 alternatives, at most 4,096 condition slots in any AND product, and at most 16,384 slots across an alternation. A clause past any of them is rejected as too complex. DynamoDB evaluates a condition as a tree and runs clauses far larger than these (40 pairs of `(a = 1 OR a = 2)` run on eu-west-2), so this is a known difference
 - **Projections:** Nested dot-notation paths
 - **Aggregates:** Not supported, matching DynamoDB: a `COUNT(...)` projection is rejected with DynamoDB's `Unexpected path component` message carrying the token's position (captured against eu-west-2)
-- **Pagination:** `LIMIT` and `NextToken` on `SELECT`. `LIMIT` bounds the rows evaluated, as it does on Query and Scan, so a filtered page can come back short or empty and still carry a token. The statement and parameters must stay identical across pages; a token replayed with either changed is rejected with DynamoDB's `NextToken does not match request` message, and one that cannot be decoded at all with `Invalid NextToken` (both captured against eu-west-2)
+- **Pagination:** `LIMIT` and `NextToken` on `SELECT`. `LIMIT` bounds the rows evaluated, as it does on Query and Scan, so a filtered page can come back short or empty and still carry a token. The statement must stay identical character for character across pages, and so must the parameters, though `Limit` may change; a token replayed with any difference is rejected with DynamoDB's `NextToken does not match request` message, and one that cannot be decoded at all with `Invalid NextToken` (both captured against eu-west-2). A statement with a list or map parameter is never resumed, even with the same parameter sent again (captured against eu-west-2 and us-east-1)
 - **Literals:** Set literals (`<< >>`), negative numbers, escaped quotes
 - **Mutations:** `INSERT` (with IF NOT EXISTS, rejects duplicates), `UPDATE` (SET with expressions, REMOVE, supports `RETURNING`), `DELETE` (requires sort key, supports `RETURNING ALL OLD *`)
-- **Transactions:** `ExecuteTransaction` with all-or-nothing semantics
+- **Transactions:** `ExecuteTransaction` with all-or-nothing semantics. A cancelled transaction lists a reason for every statement that failed, not only the first. A key of the wrong type on any statement is reported alone, with `None` for every other statement. A `DELETE` with a condition, of an item that isn't there, does nothing when the transaction commits and is reported as a failed condition when it is cancelled. Captured against eu-west-2 and us-east-1
 - **Index qualifier:** `SELECT * FROM "table"."index"` is served from the named GSI or LSI. The read follows the index, so items the index does not hold are absent and a `KEYS_ONLY` or `INCLUDE` projection returns only what it projects. An unknown index name, a path of more than two components, an empty path component and a strongly consistent read of a GSI are each rejected with DynamoDB's own wording. A GSI rejects a projection naming an attribute it does not carry; either kind rejects a filter on one when the read is keyed on the index partition key, and matches nothing when it is not. `INSERT` rejects a qualifier at parse, `UPDATE` and `DELETE` reject it in execution. Captured against eu-west-2
 
   An index-qualified `SELECT` inside `ExecuteTransaction` is rejected, as it is on DynamoDB. One limit remains: an LSI serves a projection naming an unprojected attribute from the base table on DynamoDB and returns nothing here
@@ -345,7 +356,7 @@ Parameter placeholders (`?`) supported in all positions including nested list/ma
 
 **`ReturnConsumedCapacity`:** accepted on all three PartiQL surfaces. `BatchExecuteStatement` aggregates per table across the batch and charges a failed statement the write it attempted, sized on the row already stored.
 
-**Batch member options:** `BatchStatementRequest` carries `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`. `ConsistentRead` is per member and sets the rate that member's read is charged at, so a batch mixing the two sums both rates; it does not change which rows come back. `ReturnValuesOnConditionCheckFailure` is accepted and inert, matching DynamoDB: a member whose condition fails returns the same response whether it is `ALL_OLD`, `NONE` or absent, and never the item. A batch `SELECT` must name the table's primary key and may not name an index; either shape is rejected against that member while the rest of the batch runs.
+**Batch member options:** `BatchStatementRequest` carries `ConsistentRead` and `ReturnValuesOnConditionCheckFailure`. `ConsistentRead` is per member and sets the rate that member's read is charged at, so a batch mixing the two sums both rates; it does not change which rows come back. `ReturnValuesOnConditionCheckFailure` set to `ALL_OLD` puts the item a member's `UPDATE` or `DELETE` failed its condition on on that member's `Error`, as it does on an `ExecuteTransaction` statement's cancellation reason and on `ExecuteStatement`'s `ConditionalCheckFailedException`; `NONE`, a missing item and a duplicate `INSERT` carry none. Captured against eu-west-2 and us-east-1. A batch `SELECT` must name the table's primary key and may not name an index; either shape is rejected against that member while the rest of the batch runs.
 
 ---
 
@@ -357,7 +368,7 @@ Parameter placeholders (`?`) supported in all positions including nested list/ma
 | Empty set rejection | Enforced on all write paths |
 | Number precision (38 digits, ±1E+126 range) | Enforced on all write paths |
 | Set deduplication (SS/NS/BS) | Enforced on all write paths |
-| 400KB item size limit | Enforced |
+| 400KB item size limit | Enforced. A standalone `UpdateItem` is also held to a charge worked out from its request, as DynamoDB holds it; `TransactWriteItems` updates and PartiQL `UPDATE` are measured by the finished item |
 | Unused ExpressionAttributeNames/Values | Rejected with ValidationException |
 | ReturnValues parameter validation | Enforced (PutItem, DeleteItem accept only NONE/ALL_OLD) |
 | Key attribute protection | UpdateItem rejects REMOVE/ADD/DELETE on key attributes |
@@ -391,21 +402,55 @@ DynamoDB Local fails a share of the suite that real DynamoDB passes, clustered i
 - **Single-shard stream model** - DescribeStream returns a single shard; `ExclusiveStartShardId` and `Limit` accepted but ignored
 - **Number arithmetic precision** - uses `rust_decimal` for arbitrary-precision arithmetic, which may have minor differences from DynamoDB's proprietary implementation at extreme edge cases
 - **Transaction contention errors** - `TransactionConflictException` and `TransactionInProgressException` not emulated (concurrent transaction contention doesn't apply to single-process emulator)
+- **Which of two PartiQL refusals is reported** - when one statement holds both an operand of the wrong type for its operator (such as `size(s) < true`) and something refused as the statement is read, Dynoxide reports the second and DynamoDB reports the operand's type
+- **Map order in a refused request's echo** - when a request too long to accept is echoed back in its error (`BatchWriteItem` over 25 requests, a transaction over 100 actions), each map lists its entries in the order of the Java hash map DynamoDB reads it into, sized to the map. Two entries that land in the same bucket are listed in the order they were sent on DynamoDB, and in name order on Dynoxide, which no longer has the order they were sent in once the request is read
+
+### Where AWS answers the same request differently
+
+These three come from inside AWS, so Dynoxide picks one answer and keeps to it.
+Captured in eu-west-2 and us-east-1 on 2026-10-09.
+
+**1. Scan order across partitions.** AWS walks partitions in the order of an
+internal hash of the partition key: the same six items came back with partition
+`b` ahead of `a` in both regions. Dynoxide walks them in key order. Within a
+partition both return sort key order.
+
+*What to do:* never depend on which partition a Scan reaches first.
+
+**2. `LastEvaluatedKey` on a page that ends at the last matching item.** When a
+Query or Scan fills its `Limit` with the last item there is, AWS sometimes
+returns a `LastEvaluatedKey` and sometimes does not. The same request answered
+one way in eu-west-2 and the other in us-east-1, and two requests that differed
+only in direction or `Select` answered differently in one region. Dynoxide
+always returns one when a page fills its `Limit`, so the next request comes back
+empty, which AWS also does.
+
+*What to do:* page until `LastEvaluatedKey` is absent, and treat an empty page
+as the end.
+
+**3. How a refused key schema is printed.** A request-model error that quotes a
+key schema, such as a table key with three attributes, usually lists each
+element as `KeySchemaElement(attributeName=pk, keyType=HASH)`. Some AWS hosts
+print `com.amazonaws.dynamodb.v20120810.KeySchemaElement@ad28e71d` instead; both
+forms came back from eu-west-2 within the same hour. Dynoxide prints the first.
+
+*What to do:* match the constraint text (`Member must have length less than or
+equal to 2`), not the list.
 
 ### Legacy Pre-2015 API Parameters
 
-The legacy filter and update API (pre-expression-based API from before 2015) has partial support:
+The legacy parameters that came before the expression API are implemented:
 
 | Parameter | Supported | Notes |
 |-----------|-----------|-------|
-| `AttributeUpdates` (UpdateItem) | Partial | PUT, ADD, DELETE actions supported; used when `UpdateExpression` is absent |
-| `Expected` (PutItem, UpdateItem, DeleteItem) | Accepted, ignored | Use `ConditionExpression` instead |
-| `ScanFilter` / `QueryFilter` | Accepted, ignored | Use `FilterExpression` instead |
-| `KeyConditions` (Query) | Accepted, ignored | Use `KeyConditionExpression` instead |
-| `AttributesToGet` (GetItem, Query, Scan) | Accepted, ignored | Use `ProjectionExpression` instead |
-| `ConditionalOperator` | Accepted, ignored | Use `ConditionExpression` with `AND`/`OR` instead |
+| `AttributeUpdates` (UpdateItem) | Yes | `PUT`, `ADD` and `DELETE` actions |
+| `Expected` (PutItem, UpdateItem, DeleteItem) | Yes | `Value` and `Exists`, or a `ComparisonOperator` with `AttributeValueList` |
+| `QueryFilter` (Query) / `ScanFilter` (Scan) | Yes | Every comparison operator: `EQ`, `NE`, `LE`, `LT`, `GE`, `GT`, `NULL`, `NOT_NULL`, `CONTAINS`, `NOT_CONTAINS`, `BEGINS_WITH`, `IN`, `BETWEEN` |
+| `KeyConditions` (Query) | Yes | `EQ` on the partition key; `EQ`, `LE`, `LT`, `GE`, `GT`, `BEGINS_WITH` or `BETWEEN` on the sort key |
+| `AttributesToGet` (GetItem, BatchGetItem, Query, Scan) | Yes | Returns the named top-level attributes |
+| `ConditionalOperator` | Yes | `AND` or `OR` across the conditions in `Expected`, `QueryFilter` or `ScanFilter` |
 
-All legacy parameters are silently accepted during deserialisation (serde ignores unknown fields by default). `AttributeUpdates` is the only one actively processed. Users should prefer the expression-based API (`UpdateExpression`, `FilterExpression`, `KeyConditionExpression`, `ProjectionExpression`, `ConditionExpression`) for full functionality.
+A request that mixes a legacy parameter with its expression counterpart, such as `Expected` with `ConditionExpression`, is refused, as DynamoDB refuses it. The expression API (`UpdateExpression`, `ConditionExpression`, `FilterExpression`, `KeyConditionExpression`, `ProjectionExpression`) covers more, such as nested paths and functions, and is the one to use for new code.
 
 ---
 

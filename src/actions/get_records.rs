@@ -49,9 +49,21 @@ pub struct UserIdentity {
 pub struct StreamRecord {
     #[serde(rename = "Keys")]
     pub keys: Item,
-    #[serde(rename = "NewImage", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "NewImage",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::item_in_hash_order"
+    )]
+    // Number sets in Java hash-set order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub new_image: Option<Item>,
-    #[serde(rename = "OldImage", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "OldImage",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::item_in_hash_order"
+    )]
+    // Number sets in Java hash-set order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub old_image: Option<Item>,
     #[serde(rename = "SequenceNumber")]
     pub sequence_number: String,

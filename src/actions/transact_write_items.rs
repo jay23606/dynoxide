@@ -1,7 +1,5 @@
 use crate::actions::helpers;
-use crate::actions::index_capacity::{
-    WriteCapacity, aggregate_by_table, per_table_capacity, transactional_read_units,
-};
+use crate::actions::index_capacity::{WriteCapacity, aggregate_by_table, per_table_capacity};
 use crate::errors::{CancellationReason, DynoxideError, Result};
 use crate::storage_backend::StorageBackend;
 use crate::types::{self, AttributeValue, Item};
@@ -42,7 +40,11 @@ pub struct TransactPut {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_older_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -60,7 +62,11 @@ pub struct TransactUpdate {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_older_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -76,7 +82,11 @@ pub struct TransactDelete {
     pub condition_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_older_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -92,7 +102,11 @@ pub struct TransactConditionCheck {
     pub condition_expression: String,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_older_expression_values"
+    )]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -120,7 +134,9 @@ pub struct TransactWriteItemsResponse {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CachedWrite {
     pub(crate) response: TransactWriteItemsResponse,
-    /// Per-action `(table, image size)`.
+    /// Per-action `(table, image size)`. Only the native `Database` replays a
+    /// transaction: the wasm engine refuses `TransactWriteItems`.
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
     pub(crate) replay_sizes: Vec<(String, usize)>,
 }
 
@@ -135,10 +151,179 @@ pub async fn execute<S: StorageBackend>(
     Ok(execute_cached(storage, request).await?.response)
 }
 
-pub(crate) async fn execute_cached<S: StorageBackend>(
-    storage: &S,
-    request: TransactWriteItemsRequest,
-) -> Result<CachedWrite> {
+/// Refuse an empty attribute name in one action: in the item or key (bare),
+/// in its expression names, or in its expression values. The values are
+/// reported naming their key, as eight of ten regions do; eu-west-2 and
+/// eu-north-1 answer the bare message.
+fn empty_name_in_write_action(item: &TransactWriteItem) -> Result<()> {
+    let (attributes, names, values) = if let Some(ref put) = item.put {
+        (
+            &put.item,
+            put.expression_attribute_names.as_ref(),
+            put.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(ref update) = item.update {
+        (
+            &update.key,
+            update.expression_attribute_names.as_ref(),
+            update.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(ref delete) = item.delete {
+        (
+            &delete.key,
+            delete.expression_attribute_names.as_ref(),
+            delete.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(ref check) = item.condition_check {
+        (
+            &check.key,
+            check.expression_attribute_names.as_ref(),
+            check.expression_attribute_values.as_ref(),
+        )
+    } else {
+        return Ok(());
+    };
+    if crate::empty_names::map_has_empty_name(attributes) {
+        return Err(crate::empty_names::bare());
+    }
+    crate::empty_names::check_names(names)?;
+    if let Some(key) = crate::empty_names::value_placeholder(values, None) {
+        return Err(DynoxideError::ValidationException(
+            crate::empty_names::value_placeholder_message(key),
+        ));
+    }
+    Ok(())
+}
+
+/// The action list as DynamoDB echoes it in a constraint message: each
+/// action's Java `toString`, every field named, in the form us-east-1,
+/// eu-west-1 and us-west-2 gave on 2026-10-10. eu-west-2 echoes no list
+/// (`Value at 'TransactItems'`), and some hosts print each attribute value as
+/// an object hash; the form most regions give is the one followed. Bounded by
+/// [`crate::actions::batch_write_item::ECHO_LIMIT`].
+fn items_echo(items: &[TransactWriteItem]) -> String {
+    let mut out = crate::actions::batch_write_item::BoundedEcho::new();
+    let _ = write_items(&mut out, items);
+    out.finish()
+}
+
+fn write_items(out: &mut dyn std::fmt::Write, items: &[TransactWriteItem]) -> std::fmt::Result {
+    use crate::actions::batch_write_item::{
+        write_java_item, write_java_names, write_java_text, write_java_values,
+    };
+    // The members every action shares, after its key or item.
+    let conditions = |out: &mut dyn std::fmt::Write,
+                      condition: Option<&str>,
+                      names: Option<&HashMap<String, String>>,
+                      values: Option<&HashMap<String, AttributeValue>>,
+                      return_values: Option<&str>|
+     -> std::fmt::Result {
+        out.write_str(", conditionExpression=")?;
+        write_java_text(out, condition)?;
+        out.write_str(", expressionAttributeNames=")?;
+        write_java_names(out, names)?;
+        out.write_str(", expressionAttributeValues=")?;
+        write_java_values(out, values)?;
+        out.write_str(", returnValuesOnConditionCheckFailure=")?;
+        write_java_text(out, return_values)?;
+        out.write_str(", workloadProfileName=null)")
+    };
+    out.write_str("[")?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        out.write_str("TransactWriteItem(conditionCheck=")?;
+        match item.condition_check {
+            Some(ref check) => {
+                out.write_str("ConditionCheck(key=")?;
+                write_java_item(out, &check.key)?;
+                write!(out, ", tableName={}", check.table_name)?;
+                conditions(
+                    out,
+                    Some(&check.condition_expression),
+                    check.expression_attribute_names.as_ref(),
+                    check.expression_attribute_values.as_ref(),
+                    check.return_values_on_condition_check_failure.as_deref(),
+                )?;
+            }
+            None => out.write_str("null")?,
+        }
+        out.write_str(", put=")?;
+        match item.put {
+            Some(ref put) => {
+                out.write_str("Put(item=")?;
+                write_java_item(out, &put.item)?;
+                write!(out, ", tableName={}", put.table_name)?;
+                conditions(
+                    out,
+                    put.condition_expression.as_deref(),
+                    put.expression_attribute_names.as_ref(),
+                    put.expression_attribute_values.as_ref(),
+                    put.return_values_on_condition_check_failure.as_deref(),
+                )?;
+            }
+            None => out.write_str("null")?,
+        }
+        out.write_str(", delete=")?;
+        match item.delete {
+            Some(ref delete) => {
+                out.write_str("Delete(key=")?;
+                write_java_item(out, &delete.key)?;
+                write!(out, ", tableName={}", delete.table_name)?;
+                conditions(
+                    out,
+                    delete.condition_expression.as_deref(),
+                    delete.expression_attribute_names.as_ref(),
+                    delete.expression_attribute_values.as_ref(),
+                    delete.return_values_on_condition_check_failure.as_deref(),
+                )?;
+            }
+            None => out.write_str("null")?,
+        }
+        out.write_str(", update=")?;
+        match item.update {
+            Some(ref update) => {
+                out.write_str("Update(key=")?;
+                write_java_item(out, &update.key)?;
+                write!(
+                    out,
+                    ", updateExpression={}, tableName={}",
+                    update.update_expression, update.table_name
+                )?;
+                conditions(
+                    out,
+                    update.condition_expression.as_deref(),
+                    update.expression_attribute_names.as_ref(),
+                    update.expression_attribute_values.as_ref(),
+                    update.return_values_on_condition_check_failure.as_deref(),
+                )?;
+            }
+            None => out.write_str("null")?,
+        }
+        out.write_str(")")?;
+    }
+    out.write_str("]")
+}
+
+/// The request-level checks, in the order DynamoDB reports them: the
+/// `TransactItems` length; then the request's own members, `ClientRequestToken`,
+/// `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`, reported together
+/// in one message; then whether each item carries exactly one action; then
+/// every action's table name, again in one message.
+///
+/// That is what us-east-1 and nine more regions answered on 2026-10-09.
+/// eu-west-2 and eu-north-1 have moved transactions to a newer validation
+/// layer, which reports a table name or an empty action together with the
+/// enums, words the empty action and the token differently, and reports an
+/// overlong token alone.
+///
+/// Called at the entry point ahead of the idempotency cache as well as at the
+/// start of `execute_cached`. A same-token replay never reaches
+/// `execute_cached`, and the token is keyed on the items alone, so a second
+/// call may carry a capacity mode the first one never did. Running the same
+/// checks in both places keeps their order the same whichever path answers.
+pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
     let items = &request.transact_items;
 
     // Validate: at least 1 action
@@ -148,16 +333,168 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         ));
     }
 
-    // Validate: up to 100 actions.
-    // AWS surfaces this as the standard "1 validation error detected" envelope
-    // around `Value '[<dump>]' at 'transactItems'`. The conformance suite
-    // anchors a regex on the envelope and constraint phrase but leaves the
-    // dump body unconstrained.
+    // Validate: up to 100 actions, echoing the list as DynamoDB does.
     if items.len() > 100 {
-        let dump = format!("{items:?}");
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '[{dump}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
+            "1 validation error detected: Value '{}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
+            items_echo(items)
         )));
+    }
+
+    // The request's own members, reported together before anything is read or
+    // written: every action's ReturnValuesOnConditionCheckFailure in request
+    // order, then the token and the two enums (captured 2026-10-09, six of
+    // seven regions). The idempotency layer checks the token again, for the
+    // operations that reach it without coming through here.
+    let mut member_errors: Vec<String> = Vec::new();
+    for (position, item) in items.iter().enumerate() {
+        let actions = [
+            (
+                "put",
+                item.put
+                    .as_ref()
+                    .map(|a| &a.return_values_on_condition_check_failure),
+            ),
+            (
+                "update",
+                item.update
+                    .as_ref()
+                    .map(|a| &a.return_values_on_condition_check_failure),
+            ),
+            (
+                "delete",
+                item.delete
+                    .as_ref()
+                    .map(|a| &a.return_values_on_condition_check_failure),
+            ),
+            (
+                "conditionCheck",
+                item.condition_check
+                    .as_ref()
+                    .map(|a| &a.return_values_on_condition_check_failure),
+            ),
+        ];
+        for (action, value) in actions {
+            if let Some(msg) = value.and_then(|value| {
+                crate::validation::return_values_on_condition_check_failure_rejection(
+                    value.as_deref(),
+                    &format!(
+                        "transactItems.{}.member.{action}.returnValuesOnConditionCheckFailure",
+                        position + 1
+                    ),
+                )
+            }) {
+                member_errors.push(msg);
+            }
+        }
+    }
+    member_errors.extend(
+        [
+            crate::token_constraint_error(request.client_request_token.as_deref()),
+            crate::validation::return_consumed_capacity_rejection(
+                request.return_consumed_capacity.as_deref(),
+            ),
+            crate::validation::return_item_collection_metrics_rejection(
+                request.return_item_collection_metrics.as_deref(),
+            ),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    if let Some(msg) = crate::validation::format_validation_errors(&member_errors) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
+    // Each item carries exactly one action, checked for every item before any
+    // table name is.
+    for item in items {
+        let actions = [
+            item.put.is_some(),
+            item.update.is_some(),
+            item.delete.is_some(),
+            item.condition_check.is_some(),
+        ]
+        .into_iter()
+        .filter(|&present| present)
+        .count();
+        match actions {
+            0 => {
+                return Err(DynoxideError::ValidationException(
+                    "Invalid Request: TransactWriteRequest should contain Delete or Put or Update request"
+                        .to_string(),
+                ));
+            }
+            1 => {}
+            _ => {
+                return Err(DynoxideError::ValidationException(
+                    "TransactItems can only contain one of Check, Put, Update or Delete"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    // Every action's table name, reported together under its position and
+    // action type, such as `transactItems.2.member.update.tableName`.
+    let mut name_errors = Vec::new();
+    for (position, item) in items.iter().enumerate() {
+        let (action, table_name) = if let Some(ref put) = item.put {
+            ("put", &put.table_name)
+        } else if let Some(ref update) = item.update {
+            ("update", &update.table_name)
+        } else if let Some(ref delete) = item.delete {
+            ("delete", &delete.table_name)
+        } else if let Some(ref check) = item.condition_check {
+            ("conditionCheck", &check.table_name)
+        } else {
+            continue;
+        };
+        name_errors.extend(crate::validation::member_table_name_errors(
+            table_name,
+            &format!("transactItems.{}.member.{action}.tableName", position + 1),
+        ));
+    }
+    if let Some(msg) = crate::validation::format_validation_errors(&name_errors) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn execute_cached<S: StorageBackend>(
+    storage: &S,
+    request: TransactWriteItemsRequest,
+) -> Result<CachedWrite> {
+    check_request(&request)?;
+    let items = &request.transact_items;
+
+    // An empty attribute name anywhere in an action is a top-level rejection,
+    // after the request's own members and ahead of the table lookups and the
+    // transaction (captured in ten regions).
+    for item in items {
+        empty_name_in_write_action(item)?;
+    }
+
+    // Validate: each action's request-only checks (value depth, Put item,
+    // expression sizes and condition syntax), in request order, before any
+    // table is looked up (#223). The request's own members come first, as
+    // DynamoDB reports them (captured 2026-10-09).
+    for item in items {
+        validate_action_request(item)?;
+    }
+
+    // A Delete, ConditionCheck or Update key nested too deep fails the whole
+    // request at the top level, before any table is looked up.
+    for item in items {
+        let key = item
+            .delete
+            .as_ref()
+            .map(|d| &d.key)
+            .or(item.condition_check.as_ref().map(|c| &c.key))
+            .or(item.update.as_ref().map(|u| &u.key));
+        if let Some(key) = key {
+            crate::value_nesting::check_key(key)?;
+        }
     }
 
     // Validate: no duplicate item targets. A key that can't be stringified (non-scalar
@@ -169,21 +506,6 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         {
             return Err(DynoxideError::ValidationException(
                 "Transaction request cannot include multiple operations on one item".to_string(),
-            ));
-        }
-    }
-
-    // Validate: each Put is within the item-size limit. This sits out here rather
-    // than inside the action because a put's size is knowable from the request,
-    // so DynamoDB answers it as a plain validation error before the transaction
-    // runs. An update's size is not: it depends on the stored item, and comes
-    // back as a cancellation reason instead. Captured against eu-west-2.
-    for item in items {
-        if let Some(ref put) = item.put
-            && types::item_size(&put.item) > types::MAX_ITEM_SIZE
-        {
-            return Err(DynoxideError::ValidationException(
-                "Item size has exceeded the maximum allowed size".to_string(),
             ));
         }
     }
@@ -209,6 +531,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
             consumed_capacity: build_write_capacity(&capacity, &request.return_consumed_capacity),
             item_collection_metrics: None,
         },
+        #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
         replay_sizes: replay_sizes(&capacity),
     })
 }
@@ -218,6 +541,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
 /// The write is sized on the larger of the two images, and a capture shows the
 /// replay charging against that same image, so the choice is made once here
 /// rather than twice with a chance of drifting apart.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 fn replay_sizes(capacity: &[WriteCapacity]) -> Vec<(String, usize)> {
     capacity
         .iter()
@@ -264,11 +588,12 @@ fn build_write_capacity(
 /// not carry over). The read cost is computed at 4KB read granularity, which
 /// diverges from the first-call write magnitude above 1KB. `cached` is what the
 /// first call stored: its response, and the image sizes to bill against.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub(crate) fn replay_response(cached: &CachedWrite, mode: &Option<String>) -> CachedWrite {
     CachedWrite {
         response: TransactWriteItemsResponse {
             consumed_capacity: crate::types::build_transactional_capacity(
-                &transactional_read_units(&cached.replay_sizes),
+                &crate::actions::index_capacity::transactional_read_units(&cached.replay_sizes),
                 mode,
                 crate::types::transactional_read_capacity,
             ),
@@ -282,6 +607,13 @@ pub(crate) fn replay_response(cached: &CachedWrite, mode: &Option<String>) -> Ca
 ///
 /// The records are only meaningful when the whole transaction commits; a
 /// cancellation returns an error and reports no capacity at all.
+///
+/// Every action runs even after one has failed, so the cancellation gives a
+/// reason for each. A failure of the storage itself (a full disk, an I/O
+/// error, anything not reported as a failed condition or a validation error)
+/// stops the transaction there and is returned as it is: SQLite may already
+/// have rolled the whole transaction back for it, and an action run after
+/// that would commit on its own.
 async fn execute_within_transaction<S: StorageBackend>(
     storage: &S,
     items: &[TransactWriteItem],
@@ -309,15 +641,15 @@ async fn execute_within_transaction<S: StorageBackend>(
                 if matches!(e, DynoxideError::KeyEmptyValueValidation(_)) {
                     return Err(e);
                 }
-                has_failure = true;
                 let message = Some(e.to_string());
                 let (code, item) = match e {
                     DynoxideError::ConditionalCheckFailedException(_, item) => {
                         ("ConditionalCheckFailed".to_string(), item)
                     }
                     DynoxideError::ValidationException(_) => ("ValidationError".to_string(), None),
-                    _ => ("InternalError".to_string(), None),
+                    storage_failure => return Err(storage_failure),
                 };
+                has_failure = true;
                 cancellation_reasons.push(CancellationReason {
                     code,
                     message,
@@ -366,14 +698,235 @@ async fn execute_single_action<S: StorageBackend>(
     }
 }
 
-/// Reject any ExpressionAttributeValue that nests deeper than DynamoDB allows.
-/// TransactWriteItems does not route through the shared expression-param helper, so
-/// the per-value nesting check is applied here for each sub-action's values.
-fn validate_eav_nesting(values: &Option<HashMap<String, AttributeValue>>) -> Result<()> {
-    if let Some(map) = values {
-        for value in map.values() {
+/// The checks DynamoDB makes on one action from the request alone, before the
+/// transaction looks at any table.
+///
+/// Each failure is a top-level ValidationException rather than a cancellation
+/// reason, so nothing is written even when an earlier action was fine. The
+/// actions are taken in request order and the first failure wins, ahead of a
+/// missing table, a duplicate target or an empty key value anywhere in the
+/// request. Captured in us-east-1, us-east-2, us-west-2, sa-east-1, eu-west-1,
+/// eu-central-1, ap-northeast-1 and ap-southeast-2, 2026-10-08, and in
+/// us-east-1 again for the order within an action, 2026-10-09.
+///
+/// Within one action the `ExpressionAttributeValues` depth comes first, then a
+/// Put's item depth, its condition size and its item size, or an Update's
+/// UpdateExpression size and then its condition size. The condition's syntax
+/// comes last; where it sits against the other checks in the same action was
+/// not captured, only that it runs up front.
+///
+/// eu-west-2 and eu-north-1 are part way through a change: on 2026-10-08 and
+/// 2026-10-09 they refused an `ExpressionAttributeValues` entry from 32 levels
+/// with the bare nesting message, left the size figure off the
+/// ConditionExpression message, and put a Put's item depth ahead of its
+/// condition size, where us-east-1 reports the size first. Dynoxide follows
+/// the majority except on that last point, which keeps PutItem's order.
+fn validate_action_request(item: &TransactWriteItem) -> Result<()> {
+    // Every action's sets are checked first, empty or with a repeated member,
+    // in its item or key and its expression values: ahead of a missing table
+    // and a condition's syntax error, as a top-level refusal (us-east-1,
+    // eu-west-1 and us-west-2, 2026-10-09, in the older layer's words;
+    // eu-west-2 uses the current layer's).
+    validate_action_sets(item)?;
+    if let Some(ref put) = item.put {
+        validate_expression_value_depth(&put.expression_attribute_values)?;
+        for value in put.item.values() {
             crate::validation::validate_nesting_depth(value)?;
         }
+        validate_condition_size(put.condition_expression.as_deref())?;
+        // A put's size is knowable from the request, unlike an update's, which
+        // depends on the stored item and comes back as a cancellation reason.
+        if types::item_size(&put.item) > types::MAX_ITEM_SIZE {
+            return Err(DynoxideError::ValidationException(
+                "Item size has exceeded the maximum allowed size".to_string(),
+            ));
+        }
+        validate_condition_syntax(put.condition_expression.as_deref())?;
+        validate_expression_references(
+            &put.expression_attribute_names,
+            &put.expression_attribute_values,
+            put.condition_expression.as_deref(),
+            None,
+        )?;
+    } else if let Some(ref update) = item.update {
+        validate_expression_value_depth(&update.expression_attribute_values)?;
+        // Unlike the ConditionExpression form, this message carries no size
+        // figure, in every region captured.
+        if update.update_expression.len() > crate::expressions::MAX_EXPRESSION_BYTES {
+            return Err(DynoxideError::ValidationException(
+                "Invalid UpdateExpression: Expression size has exceeded the maximum allowed size;"
+                    .to_string(),
+            ));
+        }
+        // An empty expression is refused here, ahead of the table lookup,
+        // where it used to parse as an update that changes nothing and write
+        // the key alone (captured eu-west-2 and us-east-1, 2026-10-09).
+        if update.update_expression.is_empty() {
+            return Err(DynoxideError::ValidationException(
+                "Invalid UpdateExpression: The expression can not be empty;".to_string(),
+            ));
+        }
+        let update_expression = crate::expressions::update::parse(&update.update_expression)
+            .map_err(DynoxideError::ValidationException)?;
+        validate_condition_size(update.condition_expression.as_deref())?;
+        validate_condition_syntax(update.condition_expression.as_deref())?;
+        validate_expression_references(
+            &update.expression_attribute_names,
+            &update.expression_attribute_values,
+            update.condition_expression.as_deref(),
+            Some(&update_expression),
+        )?;
+    } else if let Some(ref delete) = item.delete {
+        validate_expression_value_depth(&delete.expression_attribute_values)?;
+        validate_condition_size(delete.condition_expression.as_deref())?;
+        validate_condition_syntax(delete.condition_expression.as_deref())?;
+        validate_expression_references(
+            &delete.expression_attribute_names,
+            &delete.expression_attribute_values,
+            delete.condition_expression.as_deref(),
+            None,
+        )?;
+    } else if let Some(ref check) = item.condition_check {
+        validate_expression_value_depth(&check.expression_attribute_values)?;
+        validate_condition_size(Some(&check.condition_expression))?;
+        validate_condition_syntax(Some(&check.condition_expression))?;
+        validate_expression_references(
+            &check.expression_attribute_names,
+            &check.expression_attribute_values,
+            Some(&check.condition_expression),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// The empty or duplicated sets in one action, item or key first and then its
+/// expression values (named by key, in key order), in the older layer's words.
+fn validate_action_sets(item: &TransactWriteItem) -> Result<()> {
+    use crate::validation::{ValueLayer, find_set_error};
+    let (values, values_map) = if let Some(ref put) = item.put {
+        (&put.item, &put.expression_attribute_values)
+    } else if let Some(ref update) = item.update {
+        (&update.key, &update.expression_attribute_values)
+    } else if let Some(ref delete) = item.delete {
+        (&delete.key, &delete.expression_attribute_values)
+    } else if let Some(ref check) = item.condition_check {
+        (&check.key, &check.expression_attribute_values)
+    } else {
+        return Ok(());
+    };
+    let mut names: Vec<&String> = values.keys().collect();
+    names.sort();
+    for name in names {
+        if let Some(message) = find_set_error(&values[name], ValueLayer::Older) {
+            return Err(DynoxideError::ValidationException(message));
+        }
+    }
+    if let Some(eav) = values_map {
+        let mut keys: Vec<&String> = eav.keys().collect();
+        keys.sort();
+        for key in keys {
+            if let Some(message) = find_set_error(&eav[key], ValueLayer::Older) {
+                return Err(DynoxideError::ValidationException(format!(
+                    "ExpressionAttributeValues contains invalid value: {message} for key {key}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The names and values an action's expressions refer to, checked from the
+/// request alone: a value the condition names but the request doesn't define,
+/// then any name or value no expression uses (names first). Both are refused
+/// up front, ahead of a missing table, a duplicate target or a bad key, and in
+/// request order against the other actions' checks. Captured us-east-1 and
+/// eu-west-2, 2026-10-09.
+///
+/// An action with no expression at all is left alone. us-east-1 accepts a Put
+/// that carries ExpressionAttributeValues and no ConditionExpression and
+/// writes it; eu-west-2 refuses it ("ExpressionAttributeValues can only be
+/// specified when using expressions"). Dynoxide follows us-east-1.
+///
+/// An UpdateExpression's references are only marked as used here; whether
+/// they resolve is still checked as the action runs.
+fn validate_expression_references(
+    names: &Option<HashMap<String, String>>,
+    values: &Option<HashMap<String, AttributeValue>>,
+    condition: Option<&str>,
+    update: Option<&crate::expressions::update::UpdateExpr>,
+) -> Result<()> {
+    if condition.is_none() && update.is_none() {
+        return Ok(());
+    }
+    let tracker = crate::expressions::TrackedExpressionAttributes::new(names, values);
+    if let Some(update) = update {
+        tracker.track_update_expr(update);
+        // Overlapping target paths are refused here, before anything is
+        // written, without the envelope UpdateItem's carries.
+        crate::expressions::update::check_target_overlaps(update, &tracker)
+            .map_err(DynoxideError::ValidationException)?;
+    }
+    if let Some(condition) = condition {
+        // Syntax has already been checked, so this parses.
+        let parsed = crate::expressions::condition::parse(condition).map_err(|e| {
+            DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+        })?;
+        crate::expressions::condition::track_references(&parsed, &tracker).map_err(|e| {
+            DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+        })?;
+    }
+    tracker.check_unused()
+}
+
+/// The deepest `ExpressionAttributeValues` entry a transaction accepts, one past
+/// the stored-item limit. A 32-level entry that is only compared is evaluated,
+/// and one an Update writes is caught by the stored-item cap on the finished
+/// item; from 33 levels the entry is refused up front, used or not.
+const MAX_EXPRESSION_VALUE_DEPTH: usize = 32;
+
+fn validate_expression_value_depth(values: &Option<HashMap<String, AttributeValue>>) -> Result<()> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    let mut keys: Vec<&String> = values.keys().collect();
+    keys.sort();
+    for key in keys {
+        if crate::validation::nesting_depth(&values[key]) > MAX_EXPRESSION_VALUE_DEPTH {
+            return Err(DynoxideError::ValidationException(format!(
+                "ExpressionAttributeValues contains invalid value: Nesting Levels have exceeded \
+                 supported limits: Attributes in the item have nested levels beyond supported \
+                 limit for key {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// An empty or unparseable ConditionExpression is refused up front, where it
+/// used to surface as a cancellation reason. Captured for a ConditionCheck in
+/// us-east-1 and eu-west-2, 2026-10-09; the other actions take the same member
+/// and PutItem, UpdateItem and DeleteItem refuse it the same way.
+fn validate_condition_syntax(expression: Option<&str>) -> Result<()> {
+    let Some(expr) = expression else {
+        return Ok(());
+    };
+    if expr.is_empty() {
+        return Err(DynoxideError::ValidationException(
+            "Invalid ConditionExpression: The expression can not be empty;".to_string(),
+        ));
+    }
+    crate::expressions::condition::parse(expr).map_err(|e| {
+        DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+    })?;
+    Ok(())
+}
+
+fn validate_condition_size(expression: Option<&str>) -> Result<()> {
+    if let Some(expr) = expression {
+        crate::expressions::check_expression_size_with_figure(expr).map_err(|e| {
+            DynoxideError::ValidationException(format!("Invalid ConditionExpression: {e}"))
+        })?;
     }
     Ok(())
 }
@@ -396,12 +949,13 @@ async fn execute_put<S: StorageBackend>(
 
     // The item-size limit was applied to this put before the transaction opened,
     // and normalising cannot grow the item, so there is nothing to recheck here.
-    let size = types::item_size(&item);
+    // What the row records and the write is charged is the billed size, with a
+    // vector attribute at 4 bytes per dimension.
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+    let size = types::billed_item_size(&item, &vector_defs);
 
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&item, &key_schema)?;
-
-    validate_eav_nesting(&put.expression_attribute_values)?;
 
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
         &put.expression_attribute_names,
@@ -434,7 +988,11 @@ async fn execute_put<S: StorageBackend>(
         check_condition_tracked(cond_expr, &existing_item, &tracker, return_item)?;
     }
 
-    tracker.check_unused()?;
+    // With no ConditionExpression there is nothing to check the values
+    // against, and the transaction goes ahead (see validate_expression_references).
+    if put.condition_expression.is_some() {
+        tracker.check_unused()?;
+    }
 
     let item_json = serde_json::to_string(&item)
         .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
@@ -471,7 +1029,9 @@ async fn execute_put<S: StorageBackend>(
 
     Ok(WriteCapacity::new(
         &put.table_name,
-        old_item.as_ref().map(types::item_size),
+        old_item
+            .as_ref()
+            .map(|old| types::billed_item_size(old, &vector_defs)),
         Some(size),
         gsi_units,
         lsi_units,
@@ -497,8 +1057,6 @@ async fn execute_update<S: StorageBackend>(
         .as_ref()
         .and_then(|j| serde_json::from_str(j).ok())
         .unwrap_or_default();
-
-    validate_eav_nesting(&update.expression_attribute_values)?;
 
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
         &update.expression_attribute_names,
@@ -548,6 +1106,11 @@ async fn execute_update<S: StorageBackend>(
 
     tracker.check_unused()?;
 
+    // A transaction cancels an Update whose finished item is nested too deep
+    // with the short form of the nesting message, without the clause about the
+    // item's attributes. Captured us-east-1, 2026-10-09.
+    crate::validation::validate_updated_item_nesting(&item)?;
+
     // Validate attribute values after update expression applied
     crate::validation::validate_item_attribute_values(&item)?;
     crate::validation::normalize_item_sets(&mut item);
@@ -556,14 +1119,17 @@ async fn execute_update<S: StorageBackend>(
     helpers::validate_updated_index_keys(&before_item, &item, &meta)?;
 
     // A transacted update is measured flat against the resulting item, unlike the
-    // standalone UpdateItem, which takes the key attributes out and charges per
-    // action. Both were captured against eu-west-2; the two really do differ.
-    let size = types::item_size(&item);
-    if size > types::MAX_ITEM_SIZE {
+    // standalone UpdateItem, which is also charged for what its request carries.
+    // The flat measure is what 30 regions applied on 2026-10-08. eu-west-2,
+    // eu-north-1 and ap-northeast-2 began charging a transacted update for its
+    // request up front that day, mid-rollout; this follows the majority.
+    if types::item_size(&item) > types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
             "Item size to update has exceeded the maximum allowed size".to_string(),
         ));
     }
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+    let size = types::billed_item_size(&item, &vector_defs);
 
     // Save old item reference for streams
     let old_for_stream = existing_json.clone();
@@ -608,7 +1174,9 @@ async fn execute_update<S: StorageBackend>(
     // rather than an insert.
     Ok(WriteCapacity::new(
         &update.table_name,
-        old_item.as_ref().map(types::item_size),
+        old_item
+            .as_ref()
+            .map(|old| types::billed_item_size(old, &vector_defs)),
         Some(size),
         gsi_units,
         lsi_units,
@@ -628,8 +1196,6 @@ async fn execute_delete<S: StorageBackend>(
     helpers::validate_key_only(&delete.key, &key_schema)?;
     // TODO: validation must precede this call -- if reaching this line, caller has already validated keys.
     let (pk, sk) = helpers::extract_key_strings(&delete.key, &key_schema)?;
-
-    validate_eav_nesting(&delete.expression_attribute_values)?;
 
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
         &delete.expression_attribute_names,
@@ -662,7 +1228,11 @@ async fn execute_delete<S: StorageBackend>(
         check_condition_tracked(cond_expr, &existing_item, &tracker, return_item)?;
     }
 
-    tracker.check_unused()?;
+    // With no ConditionExpression there is nothing to check the values
+    // against, and the transaction goes ahead (see validate_expression_references).
+    if delete.condition_expression.is_some() {
+        tracker.check_unused()?;
+    }
 
     let old_json = storage.delete_item(&delete.table_name, &pk, &sk).await?;
     let old_item: Option<Item> = old_json.and_then(|j| serde_json::from_str(&j).ok());
@@ -687,9 +1257,12 @@ async fn execute_delete<S: StorageBackend>(
         crate::streams::record_stream_event(storage, &meta, old_item.as_ref(), None).await?;
     }
 
-    Ok(WriteCapacity::from_items(
+    let vector_defs = super::vector_index::parse_vector_defs(&meta)?;
+    Ok(WriteCapacity::new(
         &delete.table_name,
-        old_item.as_ref(),
+        old_item
+            .as_ref()
+            .map(|old| types::billed_item_size(old, &vector_defs)),
         None,
         gsi_units,
         lsi_units,
@@ -714,8 +1287,6 @@ async fn execute_condition_check<S: StorageBackend>(
         .as_ref()
         .and_then(|j| serde_json::from_str(j).ok())
         .unwrap_or_default();
-
-    validate_eav_nesting(&check.expression_attribute_values)?;
 
     let tracker = crate::expressions::TrackedExpressionAttributes::new(
         &check.expression_attribute_names,
@@ -748,6 +1319,7 @@ async fn execute_condition_check<S: StorageBackend>(
     Ok(WriteCapacity::condition_check(
         &check.table_name,
         existing_json.is_some().then_some(&existing_item),
+        &super::vector_index::parse_vector_defs(&meta)?,
     ))
 }
 

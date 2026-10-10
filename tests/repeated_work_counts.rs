@@ -406,3 +406,44 @@ fn report_key_schema_parses_on_a_streamed_ttl_sweep() {
         "key schema parses must not scale with the number of expired items"
     );
 }
+
+#[test]
+fn report_definition_parses_on_a_ttl_sweep_spanning_pages() {
+    // A sweep reads its table a page at a time. The definitions belong to the
+    // table, so a sweep that needs several pages must parse them no more often
+    // than one that fits in a single page.
+    let _meter = meter();
+
+    let one_page = {
+        let db = ttl_table_streamed();
+        for i in 0..20 {
+            put_expired_in(&db, TTL_STREAM_TABLE, &format!("s{i:04}"));
+        }
+        measure(|| assert_eq!(db.sweep_ttl().unwrap(), 20))
+    };
+    let several_pages = {
+        let db = ttl_table_streamed();
+        for i in 0..120 {
+            put_expired_in(&db, TTL_STREAM_TABLE, &format!("s{i:04}"));
+        }
+        measure(|| assert_eq!(db.sweep_ttl().unwrap(), 120))
+    };
+
+    println!(
+        "ttl sweep,  20 expired items : {} index definition sets, {} key schemas parsed",
+        one_page.index_defs_parses, one_page.key_schema_parses
+    );
+    println!(
+        "ttl sweep, 120 expired items : {} index definition sets, {} key schemas parsed",
+        several_pages.index_defs_parses, several_pages.key_schema_parses
+    );
+
+    assert_eq!(
+        one_page.index_defs_parses, several_pages.index_defs_parses,
+        "index definition parses must not scale with the number of pages swept"
+    );
+    assert_eq!(
+        one_page.key_schema_parses, several_pages.key_schema_parses,
+        "key schema parses must not scale with the number of pages swept"
+    );
+}

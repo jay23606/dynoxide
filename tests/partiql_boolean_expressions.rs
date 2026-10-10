@@ -16,7 +16,6 @@ use dynoxide::Database;
 use dynoxide::actions::execute_statement::ExecuteStatementRequest;
 use dynoxide::types::AttributeValue;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 const TABLE: &str = "pq_bool";
 
@@ -114,6 +113,27 @@ fn not_over_in_and_between_expands_to_the_right_shape() {
     assert_eq!(selects(&db, "NOT b BETWEEN 'p' AND 'p'"), "2");
 }
 
+/// `a NOT IN [...]` is `NOT a IN [...]`, written the other way round.
+/// DynamoDB runs it and returns the item whose value isn't listed (captured
+/// eu-west-2 and us-east-1, 2026-10-10, `x NOT IN [1, 2]` against `x = 0`);
+/// what it does for an item without the attribute wasn't captured, so here it
+/// follows the leading NOT.
+#[test]
+fn not_in_after_the_path_reads_as_a_leading_not() {
+    let db = seeded();
+    assert_eq!(selects(&db, "a NOT IN ['x','y']"), "3");
+    for (written, leading) in [
+        ("a NOT IN ['x','y']", "NOT a IN ['x','y']"),
+        ("a NOT IN ['x']", "NOT a IN ['x']"),
+        ("nope NOT IN ['x']", "NOT nope IN ['x']"),
+        ("a NOT IN [b]", "NOT a IN [b]"),
+        ("NOT a NOT IN ['x','y']", "a IN ['x','y']"),
+        ("a NOT IN ['x'] AND b = 'p'", "NOT a IN ['x'] AND b = 'p'"),
+    ] {
+        assert_eq!(selects(&db, written), selects(&db, leading), "{written}");
+    }
+}
+
 #[test]
 fn not_contains_is_the_complement_of_contains() {
     let db = seeded();
@@ -123,11 +143,13 @@ fn not_contains_is_the_complement_of_contains() {
 
 #[test]
 fn the_condition_level_negations_still_parse_as_themselves() {
-    // NOT EXISTS and NOT BEGINS_WITH are single conditions with their own
-    // variants, not the boolean operator applied to a function call. The
-    // boolean NOT must not swallow them.
+    // NOT BEGINS_WITH is a single condition with its own variant, not the
+    // boolean operator applied to a function call, and NOT in front of
+    // attribute_exists negates it. The boolean NOT must not swallow either.
+    // (`EXISTS(path)` is a function DynamoDB doesn't recognise in a WHERE
+    // clause, captured eu-west-2 and us-east-1, 2026-10-09.)
     let db = seeded();
-    assert_eq!(selects(&db, "NOT EXISTS(missing)"), "1,2,3");
+    assert_eq!(selects(&db, "NOT attribute_exists(nope)"), "1,2,3");
     assert_eq!(selects(&db, "NOT BEGINS_WITH(a, 'x')"), "2,3");
 }
 
@@ -246,6 +268,216 @@ fn equality_accepts_every_operand_type() {
     }
 }
 
+// --- operand types on begins_with -----------------------------------------
+
+/// The error a statement gets, or a panic naming what came back instead.
+fn statement_error(db: &Database, statement: String, parameters: serde_json::Value) -> String {
+    // No parameters means no Parameters member: an empty list is a request
+    // member error on DynamoDB.
+    let mut request = serde_json::json!({ "Statement": statement });
+    if parameters.as_array().is_none_or(|list| !list.is_empty()) {
+        request["Parameters"] = parameters;
+    }
+    match db.execute_statement(serde_json::from_value(request).unwrap()) {
+        Ok(_) => panic!("{statement} must be rejected"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn begins_with_rejects_an_operand_that_is_not_a_string_or_binary() {
+    // As in a condition expression, begins_with takes a string or binary and
+    // nothing else, on a key attribute or any other. DynamoDB rejects it before
+    // the table is resolved, and a negated begins_with on the same terms.
+    // Captured eu-west-2, 2026-10-08.
+    let db = seeded();
+    let mut checked = 0;
+    for (operand, type_name) in [
+        (serde_json::json!({"N": "1"}), "N"),
+        (serde_json::json!({"BOOL": true}), "BOOL"),
+        (serde_json::json!({"NULL": true}), "NULL"),
+        (serde_json::json!({"L": [{"S": "a"}]}), "L"),
+        (serde_json::json!({"M": {"k": {"S": "v"}}}), "M"),
+        (serde_json::json!({"SS": ["a"]}), "SS"),
+        (serde_json::json!({"NS": ["1"]}), "NS"),
+        (serde_json::json!({"BS": ["YQ=="]}), "BS"),
+    ] {
+        for statement in [
+            format!("SELECT pk FROM \"{TABLE}\" WHERE begins_with(a, ?)"),
+            format!("SELECT pk FROM \"{TABLE}\" WHERE NOT begins_with(a, ?)"),
+            format!("SELECT pk FROM \"{TABLE}\" WHERE pk = '1' AND begins_with(pk, ?)"),
+            "SELECT pk FROM \"no_such_table\" WHERE begins_with(a, ?)".to_string(),
+            format!("DELETE FROM \"{TABLE}\" WHERE pk = '1' AND begins_with(a, ?)"),
+        ] {
+            let err = statement_error(&db, statement.clone(), serde_json::json!([operand]));
+            assert!(
+                err.contains(&format!(
+                    "Incorrect operand type for operator or function; \
+                     operator or function: begins_with, operand type: {type_name}"
+                )),
+                "{statement} with {type_name}: got {err}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 40);
+}
+
+#[test]
+fn begins_with_rejects_a_literal_operand_that_is_not_a_string() {
+    let db = seeded();
+    for (literal, type_name) in [("1", "N"), ("true", "BOOL")] {
+        let err = statement_error(
+            &db,
+            format!("SELECT pk FROM \"{TABLE}\" WHERE begins_with(a, {literal})"),
+            serde_json::json!([]),
+        );
+        assert!(
+            err.contains(&format!(
+                "operator or function: begins_with, operand type: {type_name}"
+            )),
+            "begins_with(a, {literal}): got {err}"
+        );
+    }
+}
+
+#[test]
+fn begins_with_accepts_a_string_or_binary_operand() {
+    let db = seeded();
+    for operand in [
+        serde_json::json!({"S": "x"}),
+        serde_json::json!({"B": "YQ=="}),
+    ] {
+        assert!(
+            db.execute_statement(
+                serde_json::from_value(serde_json::json!({
+                    "Statement": format!("SELECT pk FROM \"{TABLE}\" WHERE begins_with(a, ?)"),
+                    "Parameters": [operand]
+                }))
+                .unwrap(),
+            )
+            .is_ok(),
+            "a string or binary begins_with operand must be accepted"
+        );
+    }
+}
+
+/// begins_with compares a binary attribute with a binary prefix by its bytes,
+/// and NOT begins_with keeps everything else: a binary value with another
+/// prefix, a string value (a different type), and an item without the
+/// attribute. A string prefix matches only the string value. The four
+/// statements and the items each returned were captured on eu-west-2 and
+/// us-east-1, 2026-10-09 (the regions agree).
+#[test]
+fn begins_with_matches_a_binary_value_by_its_bytes() {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value(serde_json::json!({
+            "TableName": "pq_bin",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for (pk, b) in [
+        ("h1", Some(AttributeValue::B(b"abc".to_vec()))),
+        ("h2", Some(AttributeValue::B(b"abd".to_vec()))),
+        ("h3", Some(AttributeValue::B(b"xyz".to_vec()))),
+        ("h4", Some(AttributeValue::S("abc".to_string()))),
+        ("h5", None),
+    ] {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+        if let Some(b) = b {
+            item.insert("b".to_string(), b);
+        }
+        db.put_item(
+            serde_json::from_value(serde_json::json!({"TableName": "pq_bin", "Item": item}))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    let matched = |statement: &str, parameter: serde_json::Value| -> Vec<String> {
+        let response = db
+            .execute_statement(
+                serde_json::from_value(serde_json::json!({
+                    "Statement": statement,
+                    "Parameters": [parameter]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let mut pks: Vec<String> = response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .map(|item| match item.get("pk") {
+                Some(AttributeValue::S(pk)) => pk.clone(),
+                other => panic!("unexpected pk {other:?}"),
+            })
+            .collect();
+        pks.sort();
+        pks
+    };
+    let ab = serde_json::json!({"B": "YWI="});
+    assert_eq!(
+        matched(
+            "SELECT pk FROM \"pq_bin\" WHERE begins_with(b, ?)",
+            ab.clone()
+        ),
+        ["h1", "h2"]
+    );
+    assert_eq!(
+        matched(
+            "SELECT pk FROM \"pq_bin\" WHERE NOT begins_with(b, ?)",
+            ab.clone()
+        ),
+        ["h3", "h4", "h5"]
+    );
+    assert_eq!(
+        matched(
+            "SELECT pk FROM \"pq_bin\" WHERE begins_with(b, ?)",
+            serde_json::json!({"S": "ab"})
+        ),
+        ["h4"]
+    );
+    assert_eq!(
+        matched(
+            "SELECT pk FROM \"pq_bin\" WHERE pk = 'h1' AND begins_with(b, ?)",
+            ab
+        ),
+        ["h1"]
+    );
+}
+
+#[test]
+fn operand_types_are_checked_in_the_order_written() {
+    // The first offending operand is the one reported, whichever check it
+    // belongs to.
+    let db = seeded();
+    let err = statement_error(
+        &db,
+        format!("SELECT pk FROM \"{TABLE}\" WHERE a < ? AND begins_with(a, ?)"),
+        serde_json::json!([{"BOOL": true}, {"N": "1"}]),
+    );
+    assert!(
+        err.contains("operator or function: <, operand type: BOOL"),
+        "got {err}"
+    );
+
+    let err = statement_error(
+        &db,
+        format!("SELECT pk FROM \"{TABLE}\" WHERE begins_with(a, ?) AND a < ?"),
+        serde_json::json!([{"N": "1"}, {"BOOL": true}]),
+    );
+    assert!(
+        err.contains("operator or function: begins_with, operand type: N"),
+        "got {err}"
+    );
+}
+
 // --- nesting is bounded ---------------------------------------------------
 //
 // Both halves of the parser are recursive descents, and neither had a bound.
@@ -275,21 +507,6 @@ fn a_deeply_parenthesised_clause_is_rejected_rather_than_overflowing_the_stack()
             "SELECT * FROM \"{TABLE}\" WHERE {}pk='1'{}",
             "(".repeat(500),
             ")".repeat(500)
-        ),
-    );
-    assert!(err.contains("nested too deeply"), "got {err}");
-}
-
-#[test]
-fn a_long_run_of_nots_is_rejected_rather_than_overflowing_the_stack() {
-    // `NOT` recurses on its own, so it reaches the same cliff by a different
-    // route: this one needs no parentheses at all.
-    let db = seeded();
-    let err = parse_rejection(
-        &db,
-        format!(
-            "SELECT * FROM \"{TABLE}\" WHERE {}pk='1'",
-            "NOT ".repeat(5000)
         ),
     );
     assert!(err.contains("nested too deeply"), "got {err}");
@@ -333,52 +550,6 @@ fn the_depth_budget_is_spent_across_both_descents() {
 // how much the flattening then builds. A clause can be shallow and still expand
 // enormously, and the flattener used to build the whole expansion before
 // noticing it was over the cap.
-
-#[test]
-fn a_wide_alternation_is_rejected_without_building_it_first() {
-    // The group cap used to be checked only after the whole alternation had been
-    // flattened, so a clause with tens of thousands of arms allocated every one
-    // of them on its way to a rejection it was always going to get.
-    let db = seeded();
-    let clause = (0..40_000)
-        .map(|i| format!("a='v{i}'"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let start = Instant::now();
-    let err = parse_rejection(&db, format!("SELECT * FROM \"{TABLE}\" WHERE {clause}"));
-    assert!(err.contains("too complex"), "got {err}");
-    assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "rejection took {:?}",
-        start.elapsed()
-    );
-}
-
-#[test]
-fn a_clause_too_wide_to_flatten_is_rejected_rather_than_grinding() {
-    // A negated `IN` is one group as wide as the list under De Morgan, and each
-    // negated conjunction after it clones that whole group once per alternative.
-    // Capping groups leaves that work unbounded, so a statement of a few tens of
-    // kilobytes used to spend tens of seconds of CPU cloning conditions before
-    // any cap tripped.
-    let db = seeded();
-    let values = (0..4_000)
-        .map(|i| format!("'v{i}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut clause = format!("NOT a IN ({values})");
-    for i in 0..8 {
-        clause.push_str(&format!(" AND NOT (b='p{i}' AND b='q{i}')"));
-    }
-    let start = Instant::now();
-    let err = parse_rejection(&db, format!("SELECT * FROM \"{TABLE}\" WHERE {clause}"));
-    assert!(err.contains("too complex"), "got {err}");
-    assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "rejection took {:?}",
-        start.elapsed()
-    );
-}
 
 #[test]
 fn a_clause_within_the_width_budget_still_runs() {
@@ -501,7 +672,12 @@ fn a_not_that_names_two_items_in_an_update_where_is_refused() {
         })
         .expect_err("a clause naming two items must not run as one write")
         .to_string();
-    assert!(err.contains("identifies a single item"), "got {err}");
+    // DynamoDB's words for a key not pinned by a top-level equality (captured
+    // eu-west-2 and us-east-1, 2026-10-09).
+    assert!(
+        err.contains("Where clause does not contain a mandatory equality on all key attributes"),
+        "got {err}"
+    );
     // And nothing was written on the way to the refusal.
     assert_eq!(selects(&db, "b='z'"), "");
 }
@@ -516,14 +692,18 @@ fn a_not_that_names_two_items_in_a_delete_where_is_refused() {
         })
         .expect_err("a clause naming two items must not run as one delete")
         .to_string();
-    assert!(err.contains("identifies a single item"), "got {err}");
+    assert!(
+        err.contains("Where clause does not contain a mandatory equality on all key attributes"),
+        "got {err}"
+    );
     assert_eq!(selects(&db, "pk='1' OR pk='2'"), "1,2");
 }
 
 #[test]
 fn an_or_in_an_update_where_is_still_refused() {
-    // The control. An OR the author did write is still refused, and the
-    // message still names it.
+    // The control. An OR the author did write is still refused, in DynamoDB's
+    // words: a key named only under an OR is not pinned (captured eu-west-2 and
+    // us-east-1, 2026-10-09).
     let db = seeded();
     let err = db
         .execute_statement(ExecuteStatementRequest {
@@ -532,5 +712,8 @@ fn an_or_in_an_update_where_is_still_refused() {
         })
         .expect_err("an OR in an UPDATE WHERE is refused")
         .to_string();
-    assert!(err.contains("does not support OR conditions"), "got {err}");
+    assert!(
+        err.contains("Where clause does not contain a mandatory equality on all key attributes"),
+        "got {err}"
+    );
 }

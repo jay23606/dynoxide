@@ -105,12 +105,33 @@ impl WasmBridgeBackend {
     /// path still degrades to memory on its own when OPFS is unusable.
     pub async fn open_with(name: &str, ephemeral: bool) -> Result<Self, BackendError> {
         let handle = bridge_open(name, ephemeral).await.map_err(open_err)?;
+        match Self::finish_open(handle.clone()).await {
+            Ok(backend) => Ok(backend),
+            Err(e) => {
+                // An open that fails after the bridge opened still holds the
+                // connection, and on OPFS the pool's reference to it, so a
+                // retry or another tab could not acquire the file. Release
+                // both; the open's own error is the one worth reporting.
+                let _ = bridge_close(&handle).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Everything an open does once the bridge has opened the database:
+    /// bootstrap the schema, bring an earlier build's database up to date and
+    /// record the version. [`open_with`](Self::open_with) closes the handle
+    /// when this fails.
+    async fn finish_open(handle: JsValue) -> Result<Self, BackendError> {
         // The bridge reports which VFS it actually opened against; read it off
         // the handle before treating the handle as opaque.
         let persistence_mode = js_sys::Reflect::get(&handle, &JsValue::from_str("persistenceMode"))
             .ok()
             .and_then(|v| v.as_string())
             .unwrap_or_else(|| "unknown".to_string());
+        // A database a newer build wrote is refused before anything here
+        // writes to it, so it is left as it was found.
+        refuse_newer_schema(&handle).await?;
         // Bootstrap the same metadata/config/stream schema the native backend
         // creates in `initialize`. `INIT_SCHEMA` is a multi-statement batch;
         // the bridge runs each statement in turn.
@@ -153,19 +174,35 @@ impl WasmBridgeBackend {
             .await
             .map_err(js_err)?;
         }
+        let backend = Self {
+            handle,
+            persistence_mode,
+            clock: SystemClock::arc(),
+        };
+        // The version an earlier build recorded, read before this open records
+        // its own. None for a database this open is creating, and for one the
+        // wasm backend wrote before it began recording a version (v0.10 to
+        // v0.13), which may need either migration.
+        let recorded_version = backend.recorded_schema_version().await?;
+        // A database an earlier build wrote may hold a multi-attribute GSI keyed
+        // on its first attributes only, and number-rule sizes for the items of
+        // a vector table. Bring both up to date through the steps the native
+        // open runs, each in its own write transaction that records its version.
+        crate::actions::schema_migrations::run_open_migrations(
+            &backend,
+            super::schema::open_migrations(recorded_version),
+        )
+        .await
+        .map_err(|e| BackendError::Io(format!("bringing the database up to date: {e}")))?;
         // Record the schema version (if none is recorded yet) so future wasm
         // schema changes can migrate versioned, as the native backend does,
         // instead of accreting one unconditional ALTER per column.
         let (version_sql, version_params) =
             sql_builders::init_schema_version(sql_builders::SCHEMA_VERSION);
-        bridge_exec(&handle, &version_sql, params_to_js(&version_params))
+        bridge_exec(&backend.handle, &version_sql, params_to_js(&version_params))
             .await
             .map_err(js_err)?;
-        Ok(Self {
-            handle,
-            persistence_mode,
-            clock: SystemClock::arc(),
-        })
+        Ok(backend)
     }
 
     /// The active persistence mode: `"opfs"`, `"memory"`, or `"unknown"`.
@@ -232,6 +269,37 @@ impl WasmBridgeBackend {
         Ok(rows.unchecked_into())
     }
 
+    /// Read a `(count, bytes)` pair from a two-column statement.
+    async fn count_and_size(
+        &self,
+        sql: &str,
+        params: Vec<SqlParam<'_>>,
+    ) -> Result<(i64, i64), BackendError> {
+        let rows = self.query(sql, params).await?;
+        if rows.length() == 0 {
+            return Ok((0, 0));
+        }
+        let row: js_sys::Array = rows.get(0).unchecked_into();
+        Ok((col_i64(&row, 0), col_i64(&row, 1)))
+    }
+
+    /// Count the rows of an `item_json` statement and total each entry's
+    /// projected size.
+    async fn count_and_size_entries(
+        &self,
+        sql: &str,
+        params: Vec<SqlParam<'_>>,
+    ) -> Result<(i64, i64), BackendError> {
+        let rows = self.query(sql, params).await?;
+        let mut bytes = 0i64;
+        for i in 0..rows.length() {
+            let row: js_sys::Array = rows.get(i).unchecked_into();
+            let json = col_text(&row, 0).unwrap_or_default();
+            bytes += super::projected_entry_size(&json)?;
+        }
+        Ok((rows.length() as i64, bytes))
+    }
+
     /// Shared put path: capture the prior value, then insert-or-replace.
     async fn put(
         &self,
@@ -248,6 +316,36 @@ impl WasmBridgeBackend {
         self.exec(&sql, params).await?;
         Ok(old_item)
     }
+}
+
+/// Refuse a database a newer build wrote, reading it and nothing more (see
+/// `schema::refuse_newer`). A database with no `_config` table yet records no
+/// version.
+async fn refuse_newer_schema(handle: &JsValue) -> Result<(), BackendError> {
+    let config: js_sys::Array = bridge_query(
+        handle,
+        sql_builders::TABLE_EXISTS,
+        params_to_js(&[SqlParam::text("_config")]),
+    )
+    .await
+    .map_err(js_err)?
+    .unchecked_into();
+    if config.length() == 0 || col_i64(&config.get(0).unchecked_into(), 0) != 1 {
+        return Ok(());
+    }
+    let rows = bridge_query(
+        handle,
+        sql_builders::GET_SCHEMA_VERSION,
+        js_sys::Array::new(),
+    )
+    .await
+    .map_err(js_err)?;
+    let value = js_sys::Array::from(&rows)
+        .iter()
+        .next()
+        .and_then(|row| col_text(&js_sys::Array::from(&row), 0));
+    super::schema::refuse_newer(super::schema::parse_recorded(value.as_deref()))
+        .map_err(BackendError::Other)
 }
 
 // --- JS <-> SqlParam conversion and row readers -------------------------
@@ -394,12 +492,11 @@ fn col_i64(row: &js_sys::Array, i: u32) -> i64 {
     if let Some(f) = v.as_f64() {
         return f as i64;
     }
-    if let Ok(big) = v.dyn_into::<js_sys::BigInt>() {
-        if let Some(s) = big.to_string(10).ok().and_then(|js| js.as_string()) {
-            if let Ok(n) = s.parse::<i64>() {
-                return n;
-            }
-        }
+    if let Ok(big) = v.dyn_into::<js_sys::BigInt>()
+        && let Some(s) = big.to_string(10).ok().and_then(|js| js.as_string())
+        && let Ok(n) = s.parse::<i64>()
+    {
+        return n;
     }
     0
 }
@@ -954,6 +1051,28 @@ impl StorageBackend for WasmBridgeBackend {
         self.exec(sql_builders::ROLLBACK, Vec::new()).await
     }
 
+    // --- Schema version --------------------------------------------------
+
+    async fn recorded_schema_version(&self) -> Result<Option<u32>, BackendError> {
+        let rows = bridge_query(
+            &self.handle,
+            sql_builders::GET_SCHEMA_VERSION,
+            js_sys::Array::new(),
+        )
+        .await
+        .map_err(js_err)?;
+        let value = js_sys::Array::from(&rows)
+            .iter()
+            .next()
+            .and_then(|row| col_text(&js_sys::Array::from(&row), 0));
+        Ok(super::schema::parse_recorded(value.as_deref()))
+    }
+
+    async fn record_schema_version(&self, version: u32) -> Result<(), BackendError> {
+        let (sql, params) = sql_builders::set_schema_version(version);
+        self.exec(&sql, params).await
+    }
+
     // Bulk-loading PRAGMAs do not apply to the OPFS SAHPool VFS; treat the
     // toggles as no-ops so callers that bracket writes still work.
     async fn enable_bulk_loading(&self) -> Result<(), BackendError> {
@@ -1079,6 +1198,62 @@ impl StorageBackend for WasmBridgeBackend {
         }
         let row: js_sys::Array = rows.get(0).unchecked_into();
         Ok(col_i64(&row, 0))
+    }
+
+    async fn item_count_and_size(&self, table_name: &str) -> Result<(i64, i64), BackendError> {
+        let (sql, params) = sql_builders::item_count_and_size(table_name);
+        self.count_and_size(&sql, params).await
+    }
+
+    async fn gsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError> {
+        if whole_items {
+            let (sql, params) = sql_builders::gsi_count_and_size_from_base(table_name, index_name);
+            self.count_and_size(&sql, params).await
+        } else {
+            let (sql, params) = sql_builders::gsi_entries_item_json(table_name, index_name);
+            self.count_and_size_entries(&sql, params).await
+        }
+    }
+
+    async fn lsi_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        whole_items: bool,
+    ) -> Result<(i64, i64), BackendError> {
+        if whole_items {
+            let (sql, params) = sql_builders::lsi_count_and_size_from_base(table_name, index_name);
+            self.count_and_size(&sql, params).await
+        } else {
+            let (sql, params) = sql_builders::lsi_entries_item_json(table_name, index_name);
+            self.count_and_size_entries(&sql, params).await
+        }
+    }
+
+    async fn vector_item_count_and_size(
+        &self,
+        table_name: &str,
+        index_name: &str,
+    ) -> Result<(i64, i64), BackendError> {
+        let (sql, params) = sql_builders::vector_count_and_size(table_name, index_name);
+        self.count_and_size(&sql, params).await
+    }
+
+    async fn set_item_sizes(
+        &self,
+        table_name: &str,
+        sizes: &[(String, String, usize)],
+    ) -> Result<(), BackendError> {
+        for (pk, sk, size) in sizes {
+            let (sql, params) = sql_builders::set_item_size(table_name, pk, sk, *size);
+            self.exec(&sql, params).await?;
+        }
+        Ok(())
     }
 
     // --- Introspection ---------------------------------------------------

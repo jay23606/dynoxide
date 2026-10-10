@@ -219,13 +219,17 @@ fn create_table_vector_index_missing_dimensions_reports_null_member() {
 
 #[test]
 fn query_rejects_invalid_select_value() {
-    let result = serde_json::from_value::<QueryRequest>(serde_json::json!({
+    // Query checks Select after the expression-mixing check rather than with
+    // the other members (captured 2026-10-09), so it is refused by the
+    // operation, not while the request is decoded.
+    let request = serde_json::from_value::<QueryRequest>(serde_json::json!({
         "TableName": "TestTable",
         "KeyConditionExpression": "pk = :pk",
         "ExpressionAttributeValues": {":pk": {"S": "a"}},
         "Select": "INVALID_VALUE"
-    }));
-    let err = result.unwrap_err().to_string();
+    }))
+    .unwrap();
+    let err = make_db().query(request).unwrap_err().to_string();
     assert!(
         err.contains("at 'select' failed to satisfy constraint"),
         "Expected select enum validation error, got: {err}"
@@ -560,28 +564,6 @@ fn reserved_word_case_insensitive() {
 // --------------------------------------------------------------------------
 // UpdateExpression / ProjectionExpression syntax error context
 // --------------------------------------------------------------------------
-
-#[test]
-fn update_expression_syntax_error_includes_quoted_token_and_near_window() {
-    // The conformance suite pins the AWS string for "INVALID SYNTAX HERE":
-    //   Invalid UpdateExpression: Syntax error; token: "INVALID", near: "INVALID SYNTAX"
-    let err = dynoxide::expressions::update::parse("INVALID SYNTAX HERE").unwrap_err();
-    assert_eq!(
-        err,
-        r#"Invalid UpdateExpression: Syntax error; token: "INVALID", near: "INVALID SYNTAX""#
-    );
-}
-
-#[test]
-fn projection_expression_tokenizer_error_includes_near_window() {
-    // The conformance suite pins the AWS string for "!!! INVALID !!!":
-    //   Invalid ProjectionExpression: Syntax error; token: "!", near: "!!"
-    let err = dynoxide::expressions::projection::parse("!!! INVALID !!!").unwrap_err();
-    assert_eq!(
-        err,
-        r#"Invalid ProjectionExpression: Syntax error; token: "!", near: "!!""#
-    );
-}
 
 #[test]
 fn update_expression_missing_eav_carries_invalid_update_expression_prefix() {

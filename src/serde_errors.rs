@@ -15,15 +15,17 @@
 //!   becomes the wire-invisible `DynoxideError::EnvelopedValidation`, which
 //!   the server dispatch envelopes on those two operations and untags on
 //!   every other one.
+//! - `SERIALIZATION:` maps to a `SerializationException` carrying the rest of
+//!   the message as DynamoDB words it, for a value the decoder has already
+//!   classified (an empty rest is a `SerializationException` with no message).
 //!
-//! Neither marker may ever reach the wire. Callers that decode raw serde
+//! No marker may ever reach the wire. Callers that decode raw serde
 //! messages by hand go through [`clean_serde_message`], which strips both
 //! markers along with serde_json's position suffix.
 
-// The request-body decoding path is consumed by the HTTP server and the wasm
-// engine API only, so it and its private helpers below compile just for those
-// builds (and under `cargo test`, which exercises them directly).
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+// The request-body decoding path serves the HTTP server, the wasm engine API
+// and the MCP tools, and the legacy `Expected` reader in every build, so a
+// library build refuses an unreadable condition in the same words.
 pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::Result<T> {
     serde_json::from_str(body).map_err(|e| {
         let msg = e.to_string();
@@ -59,18 +61,18 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
 /// marker and serde_json's position suffix.
 ///
 /// `VALIDATION_REQUEST:` becomes the wire-invisible
-/// [`EnvelopedValidation`](crate::DynoxideError::EnvelopedValidation) tag and
-/// `VALIDATION:` a bare `ValidationException`; an unmarked message returns
+/// [`EnvelopedValidation`](crate::DynoxideError::EnvelopedValidation) tag,
+/// `VALIDATION:` a bare `ValidationException` and `SERIALIZATION:` a
+/// `SerializationException`; an unmarked message returns
 /// `None` for the caller to classify. This is the single owner of the
 /// marker-to-variant mapping, shared by [`deserialize`] and callers that
 /// decode via `serde_json::from_value` (the MCP surface).
-#[cfg(any(
-    feature = "http-server",
-    feature = "mcp-server",
-    feature = "wasm-sqlite",
-    test
-))]
 pub(crate) fn classify_marked_serde_error(msg: &str) -> Option<crate::DynoxideError> {
+    if let Some(stripped) = msg.strip_prefix(SERIALIZATION_MARKER) {
+        return Some(crate::DynoxideError::SerializationException(
+            strip_position(stripped).to_string(),
+        ));
+    }
     if let Some(stripped) = msg.strip_prefix(REQUEST_VALIDATION_MARKER) {
         return Some(crate::DynoxideError::EnvelopedValidation(
             strip_position(stripped).to_string(),
@@ -84,15 +86,205 @@ pub(crate) fn classify_marked_serde_error(msg: &str) -> Option<crate::DynoxideEr
     None
 }
 
+/// The `SerializationException` a value the decoder has already classified as
+/// malformed fails its request with, as it is read and before any key is
+/// named; `None` for any other message.
+pub(crate) fn marked_serialization_error(msg: &str) -> Option<crate::DynoxideError> {
+    msg.strip_prefix(SERIALIZATION_MARKER).map(|stripped| {
+        crate::DynoxideError::SerializationException(strip_position(stripped).to_string())
+    })
+}
+
+/// DynamoDB's refusal of a NULL that isn't true.
+pub(crate) const NULL_NOT_TRUE: &str = "One or more parameter values were invalid: Null attribute value types must have the value \
+     of true";
+
+/// DynamoDB's refusal of a value with no type set.
+pub(crate) const EMPTY_VALUE: &str =
+    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
+
+/// DynamoDB's refusal of a value with more than one type set.
+pub(crate) const MORE_THAN_ONE_TYPE: &str = "Supplied AttributeValue has more than one datatypes \
+                                             set, must contain exactly one of the supported \
+                                             datatypes";
+
+/// What a value refused as it was read was refused for, as the readers of
+/// `ExpressionAttributeValues` tell the cases apart to decide which name the
+/// value's key.
+pub(crate) enum ValueRefusal<'a> {
+    /// No type set, or not an object.
+    Empty,
+    /// More than one type set.
+    MoreThanOneType,
+    /// An empty set beside another member, refused as the value is read.
+    EmptySet(&'a str),
+    /// A number the value layer can't store, in the layer's words.
+    Number(&'a str),
+    /// A NULL refused as it was parsed: a string that reads as false, or false
+    /// beside another member.
+    ParsedNull(&'a str),
+    /// `{"NULL": false}` on its own, refused by the request's validation.
+    RequestNull(&'a str),
+    /// Anything else, passed through as it is.
+    Other,
+}
+
+/// Which refusal a raw serde message from reading one value is.
+pub(crate) fn value_refusal(msg: &str) -> ValueRefusal<'_> {
+    let inner = clean_serde_message(msg);
+    if inner.contains("empty AttributeValue") || inner.contains("Supplied AttributeValue is empty")
+    {
+        ValueRefusal::Empty
+    } else if inner.contains("more than one datatypes") {
+        ValueRefusal::MoreThanOneType
+    } else if inner.contains("set  may not be empty") || inner.contains("sets should not be empty")
+    {
+        ValueRefusal::EmptySet(inner)
+    } else if inner.contains("cannot be converted to a numeric value")
+        || inner.contains("significant digits")
+        || inner.contains("Number overflow")
+        || inner.contains("Number underflow")
+    {
+        ValueRefusal::Number(inner)
+    } else if inner.contains(NULL_NOT_TRUE) {
+        if msg.starts_with(REQUEST_VALIDATION_MARKER) {
+            ValueRefusal::RequestNull(inner)
+        } else {
+            ValueRefusal::ParsedNull(inner)
+        }
+    } else {
+        ValueRefusal::Other
+    }
+}
+
+/// A value's refusal naming its key, as DynamoDB words it.
+pub(crate) fn named_value_refusal(refusal: &str, key: &str) -> String {
+    format!("ExpressionAttributeValues contains invalid value: {refusal} for key {key}")
+}
+
 /// Marker prefix for validation rejections raised inside serde
 /// deserialisation, mapped to a bare `ValidationException`.
 pub(crate) const VALIDATION_MARKER: &str = "VALIDATION:";
+
+/// Marker prefix for a malformed value classified inside serde
+/// deserialisation, mapped to a `SerializationException` whose message is the
+/// rest of the text.
+pub(crate) const SERIALIZATION_MARKER: &str = "SERIALIZATION:";
 
 /// Marker prefix for the request-validation class raised inside serde
 /// deserialisation, mapped to the wire-invisible `EnvelopedValidation` tag
 /// that PutItem and UpdateItem envelope. Must be checked before
 /// [`VALIDATION_MARKER`], whose spelling it extends.
 pub(crate) const REQUEST_VALIDATION_MARKER: &str = "VALIDATION_REQUEST:";
+
+/// The members a request reads as booleans, whose numbers
+/// [`boolean_numbers_as_written`] looks at.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+const BOOLEAN_MEMBERS: [&str; 5] = [
+    "BOOL",
+    "NULL",
+    "ConsistentRead",
+    "ScanIndexForward",
+    "Exists",
+];
+
+/// A request body with each whole number serde_json would read as a float,
+/// `-0` and an integer past 64 bits, written as `0` where it is the value of a
+/// member read as a boolean (`BOOL`, `NULL`, `ConsistentRead`,
+/// `ScanIndexForward`, `Exists`).
+///
+/// DynamoDB names a number given for a boolean by how it is written: a whole
+/// number of any size, `-0` included, is `NUMBER_VALUE`, and one with a point
+/// or an exponent `DECIMAL_VALUE` (captured eu-west-2 and us-east-1,
+/// 2026-10-10). serde_json keeps no text for a number and reads those two as
+/// floats, which would name them `DECIMAL_VALUE`; as `0` they read as the
+/// whole numbers they were written as. A number in one of these members fails
+/// the request whatever its value, so nothing else reads it. The body comes
+/// back as it is when there is nothing to rewrite.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn boolean_numbers_as_written(body: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = body.as_bytes();
+    let mut rewrites: Vec<(usize, usize)> = Vec::new();
+    // The key whose value comes next, once its colon has been read.
+    let mut key: Option<&str> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i + 1;
+                i = start;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                let text = &body[start..i.min(bytes.len())];
+                i += 1;
+                // A string followed by a colon is a key.
+                let mut next = i;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                key = None;
+                if next < bytes.len() && bytes[next] == b':' {
+                    key = Some(text);
+                    i = next + 1;
+                }
+                continue;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                if key.is_some_and(|key| BOOLEAN_MEMBERS.contains(&key))
+                    && whole_number_read_as_float(&body[start..i])
+                {
+                    rewrites.push((start, i));
+                }
+                key = None;
+                continue;
+            }
+            byte if byte.is_ascii_whitespace() => {}
+            _ => key = None,
+        }
+        i += 1;
+    }
+    if rewrites.is_empty() {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut rewritten = String::with_capacity(body.len());
+    let mut copied = 0;
+    for (start, end) in rewrites {
+        rewritten.push_str(&body[copied..start]);
+        rewritten.push('0');
+        copied = end;
+    }
+    rewritten.push_str(&body[copied..]);
+    std::borrow::Cow::Owned(rewritten)
+}
+
+/// Whether a number token is a JSON integer that serde_json reads as a float:
+/// `-0`, or one outside the 64-bit range. Anything that isn't a well-formed
+/// integer is left for the parser to refuse.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+fn whole_number_read_as_float(token: &str) -> bool {
+    let digits = token.strip_prefix('-').unwrap_or(token);
+    let well_formed = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    if !well_formed {
+        return false;
+    }
+    if token.starts_with('-') {
+        digits == "0" || token.parse::<i64>().is_err()
+    } else {
+        token.parse::<u64>().is_err()
+    }
+}
 
 /// Strip serde_json's " at line N column N" suffix from error messages.
 fn strip_position(msg: &str) -> &str {
@@ -105,8 +297,8 @@ fn strip_position(msg: &str) -> &str {
     msg
 }
 
-/// Strip serde_json's position suffix and either marker prefix from a raw
-/// serde error message.
+/// Strip serde_json's position suffix and any marker prefix from a raw serde
+/// error message.
 ///
 /// Hand-rolled decoders that pattern-match serde messages route through this
 /// so no marker class can ever leak into a wire message.
@@ -115,6 +307,7 @@ pub(crate) fn clean_serde_message(msg: &str) -> &str {
     clean
         .strip_prefix(REQUEST_VALIDATION_MARKER)
         .or_else(|| clean.strip_prefix(VALIDATION_MARKER))
+        .or_else(|| clean.strip_prefix(SERIALIZATION_MARKER))
         .unwrap_or(clean)
 }
 
@@ -122,7 +315,6 @@ pub(crate) fn clean_serde_message(msg: &str) -> &str {
 ///
 /// DynamoDB returns specific messages like "NUMBER_VALUE cannot be converted to String"
 /// whereas serde returns "invalid type: integer `23`, expected a string at line 1 column 42".
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
     // "invalid type: <type>, expected <target>"
     if let Some(rest) = msg.strip_prefix("invalid type: ") {
@@ -183,7 +375,6 @@ fn map_serde_to_dynamodb_message(msg: &str, body: &str) -> String {
 }
 
 /// Map a serde type mismatch to DynamoDB's SerializationException message.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 fn map_type_mismatch(source: &str, target: &str) -> String {
     // Determine target type category
     let target_is_string = target == "a string";
@@ -297,7 +488,6 @@ fn map_type_mismatch(source: &str, target: &str) -> String {
 
 /// Infer the DynamoDB type conversion error from a serde error message.
 /// Uses the column position to inspect the actual JSON value in the body.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 fn infer_type_conversion_error(msg: &str, body: &str, target_type: &str) -> String {
     // Try to extract column number from "at line N column N"
     if let Some(col_str) = msg.rsplit("column ").next()
@@ -321,7 +511,6 @@ fn infer_type_conversion_error(msg: &str, body: &str, target_type: &str) -> Stri
 }
 
 /// Map Rust struct names to DynamoDB Java class names for SerializationException messages.
-#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 fn map_struct_to_dynamo_class(struct_name: &str) -> Option<&'static str> {
     match struct_name {
         "ProvisionedThroughput" | "ProvisionedThroughputRaw" => {
@@ -433,6 +622,40 @@ mod tests {
         // suffix and stays untouched.
         assert_eq!(clean_serde_message("look at line 9"), "look at line 9");
         assert_eq!(clean_serde_message("plain msg"), "plain msg");
+    }
+
+    #[test]
+    fn boolean_numbers_are_rewritten_only_where_serde_would_read_a_float() {
+        // A whole number past 64 bits, or `-0`, in a boolean member reads as
+        // the integer it was written as.
+        assert_eq!(
+            boolean_numbers_as_written(
+                r#"{"v": {"BOOL": -0}, "w": {"NULL" : 18446744073709551616}}"#
+            ),
+            r#"{"v": {"BOOL": 0}, "w": {"NULL" : 0}}"#
+        );
+        assert_eq!(
+            boolean_numbers_as_written(r#"{"ConsistentRead":-9223372036854775809}"#),
+            r#"{"ConsistentRead":0}"#
+        );
+        // Integers serde reads as integers, decimals, other members and
+        // strings that merely mention a boolean member are left alone.
+        for body in [
+            r#"{"v": {"BOOL": 9223372036854775807}}"#,
+            r#"{"v": {"BOOL": 18446744073709551615}}"#,
+            r#"{"v": {"BOOL": -0.0}, "w": {"NULL": 1e30}}"#,
+            r#"{"Limit": -0, "v": {"N": "18446744073709551616"}}"#,
+            r#"{"s": "\"BOOL\": -0", "t": ["BOOL", -0]}"#,
+            r#"{"v": {"BOOL": 01}}"#,
+        ] {
+            assert!(
+                matches!(
+                    boolean_numbers_as_written(body),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "{body}"
+            );
+        }
     }
 
     #[test]

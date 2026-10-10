@@ -126,10 +126,13 @@ fn test_update_table_create_gsi_requires_key_in_request_attribute_definitions() 
     }))
     .unwrap();
 
+    // With fewer definitions in the request than the index has key
+    // attributes, DynamoDB gives the generic form (captured eu-west-2 and
+    // us-east-1, 2026-10-09, on the same shape).
     let err = db.update_table(req).unwrap_err();
     assert!(
         err.to_string()
-            .contains("Some index key attributes are not defined in AttributeDefinitions"),
+            .contains("Invalid KeySchema: Some index key attribute have no definition"),
         "unexpected error: {err}"
     );
 }
@@ -1737,4 +1740,81 @@ fn test_update_table_invalid_table_class_rejected() {
         matches!(err, dynoxide::errors::DynoxideError::ValidationException(_)),
         "expected ValidationException, got: {err:?}"
     );
+}
+
+#[test]
+fn test_update_table_response_reports_the_table_item_count_and_size() {
+    // #217: UpdateTable's TableDescription carries the same ItemCount and
+    // TableSizeBytes that DescribeTable reports, not zeros.
+    let db = make_db();
+    create_simple_table(&db, "SizedUpdate");
+    put_item(&db, "SizedUpdate", "a", "1", None, None);
+    put_item(&db, "SizedUpdate", "a", "2", Some("g"), None);
+    put_item(&db, "SizedUpdate", "b", "1", Some("g"), Some("s"));
+
+    let described = db
+        .describe_table(DescribeTableRequest {
+            table_name: "SizedUpdate".to_string(),
+        })
+        .unwrap()
+        .table;
+    assert_eq!(described.item_count, Some(3));
+    assert!(described.table_size_bytes.unwrap() > 0);
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "SizedUpdate",
+        "DeletionProtectionEnabled": true,
+    }))
+    .unwrap();
+    let updated = db.update_table(req).unwrap().table_description;
+
+    assert_eq!(updated.item_count, described.item_count);
+    assert_eq!(updated.table_size_bytes, described.table_size_bytes);
+}
+
+#[test]
+fn test_update_table_backfilled_gsi_reports_its_item_count_and_size() {
+    // A GSI added to a populated table reports the items its backfill wrote:
+    // the two items carrying both of its keys, each PK (2 + 1) + SK (2 + 1) +
+    // GSI1PK (6 + 1) + GSI1SK (6 + 1) = 20 bytes under an ALL projection.
+    let db = make_db();
+    create_simple_table(&db, "Backfilled");
+    put_item(&db, "Backfilled", "a", "1", None, None);
+    put_item(&db, "Backfilled", "a", "2", Some("g"), Some("s"));
+    put_item(&db, "Backfilled", "b", "1", Some("g"), Some("t"));
+    put_item(&db, "Backfilled", "b", "2", Some("g"), None);
+
+    let req: UpdateTableRequest = serde_json::from_value(json!({
+        "TableName": "Backfilled",
+        "AttributeDefinitions": [
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+            {"AttributeName": "GSI1PK", "AttributeType": "S"},
+            {"AttributeName": "GSI1SK", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexUpdates": [{
+            "Create": {
+                "IndexName": "GSI1",
+                "KeySchema": [
+                    {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        }]
+    }))
+    .unwrap();
+    db.update_table(req).unwrap();
+
+    let gsis = db
+        .describe_table(DescribeTableRequest {
+            table_name: "Backfilled".to_string(),
+        })
+        .unwrap()
+        .table
+        .global_secondary_indexes
+        .unwrap();
+    assert_eq!(gsis[0].index_name, "GSI1");
+    assert_eq!(gsis[0].item_count, Some(2));
+    assert_eq!(gsis[0].index_size_bytes, Some(40));
 }

@@ -6,12 +6,72 @@ use crate::types::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 pub struct TransactGetItemsRequest {
-    #[serde(rename = "TransactItems")]
     pub transact_items: Vec<TransactGetItem>,
-    #[serde(rename = "ReturnConsumedCapacity", default)]
     pub return_consumed_capacity: Option<String>,
+}
+
+/// The request as it arrives, before an item's `Get` is known to be there.
+#[derive(Deserialize)]
+struct TransactGetItemsRequestRaw {
+    #[serde(rename = "TransactItems")]
+    transact_items: Vec<TransactGetItemRaw>,
+    #[serde(rename = "ReturnConsumedCapacity", default)]
+    return_consumed_capacity: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TransactGetItemRaw {
+    #[serde(rename = "Get", default)]
+    get: Option<TransactGet>,
+}
+
+impl<'de> Deserialize<'de> for TransactGetItemsRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let raw = TransactGetItemsRequestRaw::deserialize(deserializer)?;
+
+        // An item without its `Get` (absent or null) is a member constraint,
+        // reported together with a `ReturnConsumedCapacity` outside the enum
+        // and ahead of every other check (captured in five regions,
+        // 2026-10-09). Only a request body can leave it out: the public type
+        // requires it.
+        let mut errors: Vec<String> = raw
+            .transact_items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.get.is_none())
+            .map(|(position, _)| {
+                format!(
+                    "Value null at 'transactItems.{}.member.get' failed to satisfy \
+                     constraint: Member must not be null",
+                    position + 1
+                )
+            })
+            .collect();
+        if !errors.is_empty() {
+            if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+                raw.return_consumed_capacity.as_deref(),
+            ) {
+                errors.push(msg);
+            }
+            if let Some(msg) = crate::validation::format_validation_errors(&errors) {
+                return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
+            }
+        }
+
+        Ok(TransactGetItemsRequest {
+            transact_items: raw
+                .transact_items
+                .into_iter()
+                .filter_map(|item| item.get)
+                .map(|get| TransactGetItem { get })
+                .collect(),
+            return_consumed_capacity: raw.return_consumed_capacity,
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -42,8 +102,45 @@ pub struct TransactGetItemsResponse {
 
 #[derive(Debug, Default, Serialize)]
 pub struct TransactGetResponse {
-    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Item",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::item_in_hash_order"
+    )]
+    // Number sets in Java hash-set order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub item: Option<Item>,
+}
+
+/// The action list as DynamoDB echoes it in a constraint message: each
+/// action's Java `toString`, every field named, in the form us-east-1,
+/// eu-west-1 and us-west-2 gave on 2026-10-10. eu-west-2 echoes no list
+/// (`Value at 'TransactItems'`), and some hosts print each attribute value as
+/// an object hash; the form most regions give is the one followed. Bounded by
+/// [`crate::actions::batch_write_item::ECHO_LIMIT`].
+fn items_echo(items: &[TransactGetItem]) -> String {
+    let mut out = crate::actions::batch_write_item::BoundedEcho::new();
+    let _ = write_items(&mut out, items);
+    out.finish()
+}
+
+fn write_items(out: &mut dyn std::fmt::Write, items: &[TransactGetItem]) -> std::fmt::Result {
+    use crate::actions::batch_write_item::{write_java_item, write_java_names, write_java_text};
+    out.write_str("[")?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        let get = &item.get;
+        out.write_str("TransactGetItem(get=Get(key=")?;
+        write_java_item(out, &get.key)?;
+        write!(out, ", tableName={}, projectionExpression=", get.table_name)?;
+        write_java_text(out, get.projection_expression.as_deref())?;
+        out.write_str(", expressionAttributeNames=")?;
+        write_java_names(out, get.expression_attribute_names.as_ref())?;
+        out.write_str(", workloadProfileName=null))")?;
+    }
+    out.write_str("]")
 }
 
 pub async fn execute<S: StorageBackend>(
@@ -57,16 +154,100 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // Validate: up to 100 actions.
-    // AWS surfaces this as the standard "1 validation error detected" envelope
-    // around `Value '[<dump>]' at 'transactItems'`. The conformance suite
-    // anchors a regex on the envelope and constraint phrase but leaves the
-    // dump body unconstrained.
+    // Validate: up to 100 actions, echoing the list as DynamoDB does.
     if request.transact_items.len() > 100 {
-        let dump = format!("{:?}", request.transact_items);
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '[{dump}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
+            "1 validation error detected: Value '{}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
+            items_echo(&request.transact_items)
         )));
+    }
+
+    // ReturnConsumedCapacity outside the enum: refused with the message the
+    // single-item operations give, after the TransactItems constraints and before
+    // anything is read or written (captured eu-west-2, 2026-10-08).
+    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(&msg),
+        ));
+    }
+
+    // Every Get's table name, reported together as a top-level error under its
+    // position, such as `transactItems.2.member.get.tableName`, never as a
+    // cancellation reason. Checked after the capacity mode, as us-east-1 and
+    // nine more regions do (captured 2026-10-09); eu-west-2 and eu-north-1
+    // report the two together.
+    let mut name_errors = Vec::new();
+    for (position, transact_item) in request.transact_items.iter().enumerate() {
+        name_errors.extend(crate::validation::member_table_name_errors(
+            &transact_item.get.table_name,
+            &format!("transactItems.{}.member.get.tableName", position + 1),
+        ));
+    }
+    if let Some(msg) = crate::validation::format_validation_errors(&name_errors) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
+    // An empty attribute name in a key or the expression names is a top-level
+    // rejection, not a cancellation reason, ahead of the table lookups
+    // (captured in ten regions).
+    for transact_item in &request.transact_items {
+        let get = &transact_item.get;
+        if crate::empty_names::map_has_empty_name(&get.key) {
+            return Err(crate::empty_names::bare());
+        }
+        crate::empty_names::check_names(get.expression_attribute_names.as_ref())?;
+    }
+
+    // A key nested too deep fails the whole request at the top level, before
+    // any table is looked up.
+    for transact_item in &request.transact_items {
+        crate::value_nesting::check_key(&transact_item.get.key)?;
+    }
+
+    // So does a key set that is empty or repeats a member, in the older
+    // layer's words (us-east-1, eu-west-1 and us-west-2, 2026-10-09;
+    // eu-west-2 uses the current layer's).
+    for transact_item in &request.transact_items {
+        let key = &transact_item.get.key;
+        let mut names: Vec<&String> = key.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(message) =
+                crate::validation::find_set_error(&key[name], crate::validation::ValueLayer::Older)
+            {
+                return Err(DynoxideError::ValidationException(message));
+            }
+        }
+    }
+
+    // ProjectionExpressions are checked before any table is looked up: an
+    // empty or whitespace-only one on a Get against a missing table is refused
+    // as a ValidationException, not reported as the missing table (captured
+    // eu-west-2, 2026-10-10). Each Get's names are checked in the same pass,
+    // undefined and unused alike, so between two Gets the earlier one's name
+    // error still wins (uncaptured; TransactWriteItems checks its names
+    // together per action the same way).
+    for transact_item in &request.transact_items {
+        let get = &transact_item.get;
+        let tracker = crate::expressions::TrackedExpressionAttributes::new(
+            &get.expression_attribute_names,
+            &None,
+        );
+        if let Some(proj_expr) = &get.projection_expression {
+            if proj_expr.is_empty() {
+                return Err(DynoxideError::ValidationException(
+                    "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
+                ));
+            }
+            let projection = expressions::projection::parse(proj_expr)
+                .map_err(DynoxideError::ValidationException)?;
+            tracker.track_projection_expr(&projection);
+            expressions::projection::validate(&projection, &tracker)
+                .map_err(DynoxideError::ValidationException)?;
+        }
+        tracker.check_unused()?;
     }
 
     // Per-action validation pass.
@@ -167,6 +348,7 @@ pub async fn execute<S: StorageBackend>(
         );
 
         let item = if let Some(proj_expr) = &get.projection_expression {
+            // Already checked before the tables were looked up.
             let projection = expressions::projection::parse(proj_expr)
                 .map_err(DynoxideError::ValidationException)?;
             tracker.track_projection_expr(&projection);
@@ -202,8 +384,6 @@ pub async fn execute<S: StorageBackend>(
         } else {
             item
         };
-
-        tracker.check_unused()?;
 
         responses.push(TransactGetResponse { item });
     }

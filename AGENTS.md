@@ -32,13 +32,16 @@ with AWS DynamoDB's observable behaviour is the headline goal.
 ## Rust conventions
 
 - Edition: 2024 (declared in `Cargo.toml`).
-- MSRV: 1.88 (declared as `rust-version` in `Cargo.toml`). Do not use
+- MSRV: 1.94.1 (declared as `rust-version` in `Cargo.toml`). Do not use
   features that raise it. The `msrv` CI job reads the declared value and
   compiles against it, so raising the floor is a deliberate edit rather than
   something a new language feature can do quietly.
 - Formatting: `cargo fmt --check` must pass.
 - Linting: `cargo clippy -- -D warnings` must pass. Warnings are
-  errors; fix them rather than silencing.
+  errors; fix them rather than silencing. The separate `benchmarks/`
+  package is linted too: CI runs `cargo fmt --check` and
+  `cargo clippy --all-targets -- -D warnings` there, with and without
+  `--features iai-callgrind`.
 - Testing: `cargo test` on the default feature set. Other feature
   combinations are exercised in CI; if you change feature gates,
   mirror what `.github/workflows/ci.yml` runs.
@@ -59,7 +62,9 @@ with AWS DynamoDB's observable behaviour is the headline goal.
   feature combinations fail to compile (for example
   `native-sqlite + encryption`). A `wasm-check` job builds the library
   for `wasm32-unknown-unknown` with `--no-default-features --features
-  wasm-sqlite`. If you change feature gates or
+  wasm-sqlite` (and `wasm-harness`), and runs `cargo clippy -- -D
+  warnings` on both, so code only the wasm build compiles is linted
+  too. If you change feature gates or
   anything cross-cutting, running the relevant matrix leg locally
   saves a CI round-trip. `.github/workflows/ci.yml` is the
   authoritative list.
@@ -71,19 +76,26 @@ with AWS DynamoDB's observable behaviour is the headline goal.
 
 ## Benchmarks
 
-The benchmark PR check has two layers and they do not carry equal
-weight:
+The benchmark PR check has two layers. Neither blocks a merge, and
+they do not carry equal weight:
 
 - **Criterion (wall-clock micro-benchmarks).** Advisory. These run on
   shared GitHub Actions runners and can vary by up to roughly 3x
   between runs because of noisy neighbours. A red Criterion row on
   your PR is not by itself a blocker; re-run the workflow if the
   result looks noisy.
-- **iai-callgrind (instruction-count benchmarks).** Deterministic and
-  blocking. If iai-callgrind flags a regression it means the code
-  path does measurably more work; investigate before merging.
+- **iai-callgrind (instruction-count benchmarks).** Deterministic, but
+  informational. The PR job reports instruction counts without a
+  stored baseline to compare against, so it never fails on a
+  regression by itself, and CI keeps no counts from `main` to compare
+  with. When you need to know whether a change does more work, run
+  `cargo bench --bench iai_core --features iai-callgrind` in
+  `benchmarks/` on `main` and on your branch, on the same Linux
+  machine or container; a difference there means the code path really
+  does more.
 
-In short: trust iai-callgrind, treat Criterion as a smoke signal.
+In short: trust iai-callgrind's numbers, treat Criterion as a smoke
+signal.
 
 ## Commit style
 

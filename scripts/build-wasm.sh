@@ -95,7 +95,7 @@ npx esbuild js/dynoxide-worker.js \
 #     block; the export names usually fold to `void 0` in a non-harness compile.
 #     If a new harness op is added, mirror it here and in dynoxide-worker.js.
 if [ "$feature" != "wasm-harness" ]; then
-  if grep -qE 'SMOKE_OPS|smoke_test|index_scan_test|error_fidelity_test' dist/dynoxide-worker.js; then
+  if grep -qE 'SMOKE_OPS|smoke_test|index_scan_test|error_fidelity_test|legacy_multi_attribute_gsi_fixture' dist/dynoxide-worker.js; then
     echo "error: harness-only ops leaked into the shipping worker bundle (#69)" >&2
     exit 1
   fi

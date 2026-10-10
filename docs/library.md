@@ -10,7 +10,7 @@ let db = Database::memory().unwrap();
 let db = Database::new("data.db").unwrap();
 
 // Encrypted (requires `encryption` feature)
-// cargo add dynoxide-rs --features encryption
+// cargo add dynoxide-rs --no-default-features --features encryption
 let db = Database::new_encrypted("data.db", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").unwrap();
 ```
 

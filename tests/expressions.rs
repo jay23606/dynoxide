@@ -1353,62 +1353,169 @@ fn test_update_with_attribute_names() {
 }
 
 // ---------------------------------------------------------------------------
-// SET list index beyond bounds: should pad with NULLs
+// SET list index past the end: appends (eu-west-2, 9 October 2026)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_set_list_index_beyond_bounds_pads_with_nulls() {
-    let db = make_db();
-    create_table(&db, "Tbl");
-
-    // Put item with a 3-element list
-    put(
-        &db,
-        "Tbl",
-        &[
-            ("pk", AttributeValue::S("k1".into())),
-            (
-                "myList",
-                AttributeValue::L(vec![
-                    AttributeValue::S("a".into()),
-                    AttributeValue::S("b".into()),
-                    AttributeValue::S("c".into()),
-                ]),
-            ),
-        ],
-    );
-
-    // SET myList[5] = :val - should pad indices 3,4 with NULL
-    db.update_item(UpdateItemRequest {
-        table_name: "Tbl".into(),
-        key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
-        update_expression: Some("SET myList[5] = :val".into()),
-        expression_attribute_values: Some(make_item(&[(":val", AttributeValue::S("x".into()))])),
-        ..Default::default()
-    })
-    .unwrap();
-
-    let resp = db
+/// Read back `myList` (or any list attribute) from the single test item.
+fn read_list(db: &Database, attr: &str) -> Vec<AttributeValue> {
+    let item = db
         .get_item(GetItemRequest {
             table_name: "Tbl".into(),
             key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
             ..Default::default()
         })
+        .unwrap()
+        .item
         .unwrap();
-
-    let item = resp.item.unwrap();
-    let list = match &item["myList"] {
-        AttributeValue::L(l) => l,
+    match &item[attr] {
+        AttributeValue::L(l) => l.clone(),
         other => panic!("expected list, got {:?}", other),
-    };
+    }
+}
 
-    assert_eq!(list.len(), 6);
-    assert_eq!(list[0], AttributeValue::S("a".into()));
-    assert_eq!(list[1], AttributeValue::S("b".into()));
-    assert_eq!(list[2], AttributeValue::S("c".into()));
-    assert_eq!(list[3], AttributeValue::NULL(true));
-    assert_eq!(list[4], AttributeValue::NULL(true));
-    assert_eq!(list[5], AttributeValue::S("x".into()));
+fn s(v: &str) -> AttributeValue {
+    AttributeValue::S(v.into())
+}
+
+#[test]
+fn a_set_past_the_end_of_a_list_appends() {
+    // Captured against eu-west-2: SET through an index past the end of a list
+    // adds the value at the end, whatever the index, rather than padding the
+    // gap. `l[5]` on a one-element list gives a two-element list.
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(
+        &db,
+        "Tbl",
+        &[
+            ("pk", s("k1")),
+            ("myList", AttributeValue::L(vec![s("a"), s("b"), s("c")])),
+        ],
+    );
+
+    db.update_item(UpdateItemRequest {
+        table_name: "Tbl".into(),
+        key: key_map(&[("pk", s("k1"))]),
+        update_expression: Some("SET myList[5] = :val".into()),
+        expression_attribute_values: Some(make_item(&[(":val", s("x"))])),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        read_list(&db, "myList"),
+        vec![s("a"), s("b"), s("c"), s("x")]
+    );
+}
+
+#[test]
+fn several_sets_past_the_end_append_in_index_order() {
+    // Captured against eu-west-2: two writes past the end of the same list
+    // append in the order of their indexes, not of their clauses, and an index
+    // inside the list is still replaced in place.
+    let db = make_db();
+    create_table(&db, "Tbl");
+    let cases: &[(&str, Vec<AttributeValue>)] = &[
+        ("SET l[5] = :a, l[7] = :b", vec![s("e"), s("a"), s("b")]),
+        ("SET l[7] = :a, l[5] = :b", vec![s("e"), s("b"), s("a")]),
+        ("SET l[3] = :a, l[0] = :b", vec![s("b"), s("a")]),
+    ];
+    for (expression, expected) in cases {
+        put(
+            &db,
+            "Tbl",
+            &[("pk", s("k1")), ("l", AttributeValue::L(vec![s("e")]))],
+        );
+        db.update_item(UpdateItemRequest {
+            table_name: "Tbl".into(),
+            key: key_map(&[("pk", s("k1"))]),
+            update_expression: Some(expression.to_string()),
+            expression_attribute_values: Some(make_item(&[(":a", s("a")), (":b", s("b"))])),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(&read_list(&db, "l"), expected, "{expression}");
+    }
+}
+
+#[test]
+fn a_set_past_the_end_of_a_nested_list_appends() {
+    // Captured against eu-west-2: the same holds for a list inside a map or
+    // inside another list.
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(
+        &db,
+        "Tbl",
+        &[
+            ("pk", s("k1")),
+            (
+                "m",
+                AttributeValue::M(
+                    [("l".to_string(), AttributeValue::L(vec![s("e")]))]
+                        .into_iter()
+                        .collect(),
+                ),
+            ),
+            (
+                "l",
+                AttributeValue::L(vec![AttributeValue::L(vec![s("e")])]),
+            ),
+        ],
+    );
+    db.update_item(UpdateItemRequest {
+        table_name: "Tbl".into(),
+        key: key_map(&[("pk", s("k1"))]),
+        update_expression: Some("SET m.l[3] = :v, l[0][3] = :v".into()),
+        expression_attribute_values: Some(make_item(&[(":v", s("v"))])),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let item = db
+        .get_item(GetItemRequest {
+            table_name: "Tbl".into(),
+            key: key_map(&[("pk", s("k1"))]),
+            ..Default::default()
+        })
+        .unwrap()
+        .item
+        .unwrap();
+    let appended = AttributeValue::L(vec![s("e"), s("v")]);
+    match &item["m"] {
+        AttributeValue::M(m) => assert_eq!(m["l"], appended),
+        other => panic!("expected a map, got {other:?}"),
+    }
+    assert_eq!(item["l"], AttributeValue::L(vec![appended]));
+}
+
+#[test]
+fn a_transacted_set_past_the_end_of_a_list_appends() {
+    // Captured against eu-west-2: a TransactWriteItems Update appends too.
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(
+        &db,
+        "Tbl",
+        &[("pk", s("k1")), ("l", AttributeValue::L(vec![s("e")]))],
+    );
+    db.transact_write_items(
+        dynoxide::actions::transact_write_items::TransactWriteItemsRequest {
+            transact_items: vec![dynoxide::actions::transact_write_items::TransactWriteItem {
+                update: Some(dynoxide::actions::transact_write_items::TransactUpdate {
+                    table_name: "Tbl".into(),
+                    key: key_map(&[("pk", s("k1"))]),
+                    update_expression: "SET l[5] = :v".into(),
+                    expression_attribute_values: Some(make_item(&[(":v", s("v"))])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(read_list(&db, "l"), vec![s("e"), s("v")]);
 }
 
 #[test]
@@ -1456,64 +1563,85 @@ fn test_set_list_index_0_on_empty_list() {
 }
 
 #[test]
-fn test_set_nested_path_through_list_index_beyond_bounds() {
+fn a_nested_set_through_an_index_past_the_end_is_refused() {
+    // Captured against eu-west-2: a path that steps through an element past the
+    // end of a list cannot be written, and the item is left as it was.
     let db = make_db();
     create_table(&db, "Tbl");
-
-    // Put item with a 1-element list
+    let zero = AttributeValue::M([("name".to_string(), s("zero"))].into_iter().collect());
     put(
         &db,
         "Tbl",
         &[
-            ("pk", AttributeValue::S("k1".into())),
-            (
-                "myList",
-                AttributeValue::L(vec![AttributeValue::M(
-                    [("name".to_string(), AttributeValue::S("zero".into()))]
-                        .into_iter()
-                        .collect(),
-                )]),
-            ),
+            ("pk", s("k1")),
+            ("myList", AttributeValue::L(vec![zero.clone()])),
         ],
     );
 
-    // SET myList[2].name = :val - index 1 should be NULL-padded, index 2 gets a map
-    db.update_item(UpdateItemRequest {
-        table_name: "Tbl".into(),
-        key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
-        update_expression: Some("SET myList[2].#n = :val".into()),
-        expression_attribute_names: Some(
-            [("#n".to_string(), "name".to_string())]
-                .into_iter()
-                .collect(),
-        ),
-        expression_attribute_values: Some(make_item(&[(":val", AttributeValue::S("two".into()))])),
-        ..Default::default()
-    })
-    .unwrap();
-
-    let resp = db
-        .get_item(GetItemRequest {
+    let err = db
+        .update_item(UpdateItemRequest {
             table_name: "Tbl".into(),
-            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            key: key_map(&[("pk", s("k1"))]),
+            update_expression: Some("SET myList[2].#n = :val".into()),
+            expression_attribute_names: Some(
+                [("#n".to_string(), "name".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            expression_attribute_values: Some(make_item(&[(":val", s("two"))])),
             ..Default::default()
         })
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "The document path provided in the update expression is invalid for update"
+    );
+    assert_eq!(read_list(&db, "myList"), vec![zero]);
+}
 
-    let item = resp.item.unwrap();
-    let list = match &item["myList"] {
-        AttributeValue::L(l) => l,
-        other => panic!("expected list, got {:?}", other),
-    };
-
-    assert_eq!(list.len(), 3);
-    assert_eq!(list[1], AttributeValue::NULL(true));
-    // Index 2 should be a map with name="two"
-    match &list[2] {
-        AttributeValue::M(map) => {
-            assert_eq!(map["name"], AttributeValue::S("two".into()));
-        }
-        other => panic!("expected map at index 2, got {:?}", other),
+#[test]
+fn a_set_through_a_stored_null_is_refused() {
+    // Captured against eu-west-2: a NULL is not a map or a list, so a path that
+    // steps through one is refused rather than turning it into either.
+    let db = make_db();
+    create_table(&db, "Tbl");
+    let null = AttributeValue::NULL(true);
+    let cases: &[(&str, Vec<(&str, AttributeValue)>)] = &[
+        (
+            "SET l[0].x = :v",
+            vec![("l", AttributeValue::L(vec![null.clone()]))],
+        ),
+        (
+            "SET l[0][0] = :v",
+            vec![("l", AttributeValue::L(vec![null.clone()]))],
+        ),
+        (
+            "SET m.n.x = :v",
+            vec![(
+                "m",
+                AttributeValue::M([("n".to_string(), null.clone())].into_iter().collect()),
+            )],
+        ),
+        ("SET n.x = :v", vec![("n", null.clone())]),
+    ];
+    for (expression, seed) in cases {
+        let mut attrs = vec![("pk", s("k1"))];
+        attrs.extend(seed.iter().cloned());
+        put(&db, "Tbl", &attrs);
+        let err = db
+            .update_item(UpdateItemRequest {
+                table_name: "Tbl".into(),
+                key: key_map(&[("pk", s("k1"))]),
+                update_expression: Some(expression.to_string()),
+                expression_attribute_values: Some(make_item(&[(":v", s("v"))])),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "The document path provided in the update expression is invalid for update",
+            "{expression}"
+        );
     }
 }
 
@@ -1927,7 +2055,10 @@ fn test_set_rejects_deep_missing_intermediate() {
 
 // ---------------------------------------------------------------------------
 // Expression size limit (4096 bytes) - rejected on each expression surface.
-// Confirmed against real DynamoDB (eu-west-2).
+// The message ends at `size;` with no figure, on every surface captured in
+// us-east-1 and eu-west-2 on 2026-10-09, except a Scan FilterExpression and a
+// transaction's ConditionExpression, where us-east-1 still appends
+// `expression size: <n>` and eu-west-2 doesn't.
 // ---------------------------------------------------------------------------
 
 // Each expression surface prefixes the size error with `Invalid <Type>Expression:`,
@@ -1960,10 +2091,10 @@ fn test_update_expression_over_size_limit_rejected() {
         .unwrap_err();
 
     // UpdateItem wraps UpdateExpression parse-time errors in the
-    // request-validation envelope (eu-west-2).
+    // request-validation envelope.
     assert_eq!(
         err.to_string(),
-        format!("1 validation error detected: {UPDATE_OVERSIZE_MSG}; expression size: 4097")
+        format!("1 validation error detected: {UPDATE_OVERSIZE_MSG};")
     );
 }
 
@@ -1987,10 +2118,10 @@ fn test_condition_expression_over_size_limit_rejected() {
         .unwrap_err();
 
     // PutItem wraps ConditionExpression parse-time errors in the
-    // request-validation envelope (eu-west-2).
+    // request-validation envelope.
     assert_eq!(
         err.to_string(),
-        format!("1 validation error detected: {CONDITION_OVERSIZE_MSG}; expression size: 4097")
+        format!("1 validation error detected: {CONDITION_OVERSIZE_MSG};")
     );
 }
 
@@ -2013,10 +2144,123 @@ fn test_projection_expression_over_size_limit_rejected() {
         })
         .unwrap_err();
 
-    assert!(
-        err.to_string().contains(PROJECTION_OVERSIZE_MSG),
-        "unexpected error: {err}"
+    assert_eq!(err.to_string(), format!("{PROJECTION_OVERSIZE_MSG};"));
+}
+
+#[test]
+fn test_expression_size_message_on_the_other_surfaces() {
+    let db = make_db();
+    create_table(&db, "Tbl");
+    put(&db, "Tbl", &[("pk", AttributeValue::S("k1".into()))]);
+    let over = format!("{} = :v", "a".repeat(4092));
+    assert_eq!(over.len(), 4097);
+    let values = Some(make_item(&[
+        (":v", AttributeValue::S("x".into())),
+        (":p", AttributeValue::S("k1".into())),
+    ]));
+
+    // DeleteItem: enveloped, no figure.
+    let err = db
+        .delete_item(DeleteItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            condition_expression: Some(over.clone()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("1 validation error detected: {CONDITION_OVERSIZE_MSG};")
     );
+
+    // UpdateItem's ConditionExpression: enveloped, no figure.
+    let err = db
+        .update_item(UpdateItemRequest {
+            table_name: "Tbl".to_string(),
+            key: key_map(&[("pk", AttributeValue::S("k1".into()))]),
+            update_expression: Some("SET b = :v".into()),
+            condition_expression: Some(over.clone()),
+            expression_attribute_values: Some(make_item(&[(":v", AttributeValue::S("x".into()))])),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("1 validation error detected: {CONDITION_OVERSIZE_MSG};")
+    );
+
+    // Query: KeyConditionExpression and FilterExpression, bare, no figure.
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "Tbl",
+                "KeyConditionExpression": format!("pk = :p AND {}", "a".repeat(4085)),
+                "ExpressionAttributeValues": {":p": {"S": "k1"}},
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid KeyConditionExpression: Expression size has exceeded the maximum allowed size;"
+    );
+    let err = db
+        .query(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "Tbl",
+                "KeyConditionExpression": "pk = :p",
+                "FilterExpression": over,
+                "ExpressionAttributeValues": values,
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid FilterExpression: Expression size has exceeded the maximum allowed size;"
+    );
+
+    // Scan's FilterExpression keeps the figure: us-east-1 sends it, eu-west-2
+    // doesn't, and Dynoxide follows us-east-1.
+    let err = db
+        .scan(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "Tbl",
+                "FilterExpression": format!("{} = :v", "a".repeat(4092)),
+                "ExpressionAttributeValues": {":v": {"S": "x"}},
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid FilterExpression: Expression size has exceeded the maximum allowed size; \
+         expression size: 4097"
+    );
+
+    // BatchGetItem and TransactGetItems projections: bare, no figure.
+    let projection = "a".repeat(4097);
+    let err = db
+        .batch_get_item(
+            serde_json::from_value(serde_json::json!({
+                "RequestItems": {"Tbl": {"Keys": [{"pk": {"S": "k1"}}],
+                    "ProjectionExpression": projection}}
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(err.to_string(), format!("{PROJECTION_OVERSIZE_MSG};"));
+    let err = db
+        .transact_get_items(
+            serde_json::from_value(serde_json::json!({
+                "TransactItems": [{"Get": {"TableName": "Tbl", "Key": {"pk": {"S": "k1"}},
+                    "ProjectionExpression": projection}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+    assert_eq!(err.to_string(), format!("{PROJECTION_OVERSIZE_MSG};"));
 }
 
 #[test]
@@ -2070,7 +2314,7 @@ fn test_put_condition_syntax_error_enveloped() {
 
     assert_eq!(
         err.to_string(),
-        "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"!\""
+        r#"1 validation error detected: Invalid ConditionExpression: Syntax error; token: "!", near: "= !!""#
     );
 }
 
@@ -2132,10 +2376,12 @@ fn test_put_eav_without_expression_enveloped() {
         })
         .unwrap_err();
 
+    // No expression is named after the message (eu-west-2 and us-east-1,
+    // 2026-10-09).
     assert_eq!(
         err.to_string(),
         "1 validation error detected: ExpressionAttributeValues can only be specified when \
-         using expressions: ConditionExpression is null"
+         using expressions"
     );
 }
 
@@ -2163,9 +2409,9 @@ fn test_put_mixing_expected_and_condition_expression_enveloped() {
 }
 
 #[test]
-fn test_put_ean_without_expression_stays_bare() {
-    // ExpressionAttributeNames misuse is not a captured enveloped family and
-    // keeps the bare message.
+fn test_put_ean_without_expression_enveloped() {
+    // ExpressionAttributeNames without an expression comes back in the
+    // envelope (eu-west-2 and us-east-1, 2026-10-09).
     let db = make_db();
     create_table(&db, "Tbl");
 
@@ -2182,7 +2428,8 @@ fn test_put_ean_without_expression_stays_bare() {
 
     assert_eq!(
         err.to_string(),
-        "ExpressionAttributeNames can only be specified when using expressions"
+        "1 validation error detected: ExpressionAttributeNames can only be specified when \
+         using expressions"
     );
 }
 
@@ -2209,8 +2456,7 @@ fn test_update_expression_syntax_error_enveloped() {
 
     assert_eq!(
         err.to_string(),
-        "1 validation error detected: Invalid UpdateExpression: \
-         Syntax error; Expected attribute name, got end of expression"
+        r#"1 validation error detected: Invalid UpdateExpression: Syntax error; token: "<EOF>", near: "SET""#
     );
 }
 
@@ -2230,7 +2476,7 @@ fn test_update_condition_syntax_error_enveloped() {
 
     assert_eq!(
         err.to_string(),
-        "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"!\""
+        r#"1 validation error detected: Invalid ConditionExpression: Syntax error; token: "!", near: "= !!""#
     );
 }
 
@@ -2319,10 +2565,12 @@ fn test_update_eav_without_expression_enveloped() {
         })
         .unwrap_err();
 
+    // No expression is named after the message (eu-west-2 and us-east-1,
+    // 2026-10-09).
     assert_eq!(
         err.to_string(),
         "1 validation error detected: ExpressionAttributeValues can only be specified when \
-         using expressions: UpdateExpression is null and ConditionExpression is null"
+         using expressions"
     );
 }
 

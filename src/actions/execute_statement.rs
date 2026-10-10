@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 pub struct ExecuteStatementRequest {
     #[serde(rename = "Statement")]
     pub statement: String,
-    #[serde(rename = "Parameters", default)]
+    #[serde(
+        rename = "Parameters",
+        default,
+        deserialize_with = "crate::types::deserialize_parameters"
+    )]
     pub parameters: Option<Vec<AttributeValue>>,
     #[serde(rename = "Limit", default)]
     pub limit: Option<usize>,
@@ -22,11 +26,22 @@ pub struct ExecuteStatementRequest {
     pub consistent_read: Option<bool>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     pub return_consumed_capacity: Option<String>,
+    /// `ALL_OLD` hands back the item an UPDATE or DELETE failed its condition
+    /// on, on the `ConditionalCheckFailedException`; `NONE`, or leaving it out,
+    /// does not.
+    #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
+    pub return_values_on_condition_check_failure: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
 pub struct ExecuteStatementResponse {
-    #[serde(rename = "Items", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Items",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::items_in_hash_order"
+    )]
+    // Number sets in Java hash-set order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub items: Option<Vec<Item>>,
     #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
@@ -38,44 +53,91 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: ExecuteStatementRequest,
 ) -> Result<ExecuteStatementResponse> {
-    // Limit is checked before the statement is parsed. A zero limit would
-    // otherwise read nothing and mint no token, silently ending a paginated
-    // walk. The wording follows Scan's shape (value kept, lowercase 'limit'),
-    // not Query's, matching what ExecuteStatement itself returns (captured
-    // eu-west-2, 2026-07-29).
-    if request.limit == Some(0) {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(
-                "Value '0' at 'limit' failed to satisfy constraint: \
-                 Member must have value greater than or equal to 1",
-            ),
-        ));
+    // Every member DynamoDB refuses is listed in one error, in DynamoDB's
+    // order: ReturnValuesOnConditionCheckFailure, Limit, the statement,
+    // ReturnConsumedCapacity, the parameters (captured eu-west-2 and
+    // us-east-1, 2026-10-10). All of them are checked before the statement
+    // is parsed. A zero limit would otherwise read nothing and mint no token,
+    // silently ending a paginated walk; its wording follows Scan's shape
+    // (value kept, lowercase 'limit'), not Query's, matching what
+    // ExecuteStatement itself returns (captured eu-west-2, 2026-07-29).
+    let violations: Vec<String> = [
+        crate::validation::return_values_on_condition_check_failure_rejection(
+            request.return_values_on_condition_check_failure.as_deref(),
+            "returnValuesOnConditionCheckFailure",
+        ),
+        (request.limit == Some(0)).then(|| {
+            "Value '0' at 'limit' failed to satisfy constraint: Member must have value \
+             greater than or equal to 1"
+                .to_string()
+        }),
+        crate::partiql::statement_length_violation(&request.statement, "statement"),
+        crate::validation::return_consumed_capacity_rejection(
+            request.return_consumed_capacity.as_deref(),
+        ),
+        crate::partiql::parameters_violation(request.parameters.as_deref(), "parameters"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(e) = crate::partiql::member_rejection(&violations) {
+        return Err(e);
     }
 
-    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-        request.return_consumed_capacity.as_deref(),
+    // A parameter holding an empty attribute name is refused bare, before the
+    // statement is parsed or its table looked up (captured in ten regions).
+    if crate::empty_names::parameters_have_empty_name(request.parameters.as_deref()) {
+        return Err(crate::empty_names::bare());
+    }
+
+    // A parameter nested too deep is refused before the statement is parsed or
+    // its table looked up.
+    if crate::value_nesting::parameters_nest_too_deep(
+        request.parameters.as_deref().unwrap_or_default(),
     ) {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&msg),
-        ));
+        return Err(crate::value_nesting::deep_parameter_error());
+    }
+
+    // Every parameter's numbers are checked before the statement is read,
+    // whether the statement uses the parameter or not, with the message any
+    // attribute value gets and no path after it (captured eu-west-2 and
+    // us-east-1, 2026-10-09).
+    for parameter in request.parameters.iter().flatten() {
+        partiql::executor::check_parameter_value(parameter)?;
     }
 
     // A COUNT projection is rejected before parsing, with DynamoDB's bare
     // message rather than the wasn't-well-formed wrapper the parse errors
     // below carry. ExecuteStatement is the captured surface for this shape.
+    // A read of a multi-attribute index is refused ahead of it (captured
+    // eu-west-2 and us-east-1, 2026-10-09).
     if let Some(msg) = partiql::parser::count_projection_rejection(&request.statement) {
+        if let Some((table, Some(index))) = partiql::parser::select_target(&request.statement) {
+            partiql::executor::reject_multi_attribute_index_by_name(storage, &table, &index)
+                .await?;
+        }
         return Err(DynoxideError::ValidationException(msg));
     }
 
     // The parser says which envelope its rejection takes: a malformed statement
     // gets DynamoDB's "wasn't well formed" wrapper, while a rejection DynamoDB
     // reports on its own terms is passed through bare.
-    let stmt = partiql::parser::parse(&request.statement)
-        .map_err(|e| DynoxideError::ValidationException(e.into_message()))?;
+    let supplied = request.parameters.as_ref().map_or(0, Vec::len);
+    let stmt = partiql::parser::parse_with_parameters(&request.statement, supplied).map_err(
+        |failure| {
+            DynoxideError::ValidationException(match failure {
+                partiql::parser::ParseFailure::Statement(e) => e.into_message(),
+                partiql::parser::ParseFailure::Literal(message) => message,
+            })
+        },
+    )?;
 
     let params = request.parameters.unwrap_or_default();
-    let run = partiql::executor::execute_page(
+    // The statement's text goes with it, so a continuation token is bound to
+    // the statement as written, as DynamoDB binds it.
+    let run = partiql::executor::execute_written_page(
         storage,
+        &request.statement,
         &stmt,
         &params,
         request.limit,
@@ -85,6 +147,7 @@ pub async fn execute<S: StorageBackend>(
         // A single statement has no preparation pass to share a resolution
         // with, so the executor resolves the table itself, once.
         None,
+        request.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD"),
     );
     // Base write, index fan-out and stream record are one atomic unit, as they
     // are on every other write path. Without it a fan-out that failed part way
@@ -166,8 +229,11 @@ pub async fn execute<S: StorageBackend>(
         )
     });
 
+    // A write without a RETURNING clause answers with an empty `Items` list,
+    // not without one (captured eu-west-2, us-east-1, eu-west-1 and
+    // us-west-2, 2026-10-09).
     Ok(ExecuteStatementResponse {
-        items,
+        items: Some(items.unwrap_or_default()),
         next_token,
         consumed_capacity,
     })

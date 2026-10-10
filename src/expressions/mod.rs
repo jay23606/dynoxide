@@ -26,7 +26,23 @@ pub(crate) const MAX_EXPRESSION_BYTES: usize = 4096;
 /// whitespace is not normalised before counting. Called at each expression
 /// parser's entry so every surface (Update/Condition/Filter/KeyCondition/
 /// Projection) is guarded.
+///
+/// The message ends at `size;`, with no figure: so it read on every surface
+/// captured in us-east-1 and eu-west-2 on 2026-10-09 except the two that
+/// [`check_expression_size_with_figure`] covers.
 pub(crate) fn check_expression_size(expr: &str) -> Result<(), String> {
+    if expr.len() > MAX_EXPRESSION_BYTES {
+        return Err("Expression size has exceeded the maximum allowed size;".to_string());
+    }
+    Ok(())
+}
+
+/// The size check for the two surfaces where the message still carries the
+/// figure in us-east-1, a Scan's FilterExpression and a transaction's
+/// ConditionExpression: `...size; expression size: 4097`. eu-west-2 has
+/// dropped the figure on both (captured 2026-10-09); Dynoxide follows
+/// us-east-1 until the regions agree.
+pub(crate) fn check_expression_size_with_figure(expr: &str) -> Result<(), String> {
     if expr.len() > MAX_EXPRESSION_BYTES {
         return Err(format!(
             "Expression size has exceeded the maximum allowed size; expression size: {}",
@@ -54,23 +70,6 @@ pub fn resolve_name(
         }
     } else {
         Ok(name.to_string())
-    }
-}
-
-/// Resolve an attribute value reference `:name`.
-pub fn resolve_value<'a>(
-    name: &str,
-    attr_values: &'a Option<HashMap<String, AttributeValue>>,
-) -> Result<&'a AttributeValue, String> {
-    match attr_values {
-        Some(map) => map.get(name).ok_or_else(|| {
-            format!(
-                "Value provided in ExpressionAttributeValues unused in expressions: keys: {{{name}}}"
-            )
-        }),
-        None => Err(format!(
-            "An expression attribute value used in expression is not defined; attribute value: {name}"
-        )),
     }
 }
 
@@ -281,31 +280,6 @@ impl<'a> TrackedExpressionAttributes<'a> {
         }
     }
 
-    /// Pre-register all `#name` and `:value` references in a parsed key condition.
-    /// Note: key_condition::parse already resolves names, so we track the original
-    /// value refs that will be resolved later via resolve_values.
-    pub fn track_key_condition(&self, cond: &key_condition::KeyCondition) {
-        self.used_values
-            .borrow_mut()
-            .insert(cond.pk_value_ref.clone());
-        if let Some(ref sk) = cond.sk_condition {
-            match sk {
-                key_condition::SortKeyCondition::Eq(_, vr)
-                | key_condition::SortKeyCondition::Lt(_, vr)
-                | key_condition::SortKeyCondition::Le(_, vr)
-                | key_condition::SortKeyCondition::Gt(_, vr)
-                | key_condition::SortKeyCondition::Ge(_, vr)
-                | key_condition::SortKeyCondition::BeginsWith(_, vr) => {
-                    self.used_values.borrow_mut().insert(vr.clone());
-                }
-                key_condition::SortKeyCondition::Between(_, lo, hi) => {
-                    self.used_values.borrow_mut().insert(lo.clone());
-                    self.used_values.borrow_mut().insert(hi.clone());
-                }
-            }
-        }
-    }
-
     /// Check for unused names/values. Returns an error listing all unused keys.
     pub fn check_unused(&self) -> Result<(), DynoxideError> {
         let used_names = self.used_names.borrow();
@@ -367,6 +341,7 @@ pub fn resolve_path_elements(
 ///
 /// This is a convenience wrapper for callers (e.g., import filters) that don't need
 /// unused-attribute validation. Uses the no-tracking variant to avoid RefCell/HashSet overhead.
+#[cfg(any(feature = "import", test))]
 pub fn evaluate_without_tracking(
     expr: &condition::ConditionExpr,
     item: &HashMap<String, AttributeValue>,
@@ -414,8 +389,8 @@ pub fn resolve_path(
     Some(current)
 }
 
-/// Set a value at a document path, creating intermediate maps/lists as needed.
-/// Returns the modified item.
+/// Set a value at a document path. Intermediate maps and lists must already
+/// exist; an index past the end of a list appends.
 pub fn set_path(
     item: &mut HashMap<String, AttributeValue>,
     path: &[PathElement],
@@ -456,13 +431,6 @@ pub fn set_path(
     }
 }
 
-/// Extend a list with NULL padding so that `list[target_len - 1]` is valid.
-fn pad_list_to(list: &mut Vec<AttributeValue>, target_len: usize) {
-    while list.len() < target_len {
-        list.push(AttributeValue::NULL(true));
-    }
-}
-
 fn set_nested(
     current: &mut AttributeValue,
     path: &[PathElement],
@@ -470,20 +438,6 @@ fn set_nested(
 ) -> Result<(), String> {
     if path.is_empty() {
         return Err("Empty remaining path".to_string());
-    }
-
-    // Auto-promote NULL to the structure type needed by the next path element.
-    // This handles the case where list padding created NULL placeholders that
-    // need to become Maps or Lists for deeper path navigation.
-    if matches!(current, AttributeValue::NULL(_)) {
-        match &path[0] {
-            PathElement::Attribute(_) => {
-                *current = AttributeValue::M(HashMap::new());
-            }
-            PathElement::Index(_) => {
-                *current = AttributeValue::L(Vec::new());
-            }
-        }
     }
 
     if path.len() == 1 {
@@ -500,9 +454,13 @@ fn set_nested(
                 }
             }
             PathElement::Index(i) => {
+                // An index past the end of the list appends the value rather
+                // than padding the gap (eu-west-2, 9 October 2026).
                 if let AttributeValue::L(list) = current {
-                    pad_list_to(list, *i + 1);
-                    list[*i] = value;
+                    match list.get_mut(*i) {
+                        Some(slot) => *slot = value,
+                        None => list.push(value),
+                    }
                     Ok(())
                 } else {
                     Err(
@@ -533,9 +491,12 @@ fn set_nested(
                 }
             }
             PathElement::Index(i) => {
-                if let AttributeValue::L(list) = current {
-                    pad_list_to(list, *i + 1);
-                    set_nested(&mut list[*i], &path[1..], value)
+                // Stepping through an element past the end is refused, as is
+                // stepping through anything that is not a map or a list.
+                if let AttributeValue::L(list) = current
+                    && let Some(next) = list.get_mut(*i)
+                {
+                    set_nested(next, &path[1..], value)
                 } else {
                     Err(
                         "The document path provided in the update expression is invalid for update"

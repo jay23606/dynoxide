@@ -5,7 +5,7 @@
 use crate::errors::{DynoxideError, Result};
 use crate::storage::TableMetadata;
 use crate::storage_backend::{IndexWriteOp, StorageBackend};
-use crate::types::{GlobalSecondaryIndex, Item, KeyType, ProjectionType};
+use crate::types::{AttributeValue, GlobalSecondaryIndex, Item, KeyType, ProjectionType};
 use std::collections::HashMap;
 
 /// Where a write lands in the base table, how the table's own keys are named,
@@ -41,10 +41,17 @@ pub struct IndexWrite<'a> {
 
 /// Parsed index definition for convenient access. Used for both GSI and LSI,
 /// since the projected-item logic is identical.
+///
+/// A GSI key can have up to four partition key and four sort key attributes.
+/// `pk_attr` and `sk_attr` name the first of each, which is the whole key for
+/// an LSI and for a single-attribute GSI; `hash_attrs` and `range_attrs` list
+/// every one in key-schema order.
 pub struct IndexDef {
     pub index_name: String,
     pub pk_attr: String,
     pub sk_attr: Option<String>,
+    pub hash_attrs: Vec<String>,
+    pub range_attrs: Vec<String>,
     pub projection_type: ProjectionType,
     pub non_key_attributes: Option<Vec<String>>,
 }
@@ -60,11 +67,7 @@ impl IndexDef {
     /// them. `build_index_item` projects by this rule and the PartiQL read path
     /// rejects by it, so it lives here rather than in either of them.
     pub fn projects(&self, attr: &str, table_pk: &str, table_sk: Option<&str>) -> bool {
-        if attr == self.pk_attr
-            || self.sk_attr.as_deref() == Some(attr)
-            || attr == table_pk
-            || table_sk == Some(attr)
-        {
+        if self.is_key_attr(attr) || attr == table_pk || table_sk == Some(attr) {
             return true;
         }
         match self.projection_type {
@@ -77,17 +80,70 @@ impl IndexDef {
         }
     }
 
+    /// Whether `attr` is one of this index's key attributes.
+    pub fn is_key_attr(&self, attr: &str) -> bool {
+        self.hash_attrs.iter().any(|a| a == attr) || self.range_attrs.iter().any(|a| a == attr)
+    }
+
     /// The `(pk, sk)` key strings for this item's index entry, or `None` if the
-    /// item is excluded. Sparse-index behaviour: an item missing the partition
-    /// key, or the sort key when one is defined, or holding a non-scalar where a
-    /// key is expected, is not projected into the index.
+    /// item is excluded. Sparse-index behaviour: an item missing any key
+    /// attribute, or holding a non-scalar where a key is expected, is not
+    /// projected into the index.
     pub fn index_key_strings(&self, item: &Item) -> Option<(String, String)> {
-        let pk = item.get(&self.pk_attr)?.to_key_string()?;
-        let sk = match self.sk_attr {
-            Some(ref sk_attr) => item.get(sk_attr)?.to_key_string()?,
-            None => String::new(),
+        let values = |attrs: &[String]| -> Option<Vec<&AttributeValue>> {
+            attrs.iter().map(|a| item.get(a)).collect()
+        };
+        let pk = composite_key_string(&values(&self.hash_attrs)?)?;
+        let sk = if self.range_attrs.is_empty() {
+            String::new()
+        } else {
+            composite_key_string(&values(&self.range_attrs)?)?
         };
         Some((pk, sk))
+    }
+}
+
+/// Closes each attribute's part of a multi-attribute key string. It sorts
+/// below anything an escaped part can hold at the same position, so a shorter
+/// value sorts ahead of a longer one it is a prefix of, as it does on its own.
+pub(crate) const KEY_PART_END: &str = "\u{1}\u{1}";
+
+/// The key string an index row is stored and compared by.
+///
+/// One attribute keeps the plain key string, so single-attribute indexes are
+/// stored exactly as before. With more than one, each attribute's key string is
+/// escaped and closed by [`KEY_PART_END`], which keeps byte order equal to
+/// comparing the attributes one after another: DynamoDB sorts a multi-attribute
+/// sort key by its first attribute, then its second, and so on. `None` when a
+/// value has no key form.
+pub fn composite_key_string(values: &[&AttributeValue]) -> Option<String> {
+    if let [only] = values {
+        return only.to_key_string();
+    }
+    let mut out = String::new();
+    for value in values {
+        push_key_part(&mut out, &value.to_key_string()?);
+    }
+    Some(out)
+}
+
+/// Append one attribute's escaped key string and its terminator.
+pub(crate) fn push_key_part(out: &mut String, key_string: &str) {
+    push_escaped_key(out, key_string);
+    out.push_str(KEY_PART_END);
+}
+
+/// Append a key string with the two characters at or below the terminator
+/// escaped. `\u{0}` and `\u{1}` become `\u{1}\u{2}` and `\u{1}\u{3}`, which
+/// sort above the terminator and below every other character, so the escaped
+/// form orders exactly as the original does.
+pub(crate) fn push_escaped_key(out: &mut String, key_string: &str) {
+    for c in key_string.chars() {
+        match c {
+            '\u{0}' => out.push_str("\u{1}\u{2}"),
+            '\u{1}' => out.push_str("\u{1}\u{3}"),
+            c => out.push(c),
+        }
     }
 }
 
@@ -105,14 +161,32 @@ pub fn gsi_to_def(gsi: &GlobalSecondaryIndex) -> Result<GsiDef> {
         .iter()
         .find(|k| k.key_type == KeyType::RANGE)
         .map(|k| k.attribute_name.clone());
+    let (hash_attrs, range_attrs) = key_attrs_by_type(&gsi.key_schema);
 
     Ok(GsiDef {
         index_name: gsi.index_name.clone(),
         pk_attr,
         sk_attr,
+        hash_attrs,
+        range_attrs,
         projection_type: gsi.projection.projection_type.clone().unwrap_or_default(),
         non_key_attributes: gsi.projection.non_key_attributes.clone(),
     })
+}
+
+/// A key schema's partition key and sort key attributes, each in key-schema
+/// order.
+pub fn key_attrs_by_type(
+    key_schema: &[crate::types::KeySchemaElement],
+) -> (Vec<String>, Vec<String>) {
+    let of = |key_type: KeyType| {
+        key_schema
+            .iter()
+            .filter(|k| k.key_type == key_type)
+            .map(|k| k.attribute_name.clone())
+            .collect()
+    };
+    (of(KeyType::HASH), of(KeyType::RANGE))
 }
 
 /// Parse GSI definitions from table metadata.
@@ -286,7 +360,58 @@ pub async fn maintain_gsis_after_delete_with_defs<S: StorageBackend>(
     Ok(gsi_units)
 }
 
-/// Parse key attribute names for a GSI.
+/// Every partition key and sort key attribute of a GSI, in key-schema order.
+pub fn parse_gsi_key_attrs(
+    meta: &TableMetadata,
+    index_name: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let gsi = parse_gsi_defs(meta)?
+        .into_iter()
+        .find(|g| g.index_name == index_name)
+        .ok_or_else(|| {
+            DynoxideError::ValidationException(format!(
+                "The table does not have the specified index: {index_name}"
+            ))
+        })?;
+    Ok((gsi.hash_attrs, gsi.range_attrs))
+}
+
+/// Rebuild every GSI whose key has more than one partition key or sort key
+/// attribute from its base table, returning how many were rebuilt.
+///
+/// Earlier versions accepted such an index but keyed its rows on the first
+/// attribute of each kind, so items sorted on the first sort key attribute
+/// alone and an item missing a later key attribute was indexed. Both backends
+/// run this when they open a database recorded before
+/// [`MULTI_ATTRIBUTE_KEYS`](crate::storage_backend::schema::MULTI_ATTRIBUTE_KEYS),
+/// through [`run_open_migrations`](super::schema_migrations::run_open_migrations).
+/// Single-attribute indexes are stored the same way as before and are left
+/// alone.
+pub(crate) async fn rebuild_multi_attribute_gsis<S: StorageBackend>(storage: &S) -> Result<usize> {
+    let mut rebuilt = 0;
+    for table_name in storage.list_table_names().await? {
+        let Some(meta) = storage.get_table_metadata(&table_name).await? else {
+            continue;
+        };
+        let key_schema = super::helpers::parse_key_schema(&meta)?;
+        for def in parse_gsi_defs(&meta)? {
+            if def.hash_attrs.len() <= 1 && def.range_attrs.len() <= 1 {
+                continue;
+            }
+            storage.drop_gsi_table(&table_name, &def.index_name).await?;
+            storage
+                .create_gsi_table(&table_name, &def.index_name)
+                .await?;
+            backfill_gsi(storage, &table_name, &key_schema, &def).await?;
+            rebuilt += 1;
+        }
+    }
+    Ok(rebuilt)
+}
+
+/// Parse key attribute names for a GSI: the first partition key and sort key
+/// attribute. See [`parse_gsi_key_attrs`] for every attribute of a
+/// multi-attribute key.
 pub fn parse_gsi_key_schema(
     meta: &TableMetadata,
     index_name: &str,
@@ -301,4 +426,118 @@ pub fn parse_gsi_key_schema(
             ))
         })?;
     Ok((gsi.pk_attr, gsi.sk_attr))
+}
+
+/// Backfill existing items into a newly created GSI, processing in batches.
+pub(crate) async fn backfill_gsi<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    key_schema: &super::helpers::KeySchema,
+    gsi_def: &GsiDef,
+) -> Result<()> {
+    const BATCH_SIZE: usize = 1000;
+    let mut last_pk: Option<String> = None;
+    let mut last_sk: Option<String> = None;
+
+    loop {
+        let items = storage
+            .scan_items(
+                table_name,
+                &crate::storage::ScanParams {
+                    limit: Some(BATCH_SIZE),
+                    exclusive_start_pk: last_pk.as_deref(),
+                    exclusive_start_sk: last_sk.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if items.is_empty() {
+            break;
+        }
+
+        let mut rows: Vec<crate::storage_backend::GsiItemRow> = Vec::new();
+        for (pk, sk, item_json) in &items {
+            let item: crate::types::Item = serde_json::from_str(item_json)
+                .map_err(|e| DynoxideError::InternalServerError(format!("Bad item JSON: {e}")))?;
+
+            // Backfill only the items that belong in this index (sparse).
+            if let Some((gsi_pk, gsi_sk)) = gsi_def.index_key_strings(&item) {
+                let projected = build_index_item(
+                    &item,
+                    gsi_def,
+                    &key_schema.partition_key,
+                    key_schema.sort_key.as_deref(),
+                );
+                let projected_json = serde_json::to_string(&projected)
+                    .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+
+                rows.push(crate::storage_backend::GsiItemRow {
+                    gsi_pk,
+                    gsi_sk,
+                    table_pk: pk.clone(),
+                    table_sk: sk.clone(),
+                    item_json: projected_json,
+                });
+            }
+        }
+
+        storage
+            .insert_gsi_items(table_name, &gsi_def.index_name, &rows)
+            .await?;
+
+        let last = &items[items.len() - 1];
+        last_pk = Some(last.0.clone());
+        last_sk = Some(last.1.clone());
+
+        if items.len() < BATCH_SIZE {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(parts: &[&str]) -> String {
+        let values: Vec<AttributeValue> = parts
+            .iter()
+            .map(|p| AttributeValue::S(p.to_string()))
+            .collect();
+        let refs: Vec<&AttributeValue> = values.iter().collect();
+        composite_key_string(&refs).unwrap()
+    }
+
+    #[test]
+    fn a_composite_key_orders_part_by_part() {
+        // Ascending by the first part, then the second. A value sorts ahead of
+        // a longer one it is a prefix of, whatever comes after it, and the two
+        // characters the encoding escapes keep their place among the others.
+        let ascending = [
+            key(&["a", "z"]),
+            key(&["a\u{0}", "a"]),
+            key(&["a\u{1}", "a"]),
+            key(&["a\u{2}", "a"]),
+            key(&["ab", "a"]),
+            key(&["ab", "b"]),
+            key(&["b", "a"]),
+        ];
+        for pair in ascending.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{:?} should sort before {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_attribute_key_is_stored_as_before() {
+        let n = AttributeValue::N("-2.5".into());
+        assert_eq!(composite_key_string(&[&n]), n.to_key_string());
+    }
 }

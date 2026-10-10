@@ -8,9 +8,13 @@ use crate::types::{
 ///
 /// AWS DynamoDB applies different constraints to `tableName` depending on the
 /// operation. CreateTable enforces a minimum of 3 characters and a regex
-/// pattern. Read/write operations (PutItem, GetItem, Query, Scan, UpdateItem,
-/// DeleteItem, BatchGet/Write, TransactGet/Write) only enforce a minimum of 1
-/// character; the regex pattern only fires on a non-empty invalid name.
+/// pattern. `ReadWrite` enforces a minimum of 1 character, with the regex
+/// pattern only firing on a non-empty invalid name. PutItem, GetItem,
+/// UpdateItem, DeleteItem, Query and Scan add a minimum of 3 for a non-empty
+/// name on top of it (see `item_table_name_errors`); the batch and transaction
+/// operations check their table names as members of the request body (see
+/// `member_table_name_errors`). SearchVectors keeps `ReadWrite` as it is: its
+/// short-name answer is uncaptured.
 #[derive(Copy, Clone, Debug)]
 pub enum TableNameContext {
     /// CreateTable: regex pattern + minimum length 3.
@@ -116,6 +120,184 @@ pub fn table_name_constraint_errors(
     errors
 }
 
+/// The newer validation layer's answer for an empty table name: no value echo,
+/// the member spelled `TableName`, reported on its own. PutItem, UpdateItem,
+/// DeleteItem, GetItem, Query and SearchVectors give it (captured on
+/// 2026-10-09 in at least five of seven regions for each); Scan, still on the
+/// older layer in most regions, gives the `ReadWrite` form instead.
+pub(crate) const EMPTY_TABLE_NAME_REJECTION: &str = "Value at 'TableName' failed to satisfy \
+     constraint: Member must have length greater than or equal to 1";
+
+fn short_table_name_error(name: &str) -> String {
+    format!(
+        "Value '{name}' at 'tableName' failed to satisfy constraint: \
+         Member must have length greater than or equal to 3"
+    )
+}
+
+fn long_table_name_error(name: &str) -> String {
+    format!(
+        "Value '{name}' at 'tableName' failed to satisfy constraint: \
+         Member must have length less than or equal to 255"
+    )
+}
+
+fn table_name_pattern_error(name: &str) -> String {
+    format!(
+        "Value '{name}' at 'tableName' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+    )
+}
+
+/// The first constraint a non-empty table name breaks, as the newer layer
+/// reports it: one error per name, the length (3 to 255) before the pattern.
+/// A name both short and malformed (`a!`) gets the length error alone
+/// (captured 2026-10-09 on PutItem, DeleteItem, GetItem, Query and
+/// SearchVectors).
+pub(crate) fn first_table_name_error(name: &str) -> Option<String> {
+    if name.len() < 3 {
+        Some(short_table_name_error(name))
+    } else if name.len() > 255 {
+        Some(long_table_name_error(name))
+    } else if !table_name_pattern_holds(name) {
+        Some(table_name_pattern_error(name))
+    } else {
+        None
+    }
+}
+
+/// The table-name errors for PutItem, DeleteItem, GetItem and Query: a missing
+/// name as `ReadWrite` reports it, an empty one in the newer wording, and
+/// otherwise [`first_table_name_error`]. Callers report the empty name on its
+/// own before anything else; the other errors join the request's member
+/// errors.
+pub(crate) fn item_table_name_errors(table_name: Option<&str>) -> Vec<String> {
+    match table_name {
+        None => table_name_constraint_errors(None, TableNameContext::ReadWrite),
+        Some("") => vec![EMPTY_TABLE_NAME_REJECTION.to_string()],
+        Some(name) => first_table_name_error(name).into_iter().collect(),
+    }
+}
+
+/// [`validate_table_name`] for the operations that take
+/// [`item_table_name_errors`], so a request built in Rust gets the same answer
+/// as one decoded from a body.
+pub(crate) fn validate_item_table_name(name: &str) -> Result<()> {
+    match format_validation_errors(&item_table_name_errors(Some(name))) {
+        Some(msg) => Err(DynoxideError::ValidationException(msg)),
+        None => Ok(()),
+    }
+}
+
+/// UpdateItem's table-name errors in the newer layer: every constraint the
+/// name breaks, the pattern listed before the length, where the other
+/// single-item operations stop at the length (captured 2026-10-09, five of
+/// seven regions).
+pub(crate) fn update_item_table_name_errors(table_name: Option<&str>) -> Vec<String> {
+    let name = match table_name {
+        None => return table_name_constraint_errors(None, TableNameContext::ReadWrite),
+        Some("") => return vec![EMPTY_TABLE_NAME_REJECTION.to_string()],
+        Some(name) => name,
+    };
+    let mut errors = Vec::new();
+    if !table_name_pattern_holds(name) {
+        errors.push(table_name_pattern_error(name));
+    }
+    if name.len() < 3 {
+        errors.push(short_table_name_error(name));
+    } else if name.len() > 255 {
+        errors.push(long_table_name_error(name));
+    }
+    errors
+}
+
+/// Scan's table-name errors in the older layer most regions still run it on:
+/// an empty name in the `ReadWrite` form, and otherwise every constraint the
+/// name breaks, the length before the pattern (captured 2026-10-09, six of
+/// seven regions).
+pub(crate) fn scan_table_name_errors(name: &str) -> Vec<String> {
+    if name.is_empty() {
+        return table_name_constraint_errors(Some(name), TableNameContext::ReadWrite);
+    }
+    let mut errors = Vec::new();
+    if name.len() < 3 {
+        errors.push(short_table_name_error(name));
+    } else if name.len() > 255 {
+        errors.push(long_table_name_error(name));
+    }
+    if !table_name_pattern_holds(name) {
+        errors.push(table_name_pattern_error(name));
+    }
+    errors
+}
+
+/// [`validate_table_name`] for Scan, so a request built in Rust gets the same
+/// answer as one decoded from a body.
+pub(crate) fn validate_scan_table_name(name: &str) -> Result<()> {
+    match format_validation_errors(&scan_table_name_errors(name)) {
+        Some(msg) => Err(DynoxideError::ValidationException(msg)),
+        None => Ok(()),
+    }
+}
+
+/// The rejection for a `ReturnValuesOnConditionCheckFailure` outside
+/// `[ALL_OLD, NONE]`, at `path`: `returnValuesOnConditionCheckFailure` on the
+/// single-item operations and `ExecuteStatement`, `transactItems.N.member.<action>.`
+/// before it in a transaction, and `statements.N.member.` or
+/// `transactStatements.N.member.` on a PartiQL batch or transaction. An empty
+/// string is refused too. Captured in all seven regions tried, 2026-10-09, and
+/// for the PartiQL operations in eu-west-2 and us-east-1, 2026-10-10.
+pub(crate) fn return_values_on_condition_check_failure_rejection(
+    value: Option<&str>,
+    path: &str,
+) -> Option<String> {
+    let value = value?;
+    if ["ALL_OLD", "NONE"].contains(&value) {
+        return None;
+    }
+    Some(format!(
+        "Value '{value}' at '{path}' failed to satisfy constraint: \
+         Member must satisfy enum value set: [ALL_OLD, NONE]"
+    ))
+}
+
+/// What DynamoDB says about a `ConditionalOperator` once the request's members
+/// are valid. It only joins legacy conditions, so it is refused when there are
+/// none and when there is only one; `conditions` is the number of entries in
+/// `Expected`, `QueryFilter` or `ScanFilter`. The newer layer checks nothing
+/// else about it, so an unknown value is refused here too (captured
+/// 2026-10-09: PutItem, UpdateItem, DeleteItem and Query in at least five of
+/// seven regions, Scan in all seven for a valid value).
+pub(crate) fn conditional_operator_misuse(
+    operator: Option<&str>,
+    conditions: usize,
+) -> Option<&'static str> {
+    let operator = operator?;
+    match conditions {
+        0 => Some("ConditionalOperator cannot be used without Filter or Expected"),
+        1 => Some(
+            "ConditionalOperator can only be used when Filter or Expected has two or more \
+             elements",
+        ),
+        // With conditions to join, a value other than AND or OR gets the
+        // generic enum message, DynamoDB's own `[ALL, OR]` list included
+        // (captured 2026-10-09: PutItem, UpdateItem and DeleteItem in five of
+        // seven regions, Query in six).
+        _ if !["AND", "OR"].contains(&operator) => {
+            Some("Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]")
+        }
+        _ => None,
+    }
+}
+
+/// How many legacy conditions an `Expected`, `QueryFilter` or `ScanFilter`
+/// carries.
+pub(crate) fn legacy_condition_count(conditions: Option<&serde_json::Value>) -> usize {
+    conditions
+        .and_then(|value| value.as_object())
+        .map_or(0, |object| object.len())
+}
+
 /// Format a list of constraint validation errors into the DynamoDB multi-error format.
 ///
 /// Returns `Some(message)` if there are errors, `None` if empty.
@@ -148,7 +330,11 @@ pub(crate) fn envelope_message(msg: &str) -> String {
 /// instead, so they had nowhere to put it and accepted anything. That was
 /// invisible while the value only chose whether a figure was reported; it
 /// stopped being invisible once an unrecognised value also meant the write path
-/// skipped sizing its indexes. All nine now ask here.
+/// skipped sizing its indexes. Every operation that takes the parameter now
+/// asks here: those six, `SearchVectors`, the three PartiQL operations, and
+/// `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and
+/// `TransactWriteItems`, which check it in their `execute` once their own
+/// request-level constraints have passed.
 ///
 /// Callers that collect several failures push the message onto their own errors
 /// vec, so the multi-error envelope they report is unchanged.
@@ -163,6 +349,118 @@ pub(crate) fn return_consumed_capacity_rejection(mode: Option<&str>) -> Option<S
     ))
 }
 
+/// [`return_consumed_capacity_rejection`] as an error, in the single-error
+/// envelope a wire client gets. For callers that check the mode outside a
+/// deserialiser, where there is no errors vec to push onto: the MCP tools.
+#[cfg(feature = "mcp-server")]
+pub(crate) fn reject_bad_capacity_mode(mode: Option<&str>) -> Result<()> {
+    match return_consumed_capacity_rejection(mode) {
+        Some(msg) => Err(DynoxideError::ValidationException(envelope_message(&msg))),
+        None => Ok(()),
+    }
+}
+/// The rejection for a `ReturnValues` outside the enum on PutItem, UpdateItem
+/// and DeleteItem: the validation framework's generic form, which names
+/// neither the value nor the member and lists the enum in DynamoDB's own
+/// order, its `UPDATE_NEW` typo included. Captured in eu-west-2, us-east-1 and
+/// two more regions on 2026-10-08; 31 of 33 regions answer this way, and
+/// eu-south-2 and me-central-1 still give the older per-value wording. Which
+/// values are accepted is unchanged: `UPDATED_NEW` is valid, `UPDATE_NEW` is
+/// only the message's spelling.
+pub(crate) const RETURN_VALUES_REJECTION: &str = "Failed to satisfy constraint: Member must \
+     satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]";
+
+/// The older validation layer's rejection for a `ReturnValues` outside the
+/// enum, naming the value and the member. UpdateItem still gives it when the
+/// request has no key, in all seven regions captured on 2026-10-09.
+pub(crate) fn return_values_value_rejection(value: &str) -> String {
+    format!(
+        "Value '{value}' at 'returnValues' failed to satisfy constraint: \
+         Member must satisfy enum value set: [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]"
+    )
+}
+
+/// The rejection for a `ConditionalOperator` outside `[OR, AND]`, or `None`
+/// when the value is one DynamoDB accepts. Only Scan checks it as an enum
+/// member: it is still on the older validation layer in most regions (six of
+/// seven, 2026-10-09). The newer layer, which the other operations run on in
+/// most regions, never reports the enum; see [`conditional_operator_misuse`].
+pub(crate) fn conditional_operator_rejection(operator: Option<&str>) -> Option<String> {
+    let operator = operator?;
+    if ["OR", "AND"].contains(&operator) {
+        return None;
+    }
+    Some(format!(
+        "Value '{operator}' at 'conditionalOperator' failed to satisfy constraint: \
+         Member must satisfy enum value set: [OR, AND]"
+    ))
+}
+
+/// The rejection for a `ReturnItemCollectionMetrics` outside the enum, or
+/// `None` when the value is one DynamoDB accepts. `BatchWriteItem` and
+/// `TransactWriteItems` ask here; PutItem, UpdateItem and DeleteItem spell the
+/// same check out in their own deserialisation.
+pub(crate) fn return_item_collection_metrics_rejection(mode: Option<&str>) -> Option<String> {
+    let mode = mode?;
+    if ["SIZE", "NONE"].contains(&mode) {
+        return None;
+    }
+    Some(format!(
+        "Value '{mode}' at 'returnItemCollectionMetrics' failed to satisfy constraint: \
+         Member must satisfy enum value set: [SIZE, NONE]"
+    ))
+}
+
+fn table_name_pattern_holds(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// Whether a table name meets the constraints on a `TableName` member of a
+/// request body: 3 to 255 characters from `[a-zA-Z0-9_.-]`. The single-item
+/// operations validate a top-level `tableName` more loosely (see
+/// [`TableNameContext::ReadWrite`]); the batch and transaction operations carry
+/// their table names inside the body and apply the full constraint.
+pub(crate) fn member_table_name_is_valid(name: &str) -> bool {
+    (3..=255).contains(&name.len()) && table_name_pattern_holds(name)
+}
+
+/// The constraint errors for a table name carried at `path` inside a
+/// transaction, such as `transactItems.2.member.update.tableName`: the length
+/// first, then the pattern, which is the order DynamoDB lists them in when a
+/// name breaks both (captured us-east-1 and three more regions, 2026-10-09;
+/// eu-west-2 lists the pattern first).
+pub(crate) fn member_table_name_errors(name: &str, path: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    if name.len() < 3 {
+        errors.push(format!(
+            "Value '{name}' at '{path}' failed to satisfy constraint: \
+             Member must have length greater than or equal to 3"
+        ));
+    } else if name.len() > 255 {
+        errors.push(format!(
+            "Value '{name}' at '{path}' failed to satisfy constraint: \
+             Member must have length less than or equal to 255"
+        ));
+    }
+    if !table_name_pattern_holds(name) {
+        errors.push(format!(
+            "Value '{name}' at '{path}' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+        ));
+    }
+    errors
+}
+
+/// The constraint a batch request's `RequestItems` map puts on its keys, the
+/// table names. DynamoDB reports it once for the whole map, echoing the map,
+/// whichever name broke it.
+pub(crate) const REQUEST_ITEMS_KEY_CONSTRAINT: &str = "Map keys must satisfy constraint: \
+     [Member must have length less than or equal to 255, Member must have length greater \
+     than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]";
+
 /// Wrap an `EnvelopedValidation` error in the `1 validation error detected: `
 /// envelope, converting it to a plain `ValidationException`. Every other error
 /// passes through unchanged.
@@ -173,6 +471,42 @@ pub(crate) fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
         DynoxideError::EnvelopedValidation(msg) => {
             DynoxideError::ValidationException(envelope_message(&msg))
         }
+        other => other,
+    }
+}
+
+/// The layer a PutItem, UpdateItem or DeleteItem request's values are checked
+/// on: the older layer when the request was read on it (a wire seam sets that
+/// from the whole body, see [`crate::types::reads_on_older_layer`]) or when its
+/// legacy `Expected` would put it there, and the current layer otherwise.
+pub(crate) fn single_write_layer(expected: Option<&serde_json::Value>) -> ValueLayer {
+    if crate::types::current_value_layer() == ValueLayer::Older
+        || expected.is_some_and(crate::types::reads_on_older_layer)
+    {
+        ValueLayer::Older
+    } else {
+        ValueLayer::Current
+    }
+}
+
+/// Resolve the request-validation tag at a single-item write's boundary: in
+/// the envelope on the current layer, and bare on the older one, which never
+/// gives it (captured eu-west-2 and us-east-1, 2026-10-10).
+pub(crate) fn resolve_for_layer(layer: ValueLayer, err: DynoxideError) -> DynoxideError {
+    match (layer, err) {
+        (ValueLayer::Older, DynoxideError::EnvelopedValidation(msg)) => {
+            DynoxideError::ValidationException(msg)
+        }
+        (_, err) => envelope_request_validation(err),
+    }
+}
+
+/// Tag a plain `ValidationException` for the request-validation envelope, for
+/// a PutItem or UpdateItem call site whose shared helper reports it plain.
+/// Every other error passes through unchanged.
+pub(crate) fn tag_for_envelope(err: DynoxideError) -> DynoxideError {
+    match err {
+        DynoxideError::ValidationException(msg) => DynoxideError::EnvelopedValidation(msg),
         other => other,
     }
 }
@@ -200,24 +534,25 @@ pub(crate) fn strip_request_validation_tag(err: DynoxideError) -> DynoxideError 
 }
 
 /// Resolve the wire-invisible `EnvelopedValidation` tag for a named operation:
-/// PutItem and UpdateItem wrap the request-validation family in the
+/// PutItem, UpdateItem and DeleteItem wrap the request-validation family in the
 /// `1 validation error detected: ` envelope, every other operation reports it
 /// bare. Either way the tag never reaches the wire. Enveloping is idempotent
 /// for untagged errors, so applying this to an already-enveloped action error
 /// is safe.
 ///
 /// Owner of the operation split for the HTTP and wasm dispatch seams, which
-/// both route through here. The same PutItem/UpdateItem membership is encoded
-/// at the action boundaries (`put_item::execute` / `update_item::execute`
-/// apply the envelope for the in-process API) and in the MCP tools' choice of
-/// resolver, so a future enveloped operation must update all three places.
+/// both route through here. The same PutItem/UpdateItem/DeleteItem membership
+/// is encoded at the action boundaries (`put_item::execute`,
+/// `update_item::execute` and `delete_item::execute` apply the envelope for the
+/// in-process API) and in the MCP tools' choice of resolver, so a future
+/// enveloped operation must update all three places.
 ///
 /// Compiled only for the dispatch seams that consume it: the HTTP server, the
 /// wasm engine API, and the unit tests.
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 pub(crate) fn resolve_request_validation_tag(operation: &str, err: DynoxideError) -> DynoxideError {
     match operation {
-        "PutItem" | "UpdateItem" => envelope_request_validation(err),
+        "PutItem" | "UpdateItem" | "DeleteItem" => envelope_request_validation(err),
         _ => strip_request_validation_tag(err),
     }
 }
@@ -335,6 +670,95 @@ pub fn validate_attribute_definitions(defs: &[AttributeDefinition]) -> Result<()
     Ok(())
 }
 
+/// Attribute names in the order DynamoDB lists them in its index definition
+/// messages: the iteration order of the Java hash table it collects them in.
+///
+/// That order is deterministic for a given set of names: each name lands in
+/// bucket `(h ^ (h >>> 16)) & (capacity - 1)` of its `String.hashCode()` `h`,
+/// buckets are walked in turn, and names sharing a bucket keep the order they
+/// were added in. `sized_to_count` picks the table: one sized to the number of
+/// names (`new HashMap<>(n)`), or a default one with sixteen buckets
+/// (`new HashSet<>()`). Either grows by doubling once it is more than three
+/// quarters full. Captured eu-west-2 and us-east-1, 2026-10-09, over 24 lists of
+/// one to sixteen names.
+pub(crate) fn java_hash_order<'a>(names: &[&'a str], sized_to_count: bool) -> Vec<&'a str> {
+    let mut seen = std::collections::HashSet::with_capacity(names.len());
+    let unique: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| seen.insert(*name))
+        .collect();
+    let initial = if sized_to_count {
+        unique.len().max(1).next_power_of_two()
+    } else {
+        16
+    };
+    let capacity = java_table_capacity(initial, unique.len());
+    let mut ordered: Vec<(usize, usize, &str)> = unique
+        .iter()
+        .enumerate()
+        .map(|(added, name)| (java_hash_bucket(name, capacity), added, *name))
+        .collect();
+    ordered.sort_unstable();
+    ordered.into_iter().map(|(_, _, name)| name).collect()
+}
+
+/// How many buckets a Java hash table that starts with `initial` (a power of
+/// two) holds once `len` names are in it: it doubles whenever it is more than
+/// three quarters full.
+pub(crate) fn java_table_capacity(initial: usize, len: usize) -> usize {
+    let mut capacity = initial;
+    while len * 4 > capacity * 3 {
+        capacity *= 2;
+    }
+    capacity
+}
+
+/// The bucket a name lands in in a Java hash table of `capacity` buckets (a
+/// power of two): `(h ^ (h >>> 16)) & (capacity - 1)` of its
+/// `String.hashCode()` `h`.
+pub(crate) fn java_hash_bucket(name: &str, capacity: usize) -> usize {
+    let h = name.encode_utf16().fold(0u32, |h, unit| {
+        h.wrapping_mul(31).wrapping_add(u32::from(unit))
+    });
+    ((h ^ (h >> 16)) as usize) & (capacity - 1)
+}
+
+/// The error for an index whose key schema names an attribute the request
+/// does not define, or `None` when every key attribute is defined.
+///
+/// The message lists the index's key attributes and the request's definitions
+/// when the request defines at least as many attributes as the index has key
+/// attributes, and is the generic one otherwise. CreateTable asks this of each
+/// index in turn and reports the first; UpdateTable asks it of a new index.
+/// Captured eu-west-2 and us-east-1, 2026-10-09.
+pub(crate) fn undefined_index_key_error(
+    key_schema: &[KeySchemaElement],
+    definitions: &[AttributeDefinition],
+) -> Option<String> {
+    let defined: Vec<&str> = definitions
+        .iter()
+        .map(|d| d.attribute_name.as_str())
+        .collect();
+    let keys: Vec<&str> = key_schema
+        .iter()
+        .map(|k| k.attribute_name.as_str())
+        .collect();
+    if keys.iter().all(|k| defined.contains(k)) {
+        return None;
+    }
+    let key_count = java_hash_order(&keys, true).len();
+    if defined.len() < key_count {
+        return Some("Invalid KeySchema: Some index key attribute have no definition".to_string());
+    }
+    Some(format!(
+        "One or more parameter values were invalid: Some index key attributes are not defined \
+         in AttributeDefinitions. Keys: [{}], AttributeDefinitions: [{}]",
+        java_hash_order(&keys, true).join(", "),
+        java_hash_order(&defined, true).join(", ")
+    ))
+}
+
 /// Validate that all key schema attributes are defined in attribute definitions.
 pub fn validate_key_attributes_in_definitions(
     key_schema: &[KeySchemaElement],
@@ -358,6 +782,64 @@ pub fn validate_key_attributes_in_definitions(
         }
     }
 
+    Ok(())
+}
+
+/// The shape rules for a global secondary index key, which can have up to four
+/// partition key (HASH) and four sort key (RANGE) attributes, HASH first, each
+/// named once. CreateTable and UpdateTable answer alike. Captured eu-west-2,
+/// 2026-10-09. An empty schema gets the length refusal both callers gave it.
+pub fn check_gsi_key_schema(key_schema: &[KeySchemaElement]) -> std::result::Result<(), String> {
+    const MAX_PER_KIND: usize = 4;
+    let Some(first) = key_schema.first() else {
+        return Err(
+            "1 validation error detected: Value null at 'keySchema' failed to satisfy \
+                    constraint: Member must have length less than or equal to 2"
+                .to_string(),
+        );
+    };
+    if first.key_type != KeyType::HASH {
+        return Err(
+            "Invalid KeySchema: The first KeySchemaElement is not a HASH key type".to_string(),
+        );
+    }
+    if let [hash, range] = key_schema
+        && range.key_type == KeyType::RANGE
+        && hash.attribute_name == range.attribute_name
+    {
+        return Err(
+            "Both the Hash Key and the Range Key element in the KeySchema have the same name"
+                .to_string(),
+        );
+    }
+    for (i, element) in key_schema.iter().enumerate() {
+        if key_schema[..i]
+            .iter()
+            .any(|earlier| earlier.attribute_name == element.attribute_name)
+        {
+            return Err(
+                "The KeySchema contains multiple key attributes with the same name".to_string(),
+            );
+        }
+    }
+    if key_schema
+        .windows(2)
+        .any(|w| w[0].key_type == KeyType::RANGE && w[1].key_type == KeyType::HASH)
+    {
+        return Err(
+            "One or more parameter values were invalid: All HASH key attributes must precede \
+             RANGE key attributes in the KeySchema"
+                .to_string(),
+        );
+    }
+    for (key_type, name) in [(KeyType::HASH, "HASH"), (KeyType::RANGE, "RANGE")] {
+        if key_schema.iter().filter(|k| k.key_type == key_type).count() > MAX_PER_KIND {
+            return Err(format!(
+                "One or more parameter values were invalid: The KeySchema exceeds the maximum \
+                 allowed number of {name} key attributes"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -393,13 +875,15 @@ pub fn validate_gsi(
     }
 
     // Validate key schema
-    validate_key_schema(&gsi.key_schema)?;
+    check_gsi_key_schema(&gsi.key_schema).map_err(DynoxideError::ValidationException)?;
 
     // Validate projection
     validate_projection(&gsi.projection, &gsi.index_name)?;
 
     // Validate GSI key attributes exist in definitions
-    validate_key_attributes_in_definitions(&gsi.key_schema, request_definitions)?;
+    if let Some(message) = undefined_index_key_error(&gsi.key_schema, request_definitions) {
+        return Err(DynoxideError::ValidationException(message));
+    }
 
     Ok(())
 }
@@ -602,7 +1086,28 @@ const MAX_NESTING_DEPTH: usize = 32;
 
 /// Real DynamoDB's verbatim message when document nesting exceeds the limit. Shared
 /// by the stored-item and ExpressionAttributeValue checks so both match AWS.
-const NESTING_LIMIT_MESSAGE: &str = "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit";
+pub(crate) const NESTING_LIMIT_MESSAGE: &str = "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit";
+
+/// The short form of the nesting message, without the clause about the item's
+/// attributes. UpdateItem sends it, bare, when the item an update would leave
+/// behind is nested too deep, and a transaction's Update gives it as the
+/// cancellation reason. Captured us-east-1 and eu-west-2, 2026-10-09.
+pub(crate) const UPDATED_ITEM_NESTING_MESSAGE: &str =
+    "Nesting Levels have exceeded supported limits";
+
+/// Refuse an updated item nested deeper than DynamoDB allows, with the short
+/// message an update gets.
+pub(crate) fn validate_updated_item_nesting(item: &Item) -> Result<()> {
+    if item
+        .values()
+        .any(|value| validate_nesting_depth(value).is_err())
+    {
+        return Err(DynoxideError::ValidationException(
+            UPDATED_ITEM_NESTING_MESSAGE.to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Validate all attribute values in an item.
 ///
@@ -620,29 +1125,121 @@ const NESTING_LIMIT_MESSAGE: &str = "Nesting Levels have exceeded supported limi
 /// **Important:** This must only be called on items being persisted, NOT on
 /// `ExpressionAttributeValues` (which may legitimately contain empty strings for comparisons).
 pub fn validate_item_attribute_values(item: &Item) -> crate::Result<()> {
-    validate_item_attribute_values_classified(item).map_err(Into::into)
+    validate_item_attribute_values_classified(item, ValueLayer::Older).map_err(Into::into)
 }
 
-/// Classified form of [`validate_item_attribute_values`]: the set families
-/// (empty and duplicate SS/NS/BS) are marked as enveloped so PutItem and
-/// UpdateItem can wrap them in the request-validation envelope; number and
-/// nesting errors stay bare. Every other caller uses the public wrapper,
-/// which converts back to the plain error unchanged.
+/// Classified form of [`validate_item_attribute_values`], read by `layer`'s
+/// rules: the set families (empty and duplicate SS/NS/BS) are marked as
+/// enveloped so PutItem and UpdateItem can wrap them in the request-validation
+/// envelope, and so are the current layer's number errors; the older layer's
+/// numbers and the second nesting check stay bare. Every other caller converts
+/// back to the plain error unchanged.
 pub(crate) fn validate_item_attribute_values_classified(
     item: &Item,
+    layer: ValueLayer,
 ) -> std::result::Result<(), ClassifiedValidationError> {
     for value in item.values() {
-        validate_attribute_value(value, 0)?;
+        validate_attribute_value(value, 0, layer).map_err(|e| match e {
+            // From 63 levels a second check answers first, with the same
+            // message outside the envelope.
+            ClassifiedValidationError::Enveloped(msg)
+                if msg == NESTING_LIMIT_MESSAGE && nesting_depth(value) > SECOND_NESTING_LIMIT =>
+            {
+                ClassifiedValidationError::bare(msg)
+            }
+            other => other,
+        })?;
     }
     Ok(())
+}
+
+/// [`validate_item_attribute_values_classified`] for one value outside an
+/// item, such as a legacy `Expected` condition's.
+pub(crate) fn validate_value_classified(
+    value: &AttributeValue,
+    layer: ValueLayer,
+) -> std::result::Result<(), ClassifiedValidationError> {
+    validate_attribute_value(value, 0, layer)
+}
+
+/// The first empty set, or set with a repeated member, anywhere in `value`,
+/// lists and maps included, worded by `layer`; `None` when every set is sound.
+pub(crate) fn find_set_error(value: &AttributeValue, layer: ValueLayer) -> Option<String> {
+    const INVALID: &str = "One or more parameter values were invalid: ";
+    match value {
+        AttributeValue::SS(set) if set.is_empty() => {
+            Some(format!("{INVALID}An string set  may not be empty"))
+        }
+        AttributeValue::NS(set) if set.is_empty() => {
+            Some(format!("{INVALID}An number set  may not be empty"))
+        }
+        AttributeValue::BS(set) if set.is_empty() => {
+            Some(format!("{INVALID}Binary sets should not be empty"))
+        }
+        AttributeValue::L(list) => list.iter().find_map(|v| find_set_error(v, layer)),
+        AttributeValue::M(map) => map.values().find_map(|v| find_set_error(v, layer)),
+        _ => duplicate_set_message(value, layer),
+    }
+}
+
+/// The first set with a repeated member anywhere in `value`, lists and maps
+/// included, worded by `layer`; `None` when there is none.
+pub(crate) fn find_duplicate_set(value: &AttributeValue, layer: ValueLayer) -> Option<String> {
+    match value {
+        AttributeValue::L(list) => list.iter().find_map(|v| find_duplicate_set(v, layer)),
+        AttributeValue::M(map) => map.values().find_map(|v| find_duplicate_set(v, layer)),
+        _ => duplicate_set_message(value, layer),
+    }
+}
+
+/// The depth past which a single-item request's nesting is refused by a
+/// second check, in a different form: a stored item's message loses the
+/// envelope, and an ExpressionAttributeValues entry is refused naming its key.
+/// Values at 62 levels get the first check's answer and values at 63 the
+/// second's. Captured us-east-1 and eu-west-2, 2026-10-09.
+pub(crate) const SECOND_NESTING_LIMIT: usize = 62;
+
+/// How many lists and maps deep a value goes: a scalar is 0, a map holding a
+/// scalar is 1.
+pub(crate) fn nesting_depth(value: &AttributeValue) -> usize {
+    match value {
+        AttributeValue::L(list) => 1 + list.iter().map(nesting_depth).max().unwrap_or(0),
+        AttributeValue::M(map) => 1 + map.values().map(nesting_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Check one PartiQL statement parameter as an item's values are checked
+/// (unreadable numbers, empty and duplicated sets), leaving its depth to the
+/// statement it fills in.
+pub(crate) fn validate_parameter_value(value: &AttributeValue) -> crate::Result<()> {
+    validate_attribute_value_within(value, 0, None, ValueLayer::Older).map_err(Into::into)
 }
 
 fn validate_attribute_value(
     value: &AttributeValue,
     depth: usize,
+    layer: ValueLayer,
 ) -> std::result::Result<(), ClassifiedValidationError> {
-    if depth >= MAX_NESTING_DEPTH {
-        return Err(ClassifiedValidationError::bare(NESTING_LIMIT_MESSAGE));
+    validate_attribute_value_within(value, depth, Some(MAX_NESTING_DEPTH), layer)
+}
+
+fn validate_attribute_value_within(
+    value: &AttributeValue,
+    depth: usize,
+    nesting_limit: Option<usize>,
+    layer: ValueLayer,
+) -> std::result::Result<(), ClassifiedValidationError> {
+    let number = |n: &str| {
+        layer
+            .check_number(n)
+            .map_err(|e| layer.classify_number_error(e))
+    };
+    // PutItem wraps the nesting rejection in the envelope (us-east-1 and
+    // eu-west-2, 2026-10-09); BatchWriteItem and a transaction's Put send it
+    // bare, which the untagged callers keep.
+    if nesting_limit.is_some_and(|limit| depth >= limit) {
+        return Err(ClassifiedValidationError::enveloped(NESTING_LIMIT_MESSAGE));
     }
     match value {
         AttributeValue::SS(set) if set.is_empty() => Err(ClassifiedValidationError::enveloped(
@@ -654,65 +1251,34 @@ fn validate_attribute_value(
         AttributeValue::BS(set) if set.is_empty() => Err(ClassifiedValidationError::enveloped(
             "One or more parameter values were invalid: Binary sets should not be empty",
         )),
-        AttributeValue::SS(set) if !set.is_empty() => {
-            let mut seen = std::collections::HashSet::new();
-            for s in set {
-                if !seen.insert(s.clone()) {
-                    let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                    return Err(ClassifiedValidationError::enveloped(format!(
-                        "One or more parameter values were invalid: Input collection [{}] contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
+        AttributeValue::SS(_) | AttributeValue::BS(_) => {
+            match duplicate_set_message(value, layer) {
+                Some(message) => Err(ClassifiedValidationError::enveloped(message)),
+                None => Ok(()),
             }
-            Ok(())
         }
-        AttributeValue::BS(set) if !set.is_empty() => {
-            let mut seen = std::collections::HashSet::new();
-            for b in set {
-                if !seen.insert(b.clone()) {
-                    use base64::Engine;
-                    let display: Vec<String> = set
-                        .iter()
-                        .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
-                        .collect();
-                    return Err(ClassifiedValidationError::enveloped(format!(
-                        "One or more parameter values were invalid: Input collection [{}]of type BS contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
-            }
-            Ok(())
-        }
-        AttributeValue::NS(set) if !set.is_empty() => {
+        AttributeValue::NS(set) => {
             for n in set {
-                crate::types::validate_dynamo_number(n)?;
+                number(n)?;
             }
-            // Check for numeric duplicates
-            let mut seen = std::collections::HashSet::new();
-            for n in set {
-                let normalized = crate::types::normalize_dynamo_number(n);
-                if !seen.insert(normalized) {
-                    return Err(ClassifiedValidationError::enveloped(
-                        "Input collection contains duplicates",
-                    ));
-                }
+            match duplicate_set_message(value, layer) {
+                Some(message) => Err(ClassifiedValidationError::enveloped(message)),
+                None => Ok(()),
             }
-            Ok(())
         }
         AttributeValue::N(n) => {
-            crate::types::validate_dynamo_number(n)?;
+            number(n)?;
             Ok(())
         }
         AttributeValue::L(list) => {
             for v in list {
-                validate_attribute_value(v, depth + 1)?;
+                validate_attribute_value_within(v, depth + 1, nesting_limit, layer)?;
             }
             Ok(())
         }
         AttributeValue::M(map) => {
             for v in map.values() {
-                validate_attribute_value(v, depth + 1)?;
+                validate_attribute_value_within(v, depth + 1, nesting_limit, layer)?;
             }
             Ok(())
         }
@@ -758,92 +1324,211 @@ fn check_nesting_depth(value: &AttributeValue, depth: usize) -> Result<()> {
 ///
 /// These errors are returned with "One or more parameter values were invalid: " prefix.
 pub fn validate_key_attribute_values(key: &Item) -> Result<()> {
+    validate_key_values(key, ValueLayer::Older).map_err(Into::into)
+}
+
+/// Check a key's values by `layer`'s rules. A duplicated set member, and on
+/// the current layer a number it can't store, are marked enveloped so
+/// UpdateItem and DeleteItem can wrap them in the request-validation envelope;
+/// the empty-set families stay bare.
+pub(crate) fn validate_key_values(
+    key: &Item,
+    layer: ValueLayer,
+) -> std::result::Result<(), ClassifiedValidationError> {
     for value in key.values() {
-        validate_key_attr_value(value)?;
+        validate_key_attr_value(value, layer)?;
     }
     Ok(())
 }
 
-fn validate_key_attr_value(value: &AttributeValue) -> Result<()> {
+fn validate_key_attr_value(
+    value: &AttributeValue,
+    layer: ValueLayer,
+) -> std::result::Result<(), ClassifiedValidationError> {
     match value {
         AttributeValue::SS(set) if set.is_empty() => {
-            return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: An string set  may not be empty"
-                    .to_string(),
+            return Err(ClassifiedValidationError::bare(
+                "One or more parameter values were invalid: An string set  may not be empty",
             ));
         }
         AttributeValue::NS(set) if set.is_empty() => {
-            return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: An number set  may not be empty"
-                    .to_string(),
+            return Err(ClassifiedValidationError::bare(
+                "One or more parameter values were invalid: An number set  may not be empty",
             ));
         }
         AttributeValue::BS(set) if set.is_empty() => {
-            return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: Binary sets should not be empty"
-                    .to_string(),
+            return Err(ClassifiedValidationError::bare(
+                "One or more parameter values were invalid: Binary sets should not be empty",
             ));
         }
-        AttributeValue::SS(set) => {
-            // Check for duplicates
-            let mut seen = std::collections::HashSet::new();
-            for s in set {
-                if !seen.insert(s.clone()) {
-                    let display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-                    return Err(DynoxideError::ValidationException(format!(
-                        "One or more parameter values were invalid: \
-                         Input collection [{}] contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
+        AttributeValue::SS(_) | AttributeValue::BS(_) => {
+            if let Some(message) = duplicate_set_message(value, layer) {
+                return Err(ClassifiedValidationError::enveloped(message));
             }
         }
-        AttributeValue::NS(set) if !set.is_empty() => {
-            // Validate numbers and check for duplicates
+        AttributeValue::NS(set) => {
             for n in set {
-                crate::types::validate_dynamo_number(n)?;
+                layer
+                    .check_number(n)
+                    .map_err(|e| layer.classify_number_error(e))?;
             }
-            let mut seen = std::collections::HashSet::new();
-            for n in set {
-                let normalized = crate::types::normalize_dynamo_number(n);
-                if !seen.insert(normalized) {
-                    return Err(DynoxideError::ValidationException(
-                        "Input collection contains duplicates".to_string(),
-                    ));
-                }
-            }
-        }
-        AttributeValue::BS(set) => {
-            // Check for duplicates
-            let mut seen = std::collections::HashSet::new();
-            for b in set {
-                if !seen.insert(b.clone()) {
-                    use base64::Engine;
-                    let display: Vec<String> = set
-                        .iter()
-                        .map(|s| base64::engine::general_purpose::STANDARD.encode(s))
-                        .collect();
-                    return Err(DynoxideError::ValidationException(format!(
-                        "One or more parameter values were invalid: \
-                         Input collection [{}]of type BS contains duplicates.",
-                        display.join(", ")
-                    )));
-                }
+            if let Some(message) = duplicate_set_message(value, layer) {
+                return Err(ClassifiedValidationError::enveloped(message));
             }
         }
         AttributeValue::N(n) => {
-            crate::types::validate_dynamo_number(n)?;
+            layer
+                .check_number(n)
+                .map_err(|e| layer.classify_number_error(e))?;
         }
         _ => {}
     }
     Ok(())
 }
 
-/// Normalize sets within an item by deduplicating them in-place.
+/// Which of DynamoDB's two attribute-value validation layers an operation
+/// runs. They word a number they can't read, and a set with a repeated member,
+/// differently. Captured in eu-west-2, us-east-1, eu-west-1 and us-west-2,
+/// 2026-10-09; where the regions split (transactions and Scan, which eu-west-2
+/// already runs on the current layer), the majority's layer is used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ValueLayer {
+    /// PutItem, UpdateItem and DeleteItem (inside the envelope), and GetItem,
+    /// BatchGetItem and Query (bare). Numbers by the stored-number rule, an
+    /// empty one ending `: `; duplicates quoted, in the order described at
+    /// [`duplicate_set_message`]; expression values with no
+    /// `ExpressionAttributeValues contains invalid value` wrapper.
+    Current,
+    /// BatchWriteItem, TransactWriteItems, TransactGetItems, Scan and the
+    /// PartiQL operations. Numbers as Java's `BigDecimal` reads them, an empty
+    /// one with no colon; duplicates unquoted, as sent; expression values
+    /// inside the wrapper.
+    Older,
+}
+
+impl ValueLayer {
+    /// The layer DynamoDB runs `operation` on, for the dispatch seams that
+    /// read a request knowing only the operation's name.
+    #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+    pub(crate) fn for_operation(operation: &str) -> Self {
+        match operation {
+            "BatchWriteItem"
+            | "TransactWriteItems"
+            | "TransactGetItems"
+            | "Scan"
+            | "ExecuteStatement"
+            | "BatchExecuteStatement"
+            | "ExecuteTransaction" => Self::Older,
+            _ => Self::Current,
+        }
+    }
+
+    /// Check a number by this layer's rule.
+    pub(crate) fn check_number(self, n: &str) -> Result<()> {
+        match self {
+            Self::Current => crate::types::validate_current_number(n),
+            Self::Older => crate::types::validate_parameter_number(n),
+        }
+    }
+
+    /// Classify a number this layer refuses: the current layer's go in the
+    /// envelope on the single-item writes, the older layer's stay bare.
+    pub(crate) fn classify_number_error(self, e: DynoxideError) -> ClassifiedValidationError {
+        match (self, e) {
+            (Self::Current, DynoxideError::ValidationException(m)) => {
+                ClassifiedValidationError::enveloped(m)
+            }
+            (_, e) => ClassifiedValidationError::Bare(e),
+        }
+    }
+}
+
+/// The message DynamoDB refuses a string, number or binary set with a repeated
+/// member in, by `layer`'s wording, or `None` when every member is distinct.
 ///
-/// - SS: deduplicates by string value
-/// - NS: deduplicates by numeric value (e.g., "1.0" and "1" are the same)
-/// - BS: deduplicates by byte content
+/// The current layer quotes the members and lists them in an odd order: they
+/// are read into a byte-ordered set until the first repeat, and the message
+/// prints that set, the repeated member, then the members not yet read, as
+/// sent. `["b", "a", "b", "C"]` reads `["a", "b", "b", "C"]`. Binary members
+/// are base64, joined with no space. A number set names no members. The older
+/// layer prints every member as sent, unquoted, and words a number set
+/// without the prefix or the full stop. Captured in eu-west-2, us-east-1,
+/// eu-west-1 and us-west-2, 2026-10-09.
+pub(crate) fn duplicate_set_message(value: &AttributeValue, layer: ValueLayer) -> Option<String> {
+    const INVALID: &str = "One or more parameter values were invalid: ";
+    /// The current layer's order: the sorted members read before the first
+    /// repeat, the repeat, then the rest as sent. `None` without a repeat.
+    fn current_order<T: Ord + Clone>(members: &[T]) -> Option<Vec<T>> {
+        let mut read = std::collections::BTreeSet::new();
+        for (i, member) in members.iter().enumerate() {
+            if !read.insert(member.clone()) {
+                let mut out: Vec<T> = read.into_iter().collect();
+                out.push(member.clone());
+                out.extend(members[i + 1..].iter().cloned());
+                return Some(out);
+            }
+        }
+        None
+    }
+    fn has_repeat<T: std::hash::Hash + Eq>(members: impl IntoIterator<Item = T>) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        members.into_iter().any(|m| !seen.insert(m))
+    }
+    use base64::Engine;
+    let b64 = |b: &Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
+    match (value, layer) {
+        (AttributeValue::SS(set), ValueLayer::Current) => current_order(set).map(|ordered| {
+            let quoted: Vec<String> = ordered
+                .iter()
+                .map(|s| serde_json::to_string(s).unwrap_or_default())
+                .collect();
+            format!(
+                "{INVALID}Input collection [{}] contains duplicates.",
+                quoted.join(", ")
+            )
+        }),
+        (AttributeValue::SS(set), ValueLayer::Older) => has_repeat(set.iter()).then(|| {
+            format!(
+                "{INVALID}Input collection [{}] contains duplicates.",
+                set.join(", ")
+            )
+        }),
+        (AttributeValue::BS(set), ValueLayer::Current) => current_order(set).map(|ordered| {
+            let quoted: Vec<String> = ordered.iter().map(|b| format!("\"{}\"", b64(b))).collect();
+            format!(
+                "{INVALID}Input collection [{}]of type BS contains duplicates.",
+                quoted.join(",")
+            )
+        }),
+        (AttributeValue::BS(set), ValueLayer::Older) => has_repeat(set.iter()).then(|| {
+            let shown: Vec<String> = set.iter().map(b64).collect();
+            format!(
+                "{INVALID}Input collection [{}]of type BS contains duplicates.",
+                shown.join(", ")
+            )
+        }),
+        (AttributeValue::NS(set), _) => {
+            has_repeat(set.iter().map(|n| crate::types::normalize_dynamo_number(n))).then(|| {
+                match layer {
+                    ValueLayer::Current => {
+                        format!("{INVALID}Input collection contains duplicates.")
+                    }
+                    ValueLayer::Older => "Input collection contains duplicates".to_string(),
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Normalize sets within an item by deduplicating and sorting them in-place.
+///
+/// - SS: deduplicates by string value, then sorts by bytes
+/// - NS: deduplicates by numeric value (e.g., "1.0" and "1" are the same),
+///   then sorts by value
+/// - BS: deduplicates by byte content, then sorts by bytes
+///
+/// The sorted order is the one DynamoDB stores and returns sets in.
 ///
 /// Recursively normalizes sets inside L (list) and M (map) values.
 pub fn normalize_item_sets(item: &mut Item) {
@@ -860,6 +1545,7 @@ fn normalize_attribute_sets(value: &mut AttributeValue) {
         AttributeValue::SS(set) => {
             let mut seen = std::collections::HashSet::new();
             set.retain(|s| seen.insert(s.clone()));
+            crate::set_order::sort_string_set(set);
         }
         AttributeValue::NS(set) => {
             let mut seen = std::collections::HashSet::new();
@@ -868,10 +1554,12 @@ fn normalize_attribute_sets(value: &mut AttributeValue) {
             for n in set.iter_mut() {
                 *n = crate::types::normalize_dynamo_number(n);
             }
+            crate::set_order::sort_number_set(set);
         }
         AttributeValue::BS(set) => {
             let mut seen = std::collections::HashSet::new();
             set.retain(|b| seen.insert(b.clone()));
+            crate::set_order::sort_binary_set(set);
         }
         AttributeValue::L(list) => {
             for v in list.iter_mut() {
@@ -986,6 +1674,44 @@ pub fn sort_key_name(key_schema: &[KeySchemaElement]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty GSI key schema is refused by the shape check itself, in the
+    /// words both callers used to give before calling it, rather than relying
+    /// on each caller to guard the first element.
+    #[test]
+    fn an_empty_gsi_key_schema_is_refused_by_the_shape_check() {
+        assert_eq!(
+            check_gsi_key_schema(&[]),
+            Err(
+                "1 validation error detected: Value null at 'keySchema' failed to satisfy \
+                 constraint: Member must have length less than or equal to 2"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn java_hash_order_matches_the_captured_lists() {
+        // Definitions as requested, in DynamoDB's message order, eu-west-2 and
+        // us-east-1, 2026-10-09: a table sized to the count, then a default one.
+        assert_eq!(
+            java_hash_order(&["PK", "h", "a", "unused"], true),
+            ["h", "a", "unused", "PK"]
+        );
+        assert_eq!(
+            java_hash_order(&["PK", "a", "b", "c", "d", "u1"], true),
+            ["a", "b", "PK", "c", "d", "u1"]
+        );
+        assert_eq!(java_hash_order(&["h", "a", "zz"], true), ["h", "zz", "a"]);
+        assert_eq!(
+            java_hash_order(&["pk", "sk", "gpk", "gsk"], false),
+            ["gpk", "sk", "pk", "gsk"]
+        );
+        assert_eq!(
+            java_hash_order(&["orderId", "customerId", "createdAt", "status"], false),
+            ["createdAt", "orderId", "customerId", "status"]
+        );
+    }
 
     fn hash_key(name: &str) -> KeySchemaElement {
         KeySchemaElement {
@@ -1157,5 +1883,57 @@ mod tests {
             &not_found,
             DynoxideError::ResourceNotFoundException(m) if m == "msg"
         ));
+    }
+
+    #[test]
+    fn normalising_an_item_sorts_its_sets_in_place_at_every_depth() {
+        // Read the stored Vecs directly: every other set-order test reads back
+        // through Serialize, which sorts on its own and would hide a write that
+        // stopped sorting.
+        let mut item: Item = [
+            (
+                "top".to_string(),
+                AttributeValue::NS(vec!["3".into(), "-1".into(), "2".into()]),
+            ),
+            (
+                "m".to_string(),
+                AttributeValue::M(
+                    [(
+                        "ss".to_string(),
+                        AttributeValue::SS(vec!["b".into(), "a".into(), "c".into()]),
+                    )]
+                    .into(),
+                ),
+            ),
+            (
+                "l".to_string(),
+                AttributeValue::L(vec![
+                    AttributeValue::NS(vec!["10".into(), "2".into(), "1e2".into()]),
+                    AttributeValue::BS(vec![vec![2], vec![0xff], vec![1]]),
+                ]),
+            ),
+        ]
+        .into();
+        normalize_item_sets(&mut item);
+
+        assert_eq!(
+            item["top"],
+            AttributeValue::NS(vec!["-1".into(), "2".into(), "3".into()])
+        );
+        let AttributeValue::M(m) = &item["m"] else {
+            panic!("m")
+        };
+        assert_eq!(
+            m["ss"],
+            AttributeValue::SS(vec!["a".into(), "b".into(), "c".into()])
+        );
+        let AttributeValue::L(l) = &item["l"] else {
+            panic!("l")
+        };
+        assert_eq!(
+            l[0],
+            AttributeValue::NS(vec!["2".into(), "10".into(), "100".into()])
+        );
+        assert_eq!(l[1], AttributeValue::BS(vec![vec![1], vec![2], vec![0xff]]));
     }
 }

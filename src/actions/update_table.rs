@@ -881,7 +881,7 @@ pub async fn execute<S: StorageBackend>(
                         .await?;
 
                     let gsi_p = gsi::gsi_to_def(&gsi_def)?;
-                    backfill_gsi(storage, &request.table_name, &key_schema, &gsi_p).await?;
+                    gsi::backfill_gsi(storage, &request.table_name, &key_schema, &gsi_p).await?;
 
                     current_gsis.push(gsi_def);
                 }
@@ -926,6 +926,16 @@ pub async fn execute<S: StorageBackend>(
                     current_vixs.retain(|v| v.index_name != delete.index_name);
                 }
             }
+
+            // An item is billed at a size that depends on which attributes a
+            // vector index reads, so the stored sizes TableSizeBytes sums
+            // follow the index set as it now stands.
+            super::vector_index::recompute_billed_sizes(
+                storage,
+                &request.table_name,
+                &current_vixs,
+            )
+            .await?;
         }
 
         // Reconcile AttributeDefinitions to exactly the attributes still
@@ -1095,7 +1105,11 @@ pub async fn execute<S: StorageBackend>(
     // Build response from updated metadata
     let updated_meta = helpers::require_table(storage, &request.table_name).await?;
     let vector_phases = lifecycle.phases_armed_on(storage, &request.table_name);
-    let mut desc = build_table_description(&updated_meta, Some(0), Some(0), &vector_phases);
+    let (item_count, table_size_bytes) =
+        crate::actions::describe_table::item_count_and_size(storage, &request.table_name).await;
+    let mut desc =
+        build_table_description(&updated_meta, item_count, table_size_bytes, &vector_phases);
+    crate::actions::describe_table::fill_index_figures(storage, &mut desc).await;
 
     // The UpdateTable response echoes the merged ceilings with any -1 kept
     // verbatim; only DescribeTable afterwards shows the post-removal state.
@@ -1469,78 +1483,8 @@ fn parse_stored_throughput(
         .and_then(|pt_json| serde_json::from_str(pt_json).ok())
 }
 
-/// Backfill existing items into a newly created GSI, processing in batches.
-async fn backfill_gsi<S: StorageBackend>(
-    storage: &S,
-    table_name: &str,
-    key_schema: &helpers::KeySchema,
-    gsi_def: &gsi::GsiDef,
-) -> Result<()> {
-    const BATCH_SIZE: usize = 1000;
-    let mut last_pk: Option<String> = None;
-    let mut last_sk: Option<String> = None;
-
-    loop {
-        let items = storage
-            .scan_items(
-                table_name,
-                &crate::storage::ScanParams {
-                    limit: Some(BATCH_SIZE),
-                    exclusive_start_pk: last_pk.as_deref(),
-                    exclusive_start_sk: last_sk.as_deref(),
-                    ..Default::default()
-                },
-            )
-            .await?;
-
-        if items.is_empty() {
-            break;
-        }
-
-        let mut rows: Vec<crate::storage_backend::GsiItemRow> = Vec::new();
-        for (pk, sk, item_json) in &items {
-            let item: crate::types::Item = serde_json::from_str(item_json)
-                .map_err(|e| DynoxideError::InternalServerError(format!("Bad item JSON: {e}")))?;
-
-            // Backfill only the items that belong in this index (sparse).
-            if let Some((gsi_pk, gsi_sk)) = gsi_def.index_key_strings(&item) {
-                let projected = gsi::build_index_item(
-                    &item,
-                    gsi_def,
-                    &key_schema.partition_key,
-                    key_schema.sort_key.as_deref(),
-                );
-                let projected_json = serde_json::to_string(&projected)
-                    .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
-
-                rows.push(crate::storage_backend::GsiItemRow {
-                    gsi_pk,
-                    gsi_sk,
-                    table_pk: pk.clone(),
-                    table_sk: sk.clone(),
-                    item_json: projected_json,
-                });
-            }
-        }
-
-        storage
-            .insert_gsi_items(table_name, &gsi_def.index_name, &rows)
-            .await?;
-
-        let last = &items[items.len() - 1];
-        last_pk = Some(last.0.clone());
-        last_sk = Some(last.1.clone());
-
-        if items.len() < BATCH_SIZE {
-            break;
-        }
-    }
-
-    Ok(())
-}
-
 /// Backfill existing items into a newly created vector index, processing in
-/// batches like [`backfill_gsi`].
+/// batches like [`gsi::backfill_gsi`].
 ///
 /// Items holding values a live write would reject are skipped silently: the
 /// index goes active without them, while re-putting the same item once the

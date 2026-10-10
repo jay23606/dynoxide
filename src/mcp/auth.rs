@@ -9,12 +9,25 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 /// Resolved authentication mode for the HTTP transport.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum AuthMode {
     /// Enforce this bearer token on every `/mcp` request.
     Enabled(String),
     /// Auth disabled. Reachable only via the loopback-only `--no-auth` escape hatch.
     Disabled,
+}
+
+/// Prints `Enabled([REDACTED])` rather than the token, so neither this nor
+/// [`ResolvedAuth`] or [`HttpOptions`](super::HttpOptions), whose derived
+/// `Debug` goes through it, can carry the token into a log line or a panic
+/// message.
+impl std::fmt::Debug for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMode::Enabled(_) => f.write_str("Enabled([REDACTED])"),
+            AuthMode::Disabled => f.write_str("Disabled"),
+        }
+    }
 }
 
 /// Outcome of resolving the auth mode, including whether a token was just
@@ -277,6 +290,55 @@ fn generate_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SENTINEL_TOKEN: &str = "debug-must-not-show-this-token";
+
+    // A struct formatted with `{:?}` in a log line or a panic message must not
+    // carry the bearer token with it.
+    #[test]
+    fn debug_output_redacts_the_bearer_token() {
+        let mode = AuthMode::Enabled(SENTINEL_TOKEN.to_string());
+        let resolved = ResolvedAuth {
+            mode: mode.clone(),
+            first_run: true,
+            token_path: Some(PathBuf::from("/tmp/mcp-token")),
+        };
+        let options = crate::mcp::HttpOptions {
+            host: "127.0.0.1".to_string(),
+            port: 19280,
+            auth: mode.clone(),
+            extra_allowed_hosts: vec!["example.test".to_string()],
+        };
+
+        for (name, debug) in [
+            ("AuthMode", format!("{mode:?}")),
+            ("AuthMode (alternate)", format!("{mode:#?}")),
+            ("ResolvedAuth", format!("{resolved:?}")),
+            ("HttpOptions", format!("{options:?}")),
+        ] {
+            assert!(
+                !debug.contains(SENTINEL_TOKEN),
+                "{name} Debug printed the bearer token: {debug}"
+            );
+        }
+
+        // Everything else still shows.
+        assert_eq!(format!("{mode:?}"), "Enabled([REDACTED])");
+        assert_eq!(format!("{:?}", AuthMode::Disabled), "Disabled");
+        let resolved_debug = format!("{resolved:?}");
+        assert!(
+            resolved_debug.contains("first_run: true"),
+            "{resolved_debug}"
+        );
+        assert!(
+            resolved_debug.contains("/tmp/mcp-token"),
+            "{resolved_debug}"
+        );
+        let options_debug = format!("{options:?}");
+        assert!(options_debug.contains("127.0.0.1"), "{options_debug}");
+        assert!(options_debug.contains("19280"), "{options_debug}");
+        assert!(options_debug.contains("example.test"), "{options_debug}");
+    }
 
     fn temp_token_path() -> PathBuf {
         let dir =

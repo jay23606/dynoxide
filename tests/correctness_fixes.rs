@@ -669,10 +669,12 @@ fn test_c10_execute_transaction_insert_duplicate_rolls_back() {
             ParameterizedStatement {
                 statement: "INSERT INTO \"Tbl\" VALUE {'pk': 'new_item'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Tbl\" VALUE {'pk': 'existing'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         ..Default::default()

@@ -87,6 +87,24 @@ fn test_underflow_rejected() {
 }
 
 #[test]
+fn test_exponent_too_large_for_i32_is_range_checked() {
+    // These were read with an exponent of 0 and stored as 1. Real DynamoDB
+    // refuses each one (captured eu-west-2, 2026-10-08).
+    let db = make_db();
+    for (input, expected) in [
+        ("1e99999999999", "magnitude larger than supported range"),
+        ("1e-99999999999", "magnitude smaller than supported range"),
+        ("0e99999999999", "magnitude larger than supported range"),
+    ] {
+        let err = put_number(&db, input).expect_err(&format!("{input} should be rejected"));
+        assert!(
+            err.contains(expected),
+            "unexpected error for {input}: {err}"
+        );
+    }
+}
+
+#[test]
 fn test_min_positive_accepted() {
     let db = make_db();
     put_number(&db, "1E-130").unwrap();
@@ -178,14 +196,14 @@ fn test_malformed_numbers_rejected_end_to_end() {
 }
 
 #[test]
-fn test_malformed_number_message_stays_bare() {
-    // Number-format errors on PutItem are not a captured enveloped family and
-    // keep the bare message, byte for byte.
+fn test_malformed_number_message_is_enveloped() {
+    // PutItem refuses every number it can't read or store inside the
+    // request-validation envelope (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
     let db = make_db();
     let err = put_number(&db, "1.2.3").unwrap_err();
     assert_eq!(
         err,
-        "The parameter cannot be converted to a numeric value: 1.2.3"
+        "1 validation error detected: The parameter cannot be converted to a numeric value: 1.2.3"
     );
 }
 

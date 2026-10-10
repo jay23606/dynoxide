@@ -218,7 +218,9 @@ fn test_insert_single_item() {
         &db,
         "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Charlie'}",
     );
-    assert!(resp.items.is_none()); // write ops return no items
+    // A write returns an empty Items list (captured eu-west-2, us-east-1,
+    // eu-west-1 and us-west-2, 2026-10-09).
+    assert_eq!(resp.items, Some(vec![]));
 
     // Verify the item exists
     let sel = exec(&db, "SELECT * FROM \"Users\" WHERE pk = 'u1'");
@@ -426,8 +428,10 @@ fn test_delete_without_returning_still_returns_no_items() {
     create_test_table(&db, "Users");
     put_test_item(&db, "Users", "u1", "Alice");
 
+    // An empty Items list, not none (captured eu-west-2, us-east-1, eu-west-1
+    // and us-west-2, 2026-10-09).
     let resp = exec(&db, "DELETE FROM \"Users\" WHERE pk = 'u1'");
-    assert!(resp.items.is_none());
+    assert_eq!(resp.items, Some(vec![]));
 }
 
 #[test]
@@ -785,12 +789,12 @@ fn test_update_returning_modified_deep_nested_path() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Users");
 
-    // Seed profile = { inner: { leaf: 'old', sib: 'keep' } } (three levels).
+    // Seed profile = { nested: { leaf: 'old', sib: 'keep' } } (three levels).
     let mut inner = HashMap::new();
     inner.insert("leaf".to_string(), AttributeValue::S("old".to_string()));
     inner.insert("sib".to_string(), AttributeValue::S("keep".to_string()));
     let mut profile = HashMap::new();
-    profile.insert("inner".to_string(), AttributeValue::M(inner));
+    profile.insert("nested".to_string(), AttributeValue::M(inner));
     let mut item = HashMap::new();
     item.insert("pk".to_string(), AttributeValue::S("d1".to_string()));
     item.insert("profile".to_string(), AttributeValue::M(profile));
@@ -802,13 +806,15 @@ fn test_update_returning_modified_deep_nested_path() {
     .unwrap();
 
     // A three-level SET projects only the changed leaf, nested all the way down.
+    // (`inner` is a keyword DynamoDB refuses as a dot component, so the
+    // middle map is `nested`.)
     let resp = exec(
         &db,
-        "UPDATE \"Users\" SET profile.inner.leaf = 'new' WHERE pk = 'd1' RETURNING MODIFIED NEW *",
+        "UPDATE \"Users\" SET profile.nested.leaf = 'new' WHERE pk = 'd1' RETURNING MODIFIED NEW *",
     );
     let items = resp.items.expect("RETURNING should return items");
     let inner = match items[0].get("profile") {
-        Some(AttributeValue::M(p)) => match p.get("inner") {
+        Some(AttributeValue::M(p)) => match p.get("nested") {
             Some(AttributeValue::M(i)) => i,
             other => panic!("expected inner map, got {other:?}"),
         },
@@ -1730,6 +1736,7 @@ fn test_transaction_delete_returning_is_rejected() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "DELETE FROM \"Users\" WHERE pk = 't1' RETURNING ALL OLD *".to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             ..Default::default()
         })
@@ -1760,6 +1767,7 @@ fn test_transaction_update_returning_is_rejected() {
                 statement: "UPDATE \"Users\" SET data = 'new' WHERE pk = 't1' RETURNING ALL NEW *"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             ..Default::default()
         })
@@ -1796,11 +1804,13 @@ fn test_transaction_returning_reports_offending_index_and_rolls_back() {
                 ParameterizedStatement {
                     statement: "DELETE FROM \"Users\" WHERE pk = 'keep-a'".to_string(),
                     parameters: None,
+                    ..Default::default()
                 },
                 ParameterizedStatement {
                     statement: "DELETE FROM \"Users\" WHERE pk = 'keep-b' RETURNING ALL OLD *"
                         .to_string(),
                     parameters: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1908,7 +1918,7 @@ fn test_table_not_found() {
 }
 
 // -----------------------------------------------------------------------
-// EXISTS / BEGINS_WITH functions
+// attribute_exists / BEGINS_WITH functions
 // -----------------------------------------------------------------------
 
 #[test]
@@ -1936,7 +1946,9 @@ fn test_select_where_exists() {
     })
     .unwrap();
 
-    let resp = exec(&db, "SELECT * FROM \"Users\" WHERE EXISTS(email)");
+    // DynamoDB's form; `EXISTS(email)` in a WHERE clause is a function it
+    // doesn't recognise (captured eu-west-2 and us-east-1, 2026-10-09).
+    let resp = exec(&db, "SELECT * FROM \"Users\" WHERE attribute_exists(email)");
     let items = resp.items.unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(
@@ -1970,7 +1982,10 @@ fn test_select_where_not_exists() {
     })
     .unwrap();
 
-    let resp = exec(&db, "SELECT * FROM \"Users\" WHERE NOT EXISTS(email)");
+    let resp = exec(
+        &db,
+        "SELECT * FROM \"Users\" WHERE attribute_not_exists(email)",
+    );
     let items = resp.items.unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(
@@ -2031,10 +2046,10 @@ fn test_select_combined_conditions_with_exists() {
 
     put_test_item(&db, "Users", "u2", "Bob"); // no email
 
-    // Combine pk equality + EXISTS
+    // Combine pk equality + attribute_exists
     let resp = exec(
         &db,
-        "SELECT * FROM \"Users\" WHERE pk = 'u1' AND EXISTS(email)",
+        "SELECT * FROM \"Users\" WHERE pk = 'u1' AND attribute_exists(email)",
     );
     let items = resp.items.unwrap();
     assert_eq!(items.len(), 1);
@@ -2163,6 +2178,66 @@ fn test_batch_execute_unparseable_does_not_mask_the_top_level_checks() {
             .contains("Provided list of item keys contains duplicates"),
         "unexpected error: {dup}"
     );
+}
+
+/// A member whose parameter DynamoDB can't store (here an empty string set)
+/// fails on its own and takes no part in the batch's read/write
+/// classification or duplicate detection, as the captured deep and empty-name
+/// parameters don't. Inferred, not captured: no capture holds an unstorable
+/// parameter value beside a read or beside a second statement on its item.
+#[test]
+fn test_batch_member_with_an_unstorable_parameter_drops_out_of_the_batch_checks() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    let with_parameters = |statement: &str, parameters: Vec<AttributeValue>| {
+        let mut req = batch_stmt(statement.to_string());
+        req.parameters = Some(parameters);
+        req
+    };
+    let empty_set = || vec![AttributeValue::SS(vec![])];
+
+    // A write with a bad value beside a read: not refused as mixed.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("SELECT * FROM \"Users\" WHERE pk = 'a'".to_string()),
+                with_parameters(
+                    "INSERT INTO \"Users\" VALUE {'pk': 'b', 's': ?}",
+                    empty_set(),
+                ),
+            ],
+        })
+        .expect("the member with the bad value fails on its own");
+    assert_eq!(resp.responses.len(), 2);
+    assert!(resp.responses[0].error.is_none(), "the read still runs");
+    assert_eq!(
+        resp.responses[1].error.as_ref().map(|e| e.code.as_str()),
+        Some("ValidationError")
+    );
+
+    // Two updates of one item, one with a bad value: not refused as
+    // duplicates, and the other one runs.
+    db.execute_statement(ExecuteStatementRequest {
+        statement: "INSERT INTO \"Users\" VALUE {'pk': 'same'}".to_string(),
+        ..Default::default()
+    })
+    .expect("the item to update is inserted");
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                with_parameters("UPDATE \"Users\" SET s = ? WHERE pk = 'same'", empty_set()),
+                batch_stmt("UPDATE \"Users\" SET name = 'x' WHERE pk = 'same'".to_string()),
+            ],
+        })
+        .expect("the member with the bad value fails on its own");
+    assert_eq!(resp.responses.len(), 2);
+    assert_eq!(
+        resp.responses[0].error.as_ref().map(|e| e.code.as_str()),
+        Some("ValidationError")
+    );
+    assert!(resp.responses[1].error.is_none(), "the other update runs");
 }
 
 #[test]
@@ -3054,6 +3129,99 @@ fn test_select_pagination_walks_every_row_once() {
     assert_eq!(keys.len(), 7, "every row exactly once, no gaps or repeats");
 }
 
+/// Walk a SELECT one row at a time, building the parameters afresh for every
+/// page the way a client's second request decodes them afresh, and return the
+/// primary keys seen.
+fn paginate_with(
+    db: &Database,
+    statement: &str,
+    parameters: impl Fn() -> Option<Vec<AttributeValue>>,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut next_token = None;
+    let mut pages = 0;
+    loop {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: statement.to_string(),
+                parameters: parameters(),
+                limit: Some(1),
+                next_token,
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("page {} was refused: {e}", pages + 1));
+        pages += 1;
+        for item in response.items.unwrap_or_default() {
+            if let Some(AttributeValue::S(pk)) = item.get("pk") {
+                keys.push(pk.clone());
+            }
+        }
+        next_token = response.next_token;
+        if next_token.is_none() {
+            break;
+        }
+        assert!(pages < 20, "pagination did not terminate");
+    }
+    keys.sort();
+    keys
+}
+
+/// A map literal is read into a hash map whose key order is drawn afresh on
+/// every request, so a NextToken bound to the clause's printed form stopped
+/// matching its own statement on the next page. Every page here repeats the
+/// same statement, and every one must resume.
+#[test]
+fn test_select_pages_through_a_map_literal_in_the_where_clause() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..5 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+    let keys = paginate_with(
+        &db,
+        "SELECT * FROM \"Paged\" WHERE name <> {'a': 1, 'b': 2, 'c': 3, 'd': 4, \
+         'e': 5, 'f': 6, 'g': 7, 'h': 8}",
+        || None,
+    );
+    assert_eq!(keys, ["k0", "k1", "k2", "k3", "k4"]);
+}
+
+/// A map parameter never resumes a read, even sent again unchanged: the first
+/// page hands out a token and the second is refused with it (captured
+/// eu-west-2 and us-east-1, 2026-10-10; `tests/partiql_next_token.rs` has
+/// the other parameter types).
+#[test]
+fn test_select_with_a_map_parameter_does_not_resume() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..5 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+    let page = |next_token: Option<String>| {
+        let map: HashMap<String, AttributeValue> = ('a'..='h')
+            .enumerate()
+            .map(|(i, k)| (k.to_string(), AttributeValue::N(i.to_string())))
+            .collect();
+        db.execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\" WHERE name <> ?".to_string(),
+            parameters: Some(vec![AttributeValue::M(map)]),
+            limit: Some(1),
+            next_token,
+            ..Default::default()
+        })
+    };
+    let first = page(None).unwrap();
+    let token = first
+        .next_token
+        .expect("the first page still hands out a token");
+    let err = page(Some(token)).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "NextToken does not match request",
+        "got {err}"
+    );
+}
+
 #[test]
 fn test_select_without_limit_returns_everything_and_no_token() {
     let db = Database::memory().unwrap();
@@ -3709,23 +3877,66 @@ fn test_count_is_rejected_per_statement_on_batch_execute() {
 #[test]
 fn test_count_is_rejected_at_the_top_level_on_execute_transaction() {
     // ExecuteTransaction surfaces the rejection where its parse errors live,
-    // at the top level, but with the bare captured message.
+    // at the top level, with the statement's index in front (captured
+    // eu-west-2 and us-east-1, 2026-10-09).
     let db = Database::memory().unwrap();
     create_test_table(&db, "Users");
 
     let err = db
         .execute_transaction(ExecuteTransactionRequest {
-            transact_statements: vec![ParameterizedStatement {
-                statement: "SELECT COUNT(*) FROM \"Users\"".to_string(),
-                parameters: None,
-            }],
+            transact_statements: vec![
+                ParameterizedStatement {
+                    statement: "SELECT * FROM \"Users\" WHERE pk = 'a'".to_string(),
+                    parameters: None,
+                    ..Default::default()
+                },
+                ParameterizedStatement {
+                    statement: "SELECT count(pk) FROM \"Users\"".to_string(),
+                    parameters: None,
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         })
         .unwrap_err();
     assert!(
-        matches!(err, DynoxideError::ValidationException(ref m) if m == "Unexpected path component at 1:8:5"),
+        matches!(err, DynoxideError::ValidationException(ref m)
+            if m == "Validation failed in TransactStatements[1]: Unexpected path component at 1:8:5"),
         "unexpected error: {err:?}"
     );
+}
+
+#[test]
+fn test_count_star_is_rejected_with_the_statement_index_in_a_transaction() {
+    // The captured form (eu-west-2 and us-east-1, 2026-10-10): `COUNT(*)` as
+    // statement 0 and as statement 1 carries that index in front.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    let select = || ParameterizedStatement {
+        statement: "SELECT * FROM \"Users\" WHERE pk = 'a'".to_string(),
+        parameters: None,
+        ..Default::default()
+    };
+    let count = || ParameterizedStatement {
+        statement: "SELECT COUNT(*) FROM \"Users\"".to_string(),
+        parameters: None,
+        ..Default::default()
+    };
+    for (statements, index) in [(vec![count(), select()], 0), (vec![select(), count()], 1)] {
+        let err = db
+            .execute_transaction(ExecuteTransactionRequest {
+                transact_statements: statements,
+                ..Default::default()
+            })
+            .unwrap_err();
+        let expected = format!(
+            "Validation failed in TransactStatements[{index}]: Unexpected path component at 1:8:5"
+        );
+        assert!(
+            matches!(err, DynoxideError::ValidationException(ref m) if *m == expected),
+            "unexpected error for index {index}: {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -3969,6 +4180,7 @@ fn partiql_surfaces_reject_an_unknown_return_consumed_capacity() {
         transact_statements: vec![ParameterizedStatement {
             statement: sql.to_string(),
             parameters: None,
+            ..Default::default()
         }],
         return_consumed_capacity: Some("TOTALS".to_string()),
         ..Default::default()
@@ -4009,6 +4221,7 @@ fn a_replayed_transaction_still_rejects_an_unknown_return_consumed_capacity() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "SELECT * FROM \"rcc_replay\" WHERE pk='a'".to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             client_request_token: Some("rcc-replay-token".to_string()),
             return_consumed_capacity: Some(mode.to_string()),

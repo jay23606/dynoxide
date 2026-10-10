@@ -30,6 +30,12 @@ jobs:
           # performance changes could stop compiling and no job would notice.
           - name: bench-counters
             flags: "--features bench-counters --test repeated_work_counts"
+          # Unit tests compile every test-only path into the library, so the
+          # library-only build is checked here with an integration test: an
+          # unreadable legacy Expected must be refused in DynamoDB's words
+          # there too.
+          - name: library-expected
+            flags: "--no-default-features --features native-sqlite --test expected_library_build"
 
     steps:
       - uses: actions/checkout@v5
@@ -41,6 +47,30 @@ jobs:
 
       - name: Test
         run: cargo test ${{ matrix.flags }}
+
+  # serde_json keeps an object's keys in insertion order when any crate in a
+  # build turns on its preserve_order feature, and a HashMap's insertion order
+  # differs between two maps holding the same entries. The idempotency hash
+  # sorts keys itself so it doesn't depend on that. Its test can only fail with
+  # the feature on, so it runs here with it.
+  map-key-order:
+    name: Map key order (serde_json preserve_order)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # libtest exits 0 when its filters match nothing, so a renamed test would
+      # turn this job into a silent no-op; the count check catches that.
+      - name: The idempotency hash ignores map key order
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --lib --features serde_json/preserve_order -- \
+            a_request_hash_ignores_map_key_order \
+            | tee map-key-order.log
+          grep -q 'test result: ok. 1 passed' map-key-order.log
 
   # The listener bind path is platform-specific (SO_REUSEADDR on Unix,
   # SO_EXCLUSIVEADDRUSE on Windows), so the unit tests need a Windows run;
@@ -171,8 +201,10 @@ jobs:
       - name: Check the version check can still fail
         run: scripts/check-versions.test.sh
 
-      # The release workflows share four small scripts (version shape, crate
-      # probe, binary probe, npm dist-tag) that only otherwise run at tag time.
+      # The release workflows share seven small scripts (version shape,
+      # prerelease rule, npm dist-tag, crate probe, crate publish decision,
+      # binary probe, mcp-publisher install) that only otherwise run at tag
+      # time.
       # Exercised here so a change to one fails on a PR rather than mid-release.
       - name: Check the release helper scripts can still fail
         run: scripts/release-helpers.test.sh
@@ -195,6 +227,41 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --lib
 
+  benchmarks-lint:
+    name: Benchmarks lint
+    runs-on: ubuntu-latest
+
+    # benchmarks/ is its own cargo package rather than a workspace member, so
+    # the lint job above never reaches it, and the benchmark workflow only
+    # runs `cargo bench` on two of its targets. Formatting, clippy and the
+    # remaining benches and binaries could break with nothing noticing.
+    # Clippy over every target also type-checks every target, so it doubles
+    # as the compile check. No --locked: benchmarks/Cargo.lock is not kept in
+    # step with the root crate's version.
+    defaults:
+      run:
+        working-directory: benchmarks
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benchmarks
+
+      - name: Format
+        run: cargo fmt --check
+
+      # Both configurations: iai_core compiles a different main without the
+      # feature, and that fallback is what `cargo bench` builds by default.
+      - name: Clippy (every target, default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (every target, iai-callgrind)
+        run: cargo clippy --all-targets --features iai-callgrind -- -D warnings
+
   benchmark-scripts:
     name: Benchmark script tests
     runs-on: ubuntu-latest
@@ -207,6 +274,24 @@ jobs:
       # into a red check with no explanation.
       - name: Test
         run: python3 -m unittest discover -s benchmarks/scripts -p 'test_*.py' -v
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+
+    # crates.io builds the crate from the files `cargo package` ships, not
+    # from the checkout. A build that leans on a file the package leaves out
+    # (anything gitignored, or outside the crate) passes every other job here
+    # and then fails at `cargo publish`, in the release, after the tag and the
+    # GitHub Release already exist. This builds exactly what would be
+    # uploaded, and needs no registry token.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the packaged crate
+        run: cargo package --locked
 
   cargo-deny:
     name: cargo-deny
@@ -227,19 +312,54 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Both features must fail
+      # Each case asserts its guard's own message, not just a failed build. A
+      # build can fail for reasons that have nothing to do with the guard (the
+      # no-backend cases still fail on type errors with their guard removed),
+      # and an exit-status check would pass on those. The cases name their
+      # features with --no-default-features so the defaults cannot satisfy a
+      # guard on the probe's behalf. The off-Apple guard is reachable because
+      # this job runs on Linux.
+      - name: Backend guards must fail on their own message
         run: |
-          if cargo check --features "native-sqlite,encryption" 2>&1; then
-            echo "ERROR: both features should cause compile_error!"
-            exit 1
-          fi
-
-      - name: Neither feature must fail
-        run: |
-          if cargo check --no-default-features --features http-server 2>&1; then
-            echo "ERROR: no SQLite backend should cause compile_error!"
-            exit 1
-          fi
+          must_fail_on() {
+            desc="$1"
+            message="$2"
+            shift 2
+            if out=$(cargo check --lib "$@" 2>&1); then
+              echo "ERROR: $desc should cause compile_error!"
+              exit 1
+            fi
+            if ! grep -qF -- "$message" <<<"$out"; then
+              echo "ERROR: $desc failed, but not on its guard:"
+              echo "$out"
+              exit 1
+            fi
+            echo "OK: $desc"
+          }
+          # The backticks are part of the guard message, not an expansion.
+          # shellcheck disable=SC2016
+          must_fail_on "native-sqlite with encryption" \
+            'Features `native-sqlite` and `encryption`' \
+            --no-default-features --features native-sqlite,encryption
+          # The backticks are part of the guard message, not an expansion.
+          # shellcheck disable=SC2016
+          must_fail_on "native-sqlite with encryption-cc" \
+            'Features `native-sqlite` and `encryption`' \
+            --no-default-features --features native-sqlite,encryption-cc
+          must_fail_on "no storage backend at all" \
+            'A storage backend feature must be enabled' \
+            --no-default-features
+          must_fail_on "no storage backend, with a server feature" \
+            'A storage backend feature must be enabled' \
+            --no-default-features --features http-server
+          # The backticks are part of the guard message, not an expansion.
+          # shellcheck disable=SC2016
+          must_fail_on "encryption with encryption-cc" \
+            'Features `encryption` and `encryption-cc` are mutually exclusive' \
+            --no-default-features --features encryption,encryption-cc
+          must_fail_on "encryption-cc off Apple platforms" \
+            'intended for Apple platforms only' \
+            --no-default-features --features encryption-cc
 
       # A non-zero exit is not enough on its own: every combination below
       # already failed to compile before the guard existed, on unrelated type
@@ -288,6 +408,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo check (wasm32, wasm-sqlite)
@@ -297,6 +418,16 @@ jobs:
       # catches trait or re-export drift the wasm-sqlite check alone misses.
       - name: cargo check (wasm32, wasm-harness)
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm-harness --lib
+
+      # The lint job runs clippy on the native build only, so warnings in code
+      # that only the wasm build compiles (or code that only it leaves unused)
+      # accumulated unseen. Both features, so the harness's extra surface is
+      # covered too.
+      - name: Clippy (wasm32, wasm-sqlite)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features wasm-sqlite --lib -- -D warnings
+
+      - name: Clippy (wasm32, wasm-harness)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features wasm-harness --lib -- -D warnings
 
   engine-client:
     name: Engine client tests

@@ -12,7 +12,13 @@ pub struct CancellationReason {
     pub code: String,
     #[serde(rename = "Message", skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Item",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::item_in_hash_order"
+    )]
+    // Number sets in Java hash-set order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub item: Option<HashMap<String, crate::types::AttributeValue>>,
 }
 
@@ -60,6 +66,17 @@ pub enum DynoxideError {
         String,
         Option<HashMap<String, crate::types::AttributeValue>>,
     ),
+
+    /// `ExecuteStatement`'s `ConditionalCheckFailedException` carrying the item
+    /// `ReturnValuesOnConditionCheckFailure` asked for. DynamoDB writes this one
+    /// with a capitalised `Message` and the item's number sets in hash order,
+    /// as it writes the PartiQL operations' other items, where `PutItem`,
+    /// `UpdateItem` and `DeleteItem` write `message` and numeric order
+    /// (captured eu-west-2 and us-east-1, 2026-10-10). Only the HTTP and wasm
+    /// dispatch seams build it, from a `ConditionalCheckFailedException`; the
+    /// in-process API returns that variant, item included.
+    #[error("{0}")]
+    StatementConditionalCheckFailed(String, HashMap<String, crate::types::AttributeValue>),
 
     /// One or more transaction conditions failed.
     /// Carries the message and per-item cancellation reasons.
@@ -180,7 +197,8 @@ impl DynoxideError {
             | DynoxideError::EnvelopedValidation(_) => {
                 "com.amazon.coral.validate#ValidationException"
             }
-            DynoxideError::ConditionalCheckFailedException(..) => {
+            DynoxideError::ConditionalCheckFailedException(..)
+            | DynoxideError::StatementConditionalCheckFailed(..) => {
                 "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException"
             }
             DynoxideError::TransactionCanceledException(..) => {
@@ -233,7 +251,8 @@ impl DynoxideError {
             | DynoxideError::KeyEmptyValueValidation(_)
             | DynoxideError::EnvelopedValidation(_)
             | DynoxideError::ConversionError(_) => "ValidationError",
-            DynoxideError::ConditionalCheckFailedException(..) => "ConditionalCheckFailed",
+            DynoxideError::ConditionalCheckFailedException(..)
+            | DynoxideError::StatementConditionalCheckFailed(..) => "ConditionalCheckFailed",
             DynoxideError::TransactionCanceledException(..) => "TransactionConflict",
             DynoxideError::DuplicateItemException(_) => "DuplicateItem",
             DynoxideError::ItemCollectionSizeLimitExceededException(_) => {
@@ -271,10 +290,10 @@ impl DynoxideError {
 
     /// Convert to a DynamoDB-compatible JSON error response body.
     pub fn to_response(&self) -> ErrorResponse {
-        let item = if let DynoxideError::ConditionalCheckFailedException(_, item) = self {
-            item.clone()
-        } else {
-            None
+        let item = match self {
+            DynoxideError::ConditionalCheckFailedException(_, item) => item.clone(),
+            DynoxideError::StatementConditionalCheckFailed(_, item) => Some(item.clone()),
+            _ => None,
         };
         ErrorResponse {
             error_type: self.error_type().to_string(),
@@ -305,13 +324,29 @@ impl DynoxideError {
                 }
                 serde_json::to_string(&m).unwrap_or_default()
             }
-            DynoxideError::SerializationException(_) => {
+            DynoxideError::StatementConditionalCheckFailed(_, item) => {
                 let mut m = serde_json::Map::new();
                 m.insert(
                     "__type".to_string(),
                     serde_json::Value::String(error_type.to_string()),
                 );
                 m.insert("Message".to_string(), serde_json::Value::String(message));
+                if let Ok(item) = serde_json::to_value(crate::set_order::HashOrderedItem(item)) {
+                    m.insert("Item".to_string(), item);
+                }
+                serde_json::to_string(&m).unwrap_or_default()
+            }
+            DynoxideError::SerializationException(_) => {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "__type".to_string(),
+                    serde_json::Value::String(error_type.to_string()),
+                );
+                // DynamoDB leaves the message out altogether when it has none
+                // to give, as for a list where a boolean belongs.
+                if !message.is_empty() {
+                    m.insert("Message".to_string(), serde_json::Value::String(message));
+                }
                 serde_json::to_string(&m).unwrap_or_default()
             }
             _ => {
@@ -330,6 +365,8 @@ pub struct ErrorResponse {
     #[serde(rename = "message")]
     pub message: String,
     #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub item: Option<HashMap<String, crate::types::AttributeValue>>,
 }
 
@@ -341,6 +378,22 @@ impl fmt::Display for ErrorResponse {
 
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, DynoxideError>;
+
+/// The error as `operation` puts it on the wire, for the HTTP and wasm
+/// dispatch seams: `ExecuteStatement`'s condition failure carrying an item is
+/// written in its own shape (see
+/// [`DynoxideError::StatementConditionalCheckFailed`]). Every other error
+/// passes through unchanged.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn for_operation(operation: &str, err: DynoxideError) -> DynoxideError {
+    match (operation, err) {
+        (
+            "ExecuteStatement",
+            DynoxideError::ConditionalCheckFailedException(message, Some(item)),
+        ) => DynoxideError::StatementConditionalCheckFailed(message, item),
+        (_, err) => err,
+    }
+}
 
 #[cfg(test)]
 mod tests {

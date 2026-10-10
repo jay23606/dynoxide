@@ -39,20 +39,23 @@ use std::collections::HashMap;
 struct SearchVectorsRequestRaw {
     #[serde(rename = "TableName", default)]
     table_name: Option<String>,
-    #[serde(rename = "IndexName", default)]
-    index_name: Option<String>,
+    /// Required: a missing IndexName, SearchVector or TopK gets serde's own
+    /// "missing field `IndexName` at line 1 column N", which is DynamoDB's
+    /// answer too (captured 2026-10-09, six of six regions).
+    #[serde(rename = "IndexName")]
+    index_name: String,
     /// A bare JSON array of number attribute values, not wrapped in `L`
     /// (confirmed on the wire against the AWS SDK's serialisation).
-    #[serde(rename = "SearchVector", default)]
-    search_vector: Option<Vec<AttributeValue>>,
+    #[serde(rename = "SearchVector")]
+    search_vector: Vec<AttributeValue>,
     /// Deserialised as i32 so a fractional or out-of-i32-range value rejects
     /// inside serde with the raw serde-style SerializationException message
     /// real DynamoDB returns for a fractional TopK: "invalid type: floating
     /// point `3.5`, expected i32 at line 1 column N", captured from real
     /// DynamoDB (eu-west-2 and us-east-1, 2026-08-13). See
     /// `serde_errors::map_serde_to_dynamodb_message` for the pass-through.
-    #[serde(rename = "TopK", default)]
-    top_k: Option<i32>,
+    #[serde(rename = "TopK")]
+    top_k: i32,
     #[serde(rename = "SearchConditionExpression", default)]
     search_condition_expression: Option<String>,
     #[serde(rename = "ProjectionExpression", default)]
@@ -90,74 +93,77 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
             TableNameContext, format_validation_errors, table_name_constraint_errors,
         };
 
-        let mut errors = Vec::new();
-        errors.extend(table_name_constraint_errors(
-            raw.table_name.as_deref(),
-            TableNameContext::ReadWrite,
-        ));
+        // An empty table name is the newer validation layer's own check,
+        // reported on its own (captured 2026-10-09, six of six regions that
+        // serve SearchVectors). A missing one joins the member errors below.
+        if raw.table_name.as_deref() == Some("") {
+            return Err(serde::de::Error::custom(format!(
+                "VALIDATION:{}",
+                crate::validation::envelope_message(crate::validation::EMPTY_TABLE_NAME_REJECTION)
+            )));
+        }
 
-        // Required members reject at the request-model layer. The null-member
-        // wording follows the captured request-model convention (`Value null
-        // at '<path>' failed to satisfy constraint: Member must not be null`,
-        // captured on the UpdateTable path, 2026-08-12); this operation's
-        // member paths and aggregation order are uncaptured.
-        match raw.index_name.as_deref() {
-            None => errors.push(
-                "Value null at 'indexName' failed to satisfy constraint: \
-                 Member must not be null"
-                    .to_string(),
-            ),
-            // The short-name rejection carries no value echo and spells the
-            // member path 'IndexName', unlike the camelCase null convention
-            // above (captured from real DynamoDB (eu-west-2 and us-east-1,
-            // 2026-08-13)). The upper bound mirrors the 255 the CreateTable
-            // family enforces; its wording for this operation is uncaptured
-            // beyond the no-echo form the captured lower bound establishes.
-            Some(name) if name.len() < 3 => errors.push(
+        let mut errors = Vec::new();
+        if raw.table_name.is_none() {
+            errors.extend(table_name_constraint_errors(
+                None,
+                TableNameContext::ReadWrite,
+            ));
+        }
+
+        // The short-name rejection carries no value echo and spells the
+        // member path 'IndexName' (captured from real DynamoDB, eu-west-2 and
+        // us-east-1, 2026-08-13). The upper bound mirrors the 255 the
+        // CreateTable family enforces; its wording for this operation is
+        // uncaptured beyond the no-echo form the captured lower bound
+        // establishes.
+        if raw.index_name.len() < 3 {
+            errors.push(
                 "Value at 'IndexName' failed to satisfy constraint: \
                  Member must have length greater than or equal to 3"
                     .to_string(),
-            ),
-            Some(name) if name.len() > 255 => errors.push(
+            );
+        } else if raw.index_name.len() > 255 {
+            errors.push(
                 "Value at 'IndexName' failed to satisfy constraint: \
                  Member must have length less than or equal to 255"
                     .to_string(),
-            ),
-            Some(_) => {}
+            );
         }
-        match raw.search_vector.as_deref() {
-            None => errors.push(
-                "Value null at 'searchVector' failed to satisfy constraint: \
-                 Member must not be null"
-                    .to_string(),
-            ),
-            // An empty vector rejects in the same no-echo, 'SearchVector'
-            // member-path form as the IndexName constraint (captured from
-            // real DynamoDB (eu-west-2 and us-east-1, 2026-08-13)).
-            Some([]) => errors.push(
+        // An empty vector rejects in the same no-echo, 'SearchVector'
+        // member-path form as the IndexName constraint (captured from real
+        // DynamoDB, eu-west-2 and us-east-1, 2026-08-13).
+        if raw.search_vector.is_empty() {
+            errors.push(
                 "Value at 'SearchVector' failed to satisfy constraint: \
                  Member must have length greater than or equal to 1"
                     .to_string(),
-            ),
-            Some(_) => {}
+            );
         }
-        // TopK 0 rejects at the request-model layer (captured 2026-08-11);
-        // the exact wording is uncaptured and follows the
-        // greater-than-or-equal convention the Dimensions member uses. Only
-        // the lower bound lives here: 101 rejects bare at the operation
-        // layer with its own captured message, and non-integer values never
-        // reach this point (the i32 field rejects them inside serde).
-        match raw.top_k {
-            None => errors.push(
-                "Value null at 'topK' failed to satisfy constraint: \
-                 Member must not be null"
-                    .to_string(),
-            ),
-            Some(v) if v < 1 => errors.push(format!(
-                "Value '{v}' at 'topK' failed to satisfy constraint: \
+        // TopK below 1 rejects at the request-model layer, in the newer
+        // layer's wording with no value echo (captured 2026-10-09, six of six
+        // regions). Only the lower bound lives here: 101 rejects bare at the
+        // operation layer with its own captured message, and non-integer
+        // values never reach this point (the i32 field rejects them inside
+        // serde).
+        if raw.top_k < 1 {
+            errors.push(
+                "Value at 'TopK' failed to satisfy constraint: \
                  Member must have value greater than or equal to 1"
-            )),
-            Some(_) => {}
+                    .to_string(),
+            );
+        }
+
+        // A table name that breaks its constraints comes after those members
+        // and ahead of ReturnConsumedCapacity, without the envelope, one error
+        // per name (captured 2026-10-09, six of six regions).
+        if errors.is_empty()
+            && let Some(msg) = raw
+                .table_name
+                .as_deref()
+                .and_then(crate::validation::first_table_name_error)
+        {
+            return Err(serde::de::Error::custom(format!("VALIDATION:{msg}")));
         }
 
         // ReturnConsumedCapacity enum validation
@@ -173,9 +179,9 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
 
         Ok(SearchVectorsRequest {
             table_name: raw.table_name.unwrap_or_default(),
-            index_name: raw.index_name.unwrap_or_default(),
-            search_vector: raw.search_vector.unwrap_or_default(),
-            top_k: raw.top_k.map(i64::from).unwrap_or_default(),
+            index_name: raw.index_name,
+            search_vector: raw.search_vector,
+            top_k: i64::from(raw.top_k),
             search_condition_expression: raw.search_condition_expression,
             projection_expression: raw.projection_expression,
             expression_attribute_names: raw.expression_attribute_names,
@@ -230,6 +236,8 @@ fn search_scanned_bytes(candidates: &[VectorCandidateRow]) -> f64 {
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
     #[serde(rename = "Item")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub item: Item,
     #[serde(rename = "Score")]
     pub score: f64,
@@ -431,7 +439,16 @@ pub async fn execute<S: StorageBackend>(
 ) -> Result<SearchVectorsResponse> {
     // Validate table name format before checking existence, mirroring the
     // Query family.
-    crate::validation::validate_table_name(&request.table_name)?;
+    // The same table-name answers the request decoder gives: the empty name
+    // enveloped, any other name error bare.
+    if request.table_name.is_empty() {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(crate::validation::EMPTY_TABLE_NAME_REJECTION),
+        ));
+    }
+    if let Some(msg) = crate::validation::first_table_name_error(&request.table_name) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
 
     // TopK beyond the request-model lower bound rejects bare with the value
     // interpolated (captured 2026-08-11: 101). Checked before the table
@@ -465,6 +482,7 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
+            layer: crate::validation::ValueLayer::Older,
         };
         helpers::validate_expression_params(&ctx)?;
     }

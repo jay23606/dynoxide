@@ -7,12 +7,981 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`aws-smithy-json` moves to 0.63.1** for GHSA-8ffr-xgwf-xj56. It reaches the
+  tree only through the AWS SDK the tests and the benchmarks use, never in a
+  released artefact, and the advisory covers smithy-rs generated servers,
+  which Dynoxide isn't. The fixed release needs Rust 1.94.1, which is why the
+  minimum supported Rust version moves (see Changed).
+
+### Behaviour changes
+
+- A PartiQL `NextToken` is bound to its statement the way DynamoDB binds it:
+  to the statement's text exactly as written, and to its parameters by value.
+  The same statement pages on, and may change its `Limit`. A page whose
+  statement differs at all (a space, a keyword's case, the projection, a map
+  literal's key order) or whose parameters are different values is refused
+  with `NextToken does not match request`, where a statement that parsed
+  alike used to resume. A number parameter is the same value when it is the
+  same decimal at the same scale, so `1E2` against `1e+2`, `01` against `1`
+  and `1.5E1` against `15` resume, and `0` against `0.0` or `100` against
+  `1E2` are refused. A set parameter is the same value with its members in
+  any order, a number set's members compared by value whatever their scale.
+  A statement with a list or map parameter is never resumed, even with the
+  same parameter sent again: its first page still hands out a token, and the
+  next page is refused with it. A map literal with more than one key used to
+  be refused on its own next page, because its key order was drawn afresh
+  for every request; it pages now. Captured against eu-west-2 and us-east-1.
+- `UpdateItem` is held to the 400KB limit the way DynamoDB holds it: by a
+  charge worked out from the request, alongside the finished item's own size,
+  rather than by the finished item less its key. Nothing the table already
+  stores enters the charge, so an update beside large attributes, maps, lists
+  or sets it leaves alone now succeeds where it was refused. Operands are
+  charged for what the request writes, so an arithmetic update, an
+  `if_not_exists`, a `list_append` or a copy from another path near the limit
+  can now be refused where it succeeded, though the item barely grows. An
+  update whose charge is over the limit is refused before its condition is
+  evaluated. The legacy `AttributeUpdates` parameter is measured by the
+  finished item alone. Captured against eu-west-2. `TransactWriteItems`
+  updates and PartiQL `UPDATE` are measured as before.
+- A `SET` through a list index past the end of the list appends the value, as
+  DynamoDB does, where it used to pad the gap with NULLs; several such writes
+  to one list append in the order of their indexes. A path that steps through
+  an element past the end of a list, or through a NULL, is refused with
+  DynamoDB's document path error where it used to create a map or a list
+  there. This covers `UpdateItem` and `TransactWriteItems` updates; PartiQL
+  `UPDATE` already appended. Captured against eu-west-2.
+- For Rust users of the crate: `AttributeValue`'s `Serialize` writes set
+  members in DynamoDB's order (string and binary sets by their bytes, number
+  sets by value), so a set no longer keeps the order it was built in through
+  serde. Normalising an item for a write sorts its sets in place.
+- `ReturnValuesOnConditionCheckFailure` works on the three PartiQL
+  operations. Set to `ALL_OLD`, an `UPDATE` or `DELETE` whose WHERE clause is
+  false on an item that exists hands back the whole item: on that statement's
+  cancellation reason in `ExecuteTransaction`, on the member's `Error` in
+  `BatchExecuteStatement`, and on `ExecuteStatement`'s
+  `ConditionalCheckFailedException`, which then writes its message as
+  `Message` and its number sets in hash order. `NONE`, leaving it out, a
+  missing item, a duplicate `INSERT` and a statement without a condition give
+  no item. A value other than `ALL_OLD` or `NONE`, an empty string included,
+  is refused as a member, ahead of the statement and its parameters, where
+  `ExecuteStatement` and `ExecuteTransaction` used to accept anything. A
+  transaction's mode takes part in its `ClientRequestToken` match, leaving it
+  out counting as `NONE`, and its over-long echo prints the value sent.
+  `ExecuteStatement` lists its member errors in DynamoDB's order: the mode,
+  `Limit`, the statement, `ReturnConsumedCapacity`, then the parameters.
+  Captured against eu-west-2 and us-east-1; this corrects the 1.0.0 entry
+  that found the option inert on a batch.
+- Opening a database brings it up to schema version 11, and the upgrade is
+  one way: once 1.3.0 has opened a file, don't open it with an older
+  Dynoxide. Earlier versions don't check the version a file records, so one
+  would open it and could read its multi-attribute indexes and vector table
+  sizes wrongly. Keep a copy or a snapshot of a file you may need to take
+  back. From this release a file written by a newer Dynoxide is refused,
+  with an error naming its schema version and the newest this build reads,
+  and is left unchanged, where it used to be opened as it was. That covers
+  `Database::new`, an encrypted open, the snapshot a restore reads from, and
+  the browser build's database.
+- While it opens, a database file waits up to 30 seconds for a lock another
+  process holds, where it gave up after five, so a second Dynoxide opening a
+  file while the first brings it up to date waits for it and then finds the
+  work done. Once open it waits five seconds, as before, so a request held up
+  by another process's lock gives up after five seconds rather than holding
+  every other request up behind it. A restore still gives up on a busy
+  snapshot after five seconds, and an in-memory database is unchanged.
+
 ### Added
 
+- The MCP tools that wrap a DynamoDB read or write take
+  `return_consumed_capacity` (`TOTAL`, `INDEXES` or `NONE`) and return the
+  `ConsumedCapacity` block the DynamoDB API returns for the same request. That
+  covers the item tools, `query`, `scan`, `search_vectors`, `batch_get_item`,
+  `batch_write_item`, both transaction tools and the three PartiQL tools. Any
+  other value is refused with DynamoDB's validation error.
+- The MCP `execute_partiql` tool takes `return_values_on_condition_check_failure`
+  (`ALL_OLD` or `NONE`), as `ExecuteStatement` does. A tool error for a failed
+  condition now carries the item the condition was evaluated against when
+  `ALL_OLD` was asked for, on `execute_partiql` and on the item tools, which
+  took the argument before but never handed the item back.
 - `--log quiet` suppresses informational startup and shutdown messages on
-  stderr. Without the flag the output is unchanged.
-- `server::ServerOptions` and `server::start_with_options` give embedded Rust
-  callers the same switch.
+  stderr. It works on `serve` and the no-subcommand form, `serve --mcp`, `mcp`
+  (stdio and `--http`), and `import --serve` or `--mcp`. Warnings, errors, the
+  first-run MCP token message and the import's own report still print. On
+  `import`, `--log` conflicts with `--output`. Without the flag the output is
+  unchanged.
+- `ServerOptions` (at the crate root, and at `server::ServerOptions`),
+  `server::start_with_options` and `mcp::serve_http_with_options` give embedded
+  Rust callers the same switch for both servers.
+- `Storage::item_count_and_size`, `gsi_item_count_and_size`,
+  `lsi_item_count_and_size` and `vector_item_count_and_size` return a table's
+  or an index's item count and total size, the figures DescribeTable reports.
+
+### Changed
+
+- The minimum supported Rust version is 1.94.1, up from 1.88. The AWS SDK the
+  tests use needs it for a security fix, and keeping the crate on the same
+  floor means one toolchain builds and tests it.
+
+#### Breaking (Rust API)
+
+- The `expressions` and `partiql` modules are no longer public. They hold the
+  parsers for DynamoDB's expression syntax and for PartiQL, whose shape changes
+  as compatibility work lands, and this release changed both substantially.
+  Expressions and PartiQL statements are still sent through `Database` and the
+  `actions` request types, which this does not change.
+- `ParameterizedStatement` and `ExecuteStatementRequest` gain
+  `return_values_on_condition_check_failure`, and `BatchStatementError` gains
+  `item`, so struct literals of them need the field adding, or
+  `..Default::default()`.
+- `actions::index_capacity::WriteCapacity::condition_check` takes the table's
+  vector indexes, so a vector attribute is charged at its billed size.
+
+### Fixed
+
+- An `UpdateItem` whose `UpdateExpression` was only whitespace, such as
+  `"   "`, answered 200 and wrote the item: the key alone for a new item, or
+  the item as it was for an existing one. 1.2.1 did this too. An expression made
+  only of whitespace is now refused as DynamoDB refuses it, as a syntax error
+  at its end with the whitespace as sent: `Invalid UpdateExpression: Syntax
+  error; token: "<EOF>", near: "   "`, and nothing is written. A
+  `ProjectionExpression` of whitespace is refused the same way on every read
+  that takes one, where it returned items with no attributes. A
+  `ConditionExpression`, `KeyConditionExpression` or `FilterExpression` of
+  whitespace was already refused, but with an empty `near`; it now gives the
+  whitespace too, in the envelope on `PutItem`, `UpdateItem` and `DeleteItem`
+  and bare elsewhere. A transaction's `Update` with an empty
+  `UpdateExpression` is refused up front with `Invalid UpdateExpression: The
+  expression can not be empty;`, where it wrote an item holding only its key.
+  Captured against eu-west-2 and us-east-1, the transactions also against
+  ap-southeast-2 and eu-central-1. `TransactGetItems` refuses an empty or
+  whitespace `ProjectionExpression` with the same messages `GetItem` gives,
+  and does so before it looks up any table, so a `Get` on a table that doesn't
+  exist gets the projection error (captured against eu-west-2).
+- A legacy `QueryFilter` or `ScanFilter` condition with a `ComparisonOperator`
+  DynamoDB doesn't have, such as `FOO`, or with none at all, was dropped, so
+  the Query or Scan ran without it, and one whose every condition dropped
+  returned every item. A lower-case `eq` ran as `EQ`. 1.2.1 did both. An
+  unknown operator, `eq` included, is now refused with `One or more parameter
+  values were invalid: Invalid comparison operator`, and a missing one with `1
+  validation error detected: Value null at
+  'scanFilter.a.member.comparisonOperator' failed to satisfy constraint:
+  Member must not be null` (`queryFilter` on a Query). `KeyConditions` takes
+  the same rule, where it also ran `eq` as `EQ` and refused an unknown or
+  missing operator in Dynoxide's own words. Captured against eu-west-2,
+  ap-southeast-2, eu-central-1 and us-east-1; us-east-1 answers an unknown
+  operator with the member's enum constraint instead, and the other three
+  regions are followed.
+- A legacy `AttributeUpdates` action written in another case, such as `put`
+  or `Delete`, was read as its upper-case form and applied. 1.2.1 did this
+  too. An action other than `ADD`, `DELETE` or `PUT` is now refused before the
+  table is looked up, with DynamoDB's own text: `1 validation error detected:
+  Member must satisfy enum value set: [ADD, DELETE, PUT]' for Action`.
+  Captured against eu-west-2 and us-east-1.
+- A legacy condition on an attribute whose name holds a `-`, a `.` or a
+  character outside ASCII, such as `user-id` or `s.k`, was refused with a
+  syntax error naming an internal placeholder, such as `near: "#kc_user-id"`.
+  1.2.1 did this too. `KeyConditions`, `QueryFilter`, `ScanFilter` and
+  `Expected` now run on any attribute name, as DynamoDB runs them. Captured
+  against eu-west-2 and us-east-1.
+- A legacy `QueryFilter` or `ScanFilter` condition whose value didn't read,
+  such as `{"NULL": false}` or `{"BOOL": "maybe"}`, was dropped, so the Query
+  or Scan ran without that condition and returned items it should have
+  filtered out. This was in 1.2.1. Such a condition is now refused as
+  DynamoDB refuses it, in `QueryFilter`, `ScanFilter`, `KeyConditions` and
+  `Expected` alike: a `NULL` that reads as false (`false`, `"no"`, `"false"`)
+  with `Null attribute value types must have the value of true`, ahead of the
+  operator's own checks, and a `BOOL` or `NULL` that doesn't read as a
+  boolean by failing the whole request with `Unexpected token received from
+  parser`. A `KeyConditions` that didn't read no longer leaves the Query
+  asking for a key condition. A legacy `IN` checks the type of every value in
+  its list, where it looked at the first, and a value whose other member is
+  `null` takes the type of the member it has; `Expected` refuses an `IN` of a
+  `BOOL` or `NULL` too, as the filters do. A condition's `Exists` reads a
+  string as a `BOOL` member does, and one read from a string makes the
+  request's refusals bare, as a `BOOL` or `NULL` read from a string does.
+  Captured against eu-west-2 and us-east-1.
+- `ExecuteTransaction` lists a reason for every statement that failed, as
+  DynamoDB does, where it stopped at the first and reported `None` for the
+  rest. A key of the wrong type on any statement is reported alone, with
+  `None` for every other statement, a statement whose condition is false
+  included. A `DELETE` with a condition, of an item that isn't there, does
+  nothing when the transaction commits, as before, and is reported as a failed
+  condition, with no item, when the transaction is cancelled. Captured against
+  eu-west-2 and us-east-1.
+- A `TransactWriteItems` that SQLite failed part way through, on a full disk
+  or an I/O error, could keep the actions that came after the failure. SQLite
+  rolls the whole transaction back on such an error, so each later action
+  committed on its own and the transaction's own rollback then failed. A
+  storage failure now stops the transaction where it happens and is returned
+  as an internal error, so nothing the transaction wrote is kept.
+  `ExecuteTransaction` does the same. The error is SQLite's own, such as
+  `backend: database or disk is full`, on any write, where it went on to say
+  that the rollback had failed too because SQLite had already ended the
+  transaction.
+
+- Restoring a snapshot taken by an earlier version brings it up to date as
+  opening the file would, running the schema migrations its recorded version
+  calls for. It used to be restored as it was, so a snapshot from before a
+  schema change came back without that change. The copy is brought up to date
+  in a private temporary database before it replaces anything, so a restore
+  that fails leaves the database as it was, and `Database::restore_from` opens
+  the snapshot file read-only: a path that doesn't exist is now an error,
+  where it used to create an empty file and restore that over the database,
+  and so is a file that isn't a Dynoxide snapshot (an empty file, `:memory:`
+  or another program's database). Restoring from a snapshot in WAL mode may
+  leave its `-wal` and `-shm` files beside it. After a restore, transactions
+  cached for idempotent retries and vector index creation windows are
+  forgotten, as the data they described has gone. A backup or restore that
+  finds a database busy keeps trying until it has been busy for five seconds by
+  the clock (plus at most one busy wait of SQLite's own) and then reports it
+  locked; one that keeps starting over because another connection keeps
+  changing the database being copied pauses briefly after each restart and
+  gives up after 50 of them.
+- A number whose exponent is too large for a 32-bit integer is range-checked
+  rather than read with an exponent of 0. `1e99999999999` was stored as 1; it
+  is now refused as an overflow, and `1e-99999999999` as an underflow, as
+  DynamoDB does. An exponent too large for a 64-bit integer is refused as a
+  value that cannot be converted, which is DynamoDB's message for it.
+- Zero is held to the number range as well, as if its last written digit were
+  a 1, so `0e126` is refused as an overflow and `0e-131` as an underflow, where
+  both used to be stored as 0.
+- A `KeyConditionExpression` rejects an operand its operator does not take, as
+  DynamoDB does: `begins_with` takes a string or binary, and `<`, `<=`, `>`,
+  `>=` and `BETWEEN` take a string, number or binary
+  ([#220](https://github.com/nubo-db/dynoxide/issues/220)). A number in
+  `begins_with(sk, :v)` used to run as a prefix match on the stored key, and a
+  boolean, null, list, map or set became an empty prefix that matched every
+  item in the partition. The check runs before the table is looked up, so a
+  missing table or index reports the operand rather than itself.
+- PartiQL's `begins_with` rejects an operand that is not a string or binary,
+  on any attribute and under `NOT`, where it used to accept the statement.
+- A global secondary index whose key has more than one partition key or sort
+  key attribute works as DynamoDB's does. Items sort by each sort key attribute
+  in turn, an item missing any key attribute is left out of the index, a Query
+  takes an equality on every partition key attribute and on a leading run of
+  sort key attributes with a range condition allowed only on the last one
+  named, and `LastEvaluatedKey` carries every key attribute. Such an index used
+  to sort and filter on its first sort key attribute alone, index items missing
+  a later one, and refuse any key condition with three clauses. In a database
+  an earlier version wrote, on disk or in the browser's OPFS storage (including
+  one from Dynoxide 0.10 to 0.13, which recorded no schema version), such an
+  index is rebuilt the first time the database is opened, in one transaction,
+  and an interrupted step leaves the database at the version before that step. `UpdateTable` can now add one. CreateTable and UpdateTable
+  check such a key as DynamoDB does: at most four partition key and four sort
+  key attributes, partition key attributes first, no name twice. A local
+  secondary index still takes one sort key attribute. A PartiQL `SELECT` on such
+  an index is refused, as DynamoDB refuses it, with `PartiQL statements cannot
+  be executed on tables with multi-attribute HASH keys or multi-attribute RANGE
+  keys.`; the table itself and its other indexes stay readable and writable.
+- A `KeyConditionExpression` with more clauses than the key has attributes is
+  refused with DynamoDB's message, `The number of query conditions (3) exceeds
+  the number of key attributes defined in the schema (2)`, rather than
+  `Unexpected token in KeyConditionExpression: AND`. Two conditions on one key
+  attribute report that each key takes only one.
+- A key condition value whose type differs from its key attribute's type is
+  refused with `Condition parameter type does not match schema type`, on a
+  table and on any index. That covers a string compared with a number sort
+  key, which used to match nothing, and a map, list, boolean, null or set
+  value, which used to fail with `Cannot convert partition key value to
+  string`.
+- `begins_with` in a key condition is case-sensitive. A lower-case prefix
+  matched upper-case sort keys too.
+- A key condition can name the sort key before the partition key. A range
+  condition on a one-attribute partition key, such as `begins_with(pk, :v)`,
+  is refused with `Query key condition not supported`, and like every key
+  condition problem that needs the key, only once the table and index are
+  found: a missing table or index reports itself first.
+- CreateTable with an index reports an attribute definition no key uses as
+  `Some AttributeDefinitions are not used`, listing the definitions and the keys
+  used, rather than as a count mismatch. An index key attribute with no
+  definition names the first index missing one, and its lists, like the unused
+  ones, come in DynamoDB's own order. When the request defines fewer
+  attributes than that index has key attributes, CreateTable and UpdateTable
+  both give `Invalid KeySchema: Some index key attribute have no definition`.
+  A GSI key schema of more than eight elements is refused as the request is
+  read.
+- `TransactWriteItems` rejects an expression over 4096 bytes on any action, and
+  a `Put` item nested past 32 levels, with a top-level `ValidationException`
+  before any action runs, as DynamoDB does. Both used to come back as a
+  `TransactionCanceledException` with a `ValidationError` reason. The `Put`
+  item-size check moves forward with them, so all three now win over a missing
+  table, a duplicate target or an empty key value elsewhere in the request.
+- An `ExpressionAttributeValues` entry nested 32 levels deep that a transaction
+  action only compares is no longer refused: the condition is evaluated, as
+  DynamoDB does. An `Update` that writes one into the item still cancels on the
+  item's nesting limit, now with DynamoDB's shorter reason message. From 33
+  levels an entry is refused up front with a top-level `ValidationException`
+  naming its key, used or not, where a `Put` whose condition compared one used
+  to write its item.
+- `TransactWriteItems` rejects an empty or unparseable `ConditionExpression` on
+  any action with a top-level `ValidationException` before any action runs,
+  where it used to cancel the transaction. An unparseable `UpdateExpression`,
+  an `ExpressionAttributeNames` or `ExpressionAttributeValues` entry no
+  expression uses, and a value a condition names but the request doesn't
+  define are refused the same way, ahead of a missing table, a duplicate
+  target or a key that doesn't match the schema. A `Put` that carries
+  `ExpressionAttributeValues` and no `ConditionExpression` is accepted, as in
+  us-east-1, where it used to cancel.
+- Expression syntax errors name the token the parse stopped at and the text
+  around it, as DynamoDB does: `Syntax error; token: "x", near: ") x y"`, or
+  `token: "<EOF>"` for an expression that ends early. This covers condition,
+  filter, key condition and update expressions, which used to say things like
+  `Expected operand, got end of expression`. A malformed key condition also
+  gains its `Invalid KeyConditionExpression:` prefix.
+- An expression over 4096 bytes is refused without the trailing
+  `expression size: <n>`, as DynamoDB now sends it. A Scan's `FilterExpression`
+  and a transaction's `ConditionExpression` keep the figure, which us-east-1
+  still sends there.
+- PutItem, UpdateItem and DeleteItem wrap the nesting error for a value past
+  32 levels in `1 validation error detected: `, and DeleteItem wraps its
+  `ConditionExpression` syntax and size errors the same way. From 63 levels a
+  stored item's error drops the wrapper and an expression value is refused
+  naming its key. An `UpdateExpression` that leaves the item nested too deep
+  gets DynamoDB's short `Nesting Levels have exceeded supported limits`.
+- UpdateItem reports a `ConditionExpression` syntax error ahead of an unused
+  expression attribute value.
+- PutItem, UpdateItem and DeleteItem wrap an unused `ExpressionAttributeNames`
+  or `ExpressionAttributeValues` entry in `1 validation error detected: `, and
+  report it, along with a value or name the condition uses but doesn't define,
+  before looking up the table. GetItem, Query and Scan send it bare, as
+  before. DeleteItem now envelopes all its `ConditionExpression` errors,
+  including reversed or mixed-type BETWEEN bounds and operand types, and an
+  undefined value in UpdateItem's condition gains its
+  `Invalid ConditionExpression:` prefix.
+- A list index written with a leading zero, such as `l[00]` or `l[01]`, is a
+  syntax error in every expression (`token: "0", near: "00]"`), as DynamoDB
+  reads it. It used to be accepted as the index its digits spell.
+- `DescribeTable` reports `TableSizeBytes` as the total size of the table's
+  items, where it was always 0, so the MCP server's `size_bytes` is right too.
+  `UpdateTable`'s response carries the same `ItemCount` and `TableSizeBytes`,
+  where both were 0. DynamoDB refreshes these figures about every six hours;
+  Dynoxide reports them live. Captured against eu-west-2.
+- `DescribeTable` and `UpdateTable` report each GSI's and LSI's `ItemCount` and
+  `IndexSizeBytes`: the number of items the index holds and the total size of
+  what it projects for them, where both were always 0. Each vector index
+  reports its entries and their billable size, as DynamoDB does: the vector at
+  4 bytes per dimension, its attribute's name and the rest of the projection. Captured against eu-west-2.
+- On a table with a vector index, a write is charged for the vector at 4 bytes
+  per dimension, whatever numbers it holds, and `TableSizeBytes` counts it the
+  same way, as DynamoDB does. Dynoxide used to size it as a list of numbers, so
+  a write of a 1,024-dimension embedding could cost two or three units more
+  than on DynamoDB. Read units and the 400 KB item limit still size the vector
+  by its numbers, which is DynamoDB's rule for those, and so do a GSI's and an
+  LSI's share of the write and their `IndexSizeBytes`, even when the index
+  projects the vector. A database written by an earlier version has its vector
+  tables' sizes recomputed once when it is opened, in one transaction, and
+  creating or deleting a vector index recomputes that table's.
+- `Database::sweep_ttl`, and the MCP `sweep_ttl` tool that calls it, no longer
+  hold the database lock for the whole sweep. The sweep takes the lock a page of
+  25 items at a time and lets requests already waiting for it go first between
+  pages, so a read or write waits for one page rather than for a read of every
+  TTL table. The first page of each table also counts its rows, so the longest
+  single hold is that count plus a page. Between pages the sweep waits up to a
+  second for the queued requests, including the time they hold the lock, before
+  it carries on. A sweep reads no more of a table than it held when the sweep
+  reached it, so a table that keeps growing cannot keep it running, and an item
+  written while the sweep is under way may be left for the next one.
+- `--help` no longer shows the value of `DYNOXIDE_MCP_AUTH_TOKEN` when it is
+  set. It still names the variable. The MCP auth types' debug output no
+  longer shows the token either.
+- A prerelease tag such as `v1.3.0-rc.1` no longer ships as if it were the
+  latest release. Its GitHub Release is flagged as a prerelease, so the GitHub
+  Action's default `version: latest` stays on the last stable release, and the
+  Homebrew tap, the MCP registry and dynoxide.dev are left alone. A stable
+  crate version is not published to crates.io from a prerelease tag. npm still
+  publishes a prerelease to `next`, and containers still get the exact tag
+  only. `docs/versioning.md` has the full list.
+- `docs/library.md` no longer tells readers to run
+  `cargo add dynoxide-rs --features encryption`, which stops on the
+  `native-sqlite` and `encryption` compile guard because the default features
+  stay on. It now adds `--no-default-features`, as the rest of the page does.
+- PartiQL reads a number written with an exponent as one number, so
+  `WHERE pk = 1e5` matches 100000 rather than 1, and `INSERT ... VALUE
+  {'pk': 2e3}` parses. A literal whose exponent, or whose scale (the digits
+  after the point less the exponent), is out of range is refused as a statement
+  that is not well formed, as DynamoDB does.
+- PartiQL reads `--` and `/* ... */` comments as whitespace wherever they
+  appear. A comment before the WHERE clause used to make a SELECT return every
+  row, and a block comment was refused.
+- A PartiQL table alias (`FROM "T" t` or `FROM "T" AS t`) on SELECT, UPDATE or
+  DELETE is refused with DynamoDB's "Aliasing is not supported". A SELECT used
+  to run it as an unfiltered read.
+- A PartiQL statement with a token left over after it, such as
+  `WHERE pk = 1 foo`, is refused with "Unexpected token after expression"
+  rather than run without the extra token. A SELECT's `ORDER BY` clause must
+  be well formed and last, so a WHERE written after it is refused rather than
+  dropped.
+- PartiQL applies a SELECT's `ORDER BY`. It used to be accepted and ignored,
+  so `ORDER BY sk DESC` came back ascending. As in DynamoDB, it reads each
+  partition the WHERE clause pins, in partition-key order, by the sort key
+  term's direction (descending when only the partition key is named), on a
+  table or an index, a page at a time when the read is paged. The forms
+  DynamoDB refuses are refused with its messages: no WHERE clause, a term that
+  is a nested path or not part of the key, a partition key not pinned with `=`
+  or `IN`, and more than one partition without the partition key in the
+  clause. `NULLS FIRST` and `NULLS LAST` are accepted.
+- PartiQL reads a number written with no digit before its point, such as `.5`
+  or `-.25e1`, where it used to refuse the statement. A number takes one
+  point, so `1.2.3` is refused as a token left over, and an exponent marker
+  with no digits (`5e`) is refused as a statement that is not well formed.
+- PartiQL checks a number written in a WHERE clause the way it checks one being
+  stored, so `WHERE pk = 1e126` is refused with DynamoDB's overflow message
+  rather than run as a comparison that matches nothing. Number errors on
+  PartiQL literals end with DynamoDB's ` under <path>`, naming where the
+  number sits inside the value (`under root`, `under root.x`, `under root[1]`),
+  and are reported before the table or item is looked up, the first one
+  written first and an UPDATE's WHERE clause before its SET. A literal at the
+  very top of the exponent range is reported as an underflow, as DynamoDB's
+  PartiQL reports it.
+- A PartiQL literal nested 32 levels deep is refused where it reaches that
+  level, with DynamoDB's `Nesting Levels have exceeded supported limits` and
+  the path to it, and a parameter nested exactly 32 levels deep gets the same
+  short message rather than the long one.
+- PartiQL statements check every parameter value before reading the
+  statement, as any attribute value is checked (its numbers, and empty or
+  duplicated sets), so a parameter DynamoDB can't store is refused even when
+  the statement doesn't use it: on `ExecuteStatement`, against the statement in
+  a `BatchExecuteStatement` (an empty value and `{"NULL": false}` included,
+  where a `{"NULL": false}` parameter used to refuse the whole batch), and for
+  the whole request in an `ExecuteTransaction`, which writes nothing.
+- A PartiQL statement against a table that doesn't exist says `Requested
+  resource not found`, as DynamoDB does, without `: Table: <name> not found`;
+  in a transaction it cancels with the `ResourceNotFound` reason rather than
+  `InternalError`.
+- An empty map key anywhere in a PartiQL literal is refused with DynamoDB's
+  `Path component cannot be an empty string`, where it used to be stored.
+- A PartiQL SELECT whose OR branches name overlapping keys, such as
+  `pk = 'a' OR pk = 'a'` or sort-key ranges (`begins_with` included) that meet
+  in one partition, is refused with DynamoDB's `Overlapping conditions with
+  range keys are not supported in where clause`. As in DynamoDB, a clause with
+  a branch that puts two different conditions, or `NOT ... BETWEEN`, on the
+  sort key isn't checked, and the check comes after an `ORDER BY` term is
+  checked and before the rest of the `ORDER BY` checks.
+- A PartiQL key value DynamoDB can't read the key by is refused with its
+  messages: `Key value must be of type S, N, or B` naming the key and the type
+  for a type no key can have, such as a map, rather than `Invalid key value`,
+  and `Key attribute's data type should match its data type in table's schema`
+  for a key type that isn't the key's, where a SELECT, UPDATE or DELETE used to
+  match nothing and an INSERT gave PutItem's message. Both apply to literals
+  and parameters, to the sort key and to an index's keys, and a SELECT's OR
+  branches are checked in the order written until one that isn't a key read.
+  In a transaction, a SELECT key, or an UPDATE or DELETE key of the wrong key
+  type, cancels with GetItem's `The provided key element does not match the
+  schema`, an UPDATE or DELETE key no key can have is refused up front, and an
+  INSERT keeps PutItem's message.
+- A SELECT in a `BatchExecuteStatement` or an `ExecuteTransaction` may name only
+  the primary key, as DynamoDB requires: each key attribute once, with `=` or
+  an `IN` of one value, the same condition written twice counting once. One
+  that also filters on another attribute is refused rather than run, and
+  overlapping key conditions are reported first.
+- `ExecuteTransaction` reports a statement that doesn't parse with
+  `Validation failed in TransactStatements[N]: ` in front, as it already did
+  for its other per-statement refusals.
+- A PartiQL statement that doesn't begin with SELECT, INSERT, UPDATE or DELETE
+  is refused as DynamoDB refuses it, reading it as an expression rather than
+  answering `Expected data manipulation` to everything: `Unsupported
+  operation: Id` for a lone name, `Path`, `Lit`, `List` and the like for other
+  whole expressions, `EXISTS can only be used in ExecuteTransaction write
+  requests.` for an operator, comparison or call, and DynamoDB's syntax
+  messages where one breaks off or carries on (`Unexpected token after
+  expression` for `INSRT INTO ...`, `Expected RIGHT_BRACKET`, `Unexpected
+  keyword` and others). `SET a = 1` and `REMOVE a` are refused for having no
+  table, and a verb with nothing it needs after it (`DELETE` alone, `INSERT`
+  with no `INTO`) is refused in DynamoDB's words.
+- A PartiQL statement may end with a semicolon, as in DynamoDB, including
+  after a `RETURNING` clause; a second statement after it is refused with
+  `Unexpected token after semicolon. (Only one query is allowed.)`.
+- A successful PartiQL INSERT, UPDATE or DELETE through `ExecuteStatement`
+  returns an empty `Items` list unless it has a `RETURNING` clause, and an
+  `ExecuteTransaction` of writes returns an empty `Responses` list, as DynamoDB
+  does. They used to return no `Items` at all and one empty entry per
+  statement.
+- A PartiQL WHERE clause that stops where a condition should start is refused
+  in DynamoDB's words: `Unexpected term` when nothing follows `WHERE`, `NOT` or
+  an opening parenthesis, `Missing right-hand side expression of infix
+  operator` when nothing follows `AND` or `OR`, and `Unexpected operator` or
+  `Unexpected keyword` when an operator or a clause keyword stands in its
+  place. It used to say `Expected condition in WHERE`.
+- PartiQL runs `FROM "T" WHERE ... SET ...` (or `REMOVE ...`) as an UPDATE, as
+  DynamoDB does, where it used to say `Expected data manipulation`, and an
+  UPDATE of either form takes any number of SET and REMOVE clauses in any
+  order. An UPDATE or DELETE takes its key only from equalities among the WHERE
+  clause's top-level conditions: a key named only under an `OR`, a `NOT` or an
+  `IN`, or no WHERE clause at all, is refused with `Where clause does not
+  contain a mandatory equality on all key attributes`, and a key given two
+  values with `Multiple conditions on same key`. `pk = 'a' AND pk = 'b'` used
+  to update the first item it named. In a transaction, the duplicate-item
+  check takes the same key: `(pk = 'b' OR x = 1) AND pk = 'a'` beside another
+  statement on `a` is refused as two operations on one item, and beside one on
+  `b` it isn't; the check used to read the key from the OR group. Captured
+  against eu-west-2 and us-east-1.
+- A PartiQL WHERE clause takes `attribute_exists(path)` and
+  `attribute_not_exists(path)`, in any case and compared with a boolean, as
+  DynamoDB does; both used to fail with `Unknown operator: (`. An operand that
+  isn't a document path, or the wrong number of operands, is refused with
+  DynamoDB's messages. A call to a function DynamoDB doesn't recognise there,
+  `EXISTS(path)` among them, is refused as `Unrecognized function: <name> at
+  <line>:<column>:<length>` before the table is looked up; `EXISTS(path)` used
+  to run as `attribute_exists`. An OR with no key condition under it no longer
+  counts as a second key range for the overlap check, so `pk = 'a' AND (x = 1
+  OR x = 2)` runs. A condition function compares with a path, a size, a
+  parameter or another call as the boolean it is, with `=`, `<>` or in an
+  `IN` list, written on either side (`b = attribute_exists(a)`,
+  `? = attribute_exists(a)`, `size(s) = attribute_exists(a)`) and as a
+  member of an `IN` list (`b IN [attribute_exists(a)]`), so
+  `attribute_exists(a) = b` holds where `b` is the boolean the call is, and
+  is unequal to a missing value or one of another type. Each such comparison
+  is one condition, so ten `attribute_exists(x) <> y` ANDed run, and
+  `pk = 'a' AND attribute_exists(x) = y` reads partition `a` by its key and
+  takes an `ORDER BY`. Its `IN` list reads a bare name as an attribute, as
+  every other `IN` list does, where a name used to be compared with the
+  string of itself. Captured against eu-west-2 and us-east-1.
+- PartiQL's `set_add` and `set_delete` work in an UPDATE's SET clause, as in
+  DynamoDB, where they used to fail with `Unexpected token after expression`.
+  A malformed call is refused with DynamoDB's message and position before the
+  table is looked up, members of the wrong type with its incorrect data type
+  message, and `<<>>` anywhere with `Empty bags are not supported`. A function
+  call in an INSERT value is refused as an unsupported data type.
+- A PartiQL number parameter is read the way DynamoDB reads it: an exponent or
+  a scale outside a 32-bit integer is `The parameter cannot be converted to a
+  numeric value: <text>`, and `1e2147483647` is an underflow, in every position
+  and on every PartiQL operation. They used to be range-checked as an item's
+  numbers are, as an overflow or underflow by the exponent's sign.
+- A PartiQL WHERE clause's `IS` tests NULL, BOOLEAN, BLOB, STRING, NUMERIC,
+  STRUCT, TUPLE and LIST as well as MISSING, and `IS NOT` their complement, as
+  DynamoDB does; only MISSING used to work. Another type name is refused with
+  DynamoDB's `Unsupported data type for IS operator` message, and `INT4`,
+  `INT8`, `DOUBLE PRECISION` and `CHARACTER VARYING` read as type names. An
+  operator where a value should be, as in `pk = LIKE`, is `Unexpected
+  operator`; `pk = LIKE` used to compare with the string `LIKE`. A negated or
+  `<>` sort key condition stops the overlap check, as `NOT ... BETWEEN`
+  already did. `DELETE FROM` with no table is `Expected identifier for simple
+  path`, and `SELECT * FROM` with none is `Unexpected term` or `Unexpected
+  keyword`.
+- A PartiQL WHERE clause takes `size(path)` and `attribute_type(path, type)`,
+  which used to fail with `Unknown operator: (`, and compares any two operands
+  as DynamoDB does: a literal or parameter on the left (`'a' = pk` names the
+  item an UPDATE or DELETE changes), two paths, two literals, and `size()` on
+  either side of a comparison, BETWEEN or IN. A size counts a string's UTF-16
+  code units, a binary's bytes and a collection's members. A comparison with a
+  missing attribute, or with the size of a value that has none, is true for
+  `<>`, as it is in a condition expression; it used to be false. An unknown
+  `attribute_type` type, the wrong number of operands, the same path on both
+  sides of a comparison, `MISSING` outside `IS`, an ordering operator on a
+  condition function and a size standing alone as a condition are each refused
+  with DynamoDB's message before the table is looked up, and a comparison with
+  nothing after its operator is `Missing right-hand side expression of infix
+  operator`. A size takes a number's type checks: a boolean under an ordering
+  operator is refused, BETWEEN refuses bounds that are out of order, and a
+  string compared with a size is simply unequal (captured against eu-west-2
+  and us-east-1). BETWEEN also refuses bounds of different types, as it does
+  for a path. A BETWEEN bound or an IN member can be a path or a size as well
+  as a value: `size(s) IN [n]` compares with the attribute `n`, where it used
+  to compare with the string `'n'`, and `n BETWEEN size(s) AND 10` parses
+  (captured against eu-west-2 and us-east-1 for a size on either side; a
+  path between path bounds follows the same reading, not yet captured).
+- A PartiQL `IN` with one value on a key attribute is read as `=`, as
+  DynamoDB reads it: `WHERE pk IN ['a']` reads item a by its key and is
+  charged what `pk = 'a'` is, where it used to scan the table, and two
+  statements naming the same item that way are duplicates in a batch or a
+  transaction (captured against eu-west-2 and us-east-1).
+- PartiQL refuses a bag it can't store with DynamoDB's messages and positions:
+  one that starts with a string at its first member that isn't one, one that
+  starts with a number without a position, and a parameter, `null` or Ion
+  literal among its members with their own messages. These used to be `Mixed
+  types in ... set literal` or a parse error. An Ion literal between backticks
+  is refused by its type where it stands; `X'...'` is a syntax error, as in
+  DynamoDB, rather than a name and a string; and a list, map or bag whose
+  members aren't separated by commas is a syntax error too.
+- A PartiQL keyword such as `inner` or `value` can't be a path's dot component
+  unless it is quoted (`m."inner"`), as in DynamoDB; it used to be read as an
+  attribute name. Any call in a SELECT list is refused as `Unexpected path
+  component` at the function's name, and inside ExecuteTransaction with the
+  statement's index; only `COUNT` used to be refused, and without the index.
+  `EXISTS(SELECT ...)` in a WHERE clause is refused as `Unsupported token in
+  expression: SELECT`.
+- When a PartiQL statement has more than one problem, the one reported is the
+  one DynamoDB reports: an unrecognised function, an unsupported `IS` type, a
+  subquery and a literal it can't store come in the order written, WHERE clause
+  first, and ahead of an operand refusal.
+- PartiQL refuses a `begins_with` operand that isn't a string or binary, and
+  BETWEEN bounds of different types or with the lower above the upper, with
+  DynamoDB's messages, `NOT` or not, before the table is looked up.
+- A PartiQL INSERT of a key that already exists is reported as a duplicate
+  before an item nested to the limit is.
+- `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and
+  `TransactWriteItems` refuse a `ReturnConsumedCapacity` other than `INDEXES`,
+  `TOTAL` or `NONE` with the ValidationException the single-item operations
+  already return, before anything is read or written. They used to accept any
+  value and treat it as `NONE`, and the two writes went ahead.
+  `TransactWriteItems` now checks its `TransactItems` length, the length of
+  its `ClientRequestToken` and then `ReturnConsumedCapacity` before looking the
+  token up, so a replayed token is checked too. `BatchWriteItem` checks the
+  capacity mode ahead of a table name that fails its pattern, as DynamoDB does.
+- `BatchWriteItem` and `TransactWriteItems` refuse a
+  `ReturnItemCollectionMetrics` other than `SIZE` or `NONE` before writing
+  anything. They used to accept any value. A request with more than one of
+  these member errors, such as both enums, or an overlong
+  `ClientRequestToken` beside either, now gets them in one
+  `N validation errors detected:` message, as DynamoDB gives them.
+- A malformed table name in a transaction is a top-level ValidationException
+  naming the action's position and type, such as
+  `transactItems.2.member.update.tableName`, checked before any action runs.
+  `TransactGetItems` used to report it as a cancellation reason, and both
+  reported the path as `tableName`. The name must now be 3 to 255 characters,
+  as DynamoDB requires inside a request body.
+- `BatchGetItem` and `BatchWriteItem` report a malformed table name as a
+  constraint on the `RequestItems` map's keys, echoing the map as DynamoDB
+  does, and `BatchGetItem` reports it together with an unknown
+  `ReturnConsumedCapacity`. An empty request list in `BatchWriteItem`, and an
+  empty `Keys` list in `BatchGetItem`, use DynamoDB's messages too.
+- A `BatchWriteItem` put whose item has no partition key is refused with "The
+  provided key element does not match the schema", as DynamoDB does, where it
+  named the missing key.
+- A `TransactWriteItems` item with no action is refused with DynamoDB's
+  "Invalid Request" message, and one with two actions with "TransactItems can
+  only contain one of Check, Put, Update or Delete". An item carrying both a
+  `Put` and a `Delete` used to run the `Put` and drop the `Delete`.
+- A `TransactGetItems` item without its `Get` is refused with DynamoDB's
+  "Value null at 'transactItems.N.member.get' failed to satisfy constraint:
+  Member must not be null", together with an unknown
+  `ReturnConsumedCapacity`. It used to come back as serde's own "missing
+  field" text.
+- The single-item operations, `Query`, `Scan` and `SearchVectors` follow the
+  member validation most regions now run. DynamoDB is moving each operation to
+  a newer validation layer region by region; these match the majority of seven
+  regions captured on 2026-10-09, which is the newer layer everywhere except
+  `Scan`.
+  - A table name of one or two characters is refused for its length before
+    the table is looked up, where it used to answer
+    `ResourceNotFoundException`. A name that breaks more than one constraint
+    gets one error on most operations, both on `UpdateItem` and `Scan`.
+  - An empty table name gets the newer "Value at 'TableName'" wording on its
+    own, except on `Scan`.
+  - `PutItem` and `DeleteItem` report a table-name error together with the
+    other member errors; `UpdateItem` reports it alone; `Scan` reports it only
+    when nothing else is wrong.
+  - `UpdateItem` without its key reports every invalid enum, in the older
+    per-value wording, followed by the missing key, as all seven regions do.
+  - An unknown `ReturnValues` gets the newer layer's message, which names
+    neither the value nor the member.
+  - An unknown `ReturnValuesOnConditionCheckFailure` is refused, on the
+    single-item operations and on every `TransactWriteItems` action. It used to
+    be accepted.
+  - `UpdateItem` reports one invalid enum, in DynamoDB's order, without the
+    envelope for `ReturnValuesOnConditionCheckFailure` and
+    `ReturnConsumedCapacity`.
+  - `Query` reports a `Limit` of 0 and an empty name together, ahead of
+    everything else, and checks `Select` after mixing `ConditionalOperator`
+    with an expression. `Scan`
+    reports its member errors in DynamoDB's order.
+  - A `ConditionalOperator` is refused unless it joins two or more legacy
+    `Expected`, `QueryFilter` or `ScanFilter` conditions, with DynamoDB's
+    messages, and joining two or more with a value other than `AND` or `OR`
+    gets DynamoDB's generic enum message. Beside an expression it gets the
+    mixing message, which `DeleteItem` now wraps in the envelope as `PutItem`
+    and `UpdateItem` do. It used to be accepted with nothing to join. `Scan`
+    still checks its value as an enum.
+  - `SearchVectors` refuses a short or malformed table name without the
+    envelope once its other members pass, a `TopK` below 1 in the newer
+    wording, and a missing `IndexName`, `SearchVector` or `TopK` with
+    DynamoDB's own "missing field" message.
+- A request carrying an attribute value nested more than about 60 levels is
+  read and refused with DynamoDB's nesting `ValidationException`, rather than
+  failing to parse with a bare `SerializationException`. As in DynamoDB, an
+  `ExpressionAttributeValues` entry is named in the message and a member such
+  as a bad table name or enum is still reported first. Past about 2,000
+  levels, where DynamoDB itself stops reading the request, it stays a bare
+  `SerializationException`.
+- A key, `ExclusiveStartKey`, or legacy `Expected`, `AttributeUpdates`,
+  `ScanFilter`, `QueryFilter` or `KeyConditions` value nested 32 or more levels
+  is refused with DynamoDB's nesting `ValidationException` before the table is
+  looked up. A key used to be reported as not matching the schema, a
+  transaction was cancelled, and a legacy condition or filter was evaluated.
+  As in DynamoDB, the message sits inside the validation envelope on
+  DeleteItem's and UpdateItem's key, `Expected` and `AttributeUpdates`, and
+  after the starting-key prefix on a Scan's `ExclusiveStartKey`, and a
+  `ScanFilter` value is refused from 33 levels.
+- A Query's `ExclusiveStartKey` that doesn't fit the key schema is refused
+  with "The provided starting key is invalid" alone, as DynamoDB does, where it
+  used to add "The provided key element does not match the schema". An invalid
+  value in it (`NULL: false`, an empty set) is reported without the
+  starting-key prefix, and a start key from another partition or outside the
+  sort key condition is refused with DynamoDB's messages rather than paged
+  from.
+- A legacy `KeyConditions` value whose type isn't the key's schema type is
+  refused with "Condition parameter type does not match schema type", and a
+  BETWEEN whose two values differ in type with "AttributeValues inside
+  AttributeValueList must be of same type". A map used to be reported as
+  "Cannot convert partition key value to string".
+- A PartiQL parameter nested 33 or more levels is refused before its statement
+  is parsed or its table looked up, as DynamoDB does: at the top level on
+  ExecuteStatement and ExecuteTransaction, where a transaction used to be
+  cancelled, and against that statement alone in a BatchExecuteStatement. It
+  used to run, or come back as "Invalid key value".
+- A BatchExecuteStatement member that fails on its own, for a parameter
+  nested too deep or holding an empty attribute name, takes no part in the
+  batch's read/write and duplicate checks, as DynamoDB does: a read beside a
+  write whose parameter is too deep, or two updates of one item where one is,
+  now return 200 and run the rest, where the whole batch used to be refused
+  (captured against eu-west-2 and us-east-1). The same is applied to a member
+  refused for a parameter value DynamoDB can't store or for a COUNT
+  projection, not yet captured.
+- Set members come back in DynamoDB's order instead of the order they were
+  written in. String and binary sets are sorted by their bytes everywhere.
+  Number sets are sorted by value from GetItem, BatchGetItem, Query and the
+  ReturnValues of PutItem, UpdateItem and DeleteItem, and come back in the
+  order of a Java hash set from Scan, TransactGetItems, the PartiQL
+  operations, stream records and transaction cancellation reasons, as
+  DynamoDB returns them. Sets are now stored sorted, and a row stored before
+  this change comes back sorted in responses on the wire (HTTP, MCP and wasm);
+  the Rust API returns such a row's sets as they were stored. An update that
+  leaves such a set alone no longer fails the type check for an index key the
+  set's attribute is named after.
+- An empty attribute name is refused with DynamoDB's `Empty attribute name`
+  before the table is looked up: in an item or a key, as a map key at any
+  depth inside a value, in AttributesToGet, in the legacy Expected,
+  AttributeUpdates, QueryFilter and ScanFilter values, in a PartiQL
+  parameter, and as an ExpressionAttributeNames value. It used to be stored,
+  or ignored. PutItem, UpdateItem and DeleteItem report it inside the
+  validation envelope, as DynamoDB does.
+- CreateTable lists a GSI's member errors before an LSI's, so two too-short
+  index names come back in DynamoDB's order.
+- `ItemCollectionMetrics` reports `SizeEstimateRangeGB` as DynamoDB does: a
+  lower and an upper bound in whole gigabytes, so a small item collection
+  reads `[0.0, 1.0]`. It used to give the collection's exact size twice.
+- PutItem, UpdateItem and DeleteItem report more of their request-validation
+  errors inside the `1 validation error detected: ` envelope, as DynamoDB does:
+  `ExpressionAttributeNames` or `ExpressionAttributeValues` without an
+  expression, either map empty, an empty `ConditionExpression`, and every
+  malformed legacy `Expected` condition. The values message no longer names
+  the missing expressions after it. DeleteItem now envelopes the same families
+  PutItem does, including `{"NULL": false}` wherever it sits, and refuses a
+  `ReturnValues` other than `ALL_OLD` or `NONE` with DynamoDB's
+  `ReturnValues can only be ALL_OLD or NONE`, before the table is looked up.
+- A legacy `Expected` value DynamoDB refuses, such as `{"NULL": false}` or a
+  number it can't store, is refused on PutItem, UpdateItem and DeleteItem.
+  The condition used to be dropped and the write went ahead.
+- A number DynamoDB can't store, and a set with a repeated member, are
+  refused in the words of the validation layer each operation runs on, as
+  DynamoDB refuses them. PutItem, UpdateItem and DeleteItem report them inside
+  the validation envelope wherever the value sits, and GetItem, BatchGetItem
+  and Query report them bare; an empty number ends `numeric value: `, a
+  duplicated string or binary set lists its members quoted, and expression
+  values carry no `ExpressionAttributeValues contains invalid value` wrapper.
+  BatchWriteItem, the transactions, Scan and PartiQL keep the older wording,
+  read numbers as DynamoDB's older layer does (`1e2147483647` is an underflow
+  there) and name the key of a bad expression value. The transactions refuse
+  an empty or duplicated set in any action up front, before a missing table or
+  a condition's syntax error, rather than cancelling. A legacy `Expected`
+  value and an `AttributeUpdates` value are checked as an item's are. A
+  PartiQL number set literal with a repeated value is refused naming its
+  members and path, in a WHERE clause too.
+- Expressions containing non-ASCII characters are read as DynamoDB reads
+  them. A character such as `é`, `€` or an emoji outside a string is refused
+  with the syntax error naming that character, in every expression and in
+  transactions, and so is a no-break space, which DynamoDB doesn't treat as
+  whitespace. A placeholder whose own name holds one is refused as an invalid
+  key of its map, and a PartiQL statement with one outside a string as not
+  well formed. Captured against eu-west-2 and us-east-1; us-east-1 names an
+  emoji in a filter or a transaction as `?`, and Dynoxide follows eu-west-2.
+  In 1.2.1 some of these expressions stopped the server instead of being
+  refused, so anyone running Dynoxide where other people's clients can reach
+  it should upgrade.
+- A `TransactWriteItems` Update whose SET paths overlap, such as
+  `SET a.b = :v, a = :m`, is refused before anything is written, with
+  DynamoDB's "Two document paths overlap" message, where it used to be
+  applied. `UpdateItem` names the two paths in the order they were written.
+  Captured against eu-west-2 and us-east-1.
+- A PartiQL statement longer than 8,192 characters, or an empty one, is
+  refused before it is parsed, as a request member with DynamoDB's message
+  (`Member must have length less than or equal to 8192`), on
+  `ExecuteStatement`, `BatchExecuteStatement` and `ExecuteTransaction`. The
+  limit counts characters, not bytes. Captured against eu-west-2 and
+  us-east-1.
+- A `BOOL` or `NULL` member's value is read as DynamoDB reads it. The
+  strings `true`, `t`, `yes`, `y` and `1`, and `false`, `f`, `no`, `n` and
+  `0`, in any case, are taken as the booleans they spell, so `{"BOOL": "no"}`
+  stores `false` and `{"NULL": "yes"}` stores a NULL, where both used to be
+  refused. Any other string is refused with `Unexpected token received from
+  parser`, a number with `NUMBER_VALUE` (or `DECIMAL_VALUE`) `cannot be
+  converted to Boolean`, and a list with a `SerializationException` that has
+  no message. A number is named by how it is written: a whole number of any
+  size, `-0` included, is `NUMBER_VALUE`, and one with a point or an exponent
+  `DECIMAL_VALUE`, where `-0` and an integer past 64 bits were named
+  `DECIMAL_VALUE`. A `NULL` that reads as false is refused bare as the value is
+  read, and named by key in an expression value on `UpdateItem`, `DeleteItem`
+  and `Query`, when it was a string or sits beside another member; a lone
+  `{"NULL": false}` keeps the envelope. A member set to JSON `null` counts as
+  absent, so `{"S": null}` is an empty value and `{"S": "a", "N": null}` a
+  string, and `Query` names the key of an empty expression value. Captured
+  against eu-west-2 and us-east-1.
+- A request that holds a `BOOL` or `NULL` written as a string, or a value with
+  more than one member, is read whole by DynamoDB's older validation layer,
+  whatever the operation, and Dynoxide now reads it the same way: every value
+  it refuses, wherever it sits, comes back bare on `PutItem`, `UpdateItem` and
+  `DeleteItem`, where the same refusal alone is wrapped in `1 validation
+  error detected:`, and `UpdateItem` names the key of the expression value at
+  fault (`ExpressionAttributeValues contains invalid value: ... for key :v`).
+  A value with more than one member is checked in DynamoDB's order: a member
+  that doesn't read as a boolean, then an empty set, then a number it can't
+  read, then a `NULL` that reads as false, and only then the second member,
+  where the empty set came after the second member. Captured against
+  eu-west-2 and us-east-1.
+- A request's own `ConsistentRead`, on `GetItem`, `Query`, `Scan` and each
+  table of `BatchGetItem`, and `Query`'s `ScanIndexForward`, read a string by
+  the rule a `BOOL` member follows, as DynamoDB reads them: `"yes"` is a
+  strongly consistent read and `"no"` reads a Query descending, where every
+  string was refused with `Unexpected token received from parser`. Any other
+  string still is, and a number is named as it is for a `BOOL`. A `null`
+  `ScanIndexForward` reads forward, as leaving it out does, where it was
+  refused. Captured against eu-west-2 and us-east-1.
+- A PartiQL statement that reads or writes by a key longer than a key can be
+  is refused with DynamoDB's words, where it used to run and find nothing: a
+  partition key over 2,048 bytes with `Size of hashkey has exceeded the
+  maximum size limit of2048 bytes`, and a sort key over 1,024 bytes with
+  `Aggregated size of all range keys has exceeded the size limit of 1024
+  bytes`. That covers a SELECT on the table or on either kind of index, a
+  sort key under any key condition (`=`, a comparison, `BETWEEN` or
+  `begins_with`), a partition key beside an `OR` that every alternative
+  shares (`pk = <key> AND (x = 1 OR x = 2)`), and the key of an `UPDATE` or a
+  `DELETE`; a statement that names several partitions, such as an `OR` of
+  keys, still runs. The refusal stands
+  on its own on `ExecuteStatement`, against that statement (with its table)
+  in a `BatchExecuteStatement`, where it is now charged nothing, and as a
+  `ValidationError` cancellation in an `ExecuteTransaction`. Captured against
+  eu-west-2 and us-east-1.
+- A PartiQL WHERE clause with more than 300 operators is refused with
+  DynamoDB's "The expression contains too many operators" message. AND, OR,
+  NOT, comparison operators, function calls, `IN`, `BETWEEN` and `IS` each
+  count, the NOT in `IS NOT` or `NOT IN` on its own, so `AND size(s) > 0`
+  and `AND x IS NOT NULL` cost three; `BETWEEN`'s own AND, an `IN` list's
+  members and a bag literal's `<<` and `>>` count nothing. A run of NOTs no
+  longer counts as nesting, so one that was refused as nested too deeply now
+  runs. Captured against eu-west-2 and us-east-1.
+- PartiQL accepts `x NOT IN [...]` and `x NOT BETWEEN lo AND hi`, read as
+  `NOT x IN [...]` and `NOT x BETWEEN lo AND hi`, so an item missing `x`, or
+  holding a value of another type, matches a numeric range's negation; both
+  were refused as an unknown operator. They also follow a `size()`, a literal
+  or a parameter, and `NOT IN` follows a condition function, where `NOT
+  BETWEEN` takes the same refusal as `BETWEEN`. A sort key read with `NOT
+  BETWEEN` reads the range's complement, as `NOT sk BETWEEN` does. A missing
+  AND in a WHERE clause's `BETWEEN` is now "Expected AND keyword", and `x NOT`
+  followed by anything but `IN`, `BETWEEN` or `LIKE` is an unexpected token
+  rather than an unknown operator. Captured against eu-west-2 and us-east-1.
+- A PartiQL `IN` or `BETWEEN` on a path that also stands among its own
+  members or bounds, such as `x IN [1, x]` or `x BETWEEN 1 AND x`, is refused
+  with DynamoDB's "The first operand must be distinct from the remaining
+  operands" message, as `x = x` already was. The message names a path by its
+  parts, `[m, a]` for `m.a` and `[l, [0]]` for `l[0]`, in a comparison too.
+  Where a WHERE clause holds more than one refusal, `MISSING` compared
+  without `IS` now outranks a refused operand whichever is written first, and
+  an `IN` with too many operands is reported in the order written against a
+  refused operand rather than ahead of it. An `IN` with too many operands
+  that also holds its own path is refused for the path, wherever it stands
+  in the list, where the operand count used to be reported. Captured against
+  eu-west-2 and us-east-1.
+- A PartiQL `UPDATE` that sets or removes a key attribute is refused with
+  `Cannot update attribute <name>. This attribute is part of the key`, and
+  writes nothing. It used to store the item under its old key with the new
+  key value inside it, so the item no longer matched its own key. It is
+  refused before the item is read, so a missing item or a false condition
+  makes no difference. In `BatchExecuteStatement` it fails its own statement
+  with a `ValidationError` that names the table, and in `ExecuteTransaction`
+  it cancels the transaction with a `ValidationError` reason. Captured against
+  eu-west-2 and us-east-1 on 10 October 2026.
+- A quoted name in a PartiQL statement is one attribute whatever it holds,
+  as DynamoDB reads it: `"a.b"` and `"a[0]"` name the top-level attributes
+  `a.b` and `a[0]` in a WHERE clause, a condition function, `IS NOT MISSING`
+  and a projection, which returns them under those names, and `SET "x.y" =
+  5` writes an attribute named `x.y`. They used to be read as `a.b` and
+  `a[0]` unquoted, a step into `a`, and `SET "x[0]"` was refused as an
+  invalid document path. `"a"."b"` and `"a"[0]` still step into `a`. A key
+  attribute whose name holds a `.` or a `[` is named by quoting it, so such
+  a table is read by its key and its items can be updated and deleted.
+  Captured against eu-west-2 and us-east-1.
+- PartiQL `size()` calls nested inside one another, and arithmetic after a
+  `size()`, are held to the same depth as nested brackets.
+- A PartiQL `IN` with more than 100 operands, negated or not, written as
+  literals or as parameters, after a path or a `size()`, is refused with
+  DynamoDB's "The IN operator is provided with too many operands" message.
+  Captured against eu-west-2.
+- A PartiQL WHERE clause that repeats a long value across the alternatives
+  it expands to, such as eight `(a = 1 OR a = 2)` pairs alongside a
+  4,000-character string, runs as it does on DynamoDB. The engine holds each
+  condition once however many alternatives share it, and checks the size of
+  an expansion before building it. Captured against eu-west-2.
+- A PartiQL condition whose `?` has no parameter to fill it no longer
+  matches an item. `flag <> ?` with no parameters used to hold for every item
+  without `flag`, so a `DELETE` or `UPDATE` short of its parameters could
+  delete or change it.
+- A PartiQL statement with more `?` placeholders than the request has
+  parameters is refused with DynamoDB's "Number of parameters in request and
+  statement don't match." message: on its own on `ExecuteStatement`, against
+  that statement alone in `BatchExecuteStatement` (where it no longer counts
+  towards the mixed read and write check), and with the statement's index on
+  `ExecuteTransaction`. More parameters than placeholders are still accepted.
+  An empty `Parameters` list is refused as a request member, on a batch or
+  transaction member too, where it refuses the whole request.
+  Captured against eu-west-2 and us-east-1.
+- A PartiQL request that breaks several member constraints at once, such as
+  an over-long statement with an empty `Parameters` list or several over-long
+  statements in a batch, lists every one in DynamoDB's "N validation errors
+  detected" form rather than the first, and an empty statement in a batch or
+  transaction refuses the whole request as a member. `ReturnConsumedCapacity`
+  is listed with the rest rather than refused on its own: on
+  `BatchExecuteStatement` ahead of the statement list's length, and on
+  `ExecuteTransaction` after an over-long `ClientRequestToken` and the
+  statements (both orders captured against eu-west-2 and us-east-1). More
+  than 25 statements in a batch is refused as a member too, where it used to
+  give "Too many statements in BatchExecuteStatement"; its echo of the
+  statements is us-east-1's, as eu-west-2 printed a hash in their place that
+  can't be reproduced. A batch member's own errors follow
+  `ReturnConsumedCapacity` (captured). Inferred rather than captured: an empty
+  transaction, or one of more than 100 statements, listed with the token and
+  the statements rather than answering after them. The MCP `execute_partiql`, `batch_execute_partiql`
+  and `execute_transaction_partiql` tools list a bad mode the same way.
+- A transaction's list longer than DynamoDB allows is echoed as DynamoDB
+  echoes it: `ExecuteTransaction`'s statements as `ParameterizedStatement(...)`
+  and an empty list as `[]`, and the actions of `TransactWriteItems` and
+  `TransactGetItems` as `TransactWriteItem(...)` and `TransactGetItem(...)`,
+  every field named, where they echoed nothing or Dynoxide's own debugging
+  form. An attribute map in any of these echoes, and in `BatchWriteItem`'s,
+  lists its entries in the order of a Java hash map sized to its entries, as
+  DynamoDB's do, rather than by name: an item, a nested map or
+  `ExpressionAttributeNames` of 2 to 6 entries is laid out over four or eight
+  buckets, not sixteen. Entries that share a bucket are listed in name order,
+  where DynamoDB keeps the order they were sent in. Captured against
+  us-east-1, eu-west-1 and us-west-2 (eu-west-2 echoes no action list), the
+  map sizes against us-east-1 and eu-west-2.
+- A PartiQL WHERE clause's alternatives are held to 16,384 condition slots
+  between them, where each alternative was already held to 4,096. Every slot is
+  evaluated against every item read, and a clause of a few hundred operators
+  could flatten to tens of thousands. The limit is Dynoxide's own, as DynamoDB
+  does not flatten a clause; a clause past it is refused as too complex.
+- A refused member echoed in a constraint message (`BatchWriteItem`'s and
+  `BatchGetItem`'s request items, `BatchExecuteStatement`'s statements, and the
+  action list `TransactWriteItems` and `TransactGetItems` echo when it holds
+  more than 100) stops at 1 MiB and ends `...`. The Java form these echoes take runs to about
+  twenty times the request, so a rejected request near the body limit built
+  an error message of hundreds of megabytes. The limit is Dynoxide's own;
+  what DynamoDB does with an echo that size has not been captured.
+- A malformed `Expected` condition on `PutItem`, `UpdateItem` or `DeleteItem`
+  is refused rather than ignored. 1.2.1 ran the write with no condition at
+  all, so a guarded `DeleteItem` deleted the item. An unknown `ComparisonOperator` gets
+  DynamoDB's "Invalid comparison operator" message, and `EQ` with an empty
+  `AttributeValueList` its "Invalid number of argument(s)" message. Captured
+  against eu-west-2 and us-east-1.
+- The `Debug` form of a map `AttributeValue` writes its entries in key order,
+  and the idempotency check on transactions sorts a map's keys itself rather
+  than rely on serde_json to, so a build in which another crate turns on
+  serde_json's `preserve_order` feature still replays a same-token retry of
+  an identical request.
+- PartiQL `begins_with` matches a binary attribute against a binary prefix by
+  its bytes, and `NOT begins_with` keeps the rest. A binary prefix matched
+  nothing and its negation everything. A string prefix still matches only a
+  string value. Captured against eu-west-2 and us-east-1.
 
 ## [1.2.1] - 2026-09-20
 

@@ -11,9 +11,11 @@ The canonical server identifier across every registry is
 
 Automated. `server.json` at the repo root describes the server, and the
 `publish-mcp-registry` job in `.github/workflows/release.yml` publishes it on
-every `v*` release tag, authenticating with GitHub OIDC (no token). Cutting a
-release as normal is all that is needed; the job waits for npm to go live,
-stamps the release version into `server.json`, and runs `mcp-publisher publish`.
+every stable `v*` release tag, authenticating with GitHub OIDC (no token).
+Cutting a release as normal is all that is needed; the job waits for npm to go
+live, stamps the release version into `server.json`, and runs
+`mcp-publisher publish`. A prerelease tag skips it, because the registry treats
+the highest semver as latest and `1.3.0-rc.1` sorts above `1.2.1`.
 
 Ownership is proved against the live release artefacts, so both markers must
 stay in place:

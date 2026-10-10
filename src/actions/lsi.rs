@@ -27,10 +27,15 @@ pub fn lsi_to_def(lsi: &LocalSecondaryIndex) -> Result<LsiDef> {
         .find(|k| k.key_type == KeyType::RANGE)
         .map(|k| k.attribute_name.clone());
 
+    // An LSI key is the table's partition key and one sort key attribute.
+    let hash_attrs = vec![pk_attr.clone()];
+    let range_attrs = sk_attr.iter().cloned().collect();
     Ok(LsiDef {
         index_name: lsi.index_name.clone(),
         pk_attr,
         sk_attr,
+        hash_attrs,
+        range_attrs,
         projection_type: lsi.projection.projection_type.clone().unwrap_or_default(),
         non_key_attributes: lsi.projection.non_key_attributes.clone(),
     })

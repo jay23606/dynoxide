@@ -596,10 +596,11 @@ async fn test_put_item_multi_datatype_attribute_value_bare() {
 
 /// The enveloped rejection UpdateItem returns for a duplicate string set in
 /// ExpressionAttributeValues.
+// UpdateItem refuses it in the current layer's words, with no
+// ExpressionAttributeValues wrapper (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
 const DUPLICATE_SET_IN_EAV_ENVELOPED: &str = "1 validation error detected: \
-     ExpressionAttributeValues contains invalid value: \
      One or more parameter values were invalid: \
-     Input collection [a, b, a] contains duplicates. for key :t";
+     Input collection [\"a\", \"b\", \"a\"] contains duplicates.";
 
 /// The bare rejection UpdateItem returns for a SET on a key attribute,
 /// captured against real DynamoDB (eu-west-2).
@@ -772,7 +773,7 @@ async fn test_put_item_duplicate_string_set_in_item_enveloped() {
     assert_validation_error(
         resp,
         "1 validation error detected: One or more parameter values were invalid: \
-         Input collection [x, x] contains duplicates.",
+         Input collection [\"x\", \"x\"] contains duplicates.",
     )
     .await;
 }
@@ -794,7 +795,7 @@ async fn test_put_item_condition_expression_syntax_error_enveloped() {
     .await;
     assert_validation_error(
         resp,
-        "1 validation error detected: Invalid ConditionExpression: Expected operand, got =",
+        r#"1 validation error detected: Invalid ConditionExpression: Syntax error; token: "=", near: "==""#,
     )
     .await;
 }
@@ -817,7 +818,7 @@ async fn test_put_item_condition_expression_oversize_enveloped() {
     assert_validation_error(
         resp,
         "1 validation error detected: Invalid ConditionExpression: \
-         Expression size has exceeded the maximum allowed size; expression size: 4200",
+         Expression size has exceeded the maximum allowed size;",
     )
     .await;
 }
@@ -839,8 +840,7 @@ async fn test_update_item_update_expression_syntax_error_enveloped() {
     .await;
     assert_validation_error(
         resp,
-        "1 validation error detected: Invalid UpdateExpression: Syntax error; \
-         Expected attribute name, got end of expression",
+        r#"1 validation error detected: Invalid UpdateExpression: Syntax error; token: "<EOF>", near: "SET""#,
     )
     .await;
 }
@@ -863,7 +863,7 @@ async fn test_update_item_update_expression_oversize_enveloped() {
     assert_validation_error(
         resp,
         "1 validation error detected: Invalid UpdateExpression: \
-         Expression size has exceeded the maximum allowed size; expression size: 4200",
+         Expression size has exceeded the maximum allowed size;",
     )
     .await;
 }
@@ -909,9 +909,10 @@ async fn test_update_item_return_values_invalid_enveloped() {
     .await;
     assert_validation_error(
         resp,
-        "1 validation error detected: Value 'BOGUS' at 'returnValues' failed to satisfy \
-         constraint: Member must satisfy enum value set: \
-         [ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]",
+        // The validation framework's generic form, in 31 of 33 regions
+        // (captured 2026-10-08): no value, no member, DynamoDB's own order.
+        "1 validation error detected: Failed to satisfy constraint: Member must satisfy enum \
+         value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]",
     )
     .await;
 }
@@ -934,7 +935,7 @@ async fn test_put_item_eav_without_expression_enveloped() {
     assert_validation_error(
         resp,
         "1 validation error detected: ExpressionAttributeValues can only be specified \
-         when using expressions: ConditionExpression is null",
+         when using expressions",
     )
     .await;
 }
@@ -1188,8 +1189,8 @@ async fn test_put_item_duplicate_set_matching_bare_wording_still_enveloped() {
     assert_validation_error(
         resp,
         "1 validation error detected: One or more parameter values were invalid: \
-         Input collection [This attribute is part of the key, \
-         This attribute is part of the key] contains duplicates.",
+         Input collection [\"This attribute is part of the key\", \
+         \"This attribute is part of the key\"] contains duplicates.",
     )
     .await;
 }
@@ -1247,7 +1248,7 @@ async fn test_get_item_projection_expression_oversize_bare() {
     assert_validation_error(
         resp,
         "Invalid ProjectionExpression: \
-         Expression size has exceeded the maximum allowed size; expression size: 4200",
+         Expression size has exceeded the maximum allowed size;",
     )
     .await;
 }
@@ -1269,7 +1270,7 @@ async fn test_query_key_condition_expression_oversize_bare() {
     assert_validation_error(
         resp,
         "Invalid KeyConditionExpression: \
-         Expression size has exceeded the maximum allowed size; expression size: 4200",
+         Expression size has exceeded the maximum allowed size;",
     )
     .await;
 }
@@ -1293,7 +1294,7 @@ async fn test_query_filter_expression_oversize_bare() {
     assert_validation_error(
         resp,
         "Invalid FilterExpression: \
-         Expression size has exceeded the maximum allowed size; expression size: 4200",
+         Expression size has exceeded the maximum allowed size;",
     )
     .await;
 }
@@ -1438,7 +1439,8 @@ async fn test_search_vectors_top_k_zero_is_enveloped_over_the_wire() {
     .await;
     assert_validation_error(
         resp,
-        "1 validation error detected: Value '0' at 'topK' failed to satisfy constraint: \
+        // The newer validation layer's wording (captured 2026-10-09).
+        "1 validation error detected: Value at 'TopK' failed to satisfy constraint: \
          Member must have value greater than or equal to 1",
     )
     .await;

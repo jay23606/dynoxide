@@ -465,3 +465,164 @@ fn test_insert_without_if_not_exists_on_duplicate_fails() {
         "Expected duplicate key error, got: {err}"
     );
 }
+
+/// An UPDATE that sets or removes a key attribute is refused and writes
+/// nothing. It used to store the item under its old key with the new key
+/// value inside it, so the item no longer matched its own key. The refusal is
+/// UpdateItem's words, and comes before the item is read, so a missing item, a
+/// false condition, a condition on a missing attribute or the key in a second
+/// SET clause make no difference (captured eu-west-2 and us-east-1, 10 October
+/// 2026).
+#[test]
+fn an_update_of_a_key_attribute_is_refused_and_writes_nothing() {
+    let db = Database::memory().unwrap();
+    create_composite_table(&db, "Keyed");
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("a".to_string())),
+        ("sk".to_string(), AttributeValue::S("1".to_string())),
+        ("v".to_string(), AttributeValue::N("0".to_string())),
+    ]);
+    put_item(&db, "Keyed", item.clone());
+    let refusal = |attribute: &str| {
+        format!(
+            "One or more parameter values were invalid: Cannot update attribute \
+             {attribute}. This attribute is part of the key"
+        )
+    };
+    for (statement, attribute) in [
+        (
+            r#"UPDATE "Keyed" SET pk = 'b' WHERE pk = 'a' AND sk = '1'"#,
+            "pk",
+        ),
+        (
+            r#"UPDATE "Keyed" SET v = 1, sk = '2' WHERE pk = 'a' AND sk = '1'"#,
+            "sk",
+        ),
+        (
+            r#"UPDATE "Keyed" SET pk = 'a' WHERE pk = 'a' AND sk = '1'"#,
+            "pk",
+        ),
+        (
+            r#"UPDATE "Keyed" REMOVE pk WHERE pk = 'a' AND sk = '1'"#,
+            "pk",
+        ),
+        (
+            r#"UPDATE "Keyed" REMOVE sk WHERE pk = 'a' AND sk = '1'"#,
+            "sk",
+        ),
+        (
+            r#"UPDATE "Keyed" SET pk = 'b' WHERE pk = 'missing' AND sk = '1'"#,
+            "pk",
+        ),
+        (
+            r#"UPDATE "Keyed" SET v = 2, pk = 'b' WHERE pk = 'a' AND sk = '1' AND v = 99"#,
+            "pk",
+        ),
+        (
+            r#"UPDATE "Keyed" SET pk = 'b' WHERE pk = 'a' AND sk = '1' AND nosuch = 1"#,
+            "pk",
+        ),
+        (
+            r#"UPDATE "Keyed" SET v = 5 SET pk = 'b' WHERE pk = 'a' AND sk = '1'"#,
+            "pk",
+        ),
+    ] {
+        assert_eq!(exec_err(&db, statement), refusal(attribute), "{statement}");
+    }
+    let stored = exec(&db, r#"SELECT * FROM "Keyed" WHERE pk = 'a' AND sk = '1'"#);
+    assert_eq!(stored.items, Some(vec![item]));
+    let missing = exec(
+        &db,
+        r#"SELECT * FROM "Keyed" WHERE pk = 'missing' AND sk = '1'"#,
+    );
+    assert_eq!(missing.items, Some(vec![]));
+}
+
+const KEY_UPDATE: &str = "One or more parameter values were invalid: Cannot update attribute pk. This attribute is part of the key";
+
+/// In a batch, an UPDATE of a key attribute fails its own statement with a
+/// `ValidationError` in UpdateItem's words, echoing the table as DynamoDB
+/// does, and writes nothing (captured eu-west-2 and us-east-1, 10 October
+/// 2026).
+#[test]
+fn a_batch_update_of_a_key_attribute_fails_its_statement_and_echoes_the_table() {
+    let db = Database::memory().unwrap();
+    create_composite_table(&db, "Keyed");
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("a".to_string())),
+        ("sk".to_string(), AttributeValue::S("1".to_string())),
+        ("v".to_string(), AttributeValue::N("0".to_string())),
+    ]);
+    put_item(&db, "Keyed", item.clone());
+    let request = serde_json::from_value(serde_json::json!({"Statements": [
+        {"Statement": r#"UPDATE "Keyed" SET pk = 'b' WHERE pk = 'a' AND sk = '1'"#}
+    ]}))
+    .unwrap();
+    let response = serde_json::to_value(db.batch_execute_statement(request).unwrap()).unwrap();
+    assert_eq!(
+        response,
+        serde_json::json!({"Responses": [{
+            "Error": {"Code": "ValidationError", "Message": KEY_UPDATE},
+            "TableName": "Keyed"
+        }]})
+    );
+    let stored = exec(&db, r#"SELECT * FROM "Keyed" WHERE pk = 'a' AND sk = '1'"#);
+    assert_eq!(stored.items, Some(vec![item]));
+}
+
+/// In a transaction, an UPDATE of a key attribute cancels the transaction with
+/// a `ValidationError` reason in UpdateItem's words, and nothing is written,
+/// not even another statement's update. The reason was captured for a
+/// transaction of that statement alone (eu-west-2 and us-east-1, 10 October
+/// 2026); with a second statement beside it, `None` for that one follows the
+/// transaction's other refusals and is inferred.
+#[test]
+fn a_transaction_update_of_a_key_attribute_cancels_it_and_writes_nothing() {
+    let db = Database::memory().unwrap();
+    create_composite_table(&db, "Keyed");
+    let item = |pk: &str| {
+        HashMap::from([
+            ("pk".to_string(), AttributeValue::S(pk.to_string())),
+            ("sk".to_string(), AttributeValue::S("1".to_string())),
+            ("v".to_string(), AttributeValue::N("0".to_string())),
+        ])
+    };
+    put_item(&db, "Keyed", item("a"));
+    put_item(&db, "Keyed", item("b"));
+    let cancelled = |statements: serde_json::Value| {
+        let request =
+            serde_json::from_value(serde_json::json!({"TransactStatements": statements})).unwrap();
+        let error = db
+            .execute_transaction(request)
+            .expect_err("the transaction is cancelled");
+        let mut body: serde_json::Value = serde_json::from_str(&error.to_json()).unwrap();
+        body.as_object_mut().unwrap().remove("Message");
+        body
+    };
+    let refused = serde_json::json!({"Code": "ValidationError", "Message": KEY_UPDATE});
+    let key_update = serde_json::json!({"Statement": r#"UPDATE "Keyed" SET pk = 'z' WHERE pk = 'a' AND sk = '1'"#});
+    assert_eq!(
+        cancelled(serde_json::json!([key_update])),
+        serde_json::json!({
+            "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
+            "CancellationReasons": [refused]
+        })
+    );
+    assert_eq!(
+        cancelled(serde_json::json!([
+            {"Statement": r#"UPDATE "Keyed" SET v = 9 WHERE pk = 'b' AND sk = '1'"#},
+            key_update
+        ])),
+        serde_json::json!({
+            "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
+            "CancellationReasons": [{"Code": "None"}, refused]
+        })
+    );
+    for pk in ["a", "b"] {
+        let stored = exec(
+            &db,
+            &format!(r#"SELECT * FROM "Keyed" WHERE pk = '{pk}' AND sk = '1'"#),
+        );
+        assert_eq!(stored.items, Some(vec![item(pk)]), "{pk}");
+    }
+}

@@ -11,7 +11,7 @@ use std::fmt;
 /// S (String), N (Number as string), B (Binary), BOOL, NULL,
 /// SS (String Set), NS (Number Set), BS (Binary Set),
 /// L (List), M (Map).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum AttributeValue {
     /// String type
     S(String),
@@ -33,6 +33,38 @@ pub enum AttributeValue {
     L(Vec<AttributeValue>),
     /// Map - key-value pairs
     M(HashMap<String, AttributeValue>),
+}
+
+/// The derived form, except that a map's entries are written in key order.
+/// A map is a `HashMap`, so its own order is drawn afresh for every map, and
+/// two equal maps decoded by two requests would otherwise print differently.
+/// A PartiQL NextToken is bound to its statement's printed form, so it relies
+/// on equal values printing alike.
+impl fmt::Debug for AttributeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AttributeValue::S(v) => f.debug_tuple("S").field(v).finish(),
+            AttributeValue::N(v) => f.debug_tuple("N").field(v).finish(),
+            AttributeValue::B(v) => f.debug_tuple("B").field(v).finish(),
+            AttributeValue::BOOL(v) => f.debug_tuple("BOOL").field(v).finish(),
+            AttributeValue::NULL(v) => f.debug_tuple("NULL").field(v).finish(),
+            AttributeValue::SS(v) => f.debug_tuple("SS").field(v).finish(),
+            AttributeValue::NS(v) => f.debug_tuple("NS").field(v).finish(),
+            AttributeValue::BS(v) => f.debug_tuple("BS").field(v).finish(),
+            AttributeValue::L(v) => f.debug_tuple("L").field(v).finish(),
+            AttributeValue::M(map) => {
+                struct Sorted<'a>(&'a HashMap<String, AttributeValue>);
+                impl fmt::Debug for Sorted<'_> {
+                    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        let mut entries: Vec<_> = self.0.iter().collect();
+                        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                        f.debug_map().entries(entries).finish()
+                    }
+                }
+                f.debug_tuple("M").field(&Sorted(map)).finish()
+            }
+        }
+    }
 }
 
 impl AttributeValue {
@@ -152,10 +184,20 @@ impl Serialize for AttributeValue {
             }
             AttributeValue::BOOL(b) => map.serialize_entry("BOOL", b)?,
             AttributeValue::NULL(n) => map.serialize_entry("NULL", n)?,
-            AttributeValue::SS(ss) => map.serialize_entry("SS", ss)?,
-            AttributeValue::NS(ns) => map.serialize_entry("NS", ns)?,
+            // DynamoDB returns set members sorted: strings and binaries by their
+            // bytes, numbers by value. Sorting here as well as on write keeps a
+            // row stored before sets were sorted in the same order on the way out.
+            AttributeValue::SS(ss) => {
+                map.serialize_entry("SS", &crate::set_order::sorted_strings(ss))?
+            }
+            AttributeValue::NS(ns) => {
+                map.serialize_entry("NS", &crate::set_order::sorted_numbers(ns))?
+            }
             AttributeValue::BS(bs) => {
-                let encoded: Vec<String> = bs.iter().map(|b| BASE64.encode(b)).collect();
+                let encoded: Vec<String> = crate::set_order::sorted_binaries(bs)
+                    .into_iter()
+                    .map(|b| BASE64.encode(b))
+                    .collect();
                 map.serialize_entry("BS", &encoded)?;
             }
             AttributeValue::L(items) => map.serialize_entry("L", items)?,
@@ -181,12 +223,13 @@ impl<'de> Deserialize<'de> for AttributeValue {
             return Err(de::Error::custom("empty AttributeValue object"));
         }
 
-        // Collect known type keys
-        let known_types = ["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS", "L", "M"];
+        // Collect known type keys. A member set to JSON null counts as absent:
+        // `{"S": null}` is an empty value and `{"S": "a", "N": null}` a string
+        // (captured eu-west-2 and us-east-1, 2026-10-10).
         let present: Vec<&str> = obj
-            .keys()
-            .filter(|k| known_types.contains(&k.as_str()))
-            .map(|k| k.as_str())
+            .iter()
+            .filter(|(k, v)| TYPE_MEMBERS.contains(&k.as_str()) && !v.is_null())
+            .map(|(k, _)| k.as_str())
             .collect();
 
         if present.is_empty() {
@@ -195,26 +238,83 @@ impl<'de> Deserialize<'de> for AttributeValue {
             ));
         }
 
+        // BOOL and NULL members are read first, as booleans: a malformed one
+        // fails the request ahead of anything else about the value, a second
+        // member included (captured eu-west-2 and us-east-1, 2026-10-10).
+        let boolean = match obj.get("BOOL").filter(|v| !v.is_null()) {
+            Some(v) => Some(read_lenient_bool(v).map_err(de::Error::custom)?),
+            None => None,
+        };
+        let null = match obj.get("NULL").filter(|v| !v.is_null()) {
+            Some(v) => Some(read_lenient_bool(v).map_err(de::Error::custom)?),
+            None => None,
+        };
+
+        // A value with more than one member is read by DynamoDB's older
+        // validation layer, and so is every other value in its request (see
+        // `reads_on_older_layer`): its refusals are bare. An empty set comes
+        // first, then a number it can't read, then a NULL that reads as false,
+        // and only then the second member itself (captured eu-west-2 and
+        // us-east-1, 2026-10-10).
+        let layer = if present.len() > 1 {
+            crate::validation::ValueLayer::Older
+        } else {
+            current_value_layer()
+        };
+        if present.len() > 1
+            && let Some(refusal) = present
+                .iter()
+                .find_map(|&type_key| empty_set_refusal(type_key, &obj[type_key]))
+        {
+            return Err(de::Error::custom(format!(
+                "{}{refusal}",
+                crate::serde_errors::VALIDATION_MARKER
+            )));
+        }
+
         // Validate numbers in ALL type keys before checking for multi-type.
         // DynamoDB validates number format before rejecting multi-type.
         for &type_key in &present {
             match type_key {
                 "N" => {
                     if let Some(n) = obj.get("N").and_then(|v| v.as_str()) {
-                        validate_number_in_deser(n).map_err(de::Error::custom)?;
+                        validate_number_in_deser(n, layer).map_err(de::Error::custom)?;
                     }
                 }
                 "NS" => {
                     if let Some(arr) = obj.get("NS").and_then(|v| v.as_array()) {
                         for item in arr {
                             if let Some(n) = item.as_str() {
-                                validate_number_in_deser(n).map_err(de::Error::custom)?;
+                                validate_number_in_deser(n, layer).map_err(de::Error::custom)?;
                             }
                         }
                     }
                 }
                 _ => {}
             }
+        }
+
+        // A NULL must read as true. JSON false on its own is refused by the
+        // request's validation, in the envelope PutItem, UpdateItem and
+        // DeleteItem give it, so it carries the request-validation marker. A
+        // string that reads as false, or a false NULL beside another member or
+        // in a request read on the older layer, is refused as the value is
+        // parsed: bare, and ahead of the check for more than one member
+        // (captured eu-west-2 and us-east-1, 2026-10-10).
+        if let Some(LenientBool {
+            value: false,
+            from_string,
+        }) = null
+        {
+            let marker = if from_string || layer == crate::validation::ValueLayer::Older {
+                crate::serde_errors::VALIDATION_MARKER
+            } else {
+                crate::serde_errors::REQUEST_VALIDATION_MARKER
+            };
+            return Err(de::Error::custom(format!(
+                "{marker}{}",
+                crate::serde_errors::NULL_NOT_TRUE
+            )));
         }
 
         // Check for multiple type keys
@@ -250,29 +350,9 @@ impl<'de> Deserialize<'de> for AttributeValue {
                     .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))?;
                 Ok(AttributeValue::B(bytes))
             }
-            "BOOL" => {
-                let b = val
-                    .as_bool()
-                    .ok_or_else(|| de::Error::custom("expected boolean for BOOL"))?;
-                Ok(AttributeValue::BOOL(b))
-            }
-            "NULL" => {
-                // AWS requires the NULL member to be exactly `true`; `{"NULL": false}`
-                // and non-boolean values (e.g. `{"NULL": "no"}`) are both rejected.
-                // dynoxide previously normalised `false` to `true` (#62/#74); real
-                // DynamoDB (eu-west-2) rejects it, so we match that here. The
-                // VALIDATION_REQUEST marker puts the rejection in the
-                // request-validation class that PutItem and UpdateItem envelope
-                // (see `crate::serde_errors`); other operations report it bare.
-                if val.as_bool() != Some(true) {
-                    return Err(de::Error::custom(format!(
-                        "{}One or more parameter values were invalid: \
-                         Null attribute value types must have the value of true",
-                        crate::serde_errors::REQUEST_VALIDATION_MARKER
-                    )));
-                }
-                Ok(AttributeValue::NULL(true))
-            }
+            // Both were read above; a NULL that reached here reads as true.
+            "BOOL" => Ok(AttributeValue::BOOL(boolean.is_some_and(|b| b.value))),
+            "NULL" => Ok(AttributeValue::NULL(true)),
             "SS" => {
                 let arr = val
                     .as_array()
@@ -345,20 +425,168 @@ impl<'de> Deserialize<'de> for AttributeValue {
     }
 }
 
+/// A BOOL or NULL member's value read as a boolean, and whether it was
+/// written as a string.
+#[derive(Clone, Copy)]
+struct LenientBool {
+    value: bool,
+    from_string: bool,
+}
+
+/// Read a BOOL or NULL member's value the way DynamoDB does: JSON `true` and
+/// `false`, or one of the strings it takes for them in any case (`true`, `t`,
+/// `yes`, `y` and `1`; `false`, `f`, `no`, `n` and `0`). Anything else is a
+/// malformed request, in DynamoDB's words for what was found: another string,
+/// a number, a list (no message at all) or a map (captured eu-west-2 and
+/// us-east-1, 2026-10-10). The error carries the serialisation marker.
+fn read_lenient_bool(value: &serde_json::Value) -> Result<LenientBool, String> {
+    let refused = |message: &str| format!("{}{message}", crate::serde_errors::SERIALIZATION_MARKER);
+    match value {
+        serde_json::Value::Bool(value) => Ok(LenientBool {
+            value: *value,
+            from_string: false,
+        }),
+        serde_json::Value::String(text) => match lenient_bool_text(text) {
+            Some(value) => Ok(LenientBool {
+                value,
+                from_string: true,
+            }),
+            None => Err(refused("Unexpected token received from parser")),
+        },
+        // A number is named by how it was written: a whole number of any size
+        // is NUMBER_VALUE and one with a point or an exponent DECIMAL_VALUE
+        // (captured eu-west-2 and us-east-1, 2026-10-10). serde_json reads
+        // `-0` and integers past 64 bits as floats, so the wire seams rewrite
+        // those first (`serde_errors::boolean_numbers_as_written`) and a float
+        // here was written as one.
+        serde_json::Value::Number(n) if n.is_f64() => {
+            Err(refused("DECIMAL_VALUE cannot be converted to Boolean"))
+        }
+        serde_json::Value::Number(_) => Err(refused("NUMBER_VALUE cannot be converted to Boolean")),
+        serde_json::Value::Array(_) => Err(refused("")),
+        serde_json::Value::Object(_) => Err(refused(
+            "Start of structure or map found where not expected",
+        )),
+        // A null member counts as absent and is never read.
+        serde_json::Value::Null => Err(refused("Unexpected token received from parser")),
+    }
+}
+
+/// Deserialise a request's own boolean member (`ConsistentRead`,
+/// `ScanIndexForward`, a legacy condition's `Exists`) the way DynamoDB reads
+/// it: by the rule a `BOOL` member follows, so the strings that read as a
+/// boolean there read as one here too, and JSON `null` leaves the member
+/// unset (captured eu-west-2 and us-east-1, 2026-10-10). A list is refused as
+/// the member's own type, as the request's other members are.
+pub(crate) fn deserialize_lenient_flag<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Array(_) => Err(de::Error::custom(format!(
+            "{}Unrecognized collection type class java.lang.Boolean",
+            crate::serde_errors::SERIALIZATION_MARKER
+        ))),
+        value => read_lenient_bool(&value)
+            .map(|flag| Some(flag.value))
+            .map_err(de::Error::custom),
+    }
+}
+
+/// The malformed-request error, marked for a `SerializationException`, for the
+/// first `BOOL` or `NULL` member, or `Exists`, in a legacy condition map
+/// (`QueryFilter`, `ScanFilter`, `KeyConditions`, `Expected`) that doesn't read
+/// as a boolean; `None` when every one reads. DynamoDB fails the whole request
+/// as it is read (captured eu-west-2 and us-east-1, 2026-10-10), and the map's
+/// values are read later than the request's own members, so the request
+/// decoders look here first.
+pub(crate) fn malformed_condition_boolean(
+    conditions: Option<&serde_json::Value>,
+) -> Option<String> {
+    let malformed = |message: String| {
+        message
+            .starts_with(crate::serde_errors::SERIALIZATION_MARKER)
+            .then_some(message)
+    };
+    for condition in conditions?.as_object()?.values() {
+        let Some(condition) = condition.as_object() else {
+            continue;
+        };
+        if let Some(exists) = condition.get("Exists")
+            && let Err(e) = deserialize_lenient_flag(exists.clone())
+            && let Some(message) = malformed(e.to_string())
+        {
+            return Some(message);
+        }
+        let values = condition.get("Value").into_iter().chain(
+            condition
+                .get("AttributeValueList")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten(),
+        );
+        for value in values {
+            if let Err(e) = serde_json::from_value::<AttributeValue>(value.clone())
+                && let Some(message) = malformed(e.to_string())
+            {
+                return Some(message);
+            }
+        }
+    }
+    None
+}
+
+/// Whether a request's own boolean member written as a string reads as a
+/// boolean, by the rule [`deserialize_lenient_flag`] follows.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn reads_as_flag(text: &str) -> bool {
+    lenient_bool_text(text).is_some()
+}
+
+/// The boolean a string reads as by DynamoDB's rule, in any case: `true`, `t`,
+/// `yes`, `y` and `1`, or `false`, `f`, `no`, `n` and `0`. Nothing is trimmed.
+fn lenient_bool_text(text: &str) -> Option<bool> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "1" => Some(true),
+        "false" | "f" | "no" | "n" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 /// Validate a number string during AttributeValue deserialization.
 ///
 /// Returns DynamoDB-matching error messages for invalid numbers.
 /// Error messages are returned WITHOUT the VALIDATION: prefix since they
 /// bypass the normal validation flow; the server routes them based on
 /// message content (see `crate::serde_errors::deserialize`).
-fn validate_number_in_deser(n: &str) -> Result<(), String> {
-    // validate_dynamo_number is the single source of truth for number format
-    // and precision/range; the deser path only reshapes the error message.
-    match validate_dynamo_number(n) {
+fn validate_number_in_deser(n: &str, layer: crate::validation::ValueLayer) -> Result<(), String> {
+    // The layer the value is read under decides the rule: the current
+    // layer's numbers are refused inside the envelope on PutItem, UpdateItem
+    // and DeleteItem, so they carry the request-validation marker, and the
+    // older layer's stay bare.
+    let marker = match layer {
+        crate::validation::ValueLayer::Current => crate::serde_errors::REQUEST_VALIDATION_MARKER,
+        crate::validation::ValueLayer::Older => crate::serde_errors::VALIDATION_MARKER,
+    };
+    match layer.check_number(n) {
         Ok(()) => Ok(()),
-        Err(crate::errors::DynoxideError::ValidationException(m)) => Err(format!("VALIDATION:{m}")),
-        Err(e) => Err(format!("VALIDATION:{e}")),
+        Err(crate::errors::DynoxideError::ValidationException(m)) => Err(format!("{marker}{m}")),
+        Err(e) => Err(format!("{marker}{e}")),
     }
+}
+
+/// Validate a number by the current validation layer's rule: the stored-number
+/// rule, with an empty string refused as `... numeric value: `, colon and
+/// space (captured eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
+pub(crate) fn validate_current_number(
+    num_str: &str,
+) -> std::result::Result<(), crate::errors::DynoxideError> {
+    if num_str.is_empty() {
+        return Err(crate::errors::DynoxideError::ValidationException(
+            "The parameter cannot be converted to a numeric value: ".to_string(),
+        ));
+    }
+    validate_dynamo_number(num_str)
 }
 
 // ---------------------------------------------------------------------------
@@ -398,11 +626,303 @@ pub fn normalize_number_for_sort(num_str: &str) -> String {
     }
 }
 
+/// DynamoDB's refusal of `type_key`'s member when it is an empty set.
+fn empty_set_refusal(type_key: &str, member: &serde_json::Value) -> Option<&'static str> {
+    if !member.as_array().is_some_and(Vec::is_empty) {
+        return None;
+    }
+    match type_key {
+        "SS" => Some("One or more parameter values were invalid: An string set  may not be empty"),
+        "NS" => Some("One or more parameter values were invalid: An number set  may not be empty"),
+        "BS" => Some("One or more parameter values were invalid: Binary sets should not be empty"),
+        _ => None,
+    }
+}
+
+/// The type members an attribute value can carry.
+const TYPE_MEMBERS: [&str; 10] = ["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS", "L", "M"];
+
+/// Whether a request is read by DynamoDB's older validation layer whatever
+/// operation it is: it holds a `BOOL` or `NULL` member, or a legacy
+/// condition's `Exists`, written as a string, or an attribute value with more
+/// than one member. Every value refusal in such a request takes the older
+/// layer's form: bare on PutItem, UpdateItem and DeleteItem, where the current
+/// layer gives the envelope, and naming its key in UpdateItem's
+/// `ExpressionAttributeValues` (captured eu-west-2 and us-east-1, 2026-10-10).
+///
+/// A map whose members are all maps is an item or an attribute map, not a
+/// value, so an attribute named `S` beside one named `N` doesn't count.
+pub(crate) fn reads_on_older_layer(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let string_flag = ["BOOL", "NULL", "Exists"]
+                .iter()
+                .any(|member| map.get(*member).is_some_and(serde_json::Value::is_string));
+            let members: Vec<&serde_json::Value> = TYPE_MEMBERS
+                .iter()
+                .filter_map(|member| map.get(*member))
+                .filter(|member| !member.is_null())
+                .collect();
+            string_flag
+                || (members.len() > 1 && members.iter().any(|member| !member.is_object()))
+                || map.values().any(reads_on_older_layer)
+        }
+        serde_json::Value::Array(items) => items.iter().any(reads_on_older_layer),
+        _ => false,
+    }
+}
+
+/// The validation layer values are being read under on this thread: the one
+/// a wire seam set for the request in hand, or the current layer outside one.
+pub(crate) fn current_value_layer() -> crate::validation::ValueLayer {
+    VALUE_LAYER.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// The validation layer the values being decoded are read under. Set
+    /// around a request's deserialisation, which runs synchronously; outside
+    /// one it is the current layer.
+    static VALUE_LAYER: std::cell::Cell<crate::validation::ValueLayer> =
+        const { std::cell::Cell::new(crate::validation::ValueLayer::Current) };
+}
+
+/// Run `read` with values decoded under `layer`, restoring the layer in force
+/// before, however `read` ends. `read` must not await: the layer belongs to
+/// the thread.
+pub(crate) fn with_value_layer<T>(
+    layer: crate::validation::ValueLayer,
+    read: impl FnOnce() -> T,
+) -> T {
+    struct Restore(crate::validation::ValueLayer);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VALUE_LAYER.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(VALUE_LAYER.with(|cell| cell.replace(layer)));
+    read()
+}
+
+/// Run `future` with values read under `layer`, set around each of its polls
+/// and restored after, so the layer holds across the future's awaits without
+/// reaching anything polled in between. The wasm engine's single thread runs
+/// other requests between those polls.
+#[cfg(any(feature = "wasm-sqlite", test))]
+pub(crate) async fn with_value_layer_async<F: std::future::Future>(
+    layer: crate::validation::ValueLayer,
+    future: F,
+) -> F::Output {
+    struct Layered<F> {
+        layer: crate::validation::ValueLayer,
+        future: std::pin::Pin<Box<F>>,
+    }
+    impl<F: std::future::Future> std::future::Future for Layered<F> {
+        type Output = F::Output;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<F::Output> {
+            let layer = self.layer;
+            with_value_layer(layer, || self.future.as_mut().poll(cx))
+        }
+    }
+    Layered {
+        layer,
+        future: Box::pin(future),
+    }
+    .await
+}
+
+/// Run `read` with numbers read as PartiQL parameters are: the older layer's
+/// rule, which [`validate_parameter_number`] holds.
+pub(crate) fn reading_parameters<T>(read: impl FnOnce() -> T) -> T {
+    with_value_layer(crate::validation::ValueLayer::Older, read)
+}
+
+/// Deserialise an operation's `ExpressionAttributeValues` on the older
+/// validation layer, which refuses a number it can't store inside the
+/// `ExpressionAttributeValues contains invalid value: ... for key :k` wrapper
+/// (TransactWriteItems in three of four regions, Scan in seven of ten;
+/// 2026-10-09). Every other value error passes through as it is.
+pub(crate) fn deserialize_older_expression_values<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
+    let Some(raw) =
+        Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    let mut values = HashMap::with_capacity(raw.len());
+    for (key, value) in raw {
+        let read = with_value_layer(crate::validation::ValueLayer::Older, || {
+            serde_json::from_value::<AttributeValue>(value)
+        });
+        match read {
+            Ok(av) => {
+                values.insert(key, av);
+            }
+            Err(e) => {
+                use crate::serde_errors::{ValueRefusal, named_value_refusal, value_refusal};
+                let msg = e.to_string();
+                return Err(de::Error::custom(match value_refusal(&msg) {
+                    ValueRefusal::Number(inner) => format!(
+                        "{}{}",
+                        crate::serde_errors::VALIDATION_MARKER,
+                        named_value_refusal(inner, &key)
+                    ),
+                    _ => msg,
+                }));
+            }
+        }
+    }
+    Ok(Some(values))
+}
+
+/// Deserialise UpdateItem's `ExpressionAttributeValues`, naming the key of a
+/// NULL refused as it was parsed (a string that reads as false, or false
+/// beside another member) the way DynamoDB does: `ExpressionAttributeValues
+/// contains invalid value: ... for key :v` (captured eu-west-2 and us-east-1,
+/// 2026-10-10). Every other value error passes through as it is.
+pub(crate) fn deserialize_named_null_refusals<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
+    deserialize_named_refusals(deserializer, false, true)
+}
+
+/// Deserialise Query's `ExpressionAttributeValues`, naming the key of an empty
+/// value as well as of a NULL refused as it was parsed (captured eu-west-2 and
+/// us-east-1, 2026-10-10: `{":v": {"S": null}}` and `{":v": {"NULL": "no"}}`).
+pub(crate) fn deserialize_named_empty_and_null_refusals<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
+    deserialize_named_refusals(deserializer, true, false)
+}
+
+/// Read `ExpressionAttributeValues`, naming the key of a NULL refused as it was
+/// parsed, of an empty value when `name_empty`, and, when `name_older` and the
+/// request is read on the older layer, of every other value refusal.
+fn deserialize_named_refusals<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    name_empty: bool,
+    name_older: bool,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
+    let Some(raw) =
+        Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    let mut values = HashMap::with_capacity(raw.len());
+    for (key, value) in raw {
+        match serde_json::from_value::<AttributeValue>(value) {
+            Ok(av) => {
+                values.insert(key, av);
+            }
+            Err(e) => {
+                use crate::serde_errors::{
+                    EMPTY_VALUE, MORE_THAN_ONE_TYPE, VALIDATION_MARKER, ValueRefusal,
+                    named_value_refusal, value_refusal,
+                };
+                let msg = e.to_string();
+                // UpdateItem, read on the older layer, names the key of every
+                // value refusal: a number, a value with more than one member
+                // (which puts the request on that layer), an empty set beside
+                // another member (captured eu-west-2 and us-east-1,
+                // 2026-10-10).
+                let older =
+                    name_older && current_value_layer() == crate::validation::ValueLayer::Older;
+                return Err(de::Error::custom(match value_refusal(&msg) {
+                    ValueRefusal::ParsedNull(inner) => {
+                        format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
+                    }
+                    ValueRefusal::Empty if name_empty => {
+                        format!(
+                            "{VALIDATION_MARKER}{}",
+                            named_value_refusal(EMPTY_VALUE, &key)
+                        )
+                    }
+                    ValueRefusal::MoreThanOneType if name_older => format!(
+                        "{VALIDATION_MARKER}{}",
+                        named_value_refusal(MORE_THAN_ONE_TYPE, &key)
+                    ),
+                    ValueRefusal::EmptySet(inner) if name_older => {
+                        format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
+                    }
+                    ValueRefusal::Number(inner) if older => {
+                        format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
+                    }
+                    _ => msg,
+                }));
+            }
+        }
+    }
+    Ok(Some(values))
+}
+
+/// Deserialise a statement's `Parameters`, reading their numbers as PartiQL
+/// parameters.
+pub(crate) fn deserialize_parameters<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<AttributeValue>>, D::Error> {
+    reading_parameters(|| Option::<Vec<AttributeValue>>::deserialize(deserializer))
+}
+
+/// Validate a PartiQL parameter's number. DynamoDB reads it as Java's
+/// `BigDecimal(String)` does, so an exponent outside an `int`, or a scale (the
+/// digits after the point less the exponent) outside one, is a value it cannot
+/// convert. Within those, a precision less scale at an `int`'s limit is an
+/// underflow, as for a PartiQL literal, and otherwise the stored-number rule
+/// applies: `1e2147483647` is an underflow here and an overflow in an item
+/// (captured eu-west-2 and us-east-1, 2026-10-09).
+pub(crate) fn validate_parameter_number(
+    num_str: &str,
+) -> std::result::Result<(), crate::errors::DynoxideError> {
+    if num_str.is_empty() || !is_well_formed_dynamo_number(num_str) {
+        return validate_dynamo_number(num_str);
+    }
+    let unconvertible = || {
+        crate::errors::DynoxideError::ValidationException(format!(
+            "The parameter cannot be converted to a numeric value: {num_str}"
+        ))
+    };
+    let unsigned = num_str.trim_start_matches(['+', '-']);
+    let (coefficient, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (
+            &unsigned[..at],
+            unsigned[at + 1..]
+                .parse::<i32>()
+                .map_err(|_| unconvertible())?,
+        ),
+        None => (unsigned, 0),
+    };
+    let fraction_digits = coefficient
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let scale = i64::try_from(fraction_digits).unwrap_or(i64::MAX) - i64::from(exponent);
+    if i32::try_from(scale).is_err() {
+        return Err(unconvertible());
+    }
+    let significant = coefficient
+        .chars()
+        .filter(char::is_ascii_digit)
+        .skip_while(|&d| d == '0')
+        .count()
+        .max(1);
+    if i64::try_from(significant).unwrap_or(i64::MAX) - scale >= i64::from(i32::MAX) {
+        return Err(crate::errors::DynoxideError::ValidationException(
+            "Number underflow. Attempting to store a number with magnitude smaller than \
+             supported range"
+                .to_string(),
+        ));
+    }
+    validate_dynamo_number(num_str)
+}
+
 /// Validate a DynamoDB number string against DynamoDB's constraints:
 /// - Up to 38 significant digits
 /// - Magnitude at most 9.9999999999999999999999999999999999999E+125
 /// - Positive values must be at least 1E-130
 /// - Negative values must be at most -1E-130
+/// - Zero is held to the same range, as if its last written digit were a 1
 pub fn validate_dynamo_number(
     num_str: &str,
 ) -> std::result::Result<(), crate::errors::DynoxideError> {
@@ -426,21 +946,42 @@ pub fn validate_dynamo_number(
         )));
     }
 
+    // DynamoDB reads the exponent as a 64-bit integer, and one that does not
+    // fit is a value it cannot convert rather than an overflow. Inside that,
+    // an exponent of any size is range-checked below (captured eu-west-2,
+    // 2026-10-08).
+    if num_str
+        .find(['e', 'E'])
+        .is_some_and(|pos| num_str[pos + 1..].parse::<i64>().is_err())
+    {
+        return Err(crate::errors::DynoxideError::ValidationException(format!(
+            "The parameter cannot be converted to a numeric value: {num_str}"
+        )));
+    }
+
     // parse_number_parts ignores the sign characters, so the magnitude checks
     // below hold for both signs.
     let (mantissa_digits, exponent) = parse_number_parts(num_str);
 
-    // Zero is always valid
-    if mantissa_digits.is_empty() || mantissa_digits.iter().all(|&d| d == 0) {
-        return Ok(());
-    }
-
-    // Check significant digits (mantissa_digits has leading/trailing zeros already stripped)
-    if mantissa_digits.len() > 38 {
-        return Err(crate::errors::DynoxideError::ValidationException(
-            "Attempting to store more than 38 significant digits in a Number".to_string(),
-        ));
-    }
+    let exponent = if mantissa_digits.is_empty() || mantissa_digits.iter().all(|&d| d == 0) {
+        // Zero has no magnitude of its own, but DynamoDB still range-checks
+        // it, as if its last written digit were a 1: `0e126` overflows like
+        // `1e126`, and `0.0e-130` underflows like `0.1e-130` (captured
+        // eu-west-2, 2026-10-08).
+        let (coeff, written_exponent) = split_exponent(num_str);
+        let frac_digits = coeff.find('.').map_or(0, |dot| coeff.len() - dot - 1);
+        written_exponent
+            .saturating_sub(frac_digits as i64)
+            .saturating_add(1)
+    } else {
+        // Check significant digits (mantissa_digits has leading/trailing zeros already stripped)
+        if mantissa_digits.len() > 38 {
+            return Err(crate::errors::DynoxideError::ValidationException(
+                "Attempting to store more than 38 significant digits in a Number".to_string(),
+            ));
+        }
+        i64::from(exponent)
+    };
 
     // Check magnitude: exponent represents the power such that value = 0.mantissa * 10^exponent
     // Max magnitude: 9.999...E+125 means exponent = 126 (since 0.999... * 10^126 = 9.99...E+125)
@@ -451,7 +992,7 @@ pub fn validate_dynamo_number(
         ));
     }
 
-    // Check underflow for non-zero values
+    // Check underflow
     // Min positive: 1E-130 means exponent = -129 (since 0.1 * 10^-129 = 1E-130)
     // But with more digits, exponent can be lower, e.g. 1.0E-130 has (mantissa=[1], exponent=-129)
     // Actually, the smallest representable is 1E-130. In our representation, 1E-130 = 0.1 * 10^-129
@@ -637,15 +1178,24 @@ fn zero_encoding() -> String {
     format!("1{}{}", "0".repeat(4), "0".repeat(40))
 }
 
+/// The exponent as four digits, offset by 5000.
+///
+/// DynamoDB's range only needs -129 to 126, but a library caller can reach the
+/// encoder with a number it never validated. One outside -5000 to 4999 sorts at
+/// the matching extreme rather than overflowing into an unrelated key.
+fn encoded_exponent(exponent: i32) -> u16 {
+    (exponent.clamp(-5000, 4999) + 5000) as u16
+}
+
 fn encode_positive(mantissa: &[u8], exponent: i32) -> String {
-    let exp_encoded = (exponent + 5000) as u16;
+    let exp_encoded = encoded_exponent(exponent);
     let mantissa_str = mantissa_to_string(mantissa, 40);
     format!("2{exp_encoded:04}{mantissa_str}")
 }
 
 fn encode_negative(mantissa: &[u8], exponent: i32) -> String {
     // For negatives, we complement everything so larger absolute values sort first (smaller)
-    let exp_encoded = 9999 - (exponent + 5000) as u16;
+    let exp_encoded = 9999 - encoded_exponent(exponent);
     let mantissa_str = complement_mantissa(mantissa, 40);
     format!("0{exp_encoded:04}{mantissa_str}")
 }
@@ -653,15 +1203,12 @@ fn encode_negative(mantissa: &[u8], exponent: i32) -> String {
 /// Parse a non-negative number string into (mantissa digits, exponent).
 /// Mantissa is normalized: first digit is non-zero, exponent is the power of 10
 /// such that the number = 0.mantissa * 10^exponent.
+///
+/// An exponent outside the i32 range saturates at its bound, so a value far
+/// outside DynamoDB's range still lands on the right side of it.
 pub(crate) fn parse_number_parts(s: &str) -> (Vec<u8>, i32) {
     // Handle scientific notation
-    let (coeff, exp_part) = if let Some(pos) = s.to_ascii_lowercase().find('e') {
-        let coeff = &s[..pos];
-        let exp: i32 = s[pos + 1..].parse().unwrap_or(0);
-        (coeff, exp)
-    } else {
-        (s, 0)
-    };
+    let (coeff, exp_part) = split_exponent(s);
 
     // Split coefficient into integer and fraction parts
     let (int_part, frac_part) = if let Some(dot) = coeff.find('.') {
@@ -683,7 +1230,7 @@ pub(crate) fn parse_number_parts(s: &str) -> (Vec<u8>, i32) {
     }
 
     // The integer part length gives us the base exponent
-    let int_len = int_part.chars().filter(|c| c.is_ascii_digit()).count() as i32;
+    let int_len = int_part.chars().filter(|c| c.is_ascii_digit()).count() as i64;
 
     // Find first non-zero digit
     let leading_zeros = digits.iter().take_while(|&&d| d == 0).count();
@@ -700,9 +1247,32 @@ pub(crate) fn parse_number_parts(s: &str) -> (Vec<u8>, i32) {
 
     // exponent = int_len - leading_zeros + exp_part
     // But we need to account for whether leading zeros were in int or frac part
-    let exponent = int_len - leading_zeros as i32 + exp_part;
+    let exponent = (int_len - leading_zeros as i64).saturating_add(exp_part);
+    let exponent = exponent.clamp(i32::MIN.into(), i32::MAX.into()) as i32;
 
     (digits, exponent)
+}
+
+/// Split a number at its `e` or `E` into the coefficient and the exponent
+/// written after it, which is 0 when there is none.
+///
+/// An exponent too large for an i64 saturates at the bound on its side rather
+/// than reading as 0, which used to turn `1e99999999999` into 1. Anything
+/// else that fails to parse also reads as 0, for callers that have not been
+/// through `validate_dynamo_number`.
+fn split_exponent(s: &str) -> (&str, i64) {
+    let Some(pos) = s.find(['e', 'E']) else {
+        return (s, 0);
+    };
+    let exponent = match s[pos + 1..].parse::<i64>() {
+        Ok(exponent) => exponent,
+        Err(e) => match e.kind() {
+            std::num::IntErrorKind::PosOverflow => i64::MAX,
+            std::num::IntErrorKind::NegOverflow => i64::MIN,
+            _ => 0,
+        },
+    };
+    (&s[..pos], exponent)
 }
 
 fn mantissa_to_string(digits: &[u8], width: usize) -> String {
@@ -765,6 +1335,43 @@ pub struct Tag {
 pub fn item_size(item: &Item) -> usize {
     item.iter()
         .map(|(name, value)| name.len() + value.size())
+        .sum()
+}
+
+/// The bytes DynamoDB bills a vector at: its f32 width, 4 bytes per
+/// dimension, whatever numbers it holds. Shared by the base item's billed size
+/// and the vector index entry.
+pub(crate) fn vector_billed_bytes(dimensions: u32) -> usize {
+    4 * dimensions as usize
+}
+
+/// The size DynamoDB bills a write of `item` at, and the figure TableSizeBytes
+/// sums, on a table whose vector indexes are `vector_indexes`.
+///
+/// An attribute a vector index reads costs its name plus
+/// [`vector_billed_bytes`], once however many indexes read it; everything else
+/// is sized as [`item_size`] sizes it. Read units and the 400 KB limit still
+/// use [`item_size`]: DynamoDB sizes the vector by its numbers for both.
+/// Captured eu-west-2 and us-east-1, 2026-10-09, at 1, 3, 6, 8, 256 and 1,024
+/// dimensions, with two indexes on different attributes charged their own
+/// dimensions each.
+///
+/// A value that is not a valid vector for its index is sized as usual. A live
+/// write refuses one, so only an item written before the index existed can
+/// hold one, and the index skips it too.
+pub(crate) fn billed_item_size(item: &Item, vector_indexes: &[VectorIndex]) -> usize {
+    if vector_indexes.is_empty() {
+        return item_size(item);
+    }
+    item.iter()
+        .map(|(name, value)| {
+            let billed = vector_indexes
+                .iter()
+                .filter(|vix| vix.vector_attribute.attribute_name == *name)
+                .find(|vix| vector_f32_values(value, vix.dimensions).is_some())
+                .map(|vix| vector_billed_bytes(vix.dimensions));
+            name.len() + billed.unwrap_or_else(|| value.size())
+        })
         .sum()
 }
 
@@ -2120,6 +2727,41 @@ mod tests {
         assert!(c < d);
     }
 
+    // A library caller can reach the key encoder with a number that never
+    // went through validation. One far outside DynamoDB's range sorts at the
+    // matching extreme rather than overflowing the encoded exponent.
+    #[test]
+    fn test_number_sort_out_of_range_sorts_at_the_extremes() {
+        let ordered = [
+            "-1e99999999999",
+            "-9.9999999999999999999999999999999999999E125",
+            "-1E-130",
+            "-1e-99999999999",
+            "0",
+            "1e-99999999999",
+            "1E-130",
+            "9.9999999999999999999999999999999999999E125",
+            "1e99999999999",
+        ];
+        for pair in ordered.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            assert!(
+                normalize_number_for_sort(a) < normalize_number_for_sort(b),
+                "{a} should sort before {b}"
+            );
+        }
+    }
+
+    // Only an exponent too large for an i64 saturates. Anything else that
+    // fails to parse keeps reading as 0 for callers that never validated.
+    #[test]
+    fn test_split_exponent_reads_an_unparseable_exponent_as_zero() {
+        assert_eq!(split_exponent("1e"), ("1", 0));
+        assert_eq!(split_exponent("1e+"), ("1", 0));
+        assert_eq!(split_exponent("1e99999999999999999999"), ("1", i64::MAX));
+        assert_eq!(split_exponent("1e-99999999999999999999"), ("1", i64::MIN));
+    }
+
     // Number validation/normalisation is pinned to real DynamoDB behaviour
     // (captured against AWS for issue #109). validate_dynamo_number accepts
     // exactly the grammar DynamoDB accepts, including a leading '+'; the bare
@@ -2154,6 +2796,97 @@ mod tests {
                 "expected {input:?} to be rejected with ValidationException, got {:?}",
                 validate_dynamo_number(input)
             );
+        }
+    }
+
+    fn validation_message(input: &str) -> Option<String> {
+        match validate_dynamo_number(input) {
+            Ok(()) => None,
+            Err(crate::errors::DynoxideError::ValidationException(m)) => Some(m),
+            Err(e) => panic!("expected a ValidationException for {input:?}, got {e:?}"),
+        }
+    }
+
+    const OVERFLOW: &str =
+        "Number overflow. Attempting to store a number with magnitude larger than supported range";
+    const UNDERFLOW: &str = "Number underflow. Attempting to store a number with magnitude smaller than supported range";
+
+    // An exponent too large for an i32 used to be read as 0, so 1e99999999999
+    // passed the range checks and was stored as 1. Every expectation here was
+    // captured against eu-west-2, 2026-10-08.
+    #[test]
+    fn test_validate_number_range_checks_exponents_beyond_i32() {
+        for (input, expected) in [
+            ("1e99999999999", OVERFLOW),
+            ("-1e99999999999", OVERFLOW),
+            ("1E+99999999999", OVERFLOW),
+            ("1e-99999999999", UNDERFLOW),
+            ("-1e-99999999999", UNDERFLOW),
+            ("1e2147483648", OVERFLOW),
+            ("1e-2147483649", UNDERFLOW),
+            // Fits in an i32, but the digits before the point push it past.
+            ("10e2147483647", OVERFLOW),
+            ("0.01e-2147483648", UNDERFLOW),
+            ("1e9223372036854775807", OVERFLOW),
+            ("1e-9223372036854775808", UNDERFLOW),
+            ("10e9223372036854775807", OVERFLOW),
+            ("0.01e-9223372036854775808", UNDERFLOW),
+        ] {
+            assert_eq!(
+                validation_message(input).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+        }
+    }
+
+    // DynamoDB reads the exponent as a 64-bit integer. One that does not fit
+    // is a value it cannot convert, not an overflow (captured eu-west-2,
+    // 2026-10-08).
+    #[test]
+    fn test_validate_number_rejects_exponent_beyond_i64_as_unconvertible() {
+        for input in [
+            "1e9223372036854775808",
+            "1e+9223372036854775808",
+            "1e-9223372036854775809",
+            "0e9223372036854775808",
+        ] {
+            assert_eq!(
+                validation_message(input),
+                Some(format!(
+                    "The parameter cannot be converted to a numeric value: {input}"
+                )),
+                "{input}"
+            );
+        }
+    }
+
+    // A zero is range-checked as if its last written digit were a 1, so
+    // `0e126` overflows like `1e126` and `0.0e-130` underflows like
+    // `0.1e-130`. Captured eu-west-2, 2026-10-08.
+    #[test]
+    fn test_validate_number_range_checks_zero_by_its_last_written_digit() {
+        let zeros_130 = format!("0.{}", "0".repeat(130));
+        let zeros_131 = format!("0.{}", "0".repeat(131));
+        for (input, expected) in [
+            ("0e125", None),
+            ("0e126", Some(OVERFLOW)),
+            ("0.0e126", None),
+            ("0.0e127", Some(OVERFLOW)),
+            ("0.00e127", None),
+            ("00e126", Some(OVERFLOW)),
+            ("00.00e126", None),
+            ("-0e127", Some(OVERFLOW)),
+            ("0e99999999999", Some(OVERFLOW)),
+            ("0e-130", None),
+            ("0e-131", Some(UNDERFLOW)),
+            ("0.0e-129", None),
+            ("0.0e-130", Some(UNDERFLOW)),
+            ("0e-99999999999", Some(UNDERFLOW)),
+            (zeros_130.as_str(), None),
+            (zeros_131.as_str(), Some(UNDERFLOW)),
+        ] {
+            assert_eq!(validation_message(input).as_deref(), expected, "{input}");
         }
     }
 

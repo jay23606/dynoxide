@@ -1,0 +1,621 @@
+//! Requests whose attribute values nest deeper than the JSON parser follows.
+//!
+//! serde_json refuses a document nested more than 127 levels. An attribute
+//! value gets there at about 61 levels, because each map or list level costs
+//! two JSON levels on top of the request's own wrappers. DynamoDB reads such a
+//! request and answers with its nesting `ValidationException`, so a body that
+//! serde refuses on depth alone comes here rather than being answered as
+//! malformed.
+//!
+//! The body is walked once, iteratively, to find every attribute value and how
+//! far it nests. Each value past DynamoDB's 32-level limit is swapped for a
+//! shallow stand-in, so the operation's own request decoder can run its member
+//! checks: DynamoDB reports a bad table name or enum ahead of the nesting
+//! error. Then the nesting error is answered for the first deep value in the
+//! request, ahead of everything else the operation would check, without
+//! running it.
+//!
+//! The answer's form depends only on where the value sits, because by the
+//! time a value is too deep for the parser DynamoDB has moved to its second
+//! nesting check on every surface (captured in us-east-1 and eu-west-2 on
+//! 2026-10-09): an `ExpressionAttributeValues` entry is named, an
+//! `ExclusiveStartKey` takes the starting-key prefix, and every other position
+//! (items, keys, `Expected`, `AttributeUpdates`, `ScanFilter`, PartiQL
+//! parameters) answers the bare message.
+//!
+//! The PartiQL operations are the exception. They check their parameters
+//! before anything runs (and BatchExecuteStatement fails only the statement
+//! whose parameter is too deep), so their bodies are rewritten with a value
+//! just past the limit and run as usual, which keeps every check DynamoDB
+//! makes first, such as `Limit`, in its place.
+
+use crate::errors::DynoxideError;
+use crate::validation::NESTING_LIMIT_MESSAGE;
+
+/// How far a value may nest inside its attribute: DynamoDB accepts a leaf
+/// wrapped in 31 maps or lists and refuses one wrapped in 32.
+const MAX_NESTING: u32 = 32;
+
+/// Past this many levels DynamoDB's own parser gives up and answers a bare
+/// `SerializationException`. Where it gives up varies by run and region,
+/// between about 2,000 and 5,000 levels (captured 2026-10-09); this sits at the
+/// bottom of that range.
+const UNREADABLE_NESTING: u32 = 2000;
+
+/// JSON nesting the walk follows before calling the body unreadable: enough
+/// for a value at [`UNREADABLE_NESTING`] inside any request's wrappers. It
+/// bounds the walk's own memory on a hostile body.
+const MAX_JSON_DEPTH: usize = 2 * UNREADABLE_NESTING as usize + 32;
+
+/// What to do with a body serde refused on depth.
+#[derive(Debug)]
+pub(crate) enum DeepBody {
+    /// Answer a bare `SerializationException`, as DynamoDB does for a body it
+    /// cannot read.
+    Unreadable,
+    /// Answer this error without running the operation.
+    Refuse(DynoxideError),
+    /// Run the operation on this body instead.
+    Run(String),
+}
+
+/// Whether serde gave up on a body because of its nesting rather than its
+/// syntax.
+pub(crate) fn is_depth_failure(err: &serde_json::Error) -> bool {
+    err.to_string().starts_with("recursion limit exceeded")
+}
+
+/// Decide what a body that serde refused on depth should get.
+pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
+    let Some(values) = scan(body) else {
+        return DeepBody::Unreadable;
+    };
+    let run_as_usual = matches!(
+        operation,
+        "ExecuteStatement" | "ExecuteTransaction" | "BatchExecuteStatement"
+    );
+    // A PartiQL parameter is refused from 33 levels, one more than any other
+    // value, so one at 32 is left to run.
+    let limit = if run_as_usual {
+        MAX_NESTING + 1
+    } else {
+        MAX_NESTING
+    };
+    let deep: Vec<&Value> = values.iter().filter(|v| v.nesting >= limit).collect();
+    // The depth came from somewhere that isn't an attribute value, or a value
+    // went past where DynamoDB itself stops reading.
+    let Some(first) = deep.first() else {
+        return DeepBody::Unreadable;
+    };
+    if deep.iter().any(|v| v.nesting > UNREADABLE_NESTING) {
+        return DeepBody::Unreadable;
+    }
+
+    let stand_in = if run_as_usual {
+        just_past_the_limit()
+    } else {
+        r#"{"NULL":true}"#.to_string()
+    };
+    let mut rewritten = String::with_capacity(body.len());
+    let mut copied = 0;
+    for value in &deep {
+        // A value inside one already replaced went with it.
+        if value.start < copied {
+            continue;
+        }
+        rewritten.push_str(&body[copied..value.start]);
+        rewritten.push_str(&stand_in);
+        copied = value.end;
+    }
+    rewritten.push_str(&body[copied..]);
+    if serde_json::from_str::<serde_json::Value>(&rewritten).is_err() {
+        return DeepBody::Unreadable;
+    }
+
+    if run_as_usual {
+        return DeepBody::Run(rewritten);
+    }
+    if let Err(e) = check_members(operation, &rewritten) {
+        let e = older_return_values_wording(operation, &rewritten, e);
+        return DeepBody::Refuse(crate::validation::resolve_request_validation_tag(
+            operation, e,
+        ));
+    }
+    DeepBody::Refuse(DynoxideError::ValidationException(refusal(first, body)))
+}
+
+/// A body too deep to decode is checked by DynamoDB's older validation layer,
+/// which names the value and the member when it refuses a `ReturnValues`,
+/// where a shallow request now gets the generic form. Captured on PutItem and
+/// UpdateItem with a value nested 100 levels, eu-west-2 and us-east-1,
+/// 2026-10-09.
+fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) -> DynoxideError {
+    if !matches!(operation, "PutItem" | "UpdateItem") {
+        return err;
+    }
+    let generic = crate::validation::RETURN_VALUES_REJECTION;
+    let reword = |message: String| {
+        if !message.contains(generic) {
+            return message;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|request| request.get("ReturnValues")?.as_str().map(str::to_string));
+        match value {
+            Some(value) => message.replace(
+                generic,
+                &crate::validation::return_values_value_rejection(&value),
+            ),
+            None => message,
+        }
+    };
+    match err {
+        DynoxideError::ValidationException(message) => {
+            DynoxideError::ValidationException(reword(message))
+        }
+        DynoxideError::EnvelopedValidation(message) => {
+            DynoxideError::EnvelopedValidation(reword(message))
+        }
+        other => other,
+    }
+}
+
+/// A value wrapped in one more map than DynamoDB accepts in a PartiQL
+/// parameter, which the operation refuses with the same message a far deeper
+/// one gets.
+fn just_past_the_limit() -> String {
+    let wraps = MAX_NESTING as usize + 1;
+    format!(
+        "{}{{\"S\":\"leaf\"}}{}",
+        "{\"M\":{\"n\":".repeat(wraps),
+        "}}".repeat(wraps)
+    )
+}
+
+/// The nesting error for a value, by where it sits in the request.
+fn refusal(value: &Value, body: &str) -> String {
+    match value.origin {
+        Origin::ExpressionValue => {
+            let raw = &body[value.key.0..value.key.1];
+            let key = serde_json::from_str::<String>(&format!("\"{raw}\""))
+                .unwrap_or_else(|_| raw.to_string());
+            format!(
+                "ExpressionAttributeValues contains invalid value: {NESTING_LIMIT_MESSAGE} for key {key}"
+            )
+        }
+        Origin::StartKey => {
+            format!("The provided starting key is invalid: {NESTING_LIMIT_MESSAGE}")
+        }
+        Origin::Plain => NESTING_LIMIT_MESSAGE.to_string(),
+    }
+}
+
+/// Run the operation's request decoder, which is where its member checks
+/// (table name, enums, limits) live, and discard the result. BatchWriteItem
+/// and TransactWriteItems keep theirs in a request check after decoding, so
+/// that runs too.
+fn check_members(operation: &str, body: &str) -> crate::Result<()> {
+    use crate::actions::*;
+    use crate::serde_errors::deserialize;
+
+    crate::serialization_checks::pre_check_serialization_types(operation, body)?;
+    match operation {
+        "PutItem" => deserialize::<put_item::PutItemRequest>(body).map(drop),
+        "GetItem" => deserialize::<get_item::GetItemRequest>(body).map(drop),
+        "DeleteItem" => deserialize::<delete_item::DeleteItemRequest>(body).map(drop),
+        "UpdateItem" => deserialize::<update_item::UpdateItemRequest>(body).map(drop),
+        "Query" => deserialize::<query::QueryRequest>(body).map(drop),
+        "Scan" => deserialize::<scan::ScanRequest>(body).map(drop),
+        "BatchGetItem" => deserialize::<batch_get_item::BatchGetItemRequest>(body).map(drop),
+        "BatchWriteItem" => deserialize::<batch_write_item::BatchWriteItemRequest>(body)
+            .and_then(|request| batch_write_item::check_request(&request)),
+        "TransactGetItems" => {
+            deserialize::<transact_get_items::TransactGetItemsRequest>(body).map(drop)
+        }
+        "TransactWriteItems" => {
+            deserialize::<transact_write_items::TransactWriteItemsRequest>(body)
+                .and_then(|request| transact_write_items::check_request(&request))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Where an attribute value sits, which decides the form of its nesting error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    Plain,
+    ExpressionValue,
+    StartKey,
+}
+
+/// One attribute value at the top of its attribute.
+#[derive(Debug)]
+struct Value {
+    /// Byte range of the value's object in the body.
+    start: usize,
+    end: usize,
+    origin: Origin,
+    /// Byte range of the member name it sits under, without quotes, when it is
+    /// an `ExpressionAttributeValues` entry.
+    key: (usize, usize),
+    /// How many maps or lists deep it goes: a bare scalar is 0.
+    nesting: u32,
+}
+
+/// What the members or elements of a JSON container are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// Request structure with no attribute values directly inside.
+    Other,
+    /// `RequestItems`: its members are per-table entries, named by the user.
+    Tables,
+    /// `Item`, `Key`, `ExclusiveStartKey`, `ExpressionAttributeValues`: its
+    /// members are attribute values.
+    Values(Origin),
+    /// `Keys`: its elements are key maps.
+    KeyList,
+    /// `AttributeValueList`, `Parameters`: its elements are attribute values.
+    ValueList,
+    /// `Expected`, `AttributeUpdates` and the legacy filters: its members are
+    /// condition objects.
+    Conditions,
+    /// One condition: its `Value` is an attribute value and its
+    /// `AttributeValueList` a value list.
+    Condition,
+    /// An attribute value: its `M` holds members and its `L` elements.
+    Attribute,
+    /// The map under `M`: its members are attribute values one level down.
+    MapMembers,
+    /// The list under `L`: its elements are attribute values one level down.
+    ListElements,
+    /// Inside an attribute value but not under its `M` or `L`, or an `M` or
+    /// `L` of the wrong shape: nothing in it is request structure or another
+    /// attribute value, however its members are named.
+    Opaque,
+}
+
+struct Frame {
+    is_object: bool,
+    role: Role,
+    /// The member name being read, without quotes, for an object.
+    key: (usize, usize),
+    expect_key: bool,
+    /// For the attribute-value roles: which value, and how deep this one is.
+    value: usize,
+    nesting: u32,
+}
+
+/// The role of a value that starts inside `parent` under member name `key`.
+fn child_role(parent: Option<&Frame>, key: &[u8]) -> Role {
+    let Some(parent) = parent else {
+        return Role::Other;
+    };
+    match parent.role {
+        Role::Other if parent.is_object => match key {
+            b"Item" | b"Key" => Role::Values(Origin::Plain),
+            b"ExclusiveStartKey" => Role::Values(Origin::StartKey),
+            b"ExpressionAttributeValues" => Role::Values(Origin::ExpressionValue),
+            b"RequestItems" => Role::Tables,
+            b"Keys" => Role::KeyList,
+            b"Parameters" => Role::ValueList,
+            b"Expected" | b"AttributeUpdates" | b"ScanFilter" | b"QueryFilter"
+            | b"KeyConditions" => Role::Conditions,
+            _ => Role::Other,
+        },
+        Role::Other | Role::Tables => Role::Other,
+        Role::Values(_) | Role::ValueList | Role::MapMembers | Role::ListElements => {
+            Role::Attribute
+        }
+        Role::KeyList => Role::Values(Origin::Plain),
+        Role::Conditions => Role::Condition,
+        Role::Condition => match key {
+            b"Value" => Role::Attribute,
+            b"AttributeValueList" => Role::ValueList,
+            _ => Role::Other,
+        },
+        Role::Attribute => match key {
+            b"M" => Role::MapMembers,
+            b"L" => Role::ListElements,
+            _ => Role::Opaque,
+        },
+        Role::Opaque => Role::Opaque,
+    }
+}
+
+/// Walk the body once, without recursion, and list its attribute values.
+/// `None` when the body is malformed or nests past [`MAX_JSON_DEPTH`].
+fn scan(body: &str) -> Option<Vec<Value>> {
+    let bytes = body.as_bytes();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    let mut seen_top = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' | b':' => i += 1,
+            b',' => {
+                if let Some(top) = stack.last_mut() {
+                    top.expect_key = top.is_object;
+                }
+                i += 1;
+            }
+            b'"' => {
+                let end = string_end(bytes, i)?;
+                match stack.last_mut() {
+                    Some(top) if top.is_object && top.expect_key => {
+                        top.key = (i + 1, end - 1);
+                        top.expect_key = false;
+                    }
+                    Some(_) => {}
+                    None => {
+                        if seen_top {
+                            return None;
+                        }
+                        seen_top = true;
+                    }
+                }
+                i = end;
+            }
+            b'{' | b'[' => {
+                if stack.len() >= MAX_JSON_DEPTH {
+                    return None;
+                }
+                if stack.is_empty() {
+                    if seen_top {
+                        return None;
+                    }
+                    seen_top = true;
+                }
+                let parent = stack.last();
+                let key = parent.map_or(&b""[..], |p| &bytes[p.key.0..p.key.1]);
+                let mut role = child_role(parent, key);
+                let is_object = b == b'{';
+                let (mut value, mut nesting) = (0, 0);
+                match role {
+                    Role::Attribute if is_object => match parent.map(|p| p.role) {
+                        Some(Role::MapMembers | Role::ListElements) => {
+                            let p = parent.expect("checked above");
+                            value = p.value;
+                            nesting = p.nesting + 1;
+                            if nesting > values[value].nesting {
+                                values[value].nesting = nesting;
+                            }
+                        }
+                        parent_role => {
+                            let origin = match parent_role {
+                                Some(Role::Values(origin)) => origin,
+                                _ => Origin::Plain,
+                            };
+                            let key = parent.map_or((0, 0), |p| p.key);
+                            values.push(Value {
+                                start: i,
+                                end: 0,
+                                origin,
+                                key,
+                                nesting: 0,
+                            });
+                            value = values.len() - 1;
+                        }
+                    },
+                    Role::MapMembers if is_object => {
+                        let p = parent.expect("an attribute value holds its map");
+                        (value, nesting) = (p.value, p.nesting);
+                    }
+                    Role::ListElements if !is_object => {
+                        let p = parent.expect("an attribute value holds its list");
+                        (value, nesting) = (p.value, p.nesting);
+                    }
+                    Role::Attribute | Role::MapMembers | Role::ListElements => role = Role::Opaque,
+                    _ => {}
+                }
+                stack.push(Frame {
+                    is_object,
+                    role,
+                    key: (0, 0),
+                    expect_key: is_object,
+                    value,
+                    nesting,
+                });
+                i += 1;
+            }
+            b'}' | b']' => {
+                let frame = stack.pop()?;
+                if frame.is_object != (b == b'}') {
+                    return None;
+                }
+                let starts_value = frame.role == Role::Attribute
+                    && !matches!(
+                        stack.last().map(|p| p.role),
+                        Some(Role::MapMembers | Role::ListElements)
+                    );
+                if starts_value {
+                    values[frame.value].end = i + 1;
+                }
+                i += 1;
+            }
+            _ => {
+                // A number, true, false or null.
+                if stack.is_empty() {
+                    if seen_top {
+                        return None;
+                    }
+                    seen_top = true;
+                }
+                while i < bytes.len()
+                    && !matches!(bytes[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+                {
+                    i += 1;
+                }
+            }
+        }
+    }
+    if !stack.is_empty() || !seen_top || values.iter().any(|v| v.end == 0) {
+        return None;
+    }
+    Some(values)
+}
+
+/// The index just past the closing quote of the string opening at `start`.
+fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deep_map(depth: usize) -> String {
+        format!(
+            "{}{{\"S\":\"leaf\"}}{}",
+            "{\"M\":{\"n\":".repeat(depth),
+            "}}".repeat(depth)
+        )
+    }
+
+    fn deep_list(depth: usize) -> String {
+        format!(
+            "{}{{\"S\":\"leaf\"}}{}",
+            "{\"L\":[".repeat(depth),
+            "]}".repeat(depth)
+        )
+    }
+
+    #[test]
+    fn serde_gives_up_on_depth_where_this_module_takes_over() {
+        // A PutItem value at 62 levels still parses and at 63 does not, which is
+        // where DynamoDB moves to its second nesting check. Pinned so a change in
+        // serde_json's limit shows up here rather than as a changed answer.
+        let at = |n| {
+            format!(
+                r#"{{"TableName":"T","Item":{{"pk":{{"S":"p"}},"data":{}}}}}"#,
+                deep_map(n)
+            )
+        };
+        assert!(serde_json::from_str::<serde_json::Value>(&at(62)).is_ok());
+        let err = serde_json::from_str::<serde_json::Value>(&at(63)).unwrap_err();
+        assert!(is_depth_failure(&err), "{err}");
+        let syntax = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        assert!(!is_depth_failure(&syntax), "{syntax}");
+    }
+
+    #[test]
+    fn the_walk_finds_each_value_and_how_deep_it_goes() {
+        let body = format!(
+            r#"{{"TableName":"T","Item":{{"pk":{{"S":"p"}},"m":{},"l":{}}},"ExpressionAttributeValues":{{":v":{{"SS":["a","b"]}}}}}}"#,
+            deep_map(3),
+            deep_list(5)
+        );
+        let values = scan(&body).unwrap();
+        let summary: Vec<(Origin, u32)> = values.iter().map(|v| (v.origin, v.nesting)).collect();
+        assert_eq!(
+            summary,
+            [
+                (Origin::Plain, 0),
+                (Origin::Plain, 3),
+                (Origin::Plain, 5),
+                (Origin::ExpressionValue, 0)
+            ]
+        );
+        assert_eq!(&body[values[1].start..values[1].end], deep_map(3));
+        assert_eq!(&body[values[3].key.0..values[3].key.1], ":v");
+    }
+
+    #[test]
+    fn strings_that_look_like_structure_are_skipped() {
+        let body = r#"{"TableName":"T","Item":{"pk":{"S":"a}]\"{["},"Item":{"S":"x"}}}"#;
+        let values = scan(body).unwrap();
+        assert_eq!(values.len(), 2);
+        assert!(values.iter().all(|v| v.nesting == 0));
+    }
+
+    #[test]
+    fn a_table_called_item_is_not_read_as_an_item() {
+        let body = r#"{"RequestItems":{"Item":{"Keys":[{"pk":{"S":"a"}}]}}}"#;
+        let values = scan(body).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(&body[values[0].start..values[0].end], r#"{"S":"a"}"#);
+    }
+
+    #[test]
+    fn a_malformed_or_bottomless_body_is_unreadable() {
+        assert!(scan(r#"{"Item":{"pk":{"S":"a"}}"#).is_none());
+        assert!(scan(r#"{"Item":{"pk":{"S":"a"]}}"#).is_none());
+        assert!(scan(r#"{} {}"#).is_none());
+        assert!(scan(&"[".repeat(MAX_JSON_DEPTH + 1)).is_none());
+    }
+
+    /// A deep value whose innermost attribute hides request-shaped members:
+    /// `{"S":{"Item":{"y":<deep>}}}`, or an `M` holding a list. The members
+    /// aren't attribute values, so nothing inside them starts a second value.
+    fn hostile(outer: &str) -> String {
+        let inner = format!(r#"{{"Item":{{"y":{}}}}}"#, deep_map(40));
+        let leaf = outer.replace("LEAF", &format!(r#"{{"S":{inner}}}"#));
+        format!(r#"{{"TableName":"Tbl","Item":{{"pk":{{"S":"p"}},"data":{leaf}}}}}"#)
+    }
+
+    #[test]
+    fn members_of_a_value_other_than_m_and_l_hold_no_values() {
+        let in_maps = hostile(&format!(
+            "{}LEAF{}",
+            "{\"M\":{\"n\":".repeat(70),
+            "}}".repeat(70)
+        ));
+        let in_lists = hostile(&format!("{}LEAF{}", "{\"L\":[".repeat(70), "]}".repeat(70)));
+        let wrong_shape_value = format!(
+            "{}{{\"M\":[{{\"Item\":{{\"y\":{}}}}}]}}{}",
+            "{\"M\":{\"n\":".repeat(70),
+            deep_map(40),
+            "}}".repeat(70)
+        );
+        let wrong_shape = format!(
+            r#"{{"TableName":"Tbl","Item":{{"pk":{{"S":"p"}},"data":{wrong_shape_value}}}}}"#
+        );
+        for body in [in_maps, in_lists, wrong_shape] {
+            let values = scan(&body).unwrap();
+            for pair in values.windows(2) {
+                assert!(pair[0].end <= pair[1].start, "values overlap");
+            }
+            match resolve("PutItem", &body) {
+                DeepBody::Refuse(e) => assert_eq!(e.to_string(), NESTING_LIMIT_MESSAGE),
+                other => panic!("expected the nesting refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn depth_outside_any_attribute_value_is_unreadable() {
+        let body = format!(
+            r#"{{"TableName":"T","Junk":{}0{}}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        assert!(matches!(resolve("PutItem", &body), DeepBody::Unreadable));
+    }
+
+    #[test]
+    fn a_deep_value_alongside_deep_junk_is_still_unreadable() {
+        let body = format!(
+            r#"{{"TableName":"Tbl","Item":{{"pk":{{"S":"p"}},"data":{}}},"Junk":{}0{}}}"#,
+            deep_map(70),
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        assert!(matches!(resolve("PutItem", &body), DeepBody::Unreadable));
+    }
+
+    #[test]
+    fn the_partiql_stand_in_is_just_past_the_limit_and_parses() {
+        let stand_in = just_past_the_limit();
+        let values = scan(&format!(r#"{{"Parameters":[{stand_in}]}}"#)).unwrap();
+        assert_eq!(values[0].nesting, MAX_NESTING + 1);
+    }
+}

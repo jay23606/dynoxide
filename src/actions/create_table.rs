@@ -736,8 +736,11 @@ fn validate_raw_and_build(raw: RawRequest) -> std::result::Result<CreateTableReq
     collect_pt_errors(&raw.provisioned_throughput, &mut errors);
     collect_ks_errors(&raw.key_schema, &mut errors);
     collect_ad_errors(&raw.attribute_definitions, &mut errors);
-    collect_lsi_errors(&raw.local_secondary_indexes, &mut errors);
+    // The GSIs' member errors come before the LSIs': with a too-short name on
+    // both, DynamoDB lists the GSI's first, whichever order the request gives
+    // them in (captured eu-west-2 and us-east-1, 2026-10-09).
     collect_gsi_errors(&raw.global_secondary_indexes, &mut errors);
+    collect_lsi_errors(&raw.local_secondary_indexes, &mut errors);
     collect_vix_errors(&raw.vector_indexes, &mut errors);
 
     // DynamoDB caps multi-field constraint errors at 10
@@ -998,6 +1001,13 @@ fn collect_lsi_errors(lsi_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
                     && ks.is_empty()
                 {
                     errors.push(format!("Value '[]' at 'localSecondaryIndexes.{}.member.keySchema' failed to satisfy constraint: Member must have length greater than or equal to 1", i + 1));
+                } else if let Some(ks) = obj.get("KeySchema").and_then(|v| v.as_array())
+                    && ks.len() > 2
+                {
+                    // An LSI key is the table's partition key and one sort key
+                    // attribute. AWS names the path `keySchema` here, not the
+                    // index member's (captured eu-west-2, 2026-10-09).
+                    errors.push(format!("Value '{}' at 'keySchema' failed to satisfy constraint: Member must have length less than or equal to 2", render_key_schema_java_toString(ks)));
                 }
                 if !obj.contains_key("Projection")
                     || obj.get("Projection") == Some(&serde_json::Value::Null)
@@ -1030,6 +1040,13 @@ fn collect_gsi_errors(gsi_val: &Option<serde_json::Value>, errors: &mut Vec<Stri
                     && ks.is_empty()
                 {
                     errors.push(format!("Value '[]' at 'globalSecondaryIndexes.{}.member.keySchema' failed to satisfy constraint: Member must have length greater than or equal to 1", i + 1));
+                } else if let Some(ks) = obj.get("KeySchema").and_then(|v| v.as_array())
+                    && ks.len() > 8
+                {
+                    // Four partition key and four sort key attributes at most.
+                    // AWS names the path `keySchema` here, as it does for an
+                    // LSI (captured eu-west-2 and us-east-1, 2026-10-09).
+                    errors.push(format!("Value '{}' at 'keySchema' failed to satisfy constraint: Member must have length less than or equal to 8", render_key_schema_java_toString(ks)));
                 }
                 if !obj.contains_key("Projection")
                     || obj.get("Projection") == Some(&serde_json::Value::Null)
@@ -1439,7 +1456,35 @@ fn validate_attr_def_count(
         }
     }
     if defs.len() != all_key_attrs.len() {
-        return Err("One or more parameter values were invalid: Number of attributes in KeySchema does not exactly match number of attributes defined in AttributeDefinitions".to_string());
+        let has_index = lsis.as_ref().is_some_and(|l| !l.is_empty())
+            || gsis.as_ref().is_some_and(|g| !g.is_empty());
+        if !has_index {
+            return Err("One or more parameter values were invalid: Number of attributes in KeySchema does not exactly match number of attributes defined in AttributeDefinitions".to_string());
+        }
+        // With an index, both sets are listed, each in the order DynamoDB's own
+        // hash tables give them. Captured eu-west-2 and us-east-1, 2026-10-09.
+        let defined: Vec<&str> = defs.iter().map(|d| d.attribute_name.as_str()).collect();
+        let mut used: Vec<&str> = ks.iter().map(|k| k.attribute_name.as_str()).collect();
+        for k in lsis.iter().flatten().flat_map(|l| &l.key_schema) {
+            used.push(k.attribute_name.as_str());
+        }
+        for k in gsis.iter().flatten().flat_map(|g| &g.key_schema) {
+            used.push(k.attribute_name.as_str());
+        }
+        for elem in vixs
+            .iter()
+            .flatten()
+            .filter_map(|v| v.search_schema.as_ref())
+            .flatten()
+        {
+            used.push(elem.attribute_name.as_str());
+        }
+        return Err(format!(
+            "One or more parameter values were invalid: Some AttributeDefinitions are not used. \
+             AttributeDefinitions: [{}], keys used: [{}]",
+            crate::validation::java_hash_order(&defined, true).join(", "),
+            crate::validation::java_hash_order(&used, false).join(", ")
+        ));
     }
     Ok(())
 }
@@ -1455,32 +1500,11 @@ fn validate_lsi_list(
         return Err("One or more parameter values were invalid: Table KeySchema does not have a range key, which is required when specifying a LocalSecondaryIndex".to_string());
     }
 
-    // Check missing attribute definitions across all LSI keys
-    let def_names: Vec<&str> = defs.iter().map(|d| d.attribute_name.as_str()).collect();
-    let mut missing_keys = Vec::new();
+    // The first index naming an attribute the request does not define.
     for lsi in lsis {
-        for k in &lsi.key_schema {
-            if !def_names.contains(&k.attribute_name.as_str())
-                && !missing_keys.contains(&k.attribute_name.as_str())
-            {
-                missing_keys.push(k.attribute_name.as_str());
-            }
+        if let Some(message) = crate::validation::undefined_index_key_error(&lsi.key_schema, defs) {
+            return Err(message);
         }
-    }
-    if !missing_keys.is_empty() {
-        let mut all_keys = Vec::new();
-        for lsi in lsis {
-            for k in &lsi.key_schema {
-                if !all_keys.contains(&k.attribute_name.as_str()) {
-                    all_keys.push(k.attribute_name.as_str());
-                }
-            }
-        }
-        return Err(format!(
-            "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [{}], AttributeDefinitions: [{}]",
-            all_keys.join(", "),
-            def_names.join(", ")
-        ));
     }
 
     // Structural validation for each LSI
@@ -1514,32 +1538,11 @@ fn validate_gsi_list(
 ) -> std::result::Result<(), String> {
     // Empty check is done earlier in validate_typed_request
 
-    // Check missing attribute definitions across all GSI keys
-    let def_names: Vec<&str> = defs.iter().map(|d| d.attribute_name.as_str()).collect();
-    let mut missing_keys = Vec::new();
+    // The first index naming an attribute the request does not define.
     for gsi in gsis {
-        for k in &gsi.key_schema {
-            if !def_names.contains(&k.attribute_name.as_str())
-                && !missing_keys.contains(&k.attribute_name.as_str())
-            {
-                missing_keys.push(k.attribute_name.as_str());
-            }
+        if let Some(message) = crate::validation::undefined_index_key_error(&gsi.key_schema, defs) {
+            return Err(message);
         }
-    }
-    if !missing_keys.is_empty() {
-        let mut all_keys = Vec::new();
-        for gsi in gsis {
-            for k in &gsi.key_schema {
-                if !all_keys.contains(&k.attribute_name.as_str()) {
-                    all_keys.push(k.attribute_name.as_str());
-                }
-            }
-        }
-        return Err(format!(
-            "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [{}], AttributeDefinitions: [{}]",
-            all_keys.join(", "),
-            def_names.join(", ")
-        ));
     }
 
     // Structural validation for each GSI
@@ -1622,7 +1625,7 @@ fn validate_lsi_structure(
 }
 
 fn validate_gsi_structure(gsi: &GlobalSecondaryIndex) -> std::result::Result<(), String> {
-    validate_key_schema_structure(&gsi.key_schema)?;
+    crate::validation::check_gsi_key_schema(&gsi.key_schema)?;
     validate_proj_structure(&gsi.projection)?;
     Ok(())
 }

@@ -183,6 +183,345 @@ fn test_tools_list() {
     let _ = child.wait();
 }
 
+/// The tools that wrap an operation DynamoDB reports consumed capacity for, and
+/// so take `return_consumed_capacity`. Nothing else should.
+const CAPACITY_TOOLS: [&str; 14] = [
+    "batch_execute_partiql",
+    "batch_get_item",
+    "batch_write_item",
+    "delete_item",
+    "execute_partiql",
+    "execute_transaction_partiql",
+    "get_item",
+    "put_item",
+    "query",
+    "scan",
+    "search_vectors",
+    "transact_get_items",
+    "transact_write_items",
+    "update_item",
+];
+
+#[test]
+fn exactly_the_capacity_bearing_tools_take_return_consumed_capacity() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    let mut taking: Vec<&str> = tools
+        .iter()
+        .filter(|t| !t["inputSchema"]["properties"]["return_consumed_capacity"].is_null())
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    taking.sort_unstable();
+    assert_eq!(taking, CAPACITY_TOOLS, "out of {} tools", tools.len());
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn the_capacity_parameter_lists_its_values_in_the_schema() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = send(
+        &mut child,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = resp["result"]["tools"].as_array().unwrap();
+    for name in CAPACITY_TOOLS {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+        let property = &tool["inputSchema"]["properties"]["return_consumed_capacity"];
+        assert_eq!(
+            property["enum"],
+            json!(["INDEXES", "TOTAL", "NONE", null]),
+            "{name}: {property}"
+        );
+        assert_eq!(property["type"], json!(["string", "null"]), "{name}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn a_tool_returns_the_capacity_block_and_refuses_an_unknown_mode() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Capacity",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({
+            "table_name": "Capacity",
+            "item": {"pk": {"S": "a"}},
+            "return_consumed_capacity": "TOTAL"
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    assert_eq!(
+        tool_content(&resp)["ConsumedCapacity"],
+        json!({"TableName": "Capacity", "CapacityUnits": 1.0})
+    );
+
+    let resp = call_tool(
+        &mut child,
+        4,
+        "put_item",
+        json!({
+            "table_name": "Capacity",
+            "item": {"pk": {"S": "b"}},
+            "return_consumed_capacity": "INDEXES"
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    assert_eq!(
+        tool_content(&resp)["ConsumedCapacity"],
+        json!({
+            "TableName": "Capacity",
+            "CapacityUnits": 1.0,
+            "Table": {"CapacityUnits": 1.0}
+        })
+    );
+
+    let resp = call_tool(
+        &mut child,
+        3,
+        "get_item",
+        json!({
+            "table_name": "Capacity",
+            "key": {"pk": {"S": "a"}},
+            "return_consumed_capacity": "BOGUS"
+        }),
+    );
+    assert!(is_tool_error(&resp), "{resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ValidationException");
+    assert_eq!(
+        content["message"],
+        "1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to \
+         satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// The item tools read a `BOOL` or `NULL` member as DynamoDB does on the wire:
+/// the strings it reads as booleans, at the top of an item or nested, and a
+/// false NULL or an unreadable BOOL refused in its words (captured eu-west-2
+/// and us-east-1, 2026-10-10, over HTTP; a nested value reading as true is
+/// inferred from the one decoder that reads every value).
+#[test]
+fn an_item_tool_reads_bool_and_null_strings_as_dynamodb_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Values",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({
+            "table_name": "Values",
+            "item": {
+                "pk": {"S": "a"},
+                "b": {"BOOL": "yes"},
+                "n": {"NULL": "T"},
+                "l": {"L": [{"BOOL": "no"}]},
+                "m": {"M": {"k": {"BOOL": "1"}}}
+            }
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let resp = call_tool(
+        &mut child,
+        3,
+        "get_item",
+        json!({"table_name": "Values", "key": {"pk": {"S": "a"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let item = &tool_content(&resp)["Item"];
+    assert_eq!(item["b"], json!({"BOOL": true}));
+    assert_eq!(item["n"], json!({"NULL": true}));
+    assert_eq!(item["l"], json!({"L": [{"BOOL": false}]}));
+    assert_eq!(item["m"], json!({"M": {"k": {"BOOL": true}}}));
+
+    let null_false = "One or more parameter values were invalid: Null attribute value types \
+                      must have the value of true";
+    for (id, value, error_type, message) in [
+        (
+            4,
+            json!({"NULL": "false"}),
+            "ValidationException",
+            null_false.to_string(),
+        ),
+        (
+            5,
+            json!({"L": [{"NULL": "no"}]}),
+            "ValidationException",
+            null_false.to_string(),
+        ),
+        (
+            6,
+            json!({"NULL": false}),
+            "ValidationException",
+            format!("1 validation error detected: {null_false}"),
+        ),
+        (
+            7,
+            json!({"BOOL": "abc"}),
+            "SerializationException",
+            "Unexpected token received from parser".to_string(),
+        ),
+    ] {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Values", "item": {"pk": {"S": "x"}, "v": value}}),
+        );
+        assert!(is_tool_error(&resp), "{value}: {resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["error_type"], error_type, "{value}: {content}");
+        assert_eq!(content["message"], message, "{value}: {content}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `return_values_on_condition_check_failure` on `execute_partiql` is
+/// ExecuteStatement's `ReturnValuesOnConditionCheckFailure`: `ALL_OLD` hands
+/// back the item an UPDATE or DELETE failed its condition on, `NONE` doesn't,
+/// and anything else is refused in DynamoDB's words (captured eu-west-2 and
+/// us-east-1, 2026-10-10). The item tools' `ALL_OLD` hands it back the same
+/// way.
+#[test]
+fn a_failed_condition_hands_back_the_item_when_asked() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Guarded",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    let stored = json!({"pk": {"S": "a"}, "v": {"N": "1"}});
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Guarded", "item": stored}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let update = r#"UPDATE "Guarded" SET w = 1 WHERE pk = 'a' AND v = 99"#;
+    let resp = call_tool(
+        &mut child,
+        3,
+        "execute_partiql",
+        json!({"statement": update, "return_values_on_condition_check_failure": "ALL_OLD"}),
+    );
+    assert!(is_tool_error(&resp), "{resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ConditionalCheckFailedException");
+    assert_eq!(content["message"], "The conditional request failed");
+    assert_eq!(content["item"], stored);
+
+    for (id, mode) in [(4, json!("NONE")), (5, Value::Null)] {
+        let mut args = json!({"statement": update});
+        if !mode.is_null() {
+            args["return_values_on_condition_check_failure"] = mode.clone();
+        }
+        let resp = call_tool(&mut child, id, "execute_partiql", args);
+        assert!(is_tool_error(&resp), "{resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["error_type"], "ConditionalCheckFailedException");
+        assert!(content.get("item").is_none(), "{mode}: {content}");
+    }
+
+    let resp = call_tool(
+        &mut child,
+        6,
+        "execute_partiql",
+        json!({"statement": update, "return_values_on_condition_check_failure": "BOGUS"}),
+    );
+    assert!(is_tool_error(&resp), "{resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ValidationException");
+    assert_eq!(
+        content["message"],
+        "1 validation error detected: Value 'BOGUS' at \
+         'returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must \
+         satisfy enum value set: [ALL_OLD, NONE]"
+    );
+
+    let resp = call_tool(
+        &mut child,
+        7,
+        "put_item",
+        json!({
+            "table_name": "Guarded",
+            "item": {"pk": {"S": "a"}, "v": {"N": "2"}},
+            "condition_expression": "attribute_not_exists(pk)",
+            "return_values_on_condition_check_failure": "ALL_OLD"
+        }),
+    );
+    assert!(is_tool_error(&resp), "{resp}");
+    assert_eq!(tool_content(&resp)["item"], stored);
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+#[test]
+fn the_instructions_say_capacity_can_be_requested() {
+    let mut child = spawn_mcp();
+    let resp = init_mcp(&mut child);
+    let instructions = resp["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("`return_consumed_capacity`"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("Vector search: search_vectors"),
+        "{instructions}"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn test_get_database_info_empty() {
     let mut child = spawn_mcp();
@@ -1852,10 +2191,11 @@ const NULL_FALSE_BARE: &str = "One or more parameter values were invalid: \
 
 /// The enveloped rejection UpdateItem returns for a duplicate string set in
 /// ExpressionAttributeValues, shared verbatim with tests/http_server.rs.
+// UpdateItem refuses it in the current layer's words, with no
+// ExpressionAttributeValues wrapper (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
 const DUPLICATE_SET_IN_EAV_ENVELOPED: &str = "1 validation error detected: \
-     ExpressionAttributeValues contains invalid value: \
      One or more parameter values were invalid: \
-     Input collection [a, b, a] contains duplicates. for key :t";
+     Input collection [\"a\", \"b\", \"a\"] contains duplicates.";
 
 /// The bare rejection UpdateItem returns for a SET on a key attribute, shared
 /// verbatim with tests/http_server.rs.
@@ -3875,7 +4215,7 @@ fn an_agents_search_is_held_to_the_wire_request_model() {
     assert!(is_tool_error(&resp), "expected a tool error: {resp}");
     let msg = tool_content(&resp)["message"].as_str().unwrap().to_string();
     assert!(
-        msg.contains("'topK' failed to satisfy constraint"),
+        msg.contains("at 'TopK' failed to satisfy constraint"),
         "topK must answer the request-model constraint: {msg}"
     );
 

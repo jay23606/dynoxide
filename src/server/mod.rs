@@ -5,7 +5,7 @@
 mod auth;
 
 use crate::serde_errors::{deserialize, serialize};
-use crate::serialization_checks::pre_check_serialization_types;
+use crate::serialization_checks::pre_check_and_read_layer;
 use auth::validate_auth;
 
 use crate::Database;
@@ -29,20 +29,7 @@ const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 const TARGET_PREFIX: &str = "DynamoDB_20120810.";
 const STREAMS_TARGET_PREFIX: &str = "DynamoDBStreams_20120810.";
 
-/// Options controlling HTTP server output.
-#[derive(Debug, Clone, Default)]
-pub struct ServerOptions {
-    suppress_informational_messages: bool,
-}
-
-impl ServerOptions {
-    /// Suppress informational server output.
-    pub const fn quiet() -> Self {
-        Self {
-            suppress_informational_messages: true,
-        }
-    }
-}
+pub use crate::server_options::ServerOptions;
 
 /// Check whether the port is already in use by attempting a TCP connection.
 ///
@@ -99,12 +86,12 @@ pub async fn start_with_options(
 
     let app = build_router(db);
 
-    if !options.suppress_informational_messages {
+    if !options.suppresses_informational_messages() {
         eprintln!("Dynoxide listening on http://{addr}");
     }
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(options.suppress_informational_messages))
+        .with_graceful_shutdown(shutdown_signal(options.suppresses_informational_messages()))
         .await
         .map_err(|e| format!("server failed: {e}"))
 }
@@ -275,9 +262,18 @@ async fn handle_request(
     };
 
     // Try to parse body as JSON. DynamoDB requires a valid JSON object.
-    // Non-JSON → SerializationException (no message).
-    if !body.is_empty() && serde_json::from_str::<serde_json::Value>(&body).is_err() {
-        return serialization_exception_bare(response_ct);
+    // Non-JSON → SerializationException (no message). Valid JSON nested deeper
+    // than the parser follows is still read, as DynamoDB reads it: see
+    // `deep_nesting`.
+    let mut too_deep = false;
+    if !body.is_empty()
+        && let Err(e) = serde_json::from_str::<serde_json::Value>(&body)
+    {
+        if crate::deep_nesting::is_depth_failure(&e) {
+            too_deep = true;
+        } else {
+            return serialization_exception_bare(response_ct);
+        }
     }
 
     // Check x-amz-target header
@@ -317,7 +313,19 @@ async fn handle_request(
     tracing::debug!(operation, body_len = body.len(), "request");
     tracing::trace!(operation, body = %body, "request body");
 
-    match dispatch(&db, operation, &body) {
+    let result = if too_deep {
+        match crate::deep_nesting::resolve(operation, &body) {
+            crate::deep_nesting::DeepBody::Unreadable => {
+                return serialization_exception_bare(response_ct);
+            }
+            crate::deep_nesting::DeepBody::Refuse(e) => Err(e),
+            crate::deep_nesting::DeepBody::Run(rewritten) => dispatch(&db, operation, &rewritten),
+        }
+    } else {
+        dispatch(&db, operation, &body)
+    };
+
+    match result {
         Ok(json) => {
             tracing::debug!(operation, body_len = json.len(), "response");
             tracing::trace!(operation, body = %json, "response body");
@@ -347,21 +355,50 @@ fn unknown_operation_response(content_type: &str) -> Response {
 }
 
 fn dispatch(db: &Database, operation: &str, body: &str) -> crate::Result<String> {
-    let result = dispatch_operation(db, operation, body);
+    // A number given for a boolean is named by how it was written, which
+    // serde_json forgets for `-0` and integers past 64 bits.
+    let body = crate::serde_errors::boolean_numbers_as_written(body);
+    let body = body.as_ref();
+    // Pre-check JSON field types for operations that use serde_json::Value
+    // internally. These checks must run before serde deserialisation because
+    // serde_json::Value accepts any JSON type, so type mismatches on
+    // list/struct fields would silently pass through.
+    //
+    // The request's values are read under the validation layer the operation
+    // runs on, or the older layer for a request that holds a boolean written
+    // as a string or a value with more than one member; the layer decides how
+    // a value it refuses is worded. The operation runs to completion on this
+    // thread (the database blocks on it), so the layer holds for the whole
+    // call.
+    let checked = pre_check_and_read_layer(operation, body);
+    let layer = checked.as_ref().map_or_else(
+        |_| crate::validation::ValueLayer::for_operation(operation),
+        |l| *l,
+    );
+    let result = checked.and_then(|layer| {
+        crate::types::with_value_layer(layer, || dispatch_operation(db, operation, body))
+    });
 
     // DynamoDB wraps the request-validation family in the
-    // "1 validation error detected: " envelope on PutItem and UpdateItem and
-    // reports it bare everywhere else. The wire-invisible EnvelopedValidation
-    // tag must never escape dispatch.
-    result.map_err(|e| crate::validation::resolve_request_validation_tag(operation, e))
+    // "1 validation error detected: " envelope on PutItem, UpdateItem and
+    // DeleteItem read on the current layer, and reports it bare everywhere
+    // else. The wire-invisible EnvelopedValidation tag must never escape
+    // dispatch. ExecuteStatement's condition failure carrying an item is
+    // written in its own shape.
+    result.map_err(|e| {
+        let resolved = match layer {
+            crate::validation::ValueLayer::Older => {
+                crate::validation::strip_request_validation_tag(e)
+            }
+            crate::validation::ValueLayer::Current => {
+                crate::validation::resolve_request_validation_tag(operation, e)
+            }
+        };
+        crate::errors::for_operation(operation, resolved)
+    })
 }
 
 fn dispatch_operation(db: &Database, operation: &str, body: &str) -> crate::Result<String> {
-    // Pre-check JSON field types for operations that use serde_json::Value internally.
-    // These checks must run before serde deserialisation because serde_json::Value accepts
-    // any JSON type, so type mismatches on list/struct fields would silently pass through.
-    pre_check_serialization_types(operation, body)?;
-
     match operation {
         "CreateTable" => {
             let req = deserialize(body)?;

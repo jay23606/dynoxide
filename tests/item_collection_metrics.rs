@@ -224,8 +224,30 @@ fn test_multiple_items_in_partition_reflect_total_size() {
     let icm = resp
         .item_collection_metrics
         .expect("should return ItemCollectionMetrics");
-    // Size should be larger than zero since we have 6 items
-    assert!(icm.size_estimate_range_gb[0] > 0.0);
+    // DynamoDB reports a whole-gigabyte range around the collection's size, so
+    // six small items still read as [0.0, 1.0] (captured eu-west-2 and
+    // us-east-1, 2026-10-09).
+    assert_eq!(icm.size_estimate_range_gb, vec![0.0, 1.0]);
+}
+
+/// A small item collection reports DynamoDB's `[0.0, 1.0]`, a lower and an
+/// upper bound in whole gigabytes, not its exact size twice (captured
+/// eu-west-2 and us-east-1, 2026-10-09).
+#[test]
+fn test_small_item_collection_reports_a_whole_gigabyte_range() {
+    let db = setup_table_with_lsi();
+    let resp = db
+        .put_item(PutItemRequest {
+            table_name: "Orders".to_string(),
+            item: make_order("user1", "order1", "PENDING"),
+            return_item_collection_metrics: Some("SIZE".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    let icm = resp
+        .item_collection_metrics
+        .expect("should return ItemCollectionMetrics");
+    assert_eq!(icm.size_estimate_range_gb, vec![0.0, 1.0]);
 }
 
 // =========================================================================

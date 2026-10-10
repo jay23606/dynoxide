@@ -22,7 +22,11 @@ pub struct KeysAndAttributes {
     pub projection_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ConsistentRead", default)]
+    #[serde(
+        rename = "ConsistentRead",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
     pub consistent_read: Option<bool>,
     #[serde(rename = "AttributesToGet", default)]
     pub attributes_to_get: Option<Vec<String>>,
@@ -31,6 +35,8 @@ pub struct KeysAndAttributes {
 #[derive(Debug, Default, Serialize)]
 pub struct BatchGetItemResponse {
     #[serde(rename = "Responses")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub responses: HashMap<String, Vec<Item>>,
     #[serde(rename = "UnprocessedKeys")]
     pub unprocessed_keys: HashMap<String, serde_json::Value>,
@@ -55,18 +61,15 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // Validate each table entry has at least one key
+    // Validate each table entry has at least one key. Checked ahead of the table
+    // names and reported alone, even beside an unknown capacity mode (captured
+    // in twelve regions, 2026-10-09).
     for (table_name, ka) in &request.request_items {
         if ka.keys.is_empty() {
             return Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value at 'requestItems.{table_name}.member.keys' failed to satisfy constraint: Member must have length greater than or equal to 1"
+                "1 validation error detected: Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1"
             )));
         }
-    }
-
-    // Validate table name format for all tables before checking existence
-    for table_name in request.request_items.keys() {
-        crate::validation::validate_table_name(table_name)?;
     }
 
     // Validate total key count.
@@ -89,9 +92,49 @@ pub async fn execute<S: StorageBackend>(
         )));
     }
 
+    // A table name that breaks its constraints is a constraint on the
+    // RequestItems map's keys, reported once for the map with the map echoed,
+    // and together with a ReturnConsumedCapacity outside the enum, before
+    // anything is read (captured us-east-1, eu-west-2 and ten more regions,
+    // 2026-10-08 and 2026-10-09).
+    let mut member_errors = Vec::new();
+    if !request
+        .request_items
+        .keys()
+        .all(|name| crate::validation::member_table_name_is_valid(name))
+    {
+        member_errors.push(format!(
+            "Value '{}' at 'requestItems' failed to satisfy constraint: {}",
+            request_items_echo(&request.request_items),
+            crate::validation::REQUEST_ITEMS_KEY_CONSTRAINT
+        ));
+    }
+    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ) {
+        member_errors.push(msg);
+    }
+    if let Some(msg) = crate::validation::format_validation_errors(&member_errors) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
+
     // --- Pre-table validations ---
     // DynamoDB validates expression attributes, key values, projections, and duplicates
     // BEFORE checking table existence. Perform these checks first.
+
+    // An empty attribute name in a key, AttributesToGet or the expression names
+    // is refused bare, before anything else here (captured in ten regions).
+    let mut tables: Vec<&String> = request.request_items.keys().collect();
+    tables.sort_unstable();
+    for table in tables {
+        let ka = &request.request_items[table];
+        if ka.keys.iter().any(crate::empty_names::map_has_empty_name)
+            || crate::empty_names::names_include_empty(ka.attributes_to_get.as_ref())
+        {
+            return Err(crate::empty_names::bare());
+        }
+        crate::empty_names::check_names(ka.expression_attribute_names.as_ref())?;
+    }
 
     // Reject a request that pairs an expression projection with a non-expression
     // AttributesToGet, whether in the same block or across blocks. AWS rejects the
@@ -162,7 +205,12 @@ pub async fn execute<S: StorageBackend>(
 
         // Validate key attribute values (empty attrs, invalid numbers, etc.)
         for key in &keys_and_attrs.keys {
-            crate::validation::validate_item_attribute_values(key)?;
+            // A key's values are checked as an item's are (depth included),
+            // in the current layer's words (2026-10-09).
+            crate::validation::validate_item_attribute_values_classified(
+                key,
+                crate::validation::ValueLayer::Current,
+            )?;
         }
 
         // Duplicate keys check
@@ -326,4 +374,53 @@ pub async fn execute<S: StorageBackend>(
         unprocessed_keys,
         consumed_capacity,
     })
+}
+
+/// The `RequestItems` map as DynamoDB echoes it in a constraint message: JSON,
+/// with the tables, each table's members and every attribute map in order of
+/// name. Two tables came back in name order in half the regions captured and
+/// in the other order in the rest, so the order is DynamoDB's own map order;
+/// name order is the deterministic choice. Cut at
+/// [`crate::actions::batch_write_item::ECHO_LIMIT`] like the other echoes; this
+/// one is JSON, no larger than the request, so it is cut once built.
+fn request_items_echo(request_items: &HashMap<String, KeysAndAttributes>) -> String {
+    let mut tables: Vec<(&String, &KeysAndAttributes)> = request_items.iter().collect();
+    tables.sort_by(|a, b| a.0.cmp(b.0));
+    let mut echo = serde_json::Map::new();
+    for (table_name, ka) in tables {
+        let mut members = serde_json::Map::new();
+        if let Some(ref attributes) = ka.attributes_to_get {
+            members.insert("AttributesToGet".to_string(), serde_json::json!(attributes));
+        }
+        if let Some(consistent_read) = ka.consistent_read {
+            members.insert(
+                "ConsistentRead".to_string(),
+                serde_json::json!(consistent_read),
+            );
+        }
+        if let Some(ref names) = ka.expression_attribute_names {
+            members.insert(
+                "ExpressionAttributeNames".to_string(),
+                crate::sorted_json(serde_json::json!(names)),
+            );
+        }
+        let keys = ka
+            .keys
+            .iter()
+            .map(|key| crate::sorted_json(serde_json::to_value(key).unwrap_or_default()))
+            .collect();
+        members.insert("Keys".to_string(), serde_json::Value::Array(keys));
+        if let Some(ref projection) = ka.projection_expression {
+            members.insert(
+                "ProjectionExpression".to_string(),
+                serde_json::json!(projection),
+            );
+        }
+        echo.insert(table_name.clone(), serde_json::Value::Object(members));
+    }
+    // Sorted as a whole too: the tables arrive in hash-map order, which
+    // serde_json keeps when its `preserve_order` feature is on.
+    crate::actions::batch_write_item::bound_echo(
+        crate::sorted_json(serde_json::Value::Object(echo)).to_string(),
+    )
 }

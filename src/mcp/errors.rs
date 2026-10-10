@@ -15,7 +15,8 @@ fn short_error_type(err: &DynoxideError) -> &'static str {
         DynoxideError::ValidationException(_)
         | DynoxideError::KeyEmptyValueValidation(_)
         | DynoxideError::EnvelopedValidation(_) => "ValidationException",
-        DynoxideError::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
+        DynoxideError::ConditionalCheckFailedException(..)
+        | DynoxideError::StatementConditionalCheckFailed(..) => "ConditionalCheckFailedException",
         DynoxideError::TransactionCanceledException(..) => "TransactionCanceledException",
         DynoxideError::ItemCollectionSizeLimitExceededException(_) => {
             "ItemCollectionSizeLimitExceededException"
@@ -54,11 +55,23 @@ fn is_retryable(err: &DynoxideError) -> bool {
 
 /// Convert a DynoxideError into an MCP tool result with `isError: true`.
 pub fn to_tool_error(err: DynoxideError) -> CallToolResult {
-    let error_json = serde_json::json!({
+    let mut error_json = serde_json::json!({
         "error_type": short_error_type(&err),
         "message": err.to_string(),
         "retryable": is_retryable(&err),
     });
+    // A failed condition asked for ALL_OLD carries the item it was evaluated
+    // against, as DynamoDB's ConditionalCheckFailedException does.
+    let item = match &err {
+        DynoxideError::ConditionalCheckFailedException(_, item) => item.as_ref(),
+        DynoxideError::StatementConditionalCheckFailed(_, item) => Some(item),
+        _ => None,
+    };
+    if let Some(item) = item
+        && let Ok(item) = serde_json::to_value(item)
+    {
+        error_json["item"] = item;
+    }
 
     CallToolResult::error(vec![ContentBlock::text(error_json.to_string())])
 }

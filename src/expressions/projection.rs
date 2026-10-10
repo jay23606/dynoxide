@@ -3,7 +3,7 @@
 //! Parses comma-separated attribute paths, supports dot notation and bracket indexing.
 //! Always includes key attributes in the result.
 
-use crate::expressions::tokenizer::{Token, TokenStream, near_window_tokenizer, tokenize};
+use crate::expressions::tokenizer::{Token, TokenStream, tokenize, tokenizer_syntax_error};
 use crate::expressions::{
     PathElement, TrackedExpressionAttributes, format_path_for_error, resolve_path,
     resolve_path_elements,
@@ -24,25 +24,26 @@ pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
     // exceeded the maximum allowed size". Confirmed against real DynamoDB
     // (eu-west-2).
     super::check_expression_size(expr).map_err(|e| format!("Invalid ProjectionExpression: {e}"))?;
-    let tokens = match tokenize(expr) {
-        Ok(t) => t,
-        Err(err) => {
-            // Tokenizer-level syntax error (e.g. stray `!`): build the
-            // AWS-style `near: "..."` window from the offending byte position.
-            let bad = &expr[err.position..err.position + err.bad_len];
-            let near = near_window_tokenizer(expr, err.position);
-            return Err(format!(
-                r#"Invalid ProjectionExpression: Syntax error; token: "{bad}", near: "{near}""#
-            ));
-        }
-    };
+    let tokens = tokenize(expr).map_err(|err| {
+        // A character the tokenizer can't read (e.g. a stray `!`).
+        format!(
+            "Invalid ProjectionExpression: {}",
+            tokenizer_syntax_error(expr, &err)
+        )
+    })?;
     let mut stream = TokenStream::new(tokens);
 
-    let mut paths = Vec::new();
-
+    // Whitespace alone names no attribute, and is refused at its end (GetItem
+    // captured eu-west-2 and us-east-1, 2026-10-10). The caller refuses an
+    // empty string before this.
     if stream.at_end() {
-        return Ok(ProjectionExpr { paths });
+        return Err(format!(
+            "Invalid ProjectionExpression: {}",
+            stream.syntax_error(expr)
+        ));
     }
+
+    let mut paths = Vec::new();
 
     paths.push(parse_path(&mut stream).map_err(|e| projection_parser_error(expr, &mut stream, e))?);
 
@@ -66,8 +67,7 @@ pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
 /// Wrap a parser-level ProjectionExpression error in the standard envelope.
 /// For now this is a passthrough through the existing message shape; if the
 /// conformance suite later pins a `near:` window for parser-level projection
-/// errors, the offending span is available via `stream.current_span()` and
-/// the next span via `stream.peek_span()`.
+/// errors, the stream's position says where the parse stopped.
 fn projection_parser_error(_expr: &str, _stream: &mut TokenStream, msg: String) -> String {
     format!("Invalid ProjectionExpression: {msg}")
 }
@@ -760,5 +760,16 @@ mod tests {
         let n1 = expect_map(&n[1]);
         assert_eq!(n1.get("q"), Some(&AttributeValue::S("q01".into())));
         assert!(!n1.contains_key("p"));
+    }
+
+    #[test]
+    fn projection_expression_tokenizer_error_includes_near_window() {
+        // The conformance suite pins the AWS string for "!!! INVALID !!!":
+        //   Invalid ProjectionExpression: Syntax error; token: "!", near: "!!"
+        let err = parse("!!! INVALID !!!").unwrap_err();
+        assert_eq!(
+            err,
+            r#"Invalid ProjectionExpression: Syntax error; token: "!", near: "!!""#
+        );
     }
 }

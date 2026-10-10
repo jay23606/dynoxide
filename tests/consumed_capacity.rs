@@ -287,3 +287,292 @@ fn test_batch_get_item_consumed_capacity() {
     // Eventually consistent read (default) uses 0.5 RCU per 4KB
     assert!(caps[0].capacity_units >= 0.5);
 }
+
+// ---------------------------------------------------------------------------
+// ReturnConsumedCapacity outside the enum, on the batch and transaction
+// operations
+// ---------------------------------------------------------------------------
+
+/// The message DynamoDB returns for a `ReturnConsumedCapacity` outside the enum,
+/// on every operation that takes one (captured eu-west-2, 2026-10-08, for
+/// BatchGetItem, BatchWriteItem, TransactGetItems and TransactWriteItems).
+const BOGUS_MODE_MESSAGE: &str = "1 validation error detected: Value 'BOGUS' at \
+    'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum \
+    value set: [INDEXES, TOTAL, NONE]";
+
+fn request<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+    serde_json::from_value(value).unwrap()
+}
+
+fn validation_message(err: dynoxide::DynoxideError) -> String {
+    match err {
+        dynoxide::DynoxideError::ValidationException(msg) => msg,
+        other => panic!("expected a ValidationException, got {other:?}"),
+    }
+}
+
+fn stored(db: &Database, pk: &str) -> bool {
+    db.get_item(request(serde_json::json!({
+        "TableName": "TestTable",
+        "Key": {"pk": {"S": pk}},
+        "ConsistentRead": true
+    })))
+    .unwrap()
+    .item
+    .is_some()
+}
+
+fn batch_get(mode: &str) -> dynoxide::actions::batch_get_item::BatchGetItemRequest {
+    request(serde_json::json!({
+        "RequestItems": {"TestTable": {"Keys": [{"pk": {"S": "u1"}}]}},
+        "ReturnConsumedCapacity": mode
+    }))
+}
+
+fn batch_write(mode: &str, pk: &str) -> dynoxide::actions::batch_write_item::BatchWriteItemRequest {
+    request(serde_json::json!({
+        "RequestItems": {"TestTable": [
+            {"PutRequest": {"Item": {"pk": {"S": pk}, "data": {"S": "x"}}}}
+        ]},
+        "ReturnConsumedCapacity": mode
+    }))
+}
+
+fn transact_get(mode: &str) -> dynoxide::actions::transact_get_items::TransactGetItemsRequest {
+    request(serde_json::json!({
+        "TransactItems": [{"Get": {"TableName": "TestTable", "Key": {"pk": {"S": "u1"}}}}],
+        "ReturnConsumedCapacity": mode
+    }))
+}
+
+fn transact_write(
+    mode: &str,
+    pk: &str,
+    token: Option<&str>,
+) -> dynoxide::actions::transact_write_items::TransactWriteItemsRequest {
+    let mut value = serde_json::json!({
+        "TransactItems": [{"Put": {"TableName": "TestTable",
+            "Item": {"pk": {"S": pk}, "data": {"S": "x"}}}}],
+        "ReturnConsumedCapacity": mode
+    });
+    if let Some(token) = token {
+        value["ClientRequestToken"] = serde_json::json!(token);
+    }
+    request(value)
+}
+
+/// BatchGetItem, BatchWriteItem, TransactGetItems and TransactWriteItems refuse
+/// a `ReturnConsumedCapacity` outside the enum with the message the single-item
+/// operations give, and the two writes write nothing.
+#[test]
+fn batch_and_transaction_operations_reject_an_unknown_return_consumed_capacity() {
+    let db = setup();
+    db.put_item(PutItemRequest {
+        table_name: "TestTable".to_string(),
+        item: make_item("u1"),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let err = db.batch_get_item(batch_get("BOGUS")).unwrap_err();
+    assert_eq!(validation_message(err), BOGUS_MODE_MESSAGE, "BatchGetItem");
+
+    let err = db.batch_write_item(batch_write("BOGUS", "w1")).unwrap_err();
+    assert_eq!(
+        validation_message(err),
+        BOGUS_MODE_MESSAGE,
+        "BatchWriteItem"
+    );
+    assert!(
+        !stored(&db, "w1"),
+        "BatchWriteItem wrote despite refusing the request"
+    );
+
+    let err = db.transact_get_items(transact_get("BOGUS")).unwrap_err();
+    assert_eq!(
+        validation_message(err),
+        BOGUS_MODE_MESSAGE,
+        "TransactGetItems"
+    );
+
+    let err = db
+        .transact_write_items(transact_write("BOGUS", "w2", None))
+        .unwrap_err();
+    assert_eq!(
+        validation_message(err),
+        BOGUS_MODE_MESSAGE,
+        "TransactWriteItems"
+    );
+    assert!(
+        !stored(&db, "w2"),
+        "TransactWriteItems wrote despite refusing the request"
+    );
+
+    // The three modes DynamoDB accepts still go through on all four.
+    for (i, mode) in ["INDEXES", "TOTAL", "NONE"].into_iter().enumerate() {
+        db.batch_get_item(batch_get(mode))
+            .unwrap_or_else(|e| panic!("BatchGetItem {mode}: {e:?}"));
+        db.batch_write_item(batch_write(mode, &format!("b{i}")))
+            .unwrap_or_else(|e| panic!("BatchWriteItem {mode}: {e:?}"));
+        db.transact_get_items(transact_get(mode))
+            .unwrap_or_else(|e| panic!("TransactGetItems {mode}: {e:?}"));
+        db.transact_write_items(transact_write(mode, &format!("t{i}"), None))
+            .unwrap_or_else(|e| panic!("TransactWriteItems {mode}: {e:?}"));
+    }
+}
+
+/// A replayed `ClientRequestToken` is checked too.
+///
+/// A same-token, same-items call replays the stored result without running the
+/// writes, and the token is keyed on the items alone, so a replay can carry a
+/// capacity mode the first call never did. The check has to sit ahead of the
+/// idempotency cache, as it does for ExecuteTransaction.
+#[test]
+fn a_replayed_transact_write_still_rejects_an_unknown_return_consumed_capacity() {
+    let db = setup();
+    db.transact_write_items(transact_write("TOTAL", "r1", Some("rcc-replay-token")))
+        .expect("a valid mode runs and caches its result");
+
+    let err = db
+        .transact_write_items(transact_write("BOGUS", "r1", Some("rcc-replay-token")))
+        .unwrap_err();
+    assert_eq!(validation_message(err), BOGUS_MODE_MESSAGE);
+}
+
+/// TransactWriteItems checks `TransactItems` before `ReturnConsumedCapacity`.
+///
+/// An empty `TransactItems` with an unknown mode reports the `transactItems`
+/// constraint, which is the order the request declares its members. The same
+/// message comes back with and without a `ClientRequestToken`; both go through
+/// the check ahead of the idempotency cache, so this pins the order of that
+/// check rather than comparing two separate paths.
+#[test]
+fn transact_write_checks_transact_items_before_return_consumed_capacity() {
+    let db = setup();
+    let empty = |token: Option<&str>| {
+        let mut value = serde_json::json!({"TransactItems": [], "ReturnConsumedCapacity": "BOGUS"});
+        if let Some(token) = token {
+            value["ClientRequestToken"] = serde_json::json!(token);
+        }
+        request::<dynoxide::actions::transact_write_items::TransactWriteItemsRequest>(value)
+    };
+    let without_token = validation_message(db.transact_write_items(empty(None)).unwrap_err());
+    let with_token = validation_message(
+        db.transact_write_items(empty(Some("rcc-order-token")))
+            .unwrap_err(),
+    );
+    assert!(
+        without_token.contains("at 'transactItems'"),
+        "expected the TransactItems constraint first, got {without_token}"
+    );
+    assert_eq!(with_token, without_token);
+}
+
+/// The action itself refuses an unknown mode, not only `Database`.
+///
+/// `actions::transact_write_items::execute` is public and skips the check
+/// `Database::transact_write_items` makes ahead of its idempotency cache, so
+/// the check inside the action is the only guard on this path.
+#[tokio::test(flavor = "current_thread")]
+async fn the_transact_write_action_rejects_an_unknown_return_consumed_capacity() {
+    use dynoxide::storage::Storage;
+
+    let storage = Storage::memory().unwrap();
+    dynoxide::actions::create_table::execute(
+        &storage,
+        request(serde_json::json!({
+            "TableName": "TestTable",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        })),
+    )
+    .await
+    .unwrap();
+
+    let err = dynoxide::actions::transact_write_items::execute(
+        &storage,
+        transact_write("BOGUS", "direct", None),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(validation_message(err), BOGUS_MODE_MESSAGE);
+
+    let got = dynoxide::actions::get_item::execute(
+        &storage,
+        request(serde_json::json!({
+            "TableName": "TestTable",
+            "Key": {"pk": {"S": "direct"}},
+            "ConsistentRead": true
+        })),
+    )
+    .await
+    .unwrap();
+    assert!(
+        got.item.is_none(),
+        "the action wrote despite refusing the request"
+    );
+}
+
+#[test]
+fn batch_write_checks_return_consumed_capacity_before_table_names() {
+    // BatchWriteItem refuses the capacity mode ahead of a table name that fails
+    // its pattern, while the RequestItems length constraints still come first.
+    // Captured us-east-1 and eu-west-2, 2026-10-09.
+    let db = setup();
+    let bad_name = |mode: &str| {
+        request::<dynoxide::actions::batch_write_item::BatchWriteItemRequest>(serde_json::json!({
+            "RequestItems": {"bad!name": [
+                {"PutRequest": {"Item": {"pk": {"S": "x"}}}}
+            ]},
+            "ReturnConsumedCapacity": mode
+        }))
+    };
+    assert_eq!(
+        validation_message(db.batch_write_item(bad_name("BOGUS")).unwrap_err()),
+        BOGUS_MODE_MESSAGE
+    );
+    let without_mode = validation_message(db.batch_write_item(bad_name("NONE")).unwrap_err());
+    assert!(
+        without_mode.contains("bad!name"),
+        "expected the table name error without a bad mode, got {without_mode}"
+    );
+
+    let too_many: Vec<serde_json::Value> = (0..26)
+        .map(|i| serde_json::json!({"PutRequest": {"Item": {"pk": {"S": format!("w{i}")}}}}))
+        .collect();
+    let err = db
+        .batch_write_item(request(serde_json::json!({
+            "RequestItems": {"TestTable": too_many},
+            "ReturnConsumedCapacity": "BOGUS"
+        })))
+        .unwrap_err();
+    let message = validation_message(err);
+    assert!(
+        message.contains("at 'requestItems'") && message.contains("less than or equal to 25"),
+        "expected the request count first, got {message}"
+    );
+}
+
+#[test]
+fn transact_write_checks_client_request_token_before_return_consumed_capacity() {
+    // An overlong ClientRequestToken is reported ahead of the capacity mode, in
+    // the same message. Captured in us-east-1 and nine more regions,
+    // 2026-10-09; eu-west-2 and eu-north-1 report the token alone, in their
+    // newer validation layer's wording.
+    let db = setup();
+    let token = "x".repeat(37);
+    let err = db
+        .transact_write_items(transact_write("BOGUS", "tok", Some(&token)))
+        .unwrap_err();
+    assert_eq!(
+        validation_message(err),
+        format!(
+            "2 validation errors detected: Value '{token}' at 'clientRequestToken' failed to \
+             satisfy constraint: Member must have length less than or equal to 36; \
+             {}",
+            BOGUS_MODE_MESSAGE.trim_start_matches("1 validation error detected: ")
+        )
+    );
+    assert!(!stored(&db, "tok"));
+}

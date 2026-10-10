@@ -12,7 +12,11 @@ struct GetItemRequestRaw {
     table_name: Option<String>,
     #[serde(rename = "Key", default)]
     key: Option<HashMap<String, AttributeValue>>,
-    #[serde(rename = "ConsistentRead", default)]
+    #[serde(
+        rename = "ConsistentRead",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
     consistent_read: Option<bool>,
     #[serde(rename = "ProjectionExpression", default)]
     projection_expression: Option<String>,
@@ -40,9 +44,16 @@ impl<'de> serde::Deserialize<'de> for GetItemRequest {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = GetItemRequestRaw::deserialize(deserializer)?;
-        use crate::validation::{
-            TableNameContext, format_validation_errors, table_name_constraint_errors,
-        };
+        use crate::validation::format_validation_errors;
+
+        // An empty name is the newer validation layer's own check and is
+        // reported on its own (captured 2026-10-09, six of seven regions).
+        if raw.table_name.as_deref() == Some("") {
+            return Err(serde::de::Error::custom(format!(
+                "VALIDATION:{}",
+                crate::validation::envelope_message(crate::validation::EMPTY_TABLE_NAME_REJECTION)
+            )));
+        }
 
         let mut errors = Vec::new();
 
@@ -56,9 +67,8 @@ impl<'de> serde::Deserialize<'de> for GetItemRequest {
         }
 
         // Table name constraints
-        errors.extend(table_name_constraint_errors(
+        errors.extend(crate::validation::item_table_name_errors(
             raw.table_name.as_deref(),
-            TableNameContext::ReadWrite,
         ));
         let table_name = raw.table_name.unwrap_or_default();
 
@@ -99,6 +109,8 @@ impl<'de> serde::Deserialize<'de> for GetItemRequest {
 #[derive(Debug, Default, Serialize)]
 pub struct GetItemResponse {
     #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub item: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
     pub consumed_capacity: Option<types::ConsumedCapacity>,
@@ -109,7 +121,16 @@ pub async fn execute<S: StorageBackend>(
     request: GetItemRequest,
 ) -> Result<GetItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_table_name(&request.table_name)?;
+    crate::validation::validate_item_table_name(&request.table_name)?;
+
+    // An empty attribute name in the key, AttributesToGet or the expression
+    // names is refused bare, ahead of the table lookup (captured in ten regions).
+    if crate::empty_names::map_has_empty_name(&request.key)
+        || crate::empty_names::names_include_empty(request.attributes_to_get.as_ref())
+    {
+        return Err(crate::empty_names::bare());
+    }
+    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
 
     // Validate expression/non-expression parameter conflicts
     {
@@ -128,12 +149,16 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &None,
             expression_attribute_values_raw: &None,
+            layer: crate::validation::ValueLayer::Current,
         };
         helpers::validate_expression_params(&ctx)?;
     }
 
+    // A key nested too deep is refused before it is matched to the schema.
+    crate::value_nesting::check_key(&request.key)?;
+
     // Validate key attribute values (unsupported datatypes, invalid numbers)
-    crate::validation::validate_key_attribute_values(&request.key)?;
+    crate::validation::validate_key_values(&request.key, crate::validation::ValueLayer::Current)?;
 
     // Validate duplicate AttributesToGet
     if let Some(ref attrs) = request.attributes_to_get {

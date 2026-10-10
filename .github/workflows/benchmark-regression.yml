@@ -68,8 +68,8 @@ jobs:
 
           # Any other non-zero means no comparison happened at all. That fails
           # the step, since a check that could not run must not look like one
-          # that passed. It still does not block merge -- this job is not a
-          # required check, and iai-callgrind is the gate that is.
+          # that passed. It still does not block merge: this job is not a
+          # required check, and neither is the iai-callgrind job.
           if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
             {
               echo "## Criterion Benchmark Results"
@@ -161,6 +161,10 @@ jobs:
           cargo install iai-callgrind-runner --version "${IAI_VERSION}"
 
       - name: Run iai-callgrind benchmarks
+        # Same reason as the criterion step: without pipefail the step takes
+        # tee's exit status, so a bench that fails to build or run still
+        # passes, and the check below reads its truncated output as clean.
+        shell: bash
         run: cd benchmarks && cargo bench --bench iai_core --features iai-callgrind 2>&1 | tee iai_output.txt
 
       - name: Check for instruction-count regressions

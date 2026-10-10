@@ -60,8 +60,10 @@ compile_error!(
 pub mod actions;
 pub mod auth_material;
 pub mod bench_counters;
+// Where DynamoDB refuses an empty attribute name, and how it words it.
+pub(crate) mod empty_names;
 pub mod errors;
-pub mod expressions;
+pub(crate) mod expressions;
 #[cfg(feature = "import")]
 pub mod import;
 #[doc(hidden)]
@@ -70,8 +72,10 @@ pub mod macros;
 pub mod mcp;
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
 pub(crate) mod net;
-pub mod partiql;
+pub(crate) mod partiql;
 pub mod schema;
+// The order DynamoDB returns set members in, per operation.
+pub(crate) mod set_order;
 // Surface-neutral mapping of serde failures to DynamoDB errors; the HTTP
 // server consumes the request wrappers and the shared message cleaning is
 // used wherever raw serde messages are decoded by hand.
@@ -81,8 +85,24 @@ pub(crate) mod serde_errors;
 // disagree on requests neither has deserialised yet.
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
 pub(crate) mod serialization_checks;
+// Nesting checks for values outside an item or an expression: keys, start
+// keys, legacy conditions and PartiQL parameters.
+pub(crate) mod value_nesting;
+// Bodies nested deeper than the JSON parser follows: still read and answered
+// with DynamoDB's nesting error, on the HTTP server and the wasm engine alike.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) mod deep_nesting;
 #[cfg(feature = "http-server")]
 pub mod server;
+// Lets a TTL sweep hand the native database lock to waiting requests between
+// pages.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+pub(crate) mod handoff_mutex;
+
+// One startup-options type for the DynamoDB HTTP server and the MCP HTTP
+// transport, outside both because either builds without the other.
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+mod server_options;
 #[cfg(feature = "mcp-server")]
 pub(crate) mod snapshots;
 pub mod storage;
@@ -119,6 +139,9 @@ pub use storage_backend::BackendError;
 pub use storage_backend::WasmBridgeBackend;
 
 pub use types::{AttributeValue, ConversionError, Item};
+
+#[cfg(any(feature = "http-server", feature = "mcp-server"))]
+pub use server_options::ServerOptions;
 
 /// The product version: what `dynoxide --version`, the HTTP headers and the
 /// MCP server report, and what the CLI, containers, browser engine and npm
@@ -200,6 +223,44 @@ impl TokenCaches {
     pub(crate) fn execute_transaction(&self) -> &Mutex<ExecuteTransactionTokenCache> {
         &self.execute_transaction
     }
+
+    /// Lock both caches, for a restore that replaces the data their results
+    /// were computed against.
+    ///
+    /// A restore takes these before the storage lock, keeping the
+    /// cache-then-storage order [`run_idempotent`] relies on, and holds them
+    /// until the restore is done so no transaction can cache a result against
+    /// the data being replaced. A poisoned cache is taken all the same, and
+    /// emptied if the restore succeeds; its poison is left as it was.
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+    pub(crate) fn lock_all(&self) -> TokenCacheGuards<'_> {
+        TokenCacheGuards {
+            transact_write: self
+                .transact_write
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            execute_transaction: self
+                .execute_transaction
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+}
+
+/// Both token caches, held for the length of a restore.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+pub(crate) struct TokenCacheGuards<'a> {
+    transact_write: std::sync::MutexGuard<'a, TransactWriteTokenCache>,
+    execute_transaction: std::sync::MutexGuard<'a, ExecuteTransactionTokenCache>,
+}
+
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+impl TokenCacheGuards<'_> {
+    /// Forget every cached transaction.
+    pub(crate) fn clear(&mut self) {
+        self.transact_write.clear();
+        self.execute_transaction.clear();
+    }
 }
 
 /// AWS caps `ClientRequestToken` at 36 characters.
@@ -211,13 +272,23 @@ const TOKEN_EXPIRY_SECS: u64 = 600;
 
 /// Reject a token longer than DynamoDB accepts, with its exact message.
 fn validate_token(token: Option<&str>) -> Result<()> {
+    match token_constraint_error(token) {
+        Some(msg) => Err(DynoxideError::ValidationException(
+            validation::envelope_message(&msg),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The constraint error for a token longer than DynamoDB accepts, without the
+/// envelope, so a caller can report it alongside the request's other member
+/// errors.
+pub(crate) fn token_constraint_error(token: Option<&str>) -> Option<String> {
     match token {
-        Some(token) if token.len() > MAX_TOKEN_LEN => {
-            Err(DynoxideError::ValidationException(format!(
-                "1 validation error detected: Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {MAX_TOKEN_LEN}"
-            )))
-        }
-        _ => Ok(()),
+        Some(token) if token.len() > MAX_TOKEN_LEN => Some(format!(
+            "Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must have length less than or equal to {MAX_TOKEN_LEN}"
+        )),
+        _ => None,
     }
 }
 
@@ -225,16 +296,50 @@ fn validate_token(token: Option<&str>) -> Result<()> {
 ///
 /// The input is the items or statements only, never `ReturnConsumedCapacity`,
 /// so a same-token call differing only in the capacity mode replays rather than
-/// mismatching. Normalised through `serde_json::Value` first so the digest does
-/// not depend on map iteration order.
+/// mismatching. Hashed through [`canonical_json`], so the digest does not depend
+/// on map iteration order.
 fn request_hash<H: serde::Serialize>(input: &H) -> u64 {
     use std::hash::{Hash, Hasher};
-    let normalised = serde_json::to_value(input)
-        .and_then(|v| serde_json::to_vec(&v))
-        .unwrap_or_default();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    normalised.hash(&mut hasher);
+    canonical_json(input).hash(&mut hasher);
     hasher.finish()
+}
+
+/// `value` serialised to JSON with every object's keys in sorted order, at any
+/// depth, for hashing or comparing by content.
+///
+/// A `serde_json::Value` keeps an object's keys sorted only while serde_json's
+/// `preserve_order` feature is off. A crate that depends on Dynoxide can turn
+/// that feature on for the whole build, and then a `HashMap`'s keys come out in
+/// its iteration order, which differs between two maps holding the same
+/// entries. So the keys are sorted here rather than left to serde_json.
+pub(crate) fn canonical_json<T: serde::Serialize + ?Sized>(value: &T) -> Vec<u8> {
+    serde_json::to_value(value)
+        .map(sorted_json)
+        .and_then(|v| serde_json::to_vec(&v))
+        .unwrap_or_default()
+}
+
+/// A JSON value with every object's keys sorted, at any depth. Building the
+/// object from sorted entries gives sorted keys whether serde_json keeps
+/// objects in key order or in insertion order.
+pub(crate) fn sorted_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, sorted_json(v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted_json).collect())
+        }
+        other => other,
+    }
 }
 
 fn lock_cache<T>(cache: &Mutex<TokenCache<T>>) -> Result<std::sync::MutexGuard<'_, TokenCache<T>>> {
@@ -268,9 +373,12 @@ fn token_window() -> Duration {
 /// rebuilds the reply via `replay` (which re-derives read capacity).
 ///
 /// Lock ordering is cache-then-storage: `execute` takes the storage lock
-/// second, and nothing takes storage first and then a token cache, so there is
-/// no reverse path to deadlock against. Any future code touching both locks
-/// must keep this order.
+/// second, and no native path takes storage first and then a token cache, so
+/// there is no reverse path to deadlock against. A restore takes both caches
+/// (transact-write, then execute-transaction) before storage. The wasm
+/// dispatch takes a cache while it holds its backend, but only briefly and
+/// never across an await, and wasm has no restore. Any future code touching
+/// both locks must keep this order.
 ///
 /// A failed `execute` is propagated without caching, so a same-token retry
 /// re-executes.
@@ -535,10 +643,12 @@ pub const WASM_BACKEND: bool = false;
 /// engine and the public synchronous API is preserved via [`NativeDatabase`].
 ///
 /// Wraps a storage layer and provides DynamoDB-compatible operations.
-/// Thread-safe via `Arc<Mutex<>>`, so clone freely across threads.
+/// Thread-safe: backend access is serialised by one mutex shared through an
+/// `Arc`, which a TTL sweep steps aside from between pages to let waiting
+/// requests in. Clone freely across threads.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub struct Database<S = RusqliteBackend> {
-    inner: Arc<Mutex<S>>,
+    inner: Arc<handoff_mutex::HandoffMutex<S>>,
     tokens: Arc<TokenCaches>,
     vector_lifecycle: Arc<VectorIndexLifecycle>,
 }
@@ -592,7 +702,7 @@ impl Database<RusqliteBackend> {
     pub fn new(path: &str) -> Result<Self> {
         let storage = storage::Storage::new(path)?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(storage)),
+            inner: Arc::new(handoff_mutex::HandoffMutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
             vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
@@ -628,7 +738,7 @@ impl Database<RusqliteBackend> {
 
         let storage = storage::Storage::new_encrypted(path, key)?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(storage)),
+            inner: Arc::new(handoff_mutex::HandoffMutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
             vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
@@ -638,7 +748,7 @@ impl Database<RusqliteBackend> {
     pub fn memory() -> Result<Self> {
         let storage = storage::Storage::memory()?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(storage)),
+            inner: Arc::new(handoff_mutex::HandoffMutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
             vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
@@ -653,7 +763,7 @@ impl Database<RusqliteBackend> {
     pub fn memory_with_clock(clock: Arc<dyn storage_backend::Clock>) -> Result<Self> {
         let storage = storage::Storage::memory()?.with_clock(clock);
         Ok(Self {
-            inner: Arc::new(Mutex::new(storage)),
+            inner: Arc::new(handoff_mutex::HandoffMutex::new(storage)),
             tokens: Arc::new(TokenCaches::new()),
             vector_lifecycle: Arc::new(VectorIndexLifecycle::new()),
         })
@@ -939,6 +1049,10 @@ impl Database<RusqliteBackend> {
         &self,
         request: actions::transact_write_items::TransactWriteItemsRequest,
     ) -> Result<actions::transact_write_items::TransactWriteItemsResponse> {
+        // Ahead of the cache, not only inside the work: a replayed token skips
+        // the work entirely, and the token is keyed on the items alone, so a
+        // replay may carry a capacity mode the first call never did.
+        actions::transact_write_items::check_request(&request)?;
         run_idempotent(
             &self.tokens.transact_write,
             request.client_request_token.as_deref(),
@@ -1033,8 +1147,48 @@ impl Database<RusqliteBackend> {
 
     /// Run a TTL sweep, deleting expired items from all TTL-enabled tables.
     /// Returns the number of items deleted.
+    ///
+    /// The sweep takes the database lock a page at a time and lets any request
+    /// already waiting for it go first between pages, so other requests on this
+    /// `Database` wait for one page of the sweep rather than all of it. The
+    /// first page of each table also counts the table's rows, so the longest
+    /// single hold is that count plus one page. Between pages the sweep waits
+    /// up to a second for the queued requests to have their turn, including
+    /// the time they hold the lock, and then goes ahead.
+    ///
+    /// A sweep reads no more of a table than it held when the sweep reached
+    /// it, so an item written while the sweep is under way may be left to the
+    /// next one.
     pub fn sweep_ttl(&self) -> Result<usize> {
-        self.with_storage(|s| pollster::block_on(ttl::sweep_expired_items(s)))
+        self.sweep_ttl_by_page(|_| {}, |_| {})
+    }
+
+    /// [`sweep_ttl`](Self::sweep_ttl), with a hook run at the end of each page
+    /// while the lock is still held, and one run between pages once the lock
+    /// has been released and handed on. Both are given the page number,
+    /// counting from 1.
+    fn sweep_ttl_by_page(
+        &self,
+        mut in_page: impl FnMut(usize),
+        mut between_pages: impl FnMut(usize),
+    ) -> Result<usize> {
+        let mut sweep = self.with_storage(|s| pollster::block_on(ttl::Sweep::begin(s)))?;
+        let mut page = 0;
+        loop {
+            page += 1;
+            // The hand-off starts while this page still holds the lock, so it
+            // is owed to exactly the requests queued behind the page.
+            let hand_off = self.with_storage(|s| {
+                let more = pollster::block_on(sweep.next_page(s))?;
+                in_page(page);
+                Ok(more.then(|| self.inner.start_hand_off()))
+            })?;
+            let Some(hand_off) = hand_off else {
+                return Ok(sweep.deleted());
+            };
+            hand_off.wait();
+            between_pages(page);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1062,14 +1216,13 @@ impl Database<RusqliteBackend> {
     ) -> Result<actions::execute_transaction::ExecuteTransactionResponse> {
         // Ahead of the cache, not only inside the work: a replayed token skips
         // the work entirely, and the token is keyed on the statements alone, so
-        // a replay may carry a capacity mode the first call never did.
-        actions::execute_transaction::reject_bad_capacity_mode(
-            request.return_consumed_capacity.as_deref(),
-        )?;
+        // a replay may carry a capacity mode or token the first call never did.
+        // The token, statements and mode are refused together, listed.
+        actions::execute_transaction::check_members(&request)?;
         run_idempotent(
             &self.tokens.execute_transaction,
             request.client_request_token.as_deref(),
-            &request.transact_statements,
+            &actions::execute_transaction::token_statements(&request.transact_statements),
             || {
                 self.with_storage(|s| {
                     pollster::block_on(actions::execute_transaction::execute_cached(
@@ -1188,9 +1341,37 @@ impl Database<RusqliteBackend> {
     ///
     /// Uses SQLite's backup API to replace the current database contents
     /// with the snapshot. Works for both in-memory and file-backed databases.
-    /// The backup is atomic: either all pages are copied or none are.
+    /// The snapshot is opened read-only, so a path that doesn't exist is an
+    /// error, as is a file that isn't a Dynoxide snapshot; it is copied and
+    /// brought up to date in a private temporary database before anything here
+    /// changes, so a refused source, a failed copy or a failed migration leaves
+    /// the current database as it was. A snapshot in WAL mode may be left with
+    /// its `-wal` and `-shm` files beside it. After a restore, transactions
+    /// cached for idempotent retries and vector index creation windows are
+    /// forgotten, as the data they described has been replaced.
     pub fn restore_from(&self, path: &str) -> Result<()> {
-        self.with_storage_mut(|s| s.restore_from(path))
+        self.restore_with(|s| s.restore_from(path))
+    }
+
+    /// Run `restore` and forget what this engine remembers about the data it
+    /// replaced: the idempotency caches and the vector index creation windows.
+    ///
+    /// Lock ordering is cache-then-storage, as in [`run_idempotent`]: both
+    /// token caches are taken before the storage lock, never after it, so a
+    /// restore can't deadlock against a tokened transaction that holds its
+    /// cache and is waiting for storage. The vector lifecycle's lock is only
+    /// ever taken briefly inside the storage lock, as it is here.
+    fn restore_with(
+        &self,
+        restore: impl FnOnce(&mut storage::Storage) -> Result<()>,
+    ) -> Result<()> {
+        let mut tokens = self.tokens.lock_all();
+        self.with_storage_mut(|s| {
+            restore(s)?;
+            tokens.clear();
+            self.vector_lifecycle.forget_all();
+            Ok(())
+        })
     }
 
     /// Backup the current database to a new in-memory SQLite connection.
@@ -1204,10 +1385,12 @@ impl Database<RusqliteBackend> {
 
     /// Restore the database from an in-memory SQLite connection.
     ///
-    /// Replaces current contents with the source connection's data.
+    /// Replaces current contents with the source connection's data, and
+    /// forgets the engine state that described the old data, as
+    /// [`Database::restore_from`] does.
     #[cfg(feature = "mcp-server")]
     pub(crate) fn restore_from_connection(&self, source: &rusqlite::Connection) -> Result<()> {
-        self.with_storage_mut(|s| s.restore_from_connection(source))
+        self.restore_with(|s| s.restore_from_connection(source))
     }
 }
 
@@ -1384,6 +1567,293 @@ impl Database<WasmBridgeBackend> {
 mod tests {
     use super::*;
 
+    /// A database with one table and a snapshot of it, for the restore tests.
+    fn database_with_snapshot(dir: &tempfile::TempDir) -> (Database, String) {
+        let snapshot = dir.path().join("before.db");
+        let snapshot = snapshot.to_str().unwrap().to_string();
+        let db = Database::memory().unwrap();
+        db.create_table(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "BillingMode": "PAY_PER_REQUEST",
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        db.vacuum_into(&snapshot).unwrap();
+        (db, snapshot)
+    }
+
+    /// Stand in for a tokened transaction that has taken its cache (the first
+    /// half of `run_idempotent`), let `restore` run on another thread, then
+    /// take the storage lock (the transaction's second half). The storage step
+    /// must not end up waiting on a restore that is itself waiting on the
+    /// cache this thread holds, and the restore must still be waiting on that
+    /// cache afterwards, or the check proved nothing.
+    fn assert_restore_keeps_cache_then_storage_order<T: Send + 'static>(
+        db: &Database,
+        cache: &Mutex<TokenCache<T>>,
+        restore: impl FnOnce(Database) -> Result<()> + Send + 'static,
+    ) {
+        let held = cache.lock().unwrap();
+        let (ready, is_ready) = std::sync::mpsc::channel();
+        let restorer = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let _ = ready.send(());
+                restore(db)
+            })
+        };
+        is_ready.recv().unwrap();
+        let (sent, got) = std::sync::mpsc::channel();
+        {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let _ = sent.send(db.with_storage(|_| Ok(())).is_ok());
+            });
+        }
+        let storage_step = got.recv_timeout(std::time::Duration::from_secs(5));
+        let restore_waited = !restorer.is_finished();
+        drop(held);
+        assert!(
+            matches!(storage_step, Ok(true)),
+            "a transaction holding its token cache must still get the storage lock while a restore waits"
+        );
+        assert!(
+            restore_waited,
+            "the restore must wait for the token cache the transaction holds"
+        );
+        restorer
+            .join()
+            .unwrap()
+            .expect("the restore finishes once the cache is free");
+    }
+
+    /// Hold the storage lock and let `restore` run on another thread until it
+    /// is queued for storage, then check it already holds `cache`. This pins
+    /// the order without timing: it waits on the storage lock's own count of
+    /// waiters, so it fails every time on a restore that takes storage first.
+    fn assert_restore_takes_cache_before_storage<T: Send + 'static>(
+        db: &Database,
+        cache: &Mutex<TokenCache<T>>,
+        restore: impl FnOnce(Database) -> Result<()> + Send + 'static,
+    ) {
+        let storage = db.inner.lock().unwrap();
+        let restorer = {
+            let db = db.clone();
+            std::thread::spawn(move || restore(db))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while db.inner.waiting() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the restore never asked for the storage lock"
+            );
+            std::thread::yield_now();
+        }
+        let cache_was_free = cache.try_lock().is_ok();
+        drop(storage);
+        restorer
+            .join()
+            .unwrap()
+            .expect("the restore finishes once storage is free");
+        assert!(
+            !cache_was_free,
+            "a restore must hold the token caches before it waits for storage"
+        );
+    }
+
+    #[test]
+    fn a_restore_cannot_deadlock_against_a_tokened_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, snapshot) = database_with_snapshot(&dir);
+        let restore = |path: &String| {
+            let path = path.clone();
+            move |db: Database| db.restore_from(&path)
+        };
+        assert_restore_keeps_cache_then_storage_order(
+            &db,
+            &db.tokens.transact_write,
+            restore(&snapshot),
+        );
+        assert_restore_keeps_cache_then_storage_order(
+            &db,
+            &db.tokens.execute_transaction,
+            restore(&snapshot),
+        );
+        assert_restore_takes_cache_before_storage(
+            &db,
+            &db.tokens.transact_write,
+            restore(&snapshot),
+        );
+        assert_restore_takes_cache_before_storage(
+            &db,
+            &db.tokens.execute_transaction,
+            restore(&snapshot),
+        );
+    }
+
+    /// A restore from an in-memory copy of `db`, made now so the restore
+    /// itself is all the returned closure does.
+    #[cfg(feature = "mcp-server")]
+    fn connection_restore(db: &Database) -> impl FnOnce(Database) -> Result<()> + Send + 'static {
+        let copy = db.backup_to_memory().unwrap();
+        move |db: Database| db.restore_from_connection(&copy)
+    }
+
+    #[cfg(feature = "mcp-server")]
+    #[test]
+    fn a_connection_restore_cannot_deadlock_against_a_tokened_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = database_with_snapshot(&dir);
+        assert_restore_keeps_cache_then_storage_order(
+            &db,
+            &db.tokens.transact_write,
+            connection_restore(&db),
+        );
+        assert_restore_keeps_cache_then_storage_order(
+            &db,
+            &db.tokens.execute_transaction,
+            connection_restore(&db),
+        );
+        assert_restore_takes_cache_before_storage(
+            &db,
+            &db.tokens.transact_write,
+            connection_restore(&db),
+        );
+        assert_restore_takes_cache_before_storage(
+            &db,
+            &db.tokens.execute_transaction,
+            connection_restore(&db),
+        );
+    }
+
+    #[test]
+    fn a_restore_forgets_cached_transactions_and_vector_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("before.db");
+        let snapshot = snapshot.to_str().unwrap();
+        let db = Database::memory().unwrap();
+        db.create_table(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "BillingMode": "PAY_PER_REQUEST",
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        db.vacuum_into(snapshot).unwrap();
+
+        let put = || {
+            serde_json::from_value::<actions::transact_write_items::TransactWriteItemsRequest>(
+                serde_json::json!({
+                    "ClientRequestToken": "same-token",
+                    "TransactItems": [{"Put": {"TableName": "tbl", "Item": {"pk": {"S": "a"}}}}]
+                }),
+            )
+            .unwrap()
+        };
+        db.transact_write_items(put()).unwrap();
+        db.with_storage(|s| {
+            db.vector_lifecycle.arm(s, "tbl", "v");
+            Ok(())
+        })
+        .unwrap();
+        assert!(!db.vector_lifecycle.is_empty());
+
+        db.restore_from(snapshot).unwrap();
+        assert!(
+            db.vector_lifecycle.is_empty(),
+            "the restored tables' creation windows must not survive"
+        );
+
+        // The same token after the restore runs again rather than replaying a
+        // result computed against the data the restore replaced.
+        db.transact_write_items(put()).unwrap();
+        let got = db
+            .get_item(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "tbl",
+                    "Key": {"pk": {"S": "a"}}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            got.item.is_some(),
+            "the retried transaction must have written"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_update_leaves_an_unsorted_stored_set_under_an_index_key_alone() {
+        let db = Database::memory().unwrap();
+        db.create_table(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "BillingMode": "PAY_PER_REQUEST",
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        db.put_item(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "Item": {"pk": {"S": "k"}, "g": {"SS": ["a", "b"]}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // As a build before sets were sorted would have stored it.
+        let stored: String = db
+            .with_storage(|s| {
+                s.conn().execute(
+                    "UPDATE \"tbl\" SET item_json = replace(item_json, '\"SS\":[\"a\",\"b\"]', '\"SS\":[\"b\",\"a\"]') \
+                     WHERE item_json LIKE '%\"SS\":[\"a\",\"b\"]%'",
+                    [],
+                )?;
+                Ok(s.conn()
+                    .query_row("SELECT item_json FROM \"tbl\"", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert!(
+            stored.contains(r#""SS":["b","a"]"#),
+            "the fixture must hold an unsorted set: {stored}"
+        );
+        // `g` becomes a GSI key; the set is the wrong type for it, so the
+        // backfill leaves the item out of the index.
+        db.update_table(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
+                "GlobalSecondaryIndexUpdates": [{"Create": {
+                    "IndexName": "byG",
+                    "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                }}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        db.update_item(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "Key": {"pk": {"S": "k"}},
+                "UpdateExpression": "SET note = :v",
+                "ExpressionAttributeValues": {":v": {"S": "x"}}
+            }))
+            .unwrap(),
+        )
+        .expect("an update that doesn't touch g must not re-check g against the index");
+    }
+
     #[test]
     fn test_database_memory() {
         let db = Database::memory().unwrap();
@@ -1455,6 +1925,16 @@ mod tests {
         );
     }
 }
+
+/// `Database::sweep_ttl` taking the lock a page at a time, and handing it to
+/// waiting requests between pages.
+#[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
+mod ttl_sweep_tests;
+
+/// Transactions that SQLite fails part way through, on a database that can't
+/// grow.
+#[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
+mod transaction_storage_error_tests;
 
 /// Cache primitives and the asynchronous driver.
 ///
@@ -1572,6 +2052,35 @@ mod idempotency_tests {
             lookup_or_claim(&cache, TOKEN, hash()).unwrap(),
             TokenClaim::Hit(2)
         ));
+    }
+
+    /// A map in the request hashes by its contents, not by the order its keys
+    /// come out in. Two `HashMap`s holding the same entries iterate in
+    /// different orders, and serde_json keeps that order when a crate in the
+    /// build turns on its `preserve_order` feature, so the digest sorts keys
+    /// itself, at every depth. Otherwise a same-token retry of an identical
+    /// request could be refused as a mismatch.
+    #[test]
+    fn a_request_hash_ignores_map_key_order() {
+        use crate::types::AttributeValue;
+        let item = |n: &str| -> HashMap<String, AttributeValue> {
+            let inner: HashMap<String, AttributeValue> = (0..16)
+                .map(|i| (format!("i{i}"), AttributeValue::N(n.to_string())))
+                .collect();
+            (0..16)
+                .map(|i| (format!("k{i}"), AttributeValue::M(inner.clone())))
+                .collect()
+        };
+        for _ in 0..8 {
+            assert_eq!(
+                request_hash(&vec![item("1")]),
+                request_hash(&vec![item("1")])
+            );
+        }
+        assert_ne!(
+            request_hash(&vec![item("1")]),
+            request_hash(&vec![item("2")])
+        );
     }
 
     #[test]
