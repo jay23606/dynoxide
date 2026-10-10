@@ -424,17 +424,19 @@ fn read_lenient_bool(value: &serde_json::Value) -> Result<LenientBool, String> {
             value: *value,
             from_string: false,
         }),
-        serde_json::Value::String(text) => match text.to_ascii_lowercase().as_str() {
-            "true" | "t" | "yes" | "y" | "1" => Ok(LenientBool {
-                value: true,
+        serde_json::Value::String(text) => match lenient_bool_text(text) {
+            Some(value) => Ok(LenientBool {
+                value,
                 from_string: true,
             }),
-            "false" | "f" | "no" | "n" | "0" => Ok(LenientBool {
-                value: false,
-                from_string: true,
-            }),
-            _ => Err(refused("Unexpected token received from parser")),
+            None => Err(refused("Unexpected token received from parser")),
         },
+        // A number is named by how it was written: a whole number of any size
+        // is NUMBER_VALUE and one with a point or an exponent DECIMAL_VALUE
+        // (captured eu-west-2 and us-east-1, 2026-10-10). serde_json reads
+        // `-0` and integers past 64 bits as floats, so the wire seams rewrite
+        // those first (`serde_errors::boolean_numbers_as_written`) and a float
+        // here was written as one.
         serde_json::Value::Number(n) if n.is_f64() => {
             Err(refused("DECIMAL_VALUE cannot be converted to Boolean"))
         }
@@ -445,6 +447,44 @@ fn read_lenient_bool(value: &serde_json::Value) -> Result<LenientBool, String> {
         )),
         // A null member counts as absent and is never read.
         serde_json::Value::Null => Err(refused("Unexpected token received from parser")),
+    }
+}
+
+/// Deserialise a request's own boolean member (`ConsistentRead`,
+/// `ScanIndexForward`, a legacy condition's `Exists`) the way DynamoDB reads
+/// it: by the rule a `BOOL` member follows, so the strings that read as a
+/// boolean there read as one here too, and JSON `null` leaves the member
+/// unset (captured eu-west-2 and us-east-1, 2026-10-10). A list is refused as
+/// the member's own type, as the request's other members are.
+pub(crate) fn deserialize_lenient_flag<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Array(_) => Err(de::Error::custom(format!(
+            "{}Unrecognized collection type class java.lang.Boolean",
+            crate::serde_errors::SERIALIZATION_MARKER
+        ))),
+        value => read_lenient_bool(&value)
+            .map(|flag| Some(flag.value))
+            .map_err(de::Error::custom),
+    }
+}
+
+/// Whether a request's own boolean member written as a string reads as a
+/// boolean, by the rule [`deserialize_lenient_flag`] follows.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn reads_as_flag(text: &str) -> bool {
+    lenient_bool_text(text).is_some()
+}
+
+/// The boolean a string reads as by DynamoDB's rule, in any case: `true`, `t`,
+/// `yes`, `y` and `1`, or `false`, `f`, `no`, `n` and `0`. Nothing is trimmed.
+fn lenient_bool_text(text: &str) -> Option<bool> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "1" => Some(true),
+        "false" | "f" | "no" | "n" | "0" => Some(false),
+        _ => None,
     }
 }
 

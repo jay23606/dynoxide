@@ -696,13 +696,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused. Any other string is refused with `Unexpected token received from
   parser`, a number with `NUMBER_VALUE` (or `DECIMAL_VALUE`) `cannot be
   converted to Boolean`, and a list with a `SerializationException` that has
-  no message. A `NULL` that reads as false is refused bare as the value is
+  no message. A number is named by how it is written: a whole number of any
+  size, `-0` included, is `NUMBER_VALUE`, and one with a point or an exponent
+  `DECIMAL_VALUE`, where `-0` and an integer past 64 bits were named
+  `DECIMAL_VALUE`. A `NULL` that reads as false is refused bare as the value is
   read, and named by key in an expression value on `UpdateItem`, `DeleteItem`
   and `Query`, when it was a string or sits beside another member; a lone
   `{"NULL": false}` keeps the envelope. A member set to JSON `null` counts as
   absent, so `{"S": null}` is an empty value and `{"S": "a", "N": null}` a
   string, and `Query` names the key of an empty expression value. Captured
   against eu-west-2 and us-east-1.
+- A request's own `ConsistentRead`, on `GetItem`, `Query`, `Scan` and each
+  table of `BatchGetItem`, and `Query`'s `ScanIndexForward`, read a string by
+  the rule a `BOOL` member follows, as DynamoDB reads them: `"yes"` is a
+  strongly consistent read and `"no"` reads a Query descending, where every
+  string was refused with `Unexpected token received from parser`. Any other
+  string still is, and a number is named as it is for a `BOOL`. A `null`
+  `ScanIndexForward` reads forward, as leaving it out does, where it was
+  refused. Captured against eu-west-2 and us-east-1.
 - A PartiQL statement that reads or writes by a key longer than a key can be
   is refused with DynamoDB's words, where it used to run and find nothing: a
   partition key over 2,048 bytes with `Size of hashkey has exceeded the

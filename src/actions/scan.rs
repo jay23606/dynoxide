@@ -32,7 +32,11 @@ struct ScanRequestRaw {
     exclusive_start_key: Option<serde_json::Value>,
     #[serde(rename = "Select", default)]
     select: Option<String>,
-    #[serde(rename = "ConsistentRead", default)]
+    #[serde(
+        rename = "ConsistentRead",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
     consistent_read: Option<bool>,
     #[serde(rename = "IndexName", default)]
     index_name: Option<String>,

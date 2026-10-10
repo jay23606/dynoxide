@@ -172,6 +172,115 @@ pub(crate) const SERIALIZATION_MARKER: &str = "SERIALIZATION:";
 /// [`VALIDATION_MARKER`], whose spelling it extends.
 pub(crate) const REQUEST_VALIDATION_MARKER: &str = "VALIDATION_REQUEST:";
 
+/// The members a request reads as booleans, whose numbers
+/// [`boolean_numbers_as_written`] looks at.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+const BOOLEAN_MEMBERS: [&str; 5] = [
+    "BOOL",
+    "NULL",
+    "ConsistentRead",
+    "ScanIndexForward",
+    "Exists",
+];
+
+/// A request body with each whole number serde_json would read as a float,
+/// `-0` and an integer past 64 bits, written as `0` where it is the value of a
+/// member read as a boolean (`BOOL`, `NULL`, `ConsistentRead`,
+/// `ScanIndexForward`, `Exists`).
+///
+/// DynamoDB names a number given for a boolean by how it is written: a whole
+/// number of any size, `-0` included, is `NUMBER_VALUE`, and one with a point
+/// or an exponent `DECIMAL_VALUE` (captured eu-west-2 and us-east-1,
+/// 2026-10-10). serde_json keeps no text for a number and reads those two as
+/// floats, which would name them `DECIMAL_VALUE`; as `0` they read as the
+/// whole numbers they were written as. A number in one of these members fails
+/// the request whatever its value, so nothing else reads it. The body comes
+/// back as it is when there is nothing to rewrite.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+pub(crate) fn boolean_numbers_as_written(body: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = body.as_bytes();
+    let mut rewrites: Vec<(usize, usize)> = Vec::new();
+    // The key whose value comes next, once its colon has been read.
+    let mut key: Option<&str> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i + 1;
+                i = start;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                let text = &body[start..i.min(bytes.len())];
+                i += 1;
+                // A string followed by a colon is a key.
+                let mut next = i;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                key = None;
+                if next < bytes.len() && bytes[next] == b':' {
+                    key = Some(text);
+                    i = next + 1;
+                }
+                continue;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                if key.is_some_and(|key| BOOLEAN_MEMBERS.contains(&key))
+                    && whole_number_read_as_float(&body[start..i])
+                {
+                    rewrites.push((start, i));
+                }
+                key = None;
+                continue;
+            }
+            byte if byte.is_ascii_whitespace() => {}
+            _ => key = None,
+        }
+        i += 1;
+    }
+    if rewrites.is_empty() {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut rewritten = String::with_capacity(body.len());
+    let mut copied = 0;
+    for (start, end) in rewrites {
+        rewritten.push_str(&body[copied..start]);
+        rewritten.push('0');
+        copied = end;
+    }
+    rewritten.push_str(&body[copied..]);
+    std::borrow::Cow::Owned(rewritten)
+}
+
+/// Whether a number token is a JSON integer that serde_json reads as a float:
+/// `-0`, or one outside the 64-bit range. Anything that isn't a well-formed
+/// integer is left for the parser to refuse.
+#[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+fn whole_number_read_as_float(token: &str) -> bool {
+    let digits = token.strip_prefix('-').unwrap_or(token);
+    let well_formed = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    if !well_formed {
+        return false;
+    }
+    if token.starts_with('-') {
+        digits == "0" || token.parse::<i64>().is_err()
+    } else {
+        token.parse::<u64>().is_err()
+    }
+}
+
 /// Strip serde_json's " at line N column N" suffix from error messages.
 fn strip_position(msg: &str) -> &str {
     if let Some(idx) = msg.rfind(" at line ") {
@@ -508,6 +617,40 @@ mod tests {
         // suffix and stays untouched.
         assert_eq!(clean_serde_message("look at line 9"), "look at line 9");
         assert_eq!(clean_serde_message("plain msg"), "plain msg");
+    }
+
+    #[test]
+    fn boolean_numbers_are_rewritten_only_where_serde_would_read_a_float() {
+        // A whole number past 64 bits, or `-0`, in a boolean member reads as
+        // the integer it was written as.
+        assert_eq!(
+            boolean_numbers_as_written(
+                r#"{"v": {"BOOL": -0}, "w": {"NULL" : 18446744073709551616}}"#
+            ),
+            r#"{"v": {"BOOL": 0}, "w": {"NULL" : 0}}"#
+        );
+        assert_eq!(
+            boolean_numbers_as_written(r#"{"ConsistentRead":-9223372036854775809}"#),
+            r#"{"ConsistentRead":0}"#
+        );
+        // Integers serde reads as integers, decimals, other members and
+        // strings that merely mention a boolean member are left alone.
+        for body in [
+            r#"{"v": {"BOOL": 9223372036854775807}}"#,
+            r#"{"v": {"BOOL": 18446744073709551615}}"#,
+            r#"{"v": {"BOOL": -0.0}, "w": {"NULL": 1e30}}"#,
+            r#"{"Limit": -0, "v": {"N": "18446744073709551616"}}"#,
+            r#"{"s": "\"BOOL\": -0", "t": ["BOOL", -0]}"#,
+            r#"{"v": {"BOOL": 01}}"#,
+        ] {
+            assert!(
+                matches!(
+                    boolean_numbers_as_written(body),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "{body}"
+            );
+        }
     }
 
     #[test]

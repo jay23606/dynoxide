@@ -22,7 +22,11 @@ pub struct KeysAndAttributes {
     pub projection_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     pub expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ConsistentRead", default)]
+    #[serde(
+        rename = "ConsistentRead",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
     pub consistent_read: Option<bool>,
     #[serde(rename = "AttributesToGet", default)]
     pub attributes_to_get: Option<Vec<String>>,

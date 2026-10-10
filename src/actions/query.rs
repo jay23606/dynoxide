@@ -28,15 +28,23 @@ struct QueryRequestRaw {
         deserialize_with = "crate::types::deserialize_named_empty_and_null_refusals"
     )]
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    #[serde(rename = "ScanIndexForward", default = "default_true")]
-    scan_index_forward: bool,
+    #[serde(
+        rename = "ScanIndexForward",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
+    scan_index_forward: Option<bool>,
     #[serde(rename = "Limit", default)]
     limit: Option<usize>,
     #[serde(rename = "ExclusiveStartKey", default)]
     exclusive_start_key: Option<serde_json::Value>,
     #[serde(rename = "Select", default)]
     select: Option<String>,
-    #[serde(rename = "ConsistentRead", default)]
+    #[serde(
+        rename = "ConsistentRead",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
     consistent_read: Option<bool>,
     #[serde(rename = "IndexName", default)]
     index_name: Option<String>,
@@ -50,10 +58,6 @@ struct QueryRequestRaw {
     query_filter: Option<serde_json::Value>,
     #[serde(rename = "ConditionalOperator", default)]
     conditional_operator: Option<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Default)]
@@ -135,7 +139,9 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
             projection_expression: raw.projection_expression,
             expression_attribute_names: raw.expression_attribute_names,
             expression_attribute_values: raw.expression_attribute_values,
-            scan_index_forward: raw.scan_index_forward,
+            // Left out or null, a Query reads forward (captured eu-west-2 and
+            // us-east-1, 2026-10-10).
+            scan_index_forward: raw.scan_index_forward.unwrap_or(true),
             limit: raw.limit,
             exclusive_start_key: None,
             select: raw.select,

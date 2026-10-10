@@ -303,6 +303,10 @@ async fn route<S: StorageBackend>(
     // validation layer the operation runs on; deserialising doesn't await, so
     // the layer is set around it alone.
     let layer = crate::validation::ValueLayer::for_operation(op);
+    // A number given for a boolean is named by how it was written, which
+    // serde_json forgets for `-0` and integers past 64 bits.
+    let request_json = crate::serde_errors::boolean_numbers_as_written(request_json);
+    let request_json = request_json.as_ref();
     fn read<T: serde::de::DeserializeOwned>(
         layer: crate::validation::ValueLayer,
         json: &str,

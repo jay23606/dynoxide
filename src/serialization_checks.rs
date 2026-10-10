@@ -502,7 +502,9 @@ fn check_field_is_string(
     Err(crate::DynoxideError::SerializationException(msg))
 }
 
-/// Check that a field, if present and not null, is a JSON boolean.
+/// Check that a field, if present and not null, reads as a boolean: JSON
+/// `true` or `false`, or a string DynamoDB reads as one, by the rule a `BOOL`
+/// member follows (captured eu-west-2 and us-east-1, 2026-10-10).
 /// Returns SerializationException for wrong types.
 fn check_field_is_bool(
     obj: &serde_json::Map<String, serde_json::Value>,
@@ -513,7 +515,7 @@ fn check_field_is_bool(
         _ => return Ok(()),
     };
 
-    if val.is_boolean() {
+    if val.is_boolean() || val.as_str().is_some_and(crate::types::reads_as_flag) {
         return Ok(());
     }
 

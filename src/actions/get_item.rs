@@ -12,7 +12,11 @@ struct GetItemRequestRaw {
     table_name: Option<String>,
     #[serde(rename = "Key", default)]
     key: Option<HashMap<String, AttributeValue>>,
-    #[serde(rename = "ConsistentRead", default)]
+    #[serde(
+        rename = "ConsistentRead",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
     consistent_read: Option<bool>,
     #[serde(rename = "ProjectionExpression", default)]
     projection_expression: Option<String>,

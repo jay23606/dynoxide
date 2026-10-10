@@ -539,3 +539,258 @@ async fn a_partiql_parameter_reads_the_strings_too() {
         );
     }
 }
+
+/// Send `body` exactly as written, for numbers serde_json would rewrite.
+async fn send_text(url: &str, operation: &str, body: &str) -> (u16, Value) {
+    let resp = reqwest::Client::new()
+        .post(url)
+        .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+        )
+        .header("x-amz-date", "20260101T000000Z")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+const NUMBER_VALUE: &str = "NUMBER_VALUE cannot be converted to Boolean";
+const DECIMAL_VALUE: &str = "DECIMAL_VALUE cannot be converted to Boolean";
+
+/// A request's `ConsistentRead` reads a string as a `BOOL` member does: a
+/// string that reads as true is a strongly consistent read (1.0 unit for a
+/// small item), one that reads as false or `null` an eventually consistent one
+/// (0.5), and anything else is a malformed request. Captured on GetItem,
+/// Query, Scan and BatchGetItem against eu-west-2 and us-east-1, 2026-10-10.
+#[tokio::test]
+async fn consistent_read_reads_the_strings_a_bool_reads() {
+    let url = start().await;
+    let (status, _) = send(
+        &url,
+        "PutItem",
+        json!({"TableName": TABLE, "Item": {"pk": {"S": "c"}}}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let get = |flag: Value| {
+        json!({
+            "TableName": TABLE, "Key": {"pk": {"S": "c"}},
+            "ConsistentRead": flag, "ReturnConsumedCapacity": "TOTAL"
+        })
+    };
+    let truthy = ["true", "TRUE", "yes", "1", "t", "y", "T", "Y"];
+    let falsy = ["false", "no", "0", "f", "n", "F", "N", "No", "FALSE"];
+    for (texts, units) in [(&truthy[..], 1.0), (&falsy[..], 0.5)] {
+        for text in texts {
+            let (status, body) = send(&url, "GetItem", get(json!(text))).await;
+            assert_eq!(status, 200, "{text:?}: {body}");
+            assert_eq!(
+                body["ConsumedCapacity"]["CapacityUnits"],
+                json!(units),
+                "{text:?}"
+            );
+        }
+    }
+    let (status, body) = send(&url, "GetItem", get(Value::Null)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ConsumedCapacity"]["CapacityUnits"], json!(0.5));
+    for text in ["abc", "off", "on", "OFF", "On", "", " true", "true "] {
+        assert_eq!(
+            send(&url, "GetItem", get(json!(text))).await,
+            (400, serialization(Some(UNEXPECTED))),
+            "{text:?}"
+        );
+    }
+    for number in [json!(1), json!(0), json!(2)] {
+        assert_eq!(
+            send(&url, "GetItem", get(number.clone())).await,
+            (400, serialization(Some(NUMBER_VALUE))),
+            "{number}"
+        );
+    }
+
+    let query = |flag: Value| {
+        json!({
+            "TableName": TABLE, "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "c"}},
+            "ConsistentRead": flag, "ReturnConsumedCapacity": "TOTAL"
+        })
+    };
+    let scan = |flag: Value| json!({"TableName": TABLE, "ConsistentRead": flag, "ReturnConsumedCapacity": "TOTAL"});
+    let batch = |flag: Value| {
+        json!({
+            "RequestItems": {TABLE: {"Keys": [{"pk": {"S": "c"}}], "ConsistentRead": flag}},
+            "ReturnConsumedCapacity": "TOTAL"
+        })
+    };
+    let reads: [(&str, &dyn Fn(Value) -> Value); 3] =
+        [("Query", &query), ("Scan", &scan), ("BatchGetItem", &batch)];
+    for (operation, request) in reads {
+        for (flag, units) in [
+            (json!("true"), 1.0),
+            (json!("yes"), 1.0),
+            (json!("1"), 1.0),
+            (json!("TRUE"), 1.0),
+            (json!("false"), 0.5),
+            (json!("no"), 0.5),
+            (json!("0"), 0.5),
+            (Value::Null, 0.5),
+        ] {
+            let (status, body) = send(&url, operation, request(flag.clone())).await;
+            assert_eq!(status, 200, "{operation} {flag}: {body}");
+            let consumed = if operation == "BatchGetItem" {
+                &body["ConsumedCapacity"][0]
+            } else {
+                &body["ConsumedCapacity"]
+            };
+            assert_eq!(
+                consumed["CapacityUnits"],
+                json!(units),
+                "{operation} {flag}"
+            );
+        }
+        for number in [json!(1), json!(0)] {
+            assert_eq!(
+                send(&url, operation, request(number.clone())).await,
+                (400, serialization(Some(NUMBER_VALUE))),
+                "{operation} {number}"
+            );
+        }
+    }
+}
+
+/// A Query's `ScanIndexForward` reads a string the same way: one that reads as
+/// false reads the sort key descending, one that reads as true ascending, and
+/// `null` is the default, ascending. Captured against eu-west-2 and us-east-1,
+/// 2026-10-10.
+#[tokio::test]
+async fn scan_index_forward_reads_the_strings_a_bool_reads() {
+    let url = start().await;
+    let (status, _) = send(
+        &url,
+        "CreateTable",
+        json!({
+            "TableName": "Sorted",
+            "BillingMode": "PAY_PER_REQUEST",
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "N"}
+            ],
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    for sk in ["1", "2", "3"] {
+        let (status, _) = send(
+            &url,
+            "PutItem",
+            json!({"TableName": "Sorted", "Item": {"pk": {"S": "p"}, "sk": {"N": sk}}}),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+    let query = |flag: Value| {
+        json!({
+            "TableName": "Sorted", "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "p"}}, "ScanIndexForward": flag
+        })
+    };
+    let order = |body: &Value| -> Vec<String> {
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["sk"]["N"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for (flag, expected) in [
+        (json!("false"), ["3", "2", "1"]),
+        (json!("no"), ["3", "2", "1"]),
+        (json!("0"), ["3", "2", "1"]),
+        (json!("f"), ["3", "2", "1"]),
+        (json!("N"), ["3", "2", "1"]),
+        (json!("FALSE"), ["3", "2", "1"]),
+        (json!("true"), ["1", "2", "3"]),
+        (json!("T"), ["1", "2", "3"]),
+        (json!("Y"), ["1", "2", "3"]),
+        (Value::Null, ["1", "2", "3"]),
+        (json!(false), ["3", "2", "1"]),
+    ] {
+        let (status, body) = send(&url, "Query", query(flag.clone())).await;
+        assert_eq!(status, 200, "{flag}: {body}");
+        assert_eq!(order(&body), expected, "{flag}");
+    }
+    for (flag, refusal) in [
+        (json!(0), serialization(Some(NUMBER_VALUE))),
+        (json!("abc"), serialization(Some(UNEXPECTED))),
+        (json!("off"), serialization(Some(UNEXPECTED))),
+        (json!(""), serialization(Some(UNEXPECTED))),
+    ] {
+        assert_eq!(
+            send(&url, "Query", query(flag.clone())).await,
+            (400, refusal),
+            "{flag}"
+        );
+    }
+    let mut both = query(json!("abc"));
+    both["ConsistentRead"] = json!("abc");
+    assert_eq!(
+        send(&url, "Query", both).await,
+        (400, serialization(Some(UNEXPECTED)))
+    );
+}
+
+/// A number given for a boolean is named by how it is written: a whole number
+/// of any size, `-0` included, is `NUMBER_VALUE`, and one with a point or an
+/// exponent `DECIMAL_VALUE`, whether it is a `BOOL`, a `NULL` or
+/// `ConsistentRead`. Captured against eu-west-2 and us-east-1, 2026-10-10.
+#[tokio::test]
+async fn a_number_for_a_boolean_is_named_by_how_it_is_written() {
+    let url = start().await;
+    let whole = [
+        "-0",
+        "0",
+        "1",
+        "2",
+        "-1",
+        "18446744073709551616",
+        "9223372036854775808",
+        "9223372036854775807",
+        "-9223372036854775809",
+        "4294967296",
+    ];
+    let decimal = ["1.0", "0.0", "-0.0", "1e30", "1E0"];
+    for (numbers, message) in [(&whole[..], NUMBER_VALUE), (&decimal[..], DECIMAL_VALUE)] {
+        for number in numbers {
+            for member in ["BOOL", "NULL"] {
+                let body = format!(
+                    r#"{{"TableName": "{TABLE}", "Item": {{"pk": {{"S": "x"}}, "v": {{"{member}": {number}}}}}}}"#
+                );
+                assert_eq!(
+                    send_text(&url, "PutItem", &body).await,
+                    (400, serialization(Some(message))),
+                    "{member} {number}"
+                );
+            }
+            let body = format!(
+                r#"{{"TableName": "{TABLE}", "Key": {{"pk": {{"S": "x"}}}}, "ConsistentRead": {number}}}"#
+            );
+            assert_eq!(
+                send_text(&url, "GetItem", &body).await,
+                (400, serialization(Some(message))),
+                "ConsistentRead {number}"
+            );
+        }
+    }
+}

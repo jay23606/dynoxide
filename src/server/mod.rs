@@ -355,6 +355,10 @@ fn unknown_operation_response(content_type: &str) -> Response {
 }
 
 fn dispatch(db: &Database, operation: &str, body: &str) -> crate::Result<String> {
+    // A number given for a boolean is named by how it was written, which
+    // serde_json forgets for `-0` and integers past 64 bits.
+    let body = crate::serde_errors::boolean_numbers_as_written(body);
+    let body = body.as_ref();
     // The request's values are read under the validation layer the operation
     // runs on, which decides how a number it can't store is worded. The
     // operation runs to completion on this thread (the database blocks on it),
