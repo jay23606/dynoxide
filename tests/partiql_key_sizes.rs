@@ -239,6 +239,80 @@ fn a_sort_key_over_1024_bytes_is_refused_under_any_key_condition() {
     assert_eq!(single(&db, statement(at_limit)), Ok(vec![]));
 }
 
+/// A key's size is its UTF-8 bytes, not its characters, and a sort key bound
+/// given as a parameter is measured as a literal one is. Inferred: the
+/// captures used one-byte characters and literal sort key bounds, and PutItem
+/// measures a key in UTF-8 bytes.
+#[test]
+fn a_key_is_measured_in_utf8_bytes_and_a_parameter_bound_is_measured_too() {
+    let db = setup();
+    let e = |n: usize| "\u{e9}".repeat(n);
+    // 513 two-byte characters are 1,026 bytes; 512 are 1,024.
+    assert_eq!(
+        single(
+            &db,
+            statement(format!(
+                r#"SELECT * FROM "{TK}" WHERE pk = 'a' AND sk = '{}'"#,
+                e(513)
+            ))
+        ),
+        Err(refused(RANGE))
+    );
+    assert_eq!(
+        single(
+            &db,
+            statement(format!(
+                r#"SELECT * FROM "{TK}" WHERE pk = 'a' AND sk = '{}'"#,
+                e(512)
+            ))
+        ),
+        Ok(vec![])
+    );
+    // 1,025 are 2,050 bytes for a partition key; 1,024 are 2,048.
+    assert_eq!(
+        single(
+            &db,
+            statement(format!(r#"SELECT * FROM "{TH}" WHERE pk = '{}'"#, e(1025)))
+        ),
+        Err(refused(HASH))
+    );
+    assert_eq!(
+        single(
+            &db,
+            statement(format!(r#"SELECT * FROM "{TH}" WHERE pk = '{}'"#, e(1024)))
+        ),
+        Ok(vec![])
+    );
+    // A BETWEEN bound given as a parameter.
+    assert_eq!(
+        single(
+            &db,
+            json!({
+                "Statement": format!(
+                    r#"SELECT * FROM "{TK}" WHERE pk = 'a' AND sk BETWEEN ? AND ?"#
+                ),
+                "Parameters": [{"S": "a"}, {"S": s(1025)}]
+            })
+        ),
+        Err(refused(RANGE))
+    );
+    assert_eq!(
+        single(
+            &db,
+            json!({
+                "Statement": format!(
+                    r#"SELECT * FROM "{TK}" WHERE pk = 'a' AND sk BETWEEN ? AND ?"#
+                ),
+                "Parameters": [{"S": "a"}, {"S": s(1024)}]
+            })
+        ),
+        Ok(vec![json!({
+            "pk": {"S": "a"}, "sk": {"S": "a"}, "lsk": {"S": "l"},
+            "gpk": {"S": "g"}, "gsk": {"S": "h"}, "x": {"N": "0"}
+        })])
+    );
+}
+
 #[test]
 fn a_statement_that_does_not_pin_the_key_is_not_refused_for_its_size() {
     let db = setup();

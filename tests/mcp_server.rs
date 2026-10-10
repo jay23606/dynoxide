@@ -324,6 +324,98 @@ fn a_tool_returns_the_capacity_block_and_refuses_an_unknown_mode() {
     let _ = child.wait();
 }
 
+/// The item tools read a `BOOL` or `NULL` member as DynamoDB does on the wire:
+/// the strings it reads as booleans, at the top of an item or nested, and a
+/// false NULL or an unreadable BOOL refused in its words (captured eu-west-2
+/// and us-east-1, 2026-10-10, over HTTP; a nested value reading as true is
+/// inferred from the one decoder that reads every value).
+#[test]
+fn an_item_tool_reads_bool_and_null_strings_as_dynamodb_does() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Values",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({
+            "table_name": "Values",
+            "item": {
+                "pk": {"S": "a"},
+                "b": {"BOOL": "yes"},
+                "n": {"NULL": "T"},
+                "l": {"L": [{"BOOL": "no"}]},
+                "m": {"M": {"k": {"BOOL": "1"}}}
+            }
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let resp = call_tool(
+        &mut child,
+        3,
+        "get_item",
+        json!({"table_name": "Values", "key": {"pk": {"S": "a"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let item = &tool_content(&resp)["Item"];
+    assert_eq!(item["b"], json!({"BOOL": true}));
+    assert_eq!(item["n"], json!({"NULL": true}));
+    assert_eq!(item["l"], json!({"L": [{"BOOL": false}]}));
+    assert_eq!(item["m"], json!({"M": {"k": {"BOOL": true}}}));
+
+    let null_false = "One or more parameter values were invalid: Null attribute value types \
+                      must have the value of true";
+    for (id, value, error_type, message) in [
+        (
+            4,
+            json!({"NULL": "false"}),
+            "ValidationException",
+            null_false.to_string(),
+        ),
+        (
+            5,
+            json!({"L": [{"NULL": "no"}]}),
+            "ValidationException",
+            null_false.to_string(),
+        ),
+        (
+            6,
+            json!({"NULL": false}),
+            "ValidationException",
+            format!("1 validation error detected: {null_false}"),
+        ),
+        (
+            7,
+            json!({"BOOL": "abc"}),
+            "SerializationException",
+            "Unexpected token received from parser".to_string(),
+        ),
+    ] {
+        let resp = call_tool(
+            &mut child,
+            id,
+            "put_item",
+            json!({"table_name": "Values", "item": {"pk": {"S": "x"}, "v": value}}),
+        );
+        assert!(is_tool_error(&resp), "{value}: {resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["error_type"], error_type, "{value}: {content}");
+        assert_eq!(content["message"], message, "{value}: {content}");
+    }
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn the_instructions_say_capacity_can_be_requested() {
     let mut child = spawn_mcp();
