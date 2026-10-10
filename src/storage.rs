@@ -1581,7 +1581,7 @@ impl Storage {
     }
 
     /// Count a GSI's entries and total their projected sizes. See
-    /// [`StorageBackend::gsi_item_count_and_size`].
+    /// [`StorageBackend::gsi_item_count_and_size`](crate::storage_backend::StorageBackend::gsi_item_count_and_size).
     pub fn gsi_item_count_and_size(
         &self,
         table_name: &str,
@@ -1598,7 +1598,7 @@ impl Storage {
     }
 
     /// Count an LSI's entries and total their projected sizes. See
-    /// [`StorageBackend::lsi_item_count_and_size`].
+    /// [`StorageBackend::lsi_item_count_and_size`](crate::storage_backend::StorageBackend::lsi_item_count_and_size).
     pub fn lsi_item_count_and_size(
         &self,
         table_name: &str,
@@ -1615,7 +1615,7 @@ impl Storage {
     }
 
     /// Count a vector index's entries and total their stored billable sizes.
-    /// See [`StorageBackend::vector_item_count_and_size`].
+    /// See [`StorageBackend::vector_item_count_and_size`](crate::storage_backend::StorageBackend::vector_item_count_and_size).
     pub fn vector_item_count_and_size(
         &self,
         table_name: &str,
@@ -1625,7 +1625,7 @@ impl Storage {
     }
 
     /// Rewrite the stored `item_size` of the given rows. See
-    /// [`StorageBackend::set_item_sizes`].
+    /// [`StorageBackend::set_item_sizes`](crate::storage_backend::StorageBackend::set_item_sizes).
     pub fn set_item_sizes(
         &self,
         table_name: &str,

@@ -120,6 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `return_values_on_condition_check_failure`, and `BatchStatementError` gains
   `item`, so struct literals of them need the field adding, or
   `..Default::default()`.
+- `actions::index_capacity::WriteCapacity::condition_check` takes the table's
+  vector indexes, so a vector attribute is charged at its billed size.
 
 ### Fixed
 
@@ -722,6 +724,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key of its map, and a PartiQL statement with one outside a string as not
   well formed. Captured against eu-west-2 and us-east-1; us-east-1 names an
   emoji in a filter or a transaction as `?`, and Dynoxide follows eu-west-2.
+  In 1.2.1 some of these expressions stopped the server instead of being
+  refused, so anyone running Dynoxide where other people's clients can reach
+  it should upgrade.
 - A `TransactWriteItems` Update whose SET paths overlap, such as
   `SET a.b = :v, a = :m`, is refused before anything is written, with
   DynamoDB's "Two document paths overlap" message, where it used to be
