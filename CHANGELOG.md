@@ -300,9 +300,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyword` and others). `SET a = 1` and `REMOVE a` are refused for having no
   table, and a verb with nothing it needs after it (`DELETE` alone, `INSERT`
   with no `INTO`) is refused in DynamoDB's words.
-- A PartiQL statement may end with a semicolon, as in DynamoDB; a second
-  statement after it is refused with `Unexpected token after semicolon. (Only
-  one query is allowed.)`.
+- A PartiQL statement may end with a semicolon, as in DynamoDB, including
+  after a `RETURNING` clause; a second statement after it is refused with
+  `Unexpected token after semicolon. (Only one query is allowed.)`.
 - A successful PartiQL INSERT, UPDATE or DELETE through `ExecuteStatement`
   returns an empty `Items` list unless it has a `RETURNING` clause, and an
   `ExecuteTransaction` of writes returns an empty `Responses` list, as DynamoDB

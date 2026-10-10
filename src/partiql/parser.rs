@@ -2199,7 +2199,10 @@ fn parse_optional_returning(t: &mut Tokenizer) -> Result<Option<ReturningVariant
                 .next_token()?
                 .ok_or("Expected returning variant after RETURNING")?;
             let star = t.next_token()?.ok_or("Expected '*' in RETURNING clause")?;
-            if star != "*" || t.peek_token()?.is_some() {
+            // A semicolon may end the statement here as anywhere else; what
+            // follows it is for `end_of_statement` to refuse (captured
+            // eu-west-2 and us-east-1, 2026-10-10).
+            if star != "*" || t.peek_token()?.is_some_and(|tok| tok != ";") {
                 return Err(
                     "Malformed RETURNING clause; expected RETURNING <ALL|MODIFIED> <OLD|NEW> *"
                         .to_string(),

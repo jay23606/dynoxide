@@ -2631,6 +2631,32 @@ fn a_statement_may_end_with_one_semicolon() {
 }
 
 #[test]
+fn a_semicolon_may_follow_a_returning_clause() {
+    // Captured eu-west-2 and us-east-1, 2026-10-10: `RETURNING ALL OLD *;`
+    // and `* ;` run and return the old item; a second statement after the
+    // semicolon is refused as it is after any other statement.
+    let db = seeded();
+    for statement in [
+        "UPDATE \"Nums\" SET a = 1 WHERE pk = 1 RETURNING ALL OLD *;",
+        "UPDATE \"Nums\" SET a = 2 WHERE pk = 1 RETURNING ALL OLD * ;",
+    ] {
+        let resp = run(&db, statement).unwrap_or_else(|e| panic!("{statement}: {e:?}"));
+        assert_eq!(pks(resp), vec!["1".to_string()], "{statement}");
+    }
+    let resp = run(&db, "SELECT * FROM \"Nums\" WHERE pk = 1").unwrap();
+    assert_eq!(
+        resp.items.unwrap()[0].get("a"),
+        Some(&AttributeValue::N("2".to_string()))
+    );
+    let statement = "UPDATE \"Nums\" SET a = 3 WHERE pk = 1 RETURNING ALL OLD *; foo";
+    let err = run(&db, statement).expect_err(statement);
+    assert_eq!(
+        message(err),
+        format!("{NOT_WELL_FORMED}Unexpected token after semicolon. (Only one query is allowed.)")
+    );
+}
+
+#[test]
 fn a_batch_or_transaction_select_names_one_value_for_each_key_attribute() {
     // Captured eu-west-2 and us-east-1, 2026-10-09: the same equality twice,
     // and an IN with one value, are accepted; two different values for one
