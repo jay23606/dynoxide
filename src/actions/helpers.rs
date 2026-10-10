@@ -233,9 +233,7 @@ fn validate_item_keys_inner(
         let sk_size = key_attribute_size(sk_val);
         if sk_size > 1024 {
             return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: \
-                 Aggregated size of all range keys has exceeded the size limit of 1024 bytes"
-                    .to_string(),
+                RANGE_KEY_TOO_LARGE.to_string(),
             ));
         }
     }
@@ -503,9 +501,7 @@ pub fn validate_key_only(key: &HashMap<String, AttributeValue>, schema: &KeySche
         let sk_size = key_attribute_size(sk_val);
         if sk_size > 1024 {
             return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: \
-                 Aggregated size of all range keys has exceeded the size limit of 1024 bytes"
-                    .to_string(),
+                RANGE_KEY_TOO_LARGE.to_string(),
             ));
         }
     }
@@ -632,6 +628,22 @@ fn validate_key_type_for_key_op(
 /// it spells it (no space before the figure).
 pub(crate) const HASH_KEY_TOO_LARGE: &str = "One or more parameter values were invalid: \
      Size of hashkey has exceeded the maximum size limit of2048 bytes";
+
+/// DynamoDB's refusal of a sort key value over 1,024 bytes.
+pub(crate) const RANGE_KEY_TOO_LARGE: &str = "One or more parameter values were invalid: \
+     Aggregated size of all range keys has exceeded the size limit of 1024 bytes";
+
+/// The refusal for a key value larger than a key can be, if it is: over
+/// 2,048 bytes for a partition key, over 1,024 for a sort key.
+pub(crate) fn key_size_refusal(value: &AttributeValue, sort_key: bool) -> Option<DynoxideError> {
+    let (limit, message) = if sort_key {
+        (1024, RANGE_KEY_TOO_LARGE)
+    } else {
+        (2048, HASH_KEY_TOO_LARGE)
+    };
+    (key_attribute_size(value) > limit)
+        .then(|| DynoxideError::ValidationException(message.to_string()))
+}
 
 /// Return the byte size of a key attribute value for size limit checks.
 pub(crate) fn key_attribute_size(val: &AttributeValue) -> usize {

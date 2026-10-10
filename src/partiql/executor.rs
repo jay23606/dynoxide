@@ -1796,13 +1796,23 @@ async fn evaluate_window<S: StorageBackend>(
     let pk_key = match pk_condition {
         Some(value) => {
             let value = resolve_value(value, parameters)?;
-            // A key read with a partition key value no key can be is refused as
-            // GetItem refuses it (captured eu-west-2 and us-east-1, 2026-10-10,
-            // on the base table; an index's key is left alone, not captured).
-            if index.is_none() && crate::actions::helpers::key_attribute_size(&value) > 2048 {
-                return Err(DynoxideError::ValidationException(
-                    crate::actions::helpers::HASH_KEY_TOO_LARGE.to_string(),
-                ));
+            // A key read with a key value no key can be is refused as GetItem
+            // and Query refuse it, on the table and on either kind of index:
+            // the partition key first, then each value the sort key's
+            // conditions name, whatever the condition (captured eu-west-2 and
+            // us-east-1, 2026-10-10).
+            if let Some(refusal) = crate::actions::helpers::key_size_refusal(&value, false) {
+                return Err(refusal);
+            }
+            if let (Some(sk_name), Some(wc)) = (read_sk, where_clause) {
+                let sk_conditions =
+                    translate_sk_conditions(&wc.groups[0], sk_name, parameters).unwrap_or_default();
+                for sk_value in sk_conditions.iter().flat_map(|c| c.values()) {
+                    if let Some(refusal) = crate::actions::helpers::key_size_refusal(sk_value, true)
+                    {
+                        return Err(refusal);
+                    }
+                }
             }
             Some(value.to_key_string())
         }
@@ -3215,28 +3225,45 @@ fn single_item_key(
     key_schema: &crate::actions::helpers::KeySchema,
     parameters: &[AttributeValue],
 ) -> Result<(String, String)> {
-    let pinned = |name: &str, declared: Option<&ScalarAttributeType>| -> Result<String> {
-        let mut key: Option<String> = None;
-        for cond in wc.top_level_equalities.iter().filter(|c| c.path == name) {
-            let value = typed_key(&resolve_value(&cond.value, parameters)?, name, declared)?;
-            match key {
-                Some(ref already) if *already != value => {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "Multiple conditions on same key {name}. Only single item \
+    let pinned =
+        |name: &str, declared: Option<&ScalarAttributeType>| -> Result<(String, AttributeValue)> {
+            let mut key: Option<(String, AttributeValue)> = None;
+            for cond in wc.top_level_equalities.iter().filter(|c| c.path == name) {
+                let resolved = resolve_value(&cond.value, parameters)?;
+                let value = typed_key(&resolved, name, declared)?;
+                match key {
+                    Some((ref already, _)) if *already != value => {
+                        return Err(DynoxideError::ValidationException(format!(
+                            "Multiple conditions on same key {name}. Only single item \
                          Update/Insert/Delete are supported"
-                    )));
+                        )));
+                    }
+                    _ => key = Some((value, resolved)),
                 }
-                _ => key = Some(value),
             }
-        }
-        key.ok_or_else(mandatory_key_equality)
-    };
-    let pk = pinned(
+            key.ok_or_else(mandatory_key_equality)
+        };
+    let (pk, pk_value) = pinned(
         &key_schema.partition_key,
         Some(&key_schema.partition_key_type),
     )?;
     let sk = match key_schema.sort_key {
-        Some(ref sk_name) => pinned(sk_name, key_schema.sort_key_type.as_ref())?,
+        Some(ref sk_name) => Some(pinned(sk_name, key_schema.sort_key_type.as_ref())?),
+        None => None,
+    };
+    // A key too large to be one is refused once the whole key is pinned, the
+    // partition key first (captured eu-west-2 and us-east-1, 2026-10-10: a
+    // missing sort key equality is reported ahead of either).
+    if let Some(refusal) = crate::actions::helpers::key_size_refusal(&pk_value, false) {
+        return Err(refusal);
+    }
+    let sk = match sk {
+        Some((sk, sk_value)) => {
+            if let Some(refusal) = crate::actions::helpers::key_size_refusal(&sk_value, true) {
+                return Err(refusal);
+            }
+            sk
+        }
         None => String::new(),
     };
     Ok((pk, sk))

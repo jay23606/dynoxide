@@ -624,14 +624,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExecuteStatement`, `BatchExecuteStatement` and `ExecuteTransaction`. The
   limit counts characters, not bytes. Captured against eu-west-2 and
   us-east-1.
-- A PartiQL read whose partition key value is longer than 2,048 bytes is
-  refused with GetItem's `Size of hashkey has exceeded the maximum size limit
-  of2048 bytes`, where it used to run and find nothing: on its own on
-  `ExecuteStatement`, against that statement (with its table) in a
-  `BatchExecuteStatement`, and as a `ValidationError` cancellation in an
-  `ExecuteTransaction`. Captured against eu-west-2 and us-east-1 for a base
-  table key; an index key and the 1,024-byte sort key limit are left as they
-  were, not yet captured.
+- A PartiQL statement that reads or writes by a key longer than a key can be
+  is refused with DynamoDB's words, where it used to run and find nothing: a
+  partition key over 2,048 bytes with `Size of hashkey has exceeded the
+  maximum size limit of2048 bytes`, and a sort key over 1,024 bytes with
+  `Aggregated size of all range keys has exceeded the size limit of 1024
+  bytes`. That covers a SELECT on the table or on either kind of index, a
+  sort key under any key condition (`=`, a comparison, `BETWEEN` or
+  `begins_with`), and the key of an `UPDATE` or a `DELETE`; a statement that
+  doesn't read by key, such as an `OR` of keys, still runs. The refusal stands
+  on its own on `ExecuteStatement`, against that statement (with its table)
+  in a `BatchExecuteStatement`, where it is now charged nothing, and as a
+  `ValidationError` cancellation in an `ExecuteTransaction`. Captured against
+  eu-west-2 and us-east-1.
 - A PartiQL WHERE clause with more than 300 operators is refused with
   DynamoDB's "The expression contains too many operators" message. AND, OR,
   NOT, comparison operators and function calls each count, so

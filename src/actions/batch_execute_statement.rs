@@ -456,6 +456,14 @@ pub async fn execute<S: StorageBackend>(
                         }
                     }
                     Err(e) => {
+                        let code = e.short_error_code().to_string();
+                        let message = e.to_string();
+                        // A key too large to be one is refused before anything
+                        // is read or written, and is charged nothing (captured
+                        // eu-west-2 and us-east-1, 2026-10-10).
+                        let key_too_large = code == "ValidationError"
+                            && (message == crate::actions::helpers::HASH_KEY_TOO_LARGE
+                                || message == crate::actions::helpers::RANGE_KEY_TOO_LARGE);
                         // A failed statement is charged the write it attempted,
                         // added to its table's total while appearing in no arm.
                         // Captured: a failing 3KB insert beside a small success
@@ -466,7 +474,9 @@ pub async fn execute<S: StorageBackend>(
                         // that is the one kind whose attempt can be sized
                         // without reading anything. Everything else falls back
                         // to the one-unit minimum.
-                        if let Some(ref name) = table {
+                        if let Some(ref name) = table
+                            && !key_too_large
+                        {
                             let units =
                                 attempted_units(storage, &stmt, params, prepared.target.as_ref())
                                     .await;
@@ -478,15 +488,11 @@ pub async fn execute<S: StorageBackend>(
                         // carry it; a `ValidationError` does not, which is what
                         // an invalid RETURNING variant or a bad expression is.
                         // Captured eu-west-2 2026-08-15 for the first pair and
-                        // 2026-07 for the second. A key too large to read is
-                        // the exception: the statement ran its key read and
-                        // failed there, and DynamoDB echoes the table with that
-                        // ValidationError (captured eu-west-2 and us-east-1,
-                        // 2026-10-10).
-                        let code = e.short_error_code().to_string();
-                        let message = e.to_string();
-                        let echoes_table = code != "ValidationError"
-                            || message == crate::actions::helpers::HASH_KEY_TOO_LARGE;
+                        // 2026-07 for the second. A key too large to be one is
+                        // the exception: DynamoDB echoes the table with that
+                        // ValidationError, for a partition key and a sort key
+                        // alike (captured eu-west-2 and us-east-1, 2026-10-10).
+                        let echoes_table = code != "ValidationError" || key_too_large;
                         BatchStatementResponse {
                             error: Some(BatchStatementError { code, message }),
                             item: None,
