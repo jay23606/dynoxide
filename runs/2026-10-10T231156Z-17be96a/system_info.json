@@ -1,0 +1,48 @@
+{
+  "os": "Linux",
+  "kernel": "6.17.0-1022-azure",
+  "arch": "x86_64",
+  "cpu_model": "AMD EPYC 7763 64-Core Processor",
+  "cpu_cores": "4",
+  "total_ram_gb": "15.6",
+  "rust_version": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "dynoxide_version": "3.0.0",
+  "dynoxide_commit": "17be96a",
+  "dynamodb_local_image_id": "sha256:9539a",
+  "dynoxide_binary_bytes": 7918936,
+  "dynamodb_local_image_bytes": 495952200,
+  "localstack_image_bytes": 1154597125,
+  "floci_image_bytes": 245244193,
+  "ministack_image_bytes": 170247796,
+  "images": {
+    "dynamodb_local": {
+      "ref": "amazon/dynamodb-local:latest",
+      "id": "sha256:9539afb506732e40093bcdb0ab91e448efbd6aba48fee560dc1d5e3b7ddcebb4",
+      "digest": "sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab",
+      "version": null,
+      "bytes": 495952200
+    },
+    "localstack": {
+      "ref": "localstack/localstack:latest",
+      "id": "sha256:0dfc905bade077d36e6dbdd6d460be846e7fbe4fd9a3535c0a366c9a0ba9d069",
+      "digest": "sha256:0c644ede65c2d0c95737e09a39007828bd381bdb07ca8200c6bf17d66a4ed191",
+      "version": null,
+      "bytes": 1154597125
+    },
+    "floci": {
+      "ref": "floci/floci:latest",
+      "id": "sha256:b12af5357828684ed6b12ff7829711c878fecceff49667cdf5b4297526d4a6ad",
+      "digest": "sha256:e97cd0c1dc2aa14e7697fb5ef5018404c4d6345169dbd276315f0bed2c7b0520",
+      "version": "2.2.0",
+      "bytes": 245244193
+    },
+    "ministack": {
+      "ref": "ministackorg/ministack:latest",
+      "id": "sha256:75ea5defe35b08aa85a37df821e3a570b3d7b6d593c18f6c28b23791ad1ca39c",
+      "digest": "sha256:1754efa38cac6fbaa696d9ce0fe30cd28f74e67e4ba60167a8a96bd167dfd9b1",
+      "version": "1.5.25",
+      "bytes": 170247796
+    }
+  },
+  "timestamp": "2026-10-10T23:01:38.931690+00:00"
+}
