@@ -2636,10 +2636,10 @@ impl ConditionFunction {
         }
     }
 
-    /// The call compared with a value. It is a boolean: equal to a boolean is
-    /// the call or its negation, equal to anything else is never true and
-    /// unequal to it always, and the ordering operators refuse it (captured
-    /// eu-west-2 and us-east-1, 2026-10-09).
+    /// The call compared with an operand. It is a boolean: equal only to the
+    /// same boolean, so unequal to a missing value or one of another type, and
+    /// the ordering operators refuse it (captured eu-west-2 and us-east-1,
+    /// 2026-10-09 for a literal, 2026-10-10 for a path, a size or a parameter).
     fn compared(&self, t: &mut Tokenizer, op: &str, value: Operand) -> Result<BoolExpr, String> {
         let equal = match op {
             "=" => true,
@@ -2649,55 +2649,78 @@ impl ConditionFunction {
                 return self.condition(true);
             }
         };
-        match value {
-            Operand::Value(PartiqlValue::Literal(AttributeValue::BOOL(b))) => {
-                self.condition(b == equal)
-            }
-            Operand::Value(PartiqlValue::Literal(_)) => {
-                let both = vec![self.condition(true)?, self.condition(false)?];
-                Ok(if equal {
-                    BoolExpr::And(both)
-                } else {
-                    BoolExpr::Or(both)
-                })
-            }
-            _ => Err(CONDITION_FUNCTION_COMPARED.into()),
+        let equals = self.equals(value)?;
+        Ok(if equal {
+            equals
+        } else {
+            BoolExpr::Not(Box::new(equals))
+        })
+    }
+
+    /// The condition that the call equals `operand`. A literal is settled
+    /// here; a path or a parameter is compared item by item, as `true` where
+    /// the call holds and as `false` where it doesn't. A size is a number, so
+    /// never equal to it.
+    fn equals(&self, operand: Operand) -> Result<BoolExpr, String> {
+        let is = |operand: &Operand, b: bool| -> BoolExpr {
+            BoolExpr::Leaf(WhereCondition::Compare(
+                operand.clone(),
+                CompOp::Eq,
+                Operand::Value(PartiqlValue::Literal(AttributeValue::BOOL(b))),
+            ))
+        };
+        match operand {
+            Operand::Value(PartiqlValue::Literal(AttributeValue::BOOL(b))) => self.condition(b),
+            Operand::Value(PartiqlValue::Literal(_)) | Operand::Size(_) => self.never(),
+            other => Ok(BoolExpr::Or(vec![
+                BoolExpr::And(vec![self.condition(true)?, is(&other, true)]),
+                BoolExpr::And(vec![self.condition(false)?, is(&other, false)]),
+            ])),
         }
     }
 
-    /// The call in a list: true when the list holds the boolean it is. A
-    /// member that is a path, a size or a parameter is refused as a comparison
-    /// with one is.
+    /// A condition that holds for no item.
+    fn never(&self) -> Result<BoolExpr, String> {
+        Ok(BoolExpr::And(vec![
+            self.condition(true)?,
+            self.condition(false)?,
+        ]))
+    }
+
+    /// The call in a list: true when any member equals it (captured eu-west-2
+    /// and us-east-1, 2026-10-10). The literal members are settled together
+    /// and a member repeated is compared once, so a long list doesn't grow
+    /// the clause by one alternative per member.
     fn listed(&self, members: &[Operand]) -> Result<BoolExpr, String> {
-        if members.iter().any(|m| {
-            matches!(
-                m,
-                Operand::Path(_) | Operand::Size(_) | Operand::Value(PartiqlValue::Parameter(_))
-            )
-        }) {
-            return Err(CONDITION_FUNCTION_COMPARED.into());
-        }
         let has = |b: bool| {
             members.contains(&Operand::Value(PartiqlValue::Literal(
                 AttributeValue::BOOL(b),
             )))
         };
-        let both = vec![self.condition(true)?, self.condition(false)?];
-        Ok(match (has(true), has(false)) {
-            (true, true) => BoolExpr::Or(both),
-            (true, false) => self.condition(true)?,
-            (false, true) => self.condition(false)?,
-            (false, false) => BoolExpr::And(both),
+        let mut alternatives = match (has(true), has(false)) {
+            (true, true) => vec![self.condition(true)?, self.condition(false)?],
+            (true, false) => vec![self.condition(true)?],
+            (false, true) => vec![self.condition(false)?],
+            (false, false) => Vec::new(),
+        };
+        let mut compared: Vec<&Operand> = Vec::new();
+        for member in members {
+            if matches!(
+                member,
+                Operand::Path(_) | Operand::Value(PartiqlValue::Parameter(_))
+            ) && !compared.contains(&member)
+            {
+                compared.push(member);
+                alternatives.push(self.equals(member.clone())?);
+            }
+        }
+        Ok(match alternatives.len() {
+            0 => self.never()?,
+            1 => alternatives.pop().unwrap_or(BoolExpr::Or(Vec::new())),
+            _ => BoolExpr::Or(alternatives),
         })
     }
 }
-
-/// Dynoxide's refusal of a condition function compared with, or listed
-/// beside, a path, a size or a parameter: it evaluates the call as a boolean
-/// at parse time, so it can't compare it with a value read from the item or
-/// bound later. DynamoDB's answer for these shapes is uncaptured.
-const CONDITION_FUNCTION_COMPARED: &str =
-    "Comparing a condition function with a path or a parameter is not supported";
 
 /// DynamoDB's refusal of a boolean as the operand of `op`.
 fn bool_operand_refusal(op: &str) -> String {
@@ -2754,6 +2777,27 @@ fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> 
             Some(function) => function.compared(t, &op, Operand::Value(left)),
             None => Ok(refused_condition()),
         };
+    }
+
+    // A path compared with a condition function, `b = attribute_exists(a)`:
+    // the same comparison as with the call written first (captured eu-west-2
+    // and us-east-1, 2026-10-10).
+    if is_name(&tok) && !calls(0, t)? {
+        let end = path_end(t)?;
+        if t.peek_token_at(end)?
+            .is_some_and(|op| is_comparison_operator(&op))
+            && t.peek_token_at(end + 1)?
+                .is_some_and(|f| is_condition_function(&f))
+            && calls(end + 1, t)?
+        {
+            let first = t.next_token()?.unwrap_or_default();
+            let path = parse_dotted_path_from_token(&first, t)?;
+            let op = t.next_token()?.unwrap_or_default();
+            return match parse_condition_function(t, depth)? {
+                Some(function) => function.compared(t, &op, Operand::Path(path)),
+                None => Ok(refused_condition()),
+            };
+        }
     }
 
     let bare_word = tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
@@ -2834,7 +2878,7 @@ fn condition_function_tail(
         return Ok(refused_condition());
     }
     // Members read as any IN's do, so a bare name is an attribute rather than
-    // a string. Inferred, not captured for a condition function's list.
+    // a string (captured eu-west-2 and us-east-1, 2026-10-10).
     if is_keyword(&next, "IN") {
         t.next_token()?;
         let members = parse_in_list(t, depth, parse_bound_operand)?;
@@ -3762,6 +3806,19 @@ fn path_parts(path: &str) -> String {
         parts.push(name);
     }
     parts.join(", ")
+}
+
+/// How many tokens ahead a path starting at the next token ends: a name, then
+/// any `.name` and `[index]` steps.
+fn path_end(t: &Tokenizer) -> Result<usize, String> {
+    let mut end = 1;
+    loop {
+        match t.peek_token_at(end)?.as_deref() {
+            Some(".") => end += 2,
+            Some("[") => end += 3,
+            _ => return Ok(end),
+        }
+    }
 }
 
 /// Parse a dotted path starting from an already-consumed first token.

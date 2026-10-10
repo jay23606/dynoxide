@@ -2,7 +2,8 @@
 //!
 //! DynamoDB accepts `attribute_exists(path)` and `attribute_not_exists(path)`
 //! in a SELECT, UPDATE or DELETE WHERE clause, in any case, and compared with
-//! a boolean. A literal or parameter operand, or the wrong number of operands,
+//! a boolean, a path, a size or a parameter (captured 2026-10-10 for the last
+//! three). A literal or parameter operand, or the wrong number of operands,
 //! is refused without the syntax envelope. A function it doesn't recognise,
 //! `EXISTS(path)` among them, is refused as `Unrecognized function: <name> at
 //! line:column:length`, ahead of an operand refusal; a syntax error comes
@@ -184,39 +185,132 @@ fn a_condition_function_compares_with_a_boolean() {
     }
 }
 
-/// A condition function's IN list reads its members as every other IN list
-/// does: a bare name is an attribute, not a string. Dynoxide can't compare the
-/// call with a value read from the item, so it refuses that, as it refuses
-/// `attribute_exists(ss) = b`, rather than comparing with the string `'b'`.
-/// Inferred, not captured: DynamoDB's answer for a path in the list is
-/// unknown. A boolean member works as before.
+/// The items the comparisons below were captured against: `a` there or not,
+/// beside a `b` that is each boolean, missing, or another type.
+fn compared_db() -> Database {
+    let db = Database::memory().unwrap();
+    db.create_table(CreateTableRequest {
+        table_name: "Compared".to_string(),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::HASH,
+        }],
+        attribute_definitions: vec![AttributeDefinition {
+            attribute_name: "pk".to_string(),
+            attribute_type: ScalarAttributeType::S,
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    let a = || ("a".to_string(), s("x"));
+    let b = |v: AttributeValue| ("b".to_string(), v);
+    let items: Vec<(&str, Vec<(String, AttributeValue)>)> = vec![
+        ("i1", vec![a(), b(AttributeValue::BOOL(true))]),
+        ("i2", vec![a(), b(AttributeValue::BOOL(false))]),
+        ("i3", vec![b(AttributeValue::BOOL(false))]),
+        ("i4", vec![b(AttributeValue::BOOL(true))]),
+        ("i5", vec![a()]),
+        ("i6", vec![]),
+        ("i7", vec![a(), b(s("true"))]),
+        ("i8", vec![a(), b(n("1"))]),
+        ("i9", vec![a(), b(AttributeValue::NULL(true))]),
+        (
+            "i10",
+            vec![
+                a(),
+                b(AttributeValue::M(HashMap::from([(
+                    "c".to_string(),
+                    AttributeValue::BOOL(true),
+                )]))),
+            ],
+        ),
+    ];
+    for (pk, attributes) in items {
+        let mut item: Item = attributes.into_iter().collect();
+        item.insert("pk".to_string(), s(pk));
+        db.put_item(PutItemRequest {
+            table_name: "Compared".to_string(),
+            item,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    db
+}
+
+/// A condition function is a boolean, and compares with a path, a size or a
+/// parameter as one: equal only to the same boolean, so unequal to a missing
+/// value or one of another type, and in a list when any member equals it,
+/// with the call on either side. An ordering operator refuses it. Every row is
+/// DynamoDB's answer (captured eu-west-2 and us-east-1, 2026-10-10; the
+/// regions agree on every row).
 #[test]
-fn a_condition_functions_in_list_reads_names_as_attributes() {
-    let db = db();
-    for (member, parameters) in [
-        ("b", None),
-        ("size(ss)", None),
-        ("?", Some(vec![AttributeValue::BOOL(true)])),
+fn a_condition_function_compares_with_a_path_size_or_parameter() {
+    let db = compared_db();
+    let all = "i1,i10,i2,i3,i4,i5,i6,i7,i8,i9";
+    let not_one = "i10,i2,i4,i5,i6,i7,i8,i9";
+    let a_there = "i1,i10,i2,i5,i7,i8,i9";
+    let bool_param = |b: bool| Some(vec![AttributeValue::BOOL(b)]);
+    for (condition, parameters, expected) in [
+        ("attribute_exists(a) = b", None, "i1,i3"),
+        ("attribute_exists(a) <> b", None, not_one),
+        ("attribute_exists(a) != b", None, not_one),
+        ("NOT attribute_exists(a) = b", None, not_one),
+        ("attribute_exists(a) IN [b]", None, "i1,i3"),
+        ("attribute_exists(a) IN [b, b]", None, "i1,i3"),
+        (
+            "attribute_exists(a) IN [b, true]",
+            None,
+            "i1,i10,i2,i3,i5,i7,i8,i9",
+        ),
+        ("attribute_exists(a) = ?", bool_param(true), a_there),
+        ("attribute_exists(a) <> ?", bool_param(true), "i3,i4,i6"),
+        ("attribute_exists(a) = ?", Some(vec![s("x")]), ""),
+        ("attribute_exists(a) <> ?", Some(vec![s("x")]), all),
+        (
+            "attribute_exists(a) = ?",
+            Some(vec![AttributeValue::NULL(true)]),
+            "",
+        ),
+        ("attribute_exists(a) IN [?]", bool_param(false), "i3,i4,i6"),
+        (
+            "attribute_exists(a) IN [?, ?]",
+            Some(vec![s("x"), AttributeValue::BOOL(true)]),
+            a_there,
+        ),
+        ("attribute_not_exists(a) = b", None, "i2,i4"),
+        ("attribute_type(a, 'S') = b", None, "i1,i3"),
+        ("attribute_exists(a) = b.c", None, "i10"),
+        ("attribute_exists(a) = size(b)", None, ""),
+        ("attribute_exists(a) <> size(b)", None, all),
+        ("attribute_exists(a) IN [size(b)]", None, ""),
+        ("b = attribute_exists(a)", None, "i1,i3"),
+        ("b <> attribute_exists(a)", None, not_one),
     ] {
-        let statement = format!(
-            "SELECT pk FROM \"Things\" WHERE pk = 'a1' AND attribute_exists(ss) IN [{member}]"
-        );
-        let message = refusal(&db, &statement, parameters);
-        assert!(
-            message.contains(
-                "Comparing a condition function with a path or a parameter is not supported"
-            ),
-            "{statement}: {message}"
-        );
+        let statement = format!("SELECT pk FROM \"Compared\" WHERE {condition}");
+        let response =
+            run(&db, &statement, parameters).unwrap_or_else(|e| panic!("{statement}: {e}"));
+        let mut pks: Vec<String> = response
+            .items
+            .unwrap_or_default()
+            .iter()
+            .map(|item| match item.get("pk") {
+                Some(AttributeValue::S(pk)) => pk.clone(),
+                other => panic!("{statement}: no pk in {other:?}"),
+            })
+            .collect();
+        pks.sort();
+        assert_eq!(pks.join(","), expected, "{statement}");
     }
-    for (condition, expected) in [
-        ("attribute_exists(ss) IN [true]", "a1"),
-        ("attribute_exists(ss) IN [false]", ""),
-        ("attribute_exists(nope) IN [false, 1]", "a1"),
-    ] {
-        let statement = format!("SELECT pk FROM \"Things\" WHERE pk = 'a1' AND {condition}");
-        assert_eq!(pks(&db, &statement), expected, "{statement}");
-    }
+    assert_eq!(
+        refusal(
+            &db,
+            "SELECT pk FROM \"Compared\" WHERE attribute_exists(a) < b",
+            None
+        ),
+        "Incorrect operand type for operator or function; operator or function: <, operand \
+         type: BOOL"
+    );
 }
 
 #[test]
