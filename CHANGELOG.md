@@ -409,9 +409,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to run as `attribute_exists`. An OR with no key condition under it no longer
   counts as a second key range for the overlap check, so `pk = 'a' AND (x = 1
   OR x = 2)` runs. A condition function compares with a path, a size or a
-  parameter as the boolean it is, with `=`, `<>` or in an `IN` list and with
-  the call on either side, so `attribute_exists(a) = b` holds where `b` is the
-  boolean the call is, and is unequal to a missing value or one of another
+  parameter as the boolean it is, with `=`, `<>` or in an `IN` list, written
+  first or after a path (`b = attribute_exists(a)`), so
+  `attribute_exists(a) = b` holds where `b` is the boolean the call is, and is unequal to a missing value or one of another
   type. Its `IN` list reads a bare name as an attribute, as every other `IN`
   list does, where a name used to be compared with the string of itself.
   Captured against eu-west-2 and us-east-1.

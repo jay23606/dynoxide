@@ -241,7 +241,8 @@ fn compared_db() -> Database {
 /// A condition function is a boolean, and compares with a path, a size or a
 /// parameter as one: equal only to the same boolean, so unequal to a missing
 /// value or one of another type, and in a list when any member equals it,
-/// with the call on either side. An ordering operator refuses it. Every row is
+/// with the call written first or after a path. An ordering operator refuses
+/// it. Every row is
 /// DynamoDB's answer (captured eu-west-2 and us-east-1, 2026-10-10; the
 /// regions agree on every row).
 #[test]
