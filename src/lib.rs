@@ -223,6 +223,20 @@ impl TokenCaches {
     pub(crate) fn execute_transaction(&self) -> &Mutex<ExecuteTransactionTokenCache> {
         &self.execute_transaction
     }
+
+    /// Forget every cached transaction, for a restore that replaces the data
+    /// those results were computed against.
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+    pub(crate) fn clear(&self) {
+        self.transact_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.execute_transaction
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
 }
 
 /// AWS caps `ClientRequestToken` at 36 characters.
@@ -1301,11 +1315,26 @@ impl Database<RusqliteBackend> {
     /// Uses SQLite's backup API to replace the current database contents
     /// with the snapshot. Works for both in-memory and file-backed databases.
     /// The snapshot is opened read-only, so a path that doesn't exist is an
-    /// error, and it is copied and brought up to date in a scratch in-memory
-    /// database before anything here changes: a missing file, a failed copy
-    /// or a failed migration leaves the current database as it was.
+    /// error, as is a file that isn't a Dynoxide snapshot; it is copied and
+    /// brought up to date in a private temporary database before anything here
+    /// changes, so a refused source, a failed copy or a failed migration leaves
+    /// the current database as it was. A snapshot in WAL mode may be left with
+    /// its `-wal` and `-shm` files beside it. After a restore, transactions
+    /// cached for idempotent retries and vector index creation windows are
+    /// forgotten, as the data they described has been replaced.
     pub fn restore_from(&self, path: &str) -> Result<()> {
-        self.with_storage_mut(|s| s.restore_from(path))
+        self.with_storage_mut(|s| {
+            s.restore_from(path)?;
+            self.forget_engine_state();
+            Ok(())
+        })
+    }
+
+    /// Forget what this engine remembers about data a restore has replaced:
+    /// the idempotency caches and the vector index creation windows.
+    fn forget_engine_state(&self) {
+        self.tokens.clear();
+        self.vector_lifecycle.forget_all();
     }
 
     /// Backup the current database to a new in-memory SQLite connection.
@@ -1319,10 +1348,16 @@ impl Database<RusqliteBackend> {
 
     /// Restore the database from an in-memory SQLite connection.
     ///
-    /// Replaces current contents with the source connection's data.
+    /// Replaces current contents with the source connection's data, and
+    /// forgets the engine state that described the old data, as
+    /// [`Database::restore_from`] does.
     #[cfg(feature = "mcp-server")]
     pub(crate) fn restore_from_connection(&self, source: &rusqlite::Connection) -> Result<()> {
-        self.with_storage_mut(|s| s.restore_from_connection(source))
+        self.with_storage_mut(|s| {
+            s.restore_from_connection(source)?;
+            self.forget_engine_state();
+            Ok(())
+        })
     }
 }
 
@@ -1498,6 +1533,65 @@ impl Database<WasmBridgeBackend> {
 #[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restore_forgets_cached_transactions_and_vector_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("before.db");
+        let snapshot = snapshot.to_str().unwrap();
+        let db = Database::memory().unwrap();
+        db.create_table(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "BillingMode": "PAY_PER_REQUEST",
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        db.vacuum_into(snapshot).unwrap();
+
+        let put = || {
+            serde_json::from_value::<actions::transact_write_items::TransactWriteItemsRequest>(
+                serde_json::json!({
+                    "ClientRequestToken": "same-token",
+                    "TransactItems": [{"Put": {"TableName": "tbl", "Item": {"pk": {"S": "a"}}}}]
+                }),
+            )
+            .unwrap()
+        };
+        db.transact_write_items(put()).unwrap();
+        db.with_storage(|s| {
+            db.vector_lifecycle.arm(s, "tbl", "v");
+            Ok(())
+        })
+        .unwrap();
+        assert!(!db.vector_lifecycle.is_empty());
+
+        db.restore_from(snapshot).unwrap();
+        assert!(
+            db.vector_lifecycle.is_empty(),
+            "the restored tables' creation windows must not survive"
+        );
+
+        // The same token after the restore runs again rather than replaying a
+        // result computed against the data the restore replaced.
+        db.transact_write_items(put()).unwrap();
+        let got = db
+            .get_item(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "tbl",
+                    "Key": {"pk": {"S": "a"}}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            got.item.is_some(),
+            "the retried transaction must have written"
+        );
+    }
 
     #[test]
     fn test_database_memory() {

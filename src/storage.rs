@@ -1740,6 +1740,11 @@ impl Storage {
     /// Restore the database from a snapshot file using SQLite's backup API.
     /// This replaces the current database contents with the snapshot contents.
     /// Works for both in-memory and file-backed databases.
+    ///
+    /// The snapshot is opened read-only, so it is never written to. A snapshot
+    /// in WAL mode (every file Dynoxide creates is) may be left with its
+    /// `-wal` and `-shm` files beside it afterwards, as reading a WAL database
+    /// creates them and a read-only connection can't remove them on close.
     pub fn restore_from(&mut self, path: &str) -> Result<()> {
         // Read-only and without CREATE: a mistyped path is an error, rather
         // than a new, empty file backed up over this database, and the
@@ -1761,34 +1766,41 @@ impl Storage {
         let mut dest = Connection::open_in_memory()?;
         {
             let backup = rusqlite::backup::Backup::new(&self.conn, &mut dest)?;
-            backup.run_to_completion(100, std::time::Duration::from_millis(0), None)?;
+            run_backup(&backup)?;
         }
         Ok(dest)
     }
 
     /// Restore the database from another SQLite connection using the backup API.
     ///
-    /// The source is copied into a scratch in-memory database and brought up
-    /// to date there, as an open would bring a file an earlier build wrote;
-    /// only then does the copy replace this database's contents and the
-    /// metadata cache get cleared. A copy or migration that fails leaves this
-    /// database as it was. The scratch copy costs memory the size of the
-    /// snapshot for the length of the restore.
+    /// A source with no Dynoxide metadata (an empty or zero-byte file,
+    /// `:memory:`, or another program's database) is refused as not a
+    /// snapshot. Otherwise the source is copied into a private temporary
+    /// database and brought up to date there, as an open would bring a file
+    /// an earlier build wrote; only then does the copy replace this database's
+    /// contents and the metadata cache get cleared. A copy or migration that
+    /// fails leaves this database as it was. SQLite keeps the temporary copy
+    /// in its page cache and spills it to a temporary file as it grows, so a
+    /// large snapshot doesn't need its own size in memory.
     pub fn restore_from_connection(&mut self, source: &Connection) -> Result<()> {
+        ensure_snapshot(source)?;
         let staged = self.staged_copy(source)?;
         {
             let backup = rusqlite::backup::Backup::new(&staged.conn, &mut self.conn)?;
-            backup.run_to_completion(100, std::time::Duration::from_millis(0), None)?;
+            run_backup(&backup)?;
         }
         self.metadata_cache.borrow_mut().clear();
         Ok(())
     }
 
-    /// Copy `source` into a fresh in-memory database and run every migration
-    /// its recorded schema version calls for, leaving this database untouched.
+    /// Copy `source` into a fresh private temporary database and run every
+    /// migration its recorded schema version calls for, leaving this database
+    /// untouched.
     fn staged_copy(&self, source: &Connection) -> Result<Storage> {
         let mut staged = Storage {
-            conn: Connection::open_in_memory()?,
+            // An empty path opens a private temporary database: on disk once
+            // it outgrows the page cache, and deleted when it is closed.
+            conn: Connection::open("")?,
             metadata_cache: RefCell::new(HashMap::new()),
             // A countdown armed on this database fires in the migration that
             // stands in for it.
@@ -1799,9 +1811,7 @@ impl Storage {
             clock: Arc::clone(&self.clock),
         };
         let copied = match rusqlite::backup::Backup::new(source, &mut staged.conn) {
-            Ok(backup) => backup
-                .run_to_completion(100, std::time::Duration::from_millis(0), None)
-                .map_err(DynoxideError::from),
+            Ok(backup) => run_backup(&backup),
             Err(e) => Err(e.into()),
         };
         let migrated = copied
@@ -2143,6 +2153,72 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
         table_id: row.get(18)?,
         vector_index_definitions: row.get(19)?,
     })
+}
+
+/// How long a backup waits between attempts on a database another
+/// connection has busy or locked.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+const BACKUP_LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How long a backup keeps retrying a busy or locked database before giving
+/// up: the same patience as a connection's busy timeout, and shorter under
+/// test so a test of the limit runs quickly.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+const BACKUP_LOCK_PATIENCE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(200)
+} else {
+    std::time::Duration::from_secs(5)
+};
+
+/// Copy every remaining page through `backup`.
+///
+/// Steps run back to back while they make progress. A busy or locked
+/// database is retried every [`BACKUP_LOCK_PAUSE`] for up to
+/// [`BACKUP_LOCK_PATIENCE`] and then reported as locked, rather than spun on
+/// at full CPU for as long as the lock lasts, or slept on after every step.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+fn run_backup(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<()> {
+    use rusqlite::backup::StepResult;
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        match backup.step(100)? {
+            StepResult::Done => return Ok(()),
+            StepResult::More => {}
+            // Busy, Locked and any later variant: wait and retry, within limits.
+            _ => {
+                if waited >= BACKUP_LOCK_PATIENCE {
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                        Some("database is locked".to_string()),
+                    )
+                    .into());
+                }
+                std::thread::sleep(BACKUP_LOCK_PAUSE);
+                waited += BACKUP_LOCK_PAUSE;
+            }
+        }
+    }
+}
+
+/// Refuse a restore source that holds no Dynoxide metadata.
+///
+/// An empty or zero-byte file, `:memory:` or another program's database
+/// opens without complaint, and restoring one would replace this database
+/// with an empty one.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+fn ensure_snapshot(source: &Connection) -> Result<()> {
+    let has_tables: bool = source.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_tables')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_tables {
+        Ok(())
+    } else {
+        Err(DynoxideError::ValidationException(
+            "not a Dynoxide snapshot: it has no table metadata".to_string(),
+        ))
+    }
 }
 
 #[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
@@ -2511,6 +2587,15 @@ mod tests {
         );
     }
 
+    /// A path for a test database inside a fresh temporary directory, so the
+    /// `-wal` and `-shm` files a WAL database (or a read-only restore from
+    /// one) leaves beside it are removed with the directory.
+    fn v9_snapshot_path() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db").to_str().unwrap().to_string();
+        (dir, path)
+    }
+
     /// Write a database the way a v9 build left it at `path`. Table `Legacy`
     /// has three GSIs:
     ///
@@ -2522,9 +2607,9 @@ mod tests {
     ///   stores it.
     ///
     /// Three named items come first, then `extra` more carrying every key
-    /// attribute. Table `Vec` has a vector index and one item, stored at the
-    /// size a build before the vector rule gave it, so the size recompute has a
-    /// row to rewrite.
+    /// attribute. Table `Vec` has a vector index and one item whose stored size
+    /// is deliberately stale, the billed size plus an arbitrary amount, so the
+    /// size recompute has a row to rewrite.
     fn write_v9_database(path: &str, extra: usize) {
         {
             let db = crate::Database::new(path).unwrap();
@@ -2681,8 +2766,7 @@ mod tests {
 
     #[test]
     fn an_interrupted_gsi_rebuild_leaves_the_database_as_it_was() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let (_dir, path) = v9_snapshot_path();
         write_v9_database(&path, 0);
         let before = {
             let conn = Connection::open(&path).unwrap();
@@ -2709,8 +2793,7 @@ mod tests {
 
     #[test]
     fn an_interrupted_size_recompute_leaves_the_database_as_it_was() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let (_dir, path) = v9_snapshot_path();
         {
             let db = crate::Database::new(&path).unwrap();
             db.create_table(
@@ -2785,8 +2868,7 @@ mod tests {
 
     #[test]
     fn a_second_open_runs_no_migration() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let (_dir, path) = v9_snapshot_path();
         write_v9_database(&path, 0);
         drop(Storage::new(&path).unwrap());
         // The fixture gives each migration a row to write, and either would
@@ -2797,8 +2879,7 @@ mod tests {
 
     #[test]
     fn a_recompute_interrupted_after_the_rebuild_leaves_version_10() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let (_dir, path) = v9_snapshot_path();
         write_v9_database(&path, 0);
         let stale_size = vec_size(&Connection::open(&path).unwrap());
 
@@ -2834,8 +2915,7 @@ mod tests {
 
     #[test]
     fn the_rebuild_keeps_single_attribute_indexes_and_keys_every_hash_attribute() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let (_dir, path) = v9_snapshot_path();
         write_v9_database(&path, 0);
         let single_before = gsi_rows(&Connection::open(&path).unwrap(), "bySingle");
 
@@ -2878,8 +2958,7 @@ mod tests {
 
     #[test]
     fn a_restored_snapshot_from_an_earlier_version_is_brought_up_to_date() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let (_dir, path) = v9_snapshot_path();
         write_v9_database(&path, 0);
 
         let mut storage = Storage::memory().unwrap();
@@ -2937,15 +3016,18 @@ mod tests {
 
     #[test]
     fn a_restore_whose_migration_fails_leaves_the_database_alone() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let (_dir, path) = v9_snapshot_path();
         write_v9_database(&path, 0);
 
         let mut storage = Storage::memory().unwrap();
         mark_live(&storage);
         // The restored snapshot's GSI rebuild fails at its first insert.
         storage.fail_gsi_insert_after(0);
-        assert!(storage.restore_from(&path).is_err());
+        let err = storage.restore_from(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("injected GSI insert failure"),
+            "the restore must fail in the migration, not elsewhere: {err}"
+        );
 
         assert!(still_live(&storage), "the database must be left as it was");
         let legacy: i64 = storage
@@ -2961,9 +3043,76 @@ mod tests {
     }
 
     #[test]
+    fn restoring_from_something_that_is_not_a_snapshot_errors_and_leaves_the_database_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("zero-bytes.db");
+        std::fs::write(&empty, b"").unwrap();
+        let foreign = dir.path().join("foreign.db");
+        Connection::open(&foreign)
+            .unwrap()
+            .execute_batch("CREATE TABLE notes (body TEXT); INSERT INTO notes VALUES ('x');")
+            .unwrap();
+
+        for source in [
+            empty.to_str().unwrap(),
+            foreign.to_str().unwrap(),
+            ":memory:",
+        ] {
+            let mut storage = Storage::memory().unwrap();
+            mark_live(&storage);
+            let err = storage.restore_from(source).unwrap_err().to_string();
+            assert!(
+                err.contains("not a Dynoxide snapshot"),
+                "{source}: refused for the wrong reason: {err}"
+            );
+            assert!(
+                still_live(&storage),
+                "{source}: the database must be left as it was"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backup_gives_up_on_a_source_that_stays_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.db");
+        let path = path.to_str().unwrap().to_string();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode = DELETE; CREATE TABLE t (v); INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+        }
+        // Another connection holds the file exclusively for the whole copy.
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("BEGIN EXCLUSIVE; INSERT INTO t VALUES (2);")
+            .unwrap();
+
+        let (done, outcome) = std::sync::mpsc::channel();
+        let copier_path = path.clone();
+        std::thread::spawn(move || {
+            let source = Connection::open(&copier_path).unwrap();
+            source.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let mut dest = Connection::open_in_memory().unwrap();
+            let result = rusqlite::backup::Backup::new(&source, &mut dest)
+                .map_err(DynoxideError::from)
+                .and_then(|backup| run_backup(&backup));
+            let _ = done.send(result.map_err(|e| e.to_string()));
+        });
+
+        let result = outcome
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a backup of a locked source must give up, not spin until the lock goes");
+        let err = result.expect_err("the source stayed locked, so the copy must fail");
+        assert!(err.contains("locked") || err.contains("busy"), "{err}");
+        drop(holder);
+    }
+
+    #[test]
     fn a_restore_leaves_its_source_file_unchanged() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
+        let (_dir, path) = v9_snapshot_path();
         write_v9_database(&path, 0);
         let before = std::fs::read(&path).unwrap();
 

@@ -56,10 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opening the file would, running the schema migrations its recorded version
   calls for. It used to be restored as it was, so a snapshot from before a
   schema change came back without that change. The copy is brought up to date
-  before it replaces anything, so a restore that fails leaves the database as
-  it was, and `Database::restore_from` opens the snapshot file read-only: a
-  path that doesn't exist is now an error, where it used to create an empty
-  file and restore that over the database.
+  in a private temporary database before it replaces anything, so a restore
+  that fails leaves the database as it was, and `Database::restore_from` opens
+  the snapshot file read-only: a path that doesn't exist is now an error,
+  where it used to create an empty file and restore that over the database,
+  and so is a file that isn't a Dynoxide snapshot (an empty file, `:memory:`
+  or another program's database). Restoring from a snapshot in WAL mode may
+  leave its `-wal` and `-shm` files beside it. After a restore, transactions
+  cached for idempotent retries and vector index creation windows are
+  forgotten, as the data they described has gone. A restore that finds the
+  database locked retries for up to five seconds and then reports it locked,
+  where it used to spin until the lock went.
 - A number whose exponent is too large for a 32-bit integer is range-checked
   rather than read with an exponent of 0. `1e99999999999` was stored as 1; it
   is now refused as an overflow, and `1e-99999999999` as an underflow, as
@@ -347,12 +354,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <line>:<column>:<length>` before the table is looked up; `EXISTS(path)` used
   to run as `attribute_exists`. An OR with no key condition under it no longer
   counts as a second key range for the overlap check, so `pk = 'a' AND (x = 1
-  OR x = 2)` runs. A condition function's IN list reads a bare name as an
-  attribute, as every other IN list does, and a path, a size or a parameter in
-  that list is refused as unsupported, where a name used to be compared with
-  the string of itself and a parameter never matched (inferred, not captured).
-  Comparing a condition function with an attribute was already refused; only
-  that message's wording changed.
+  OR x = 2)` runs. A path, a size or a parameter in a condition function's IN
+  list, or compared with the call, is refused as unsupported (inferred, not
+  captured).
 - PartiQL's `set_add` and `set_delete` work in an UPDATE's SET clause, as in
   DynamoDB, where they used to fail with `Unexpected token after expression`.
   A malformed call is refused with DynamoDB's message and position before the

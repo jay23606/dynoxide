@@ -247,6 +247,19 @@ impl VectorIndexLifecycle {
         self.armed().remove(table_name);
     }
 
+    /// Forget every index on every table, for a restore that replaces the
+    /// tables the windows were armed on.
+    #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+    pub(crate) fn forget_all(&self) {
+        self.armed().clear();
+    }
+
+    /// Whether any index is armed on any table.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.armed().is_empty()
+    }
+
     /// The phase of every index this engine has armed on `table_name`, read at
     /// the backend's own clock.
     ///
