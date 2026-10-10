@@ -63,6 +63,17 @@ fn keys(db: &Database) -> Vec<String> {
     keys
 }
 
+/// The storage error as SQLite reported it. SQLite has already rolled the
+/// transaction back, so the closing rollback finds none to end; that adds
+/// nothing, and the caller sees the error that stopped the write alone.
+fn assert_full(err: DynoxideError) {
+    assert!(
+        matches!(err, DynoxideError::InternalServerError(_)),
+        "{err:?}"
+    );
+    assert_eq!(err.to_string(), "backend: database or disk is full");
+}
+
 /// The database still takes a small write, so nothing is left holding a
 /// transaction open.
 fn assert_still_writable(db: &Database) {
@@ -82,9 +93,8 @@ fn a_full_database_fails_a_big_write_and_takes_a_small_one() {
             "TableName": "Tbl",
             "Item": {"pk": {"S": "big"}, "v": {"S": too_big()}}
         })))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("database or disk is full"), "{err}");
+        .unwrap_err();
+    assert_full(err);
     assert_still_writable(&db);
 }
 
@@ -111,10 +121,9 @@ fn execute_transaction_stops_at_a_storage_error_and_keeps_nothing() {
             ],
             ..Default::default()
         })
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
     assert_eq!(keys(&db), ["seed"], "nothing the transaction wrote is kept");
-    assert!(err.contains("database or disk is full"), "{err}");
+    assert_full(err);
     assert_still_writable(&db);
 }
 
@@ -131,9 +140,8 @@ fn transact_write_items_stops_at_a_storage_error_and_keeps_nothing() {
                 put(json!({"pk": {"S": "after"}}))
             ]
         })))
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
     assert_eq!(keys(&db), ["seed"], "nothing the transaction wrote is kept");
-    assert!(err.contains("database or disk is full"), "{err}");
+    assert_full(err);
     assert_still_writable(&db);
 }

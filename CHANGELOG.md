@@ -195,7 +195,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed on its own and the transaction's own rollback then failed. A
   storage failure now stops the transaction where it happens and is returned
   as an internal error, so nothing the transaction wrote is kept.
-  `ExecuteTransaction` does the same.
+  `ExecuteTransaction` does the same. The error is SQLite's own, such as
+  `backend: database or disk is full`, on any write, where it went on to say
+  that the rollback had failed too because SQLite had already ended the
+  transaction.
 
 - Restoring a snapshot taken by an earlier version brings it up to date as
   opening the file would, running the schema migrations its recorded version

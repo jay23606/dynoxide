@@ -14,6 +14,10 @@ use std::future::Future;
 /// failure rather than leaving the connection stuck mid-transaction (a leftover
 /// open transaction makes the next `begin_transaction` fail). On any error from
 /// `body`, rolls back; if that rollback also fails, surfaces a combined error.
+/// A rollback that fails only because SQLite has already ended the transaction
+/// itself (it rolls the whole transaction back on a full disk, among other
+/// errors) adds nothing, and the error that stopped the write is returned as
+/// it is.
 ///
 /// This is the single place the write-transaction lifecycle policy lives, so
 /// every write path handles a failed commit or rollback identically.
@@ -26,26 +30,35 @@ where
     match body.await {
         Ok(value) => match storage.commit().await {
             Ok(()) => Ok(value),
-            Err(commit_err) => {
-                if let Err(rb_err) = storage.rollback().await {
+            Err(commit_err) => match storage.rollback().await {
+                Err(rb_err) if !rollback_found_no_transaction(&rb_err) => {
                     Err(DynoxideError::InternalServerError(format!(
                         "commit failed ({commit_err}) and rollback also failed ({rb_err})"
                     )))
-                } else {
-                    Err(commit_err.into())
                 }
-            }
+                _ => Err(commit_err.into()),
+            },
         },
-        Err(e) => {
-            if let Err(rb_err) = storage.rollback().await {
+        Err(e) => match storage.rollback().await {
+            Err(rb_err) if !rollback_found_no_transaction(&rb_err) => {
                 Err(DynoxideError::InternalServerError(format!(
                     "operation failed ({e}) and rollback also failed ({rb_err})"
                 )))
-            } else {
-                Err(e)
             }
-        }
+            _ => Err(e),
+        },
     }
+}
+
+/// Whether a rollback failed only because no transaction was active: SQLite's
+/// `cannot rollback - no transaction is active`, which both backends pass on
+/// in SQLite's own words.
+fn rollback_found_no_transaction(err: &crate::storage_backend::BackendError) -> bool {
+    matches!(
+        err,
+        crate::storage_backend::BackendError::Other(message)
+            if message.contains("no transaction is active")
+    )
 }
 
 /// Parsed key schema for convenient access.
@@ -2511,6 +2524,21 @@ fn validate_filter_attribute_value(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rollback_that_found_no_transaction_is_told_apart() {
+        use crate::storage_backend::BackendError;
+        let found_none = |message: &str| {
+            super::rollback_found_no_transaction(&BackendError::Other(message.to_string()))
+        };
+        // As the native backend and the wasm one pass SQLite's message on.
+        assert!(found_none("cannot rollback - no transaction is active"));
+        assert!(found_none(
+            "sqlite-wasm: SQLITE_ERROR: sqlite3 result code 1: cannot rollback - no transaction is active"
+        ));
+        assert!(!found_none("disk I/O error"));
+        assert!(!super::rollback_found_no_transaction(&BackendError::Locked));
+    }
+
     #[test]
     fn size_estimate_range_is_whole_gigabytes_around_the_size() {
         const GB: i64 = 1024 * 1024 * 1024;
