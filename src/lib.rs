@@ -1141,8 +1141,9 @@ impl Database<RusqliteBackend> {
     ) -> Result<actions::execute_transaction::ExecuteTransactionResponse> {
         // Ahead of the cache, not only inside the work: a replayed token skips
         // the work entirely, and the token is keyed on the statements alone, so
-        // a replay may carry a capacity mode the first call never did.
-        crate::validation::reject_bad_capacity_mode(request.return_consumed_capacity.as_deref())?;
+        // a replay may carry a capacity mode or token the first call never did.
+        // The token, statements and mode are refused together, listed.
+        actions::execute_transaction::check_members(&request)?;
         run_idempotent(
             &self.tokens.execute_transaction,
             request.client_request_token.as_deref(),

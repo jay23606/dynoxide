@@ -79,15 +79,52 @@ pub async fn execute<S: StorageBackend>(
     Ok(execute_cached(storage, request).await?.response)
 }
 
+/// The request's member violations, listed as DynamoDB lists them: the
+/// token, then each statement's text and parameters by index, then
+/// ReturnConsumedCapacity (captured eu-west-2 and us-east-1, 2026-10-10, the
+/// regions identical). Any of them refuses the whole request before a
+/// statement is parsed or the idempotency cache is consulted.
+fn member_violations(request: &ExecuteTransactionRequest) -> Vec<String> {
+    let mut violations = Vec::new();
+    violations.extend(crate::token_constraint_error(
+        request.client_request_token.as_deref(),
+    ));
+    for (i, statement) in request.transact_statements.iter().enumerate() {
+        let member = format!("transactStatements.{}.member", i + 1);
+        violations.extend(crate::partiql::statement_length_violation(
+            &statement.statement,
+            &format!("{member}.statement"),
+        ));
+        violations.extend(crate::partiql::parameters_violation(
+            statement.parameters.as_deref(),
+            &format!("{member}.parameters"),
+        ));
+    }
+    violations.extend(crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ));
+    violations
+}
+
+/// Refuse a request whose members DynamoDB refuses, every violation listed in
+/// one error. The entry points call this ahead of the idempotency cache,
+/// because a same-token replay never reaches [`execute_cached`] and the token
+/// is keyed on the statements alone, so a replay may carry a mode or token
+/// the first call never did.
+pub(crate) fn check_members(request: &ExecuteTransactionRequest) -> Result<()> {
+    match crate::partiql::member_rejection(&member_violations(request)) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 pub(crate) async fn execute_cached<S: StorageBackend>(
     storage: &S,
     request: ExecuteTransactionRequest,
 ) -> Result<CachedTransaction> {
-    // The entry points also check the mode ahead of the idempotency cache,
-    // because a same-token replay never reaches this function and the token is
-    // keyed on the statements alone, so a replay may carry a mode the first
-    // call never did. This check stays for callers that come here directly.
-    crate::validation::reject_bad_capacity_mode(request.return_consumed_capacity.as_deref())?;
+    // The entry points check the members ahead of the idempotency cache too;
+    // this stays for callers that come here directly.
+    check_members(&request)?;
 
     let statements = &request.transact_statements;
 
@@ -101,25 +138,6 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         return Err(DynoxideError::ValidationException(
             "Member must have length less than or equal to 100".to_string(),
         ));
-    }
-    // Every member violation across the statements is listed in one error, in
-    // member order: each statement's text and parameters by index. Any of
-    // them refuses the whole request (captured eu-west-2 and us-east-1,
-    // 2026-10-10).
-    let mut violations = Vec::new();
-    for (i, statement) in statements.iter().enumerate() {
-        let member = format!("transactStatements.{}.member", i + 1);
-        violations.extend(crate::partiql::statement_length_violation(
-            &statement.statement,
-            &format!("{member}.statement"),
-        ));
-        violations.extend(crate::partiql::parameters_violation(
-            statement.parameters.as_deref(),
-            &format!("{member}.parameters"),
-        ));
-    }
-    if let Some(e) = crate::partiql::member_rejection(&violations) {
-        return Err(e);
     }
 
     // A parameter holding an empty attribute name is a top-level rejection,

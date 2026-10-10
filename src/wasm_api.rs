@@ -398,8 +398,9 @@ async fn execute_transaction<S: StorageBackend>(
     let capacity_mode = request.return_consumed_capacity.clone();
     // Ahead of the cache, not only inside the work: a replayed token skips the
     // work entirely, and the token is keyed on the statements alone, so a replay
-    // may carry a capacity mode the first call never did.
-    crate::validation::reject_bad_capacity_mode(capacity_mode.as_deref())?;
+    // may carry a capacity mode or token the first call never did. The token,
+    // statements and mode are refused together, listed.
+    actions::execute_transaction::check_members(&request)?;
 
     let response = crate::run_idempotent_async(
         ctx.tokens.execute_transaction(),
@@ -1761,6 +1762,28 @@ mod tests {
         let backend = Storage::memory().unwrap();
         let err = run(&backend, "ExecuteTransaction", &transaction(&[], None)).unwrap_err();
         assert!(error_type(&err).ends_with("ValidationException"), "{err}");
+    }
+
+    /// The token, the statements and ReturnConsumedCapacity are listed
+    /// together, in that order, as on every other surface (captured eu-west-2
+    /// and us-east-1, 2026-10-10).
+    #[test]
+    fn execute_transaction_lists_its_token_and_capacity_mode_with_its_statements() {
+        let backend = Storage::memory().unwrap();
+        let request = serde_json::json!({
+            "TransactStatements": [{"Statement": format!("SELECT * FROM \"Music\" WHERE artist = '{}'", "x".repeat(9_000))}],
+            "ReturnConsumedCapacity": "BOGUS",
+            "ClientRequestToken": "t".repeat(40),
+        })
+        .to_string();
+        let err = run(&backend, "ExecuteTransaction", &request).unwrap_err();
+        assert!(err.contains("3 validation errors detected: "), "{err}");
+        let token = err.find("at 'clientRequestToken'").expect("the token");
+        let statement = err
+            .find("at 'transactStatements.1.member.statement'")
+            .expect("the statement");
+        let mode = err.find("at 'returnConsumedCapacity'").expect("the mode");
+        assert!(token < statement && statement < mode, "{err}");
     }
 
     #[test]

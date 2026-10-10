@@ -604,8 +604,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an over-long statement with an empty `Parameters` list or several over-long
   statements in a batch, lists every one in DynamoDB's "N validation errors
   detected" form rather than the first, and an empty statement in a batch or
-  transaction refuses the whole request as a member. Captured against
-  eu-west-2 and us-east-1.
+  transaction refuses the whole request as a member. `ReturnConsumedCapacity`
+  is listed with the rest rather than refused on its own: first on
+  `BatchExecuteStatement`, last on `ExecuteTransaction`, after an over-long
+  `ClientRequestToken` and the statements. More than 25 statements in a batch
+  is refused as a member too, echoing the statements, where it used to give
+  "Too many statements in BatchExecuteStatement". Captured against eu-west-2
+  and us-east-1.
 - A malformed `Expected` condition on `PutItem`, `UpdateItem` or `DeleteItem`
   is refused rather than ignored. An unknown `ComparisonOperator` gets
   DynamoDB's "Invalid comparison operator" message, and `EQ` with an empty

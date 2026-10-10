@@ -604,7 +604,7 @@ fn java_item(item: &HashMap<String, AttributeValue>) -> String {
 /// One attribute value with all sixteen of the Java model's fields, the one in
 /// use filled in. Only the string form has been captured; the others follow the
 /// same model, with binary shown as Java prints a `ByteBuffer`.
-fn java_attribute_value(value: &AttributeValue) -> String {
+pub(crate) fn java_attribute_value(value: &AttributeValue) -> String {
     let byte_buffer = |bytes: &[u8]| {
         format!(
             "java.nio.HeapByteBuffer[pos=0 lim={len} cap={len}]",

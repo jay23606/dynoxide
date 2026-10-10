@@ -147,30 +147,64 @@ pub struct BatchStatementError {
     pub message: String,
 }
 
+/// The statement list as DynamoDB echoes it in a constraint message: each
+/// request's Java `toString`, as us-east-1 printed it on 2026-10-10.
+/// eu-west-2 printed an object identity per statement instead, which can't be
+/// reproduced. A member's parameters follow the same Java model, uncaptured.
+fn statements_echo(statements: &[BatchStatementRequest]) -> String {
+    let java = |shown: Option<String>| shown.unwrap_or_else(|| "null".to_string());
+    let statements: Vec<String> = statements
+        .iter()
+        .map(|s| {
+            let parameters = s.parameters.as_ref().map(|parameters| {
+                let parameters: Vec<String> = parameters
+                    .iter()
+                    .map(crate::actions::batch_write_item::java_attribute_value)
+                    .collect();
+                format!("[{}]", parameters.join(", "))
+            });
+            format!(
+                "BatchStatementRequest(statement={}, parameters={}, consistentRead={}, \
+                 returnValuesOnConditionCheckFailure={})",
+                s.statement,
+                java(parameters),
+                java(s.consistent_read.map(|c| c.to_string())),
+                java(s.return_values_on_condition_check_failure.clone()),
+            )
+        })
+        .collect();
+    format!("[{}]", statements.join(", "))
+}
+
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: BatchExecuteStatementRequest,
 ) -> Result<BatchExecuteStatementResponse> {
-    if request.statements.len() > 25 {
-        return Err(DynoxideError::ValidationException(
-            "Too many statements in BatchExecuteStatement; limit is 25".to_string(),
-        ));
-    }
-
-    // Every member DynamoDB refuses is listed in one error, in member order:
-    // the statement list, each statement's text and parameters by index, then
-    // ReturnConsumedCapacity. Any of them refuses the whole request, before a
-    // statement is parsed or runs (captured eu-west-2 and us-east-1,
-    // 2026-10-10: statement then parameters across members, and every
-    // over-long statement listed; ReturnConsumedCapacity after the statements
-    // follows the operation's member order).
+    // Every member DynamoDB refuses is listed in one error: ReturnConsumedCapacity,
+    // then the statements (the list's length, then each statement's text and
+    // parameters by index). Any of them refuses the whole request, before a
+    // statement is parsed or runs. Captured eu-west-2 and us-east-1,
+    // 2026-10-10: statement then parameters across members, every over-long
+    // statement listed, and ReturnConsumedCapacity ahead of an over-long list.
+    // That a member's own violations also come after ReturnConsumedCapacity
+    // follows from that: they are the same `statements` member.
     let mut violations = Vec::new();
+    violations.extend(crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ));
     if request.statements.is_empty() {
         violations.push(
             "Value '[]' at 'statements' failed to satisfy constraint: Member must have length \
              greater than or equal to 1"
                 .to_string(),
         );
+    }
+    if request.statements.len() > 25 {
+        violations.push(format!(
+            "Value '{}' at 'statements' failed to satisfy constraint: Member must have length \
+             less than or equal to 25",
+            statements_echo(&request.statements)
+        ));
     }
     for (i, statement) in request.statements.iter().enumerate() {
         let member = format!("statements.{}.member", i + 1);
@@ -190,9 +224,6 @@ pub async fn execute<S: StorageBackend>(
             &format!("{member}.parameters"),
         ));
     }
-    violations.extend(crate::validation::return_consumed_capacity_rejection(
-        request.return_consumed_capacity.as_deref(),
-    ));
     if let Some(e) = crate::partiql::member_rejection(&violations) {
         return Err(e);
     }
