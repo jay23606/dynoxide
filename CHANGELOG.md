@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ServerOptions` (at the crate root, and at `server::ServerOptions`),
   `server::start_with_options` and `mcp::serve_http_with_options` give embedded
   Rust callers the same switch for both servers.
+- `Storage::item_count_and_size`, `gsi_item_count_and_size`,
+  `lsi_item_count_and_size` and `vector_item_count_and_size` return a table's
+  or an index's item count and total size, the figures DescribeTable reports.
 
 ### Fixed
 
@@ -165,12 +168,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   items, where it was always 0, so the MCP server's `size_bytes` is right too.
   `UpdateTable`'s response carries the same `ItemCount` and `TableSizeBytes`,
   where both were 0. DynamoDB refreshes these figures about every six hours;
-  Dynoxide reports them live.
+  Dynoxide reports them live. Captured against eu-west-2.
 - `DescribeTable` and `UpdateTable` report each GSI's and LSI's `ItemCount` and
   `IndexSizeBytes`: the number of items the index holds and the total size of
   what it projects for them, where both were always 0. Each vector index
   reports its entries and their billable size, as DynamoDB does: the vector at
-  4 bytes per dimension, its attribute's name and the rest of the projection.
+  4 bytes per dimension, its attribute's name and the rest of the projection. Captured against eu-west-2.
 - On a table with a vector index, a write is charged for the vector at 4 bytes
   per dimension, whatever numbers it holds, and `TableSizeBytes` counts it the
   same way, as DynamoDB does. Dynoxide used to size it as a list of numbers, so

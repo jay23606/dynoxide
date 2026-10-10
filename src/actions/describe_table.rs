@@ -173,7 +173,7 @@ mod tests {
     use crate::actions::vector_lifecycle::VectorIndexLifecycle;
     use crate::actions::{
         batch_write_item, create_table, delete_item, describe_table, get_item, put_item,
-        transact_write_items, update_item,
+        transact_write_items, update_item, update_table,
     };
     use crate::storage::Storage;
     use crate::types::{Item, item_size};
@@ -382,8 +382,10 @@ mod tests {
     }
 
     /// The table DynamoDB was asked about: an ALL and a KEYS_ONLY GSI on `g`
-    /// and a KEYS_ONLY LSI on `l`, plus (when `include` is set) an INCLUDE
-    /// GSI on `g` projecting only `n`.
+    /// and a KEYS_ONLY LSI on `l`, plus an ALL LSI on `l`, and (when `include`
+    /// is set) an INCLUDE GSI on `g` and an INCLUDE LSI on `l` projecting only
+    /// `n`. The capture table had no ALL LSI; its entries are whole items, by
+    /// the same rule as the ALL GSI's.
     fn create_indexed_table(storage: &Storage, include: bool) {
         let mut gsis = vec![
             serde_json::json!({"IndexName": "gsiAll",
@@ -393,10 +395,24 @@ mod tests {
                 "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
                 "Projection": {"ProjectionType": "KEYS_ONLY"}}),
         ];
+        let lsi_key = serde_json::json!([
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "l", "KeyType": "RANGE"}
+        ]);
+        let mut lsis = vec![
+            serde_json::json!({"IndexName": "lsiKeys", "KeySchema": lsi_key,
+                "Projection": {"ProjectionType": "KEYS_ONLY"}}),
+            serde_json::json!({"IndexName": "lsiAll", "KeySchema": lsi_key,
+                "Projection": {"ProjectionType": "ALL"}}),
+        ];
         if include {
             gsis.push(serde_json::json!({"IndexName": "gsiInc",
                 "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
                 "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["n"]}}));
+            lsis.push(
+                serde_json::json!({"IndexName": "lsiInc", "KeySchema": lsi_key,
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["n"]}}),
+            );
         }
         let create = serde_json::from_value(serde_json::json!({
             "TableName": "Sized",
@@ -411,12 +427,7 @@ mod tests {
                 {"AttributeName": "l", "AttributeType": "S"}
             ],
             "GlobalSecondaryIndexes": gsis,
-            "LocalSecondaryIndexes": [{"IndexName": "lsiKeys",
-                "KeySchema": [
-                    {"AttributeName": "pk", "KeyType": "HASH"},
-                    {"AttributeName": "l", "KeyType": "RANGE"}
-                ],
-                "Projection": {"ProjectionType": "KEYS_ONLY"}}],
+            "LocalSecondaryIndexes": lsis,
             "BillingMode": "PAY_PER_REQUEST"
         }))
         .unwrap();
@@ -460,6 +471,7 @@ mod tests {
         assert_eq!(figures["gsiAll"], (Some(2), Some(3034)));
         assert_eq!(figures["gsiKeys"], (Some(2), Some(20)));
         assert_eq!(figures["lsiKeys"], (Some(2), Some(20)));
+        assert_eq!(figures["lsiAll"], (Some(2), Some(3034)));
     }
 
     /// The figures follow every write that moves an item into, out of or
@@ -469,8 +481,11 @@ mod tests {
         let storage = Storage::memory().unwrap();
         create_indexed_table(&storage, true);
         put_captured_items(&storage);
-        // s1 and s2 carry no `n`, so the INCLUDE index holds their keys only.
-        assert_eq!(index_figures(&storage)["gsiInc"], (Some(2), Some(20)));
+        // s1 and s2 carry no `n`, so the INCLUDE indexes hold their keys only.
+        let figures = index_figures(&storage);
+        assert_eq!(figures["gsiInc"], (Some(2), Some(20)));
+        assert_eq!(figures["lsiInc"], (Some(2), Some(20)));
+        assert_eq!(figures["lsiAll"], (Some(2), Some(3034)));
 
         // Deleting s1 takes it out of every index.
         let delete = serde_json::from_value(serde_json::json!({
@@ -484,18 +499,26 @@ mod tests {
         assert_eq!(figures["gsiKeys"], (Some(1), Some(10)));
         assert_eq!(figures["gsiInc"], (Some(1), Some(10)));
         assert_eq!(figures["lsiKeys"], (Some(1), Some(10)));
+        assert_eq!(figures["lsiInc"], (Some(1), Some(10)));
+        assert_eq!(figures["lsiAll"], (Some(1), Some(2017)));
 
         // Overwriting s2 without `g` drops it from the GSIs; it keeps `l`, so
-        // it stays in the LSI.
-        put(
+        // it stays in the LSIs, now with `n` for the INCLUDE one to project.
+        let s2 = put(
             &storage,
-            serde_json::json!({"pk": {"S": "p"}, "sk": {"S": "s2"}, "l": {"S": "l2"}}),
+            serde_json::json!({
+                "pk": {"S": "p"}, "sk": {"S": "s2"}, "l": {"S": "l2"},
+                "n": {"N": "12345"}, "data": {"S": "x".repeat(50)}
+            }),
         );
         let figures = index_figures(&storage);
         assert_eq!(figures["gsiAll"], (Some(0), Some(0)));
         assert_eq!(figures["gsiKeys"], (Some(0), Some(0)));
         assert_eq!(figures["gsiInc"], (Some(0), Some(0)));
         assert_eq!(figures["lsiKeys"], (Some(1), Some(10)));
+        // pk (2 + 1) + sk (2 + 2) + l (1 + 2) = 10 for the keys; n is 1 + 4.
+        assert_eq!(figures["lsiInc"], (Some(1), Some(15)));
+        assert_eq!(figures["lsiAll"], (Some(1), Some(item_size(&s2) as i64)));
 
         // Overwriting s3 with `g` and `n` brings it into the GSIs. The INCLUDE
         // entry is its keys plus `n`; the ALL entry is the whole item.
@@ -534,5 +557,102 @@ mod tests {
         assert_eq!(figures["gsiKeys"], (Some(1), Some(12)));
         assert_eq!(figures["gsiInc"], (Some(1), Some(12)));
         assert_eq!(figures["lsiKeys"], (Some(1), Some(10)));
+        assert_eq!(figures["lsiInc"], (Some(1), Some(15)));
+        assert_eq!(figures["lsiAll"], (Some(1), Some(item_size(&s2) as i64)));
+    }
+
+    /// A table with no sort key has its GSI figures too: an ALL entry is the
+    /// whole item, a KEYS_ONLY entry the table key and the index key.
+    #[test]
+    fn index_figures_on_a_table_without_a_sort_key() {
+        let storage = Storage::memory().unwrap();
+        let create = serde_json::from_value(serde_json::json!({
+            "TableName": "Sized",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "g", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [
+                {"IndexName": "gsiAll",
+                    "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}},
+                {"IndexName": "gsiKeys",
+                    "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "KEYS_ONLY"}}
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap();
+        pollster::block_on(create_table::execute(&storage, create)).unwrap();
+        let a = put(
+            &storage,
+            serde_json::json!({"pk": {"S": "a"}, "g": {"S": "g1"}, "data": {"S": "x".repeat(100)}}),
+        );
+        let b = put(
+            &storage,
+            serde_json::json!({"pk": {"S": "bb"}, "g": {"S": "g2"}, "data": {"S": "y".repeat(200)}}),
+        );
+        put(
+            &storage,
+            serde_json::json!({"pk": {"S": "c"}, "data": {"S": "z".repeat(300)}}),
+        );
+
+        let figures = index_figures(&storage);
+        assert_eq!(
+            figures["gsiAll"],
+            (Some(2), Some((item_size(&a) + item_size(&b)) as i64))
+        );
+        // pk (2 + 1) + g (1 + 2) = 6 for a; pk (2 + 2) + g (1 + 2) = 7 for bb.
+        assert_eq!(figures["gsiKeys"], (Some(2), Some(13)));
+    }
+
+    /// UpdateTable's response carries the same index figures DescribeTable
+    /// reports.
+    #[test]
+    fn update_table_response_carries_the_index_figures() {
+        let storage = Storage::memory().unwrap();
+        create_indexed_table(&storage, true);
+        put_captured_items(&storage);
+
+        let lifecycle = VectorIndexLifecycle::default();
+        let request = serde_json::from_value(serde_json::json!({
+            "TableName": "Sized",
+            "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_IMAGE"}
+        }))
+        .unwrap();
+        let table = pollster::block_on(update_table::execute(&storage, request, &lifecycle))
+            .unwrap()
+            .table_description;
+        let mut figures = std::collections::BTreeMap::new();
+        for gsi in table.global_secondary_indexes.unwrap_or_default() {
+            figures.insert(gsi.index_name, (gsi.item_count, gsi.index_size_bytes));
+        }
+        for lsi in table.local_secondary_indexes.unwrap_or_default() {
+            figures.insert(lsi.index_name, (lsi.item_count, lsi.index_size_bytes));
+        }
+        assert_eq!(figures, index_figures(&storage));
+        assert_eq!(figures["gsiAll"], (Some(2), Some(3034)));
+        assert_eq!(figures["lsiAll"], (Some(2), Some(3034)));
+        assert_eq!(figures["lsiInc"], (Some(2), Some(20)));
+    }
+
+    /// An index whose figures can't be read reports neither, and the rest of
+    /// the description is unaffected.
+    #[test]
+    fn an_index_whose_figures_cannot_be_read_reports_neither() {
+        let storage = Storage::memory().unwrap();
+        create_indexed_table(&storage, false);
+        put_captured_items(&storage);
+        storage
+            .conn()
+            .execute_batch(r#"DROP TABLE "Sized::gsi::gsiKeys""#)
+            .unwrap();
+
+        let figures = index_figures(&storage);
+        assert_eq!(figures["gsiKeys"], (None, None));
+        assert_eq!(figures["gsiAll"], (Some(2), Some(3034)));
+        assert_eq!(figures["lsiAll"], (Some(2), Some(3034)));
+        assert_eq!(described(&storage), (Some(4), Some(10056)));
     }
 }

@@ -1161,12 +1161,7 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn item_count_and_size(&self, table_name: &str) -> Result<(i64, i64), BackendError> {
         let (sql, params) = sql_builders::item_count_and_size(table_name);
-        let rows = self.query(&sql, params).await?;
-        if rows.length() == 0 {
-            return Ok((0, 0));
-        }
-        let row: js_sys::Array = rows.get(0).unchecked_into();
-        Ok((col_i64(&row, 0), col_i64(&row, 1)))
+        self.count_and_size(&sql, params).await
     }
 
     async fn gsi_item_count_and_size(
