@@ -396,10 +396,15 @@ impl Storage {
     fn initialize(&mut self) -> Result<()> {
         // Enable WAL mode for better concurrency
         self.conn.pragma_update(None, "journal_mode", "WAL")?;
+        Self::register_functions(&self.conn)?;
+        self.migrate_to_current()
+    }
 
+    /// Register the SQL functions every statement this layer runs may call.
+    fn register_functions(conn: &Connection) -> Result<()> {
         // Register FNV-1a hash function for parallel scan segment assignment.
         // Uses get_raw() to borrow directly from SQLite's buffer (zero-copy).
-        self.conn.create_scalar_function(
+        conn.create_scalar_function(
             "fnv1a_hash",
             1,
             rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
@@ -423,13 +428,12 @@ impl Storage {
                 Ok(hash as i64)
             },
         )?;
-
-        self.migrate_to_current()
+        Ok(())
     }
 
     /// Create the metadata tables if they are missing and run every migration
-    /// the recorded schema version calls for. Runs on open, and after a restore
-    /// replaces the database with a snapshot an earlier build may have taken.
+    /// the recorded schema version calls for. Runs on open, and on the scratch
+    /// copy a restore brings up to date before it replaces this database.
     fn migrate_to_current(&self) -> Result<()> {
         // Create metadata tables (schema shared with the wasm backend).
         self.conn.execute_batch(sql_builders::INIT_SCHEMA)?;
@@ -1737,7 +1741,15 @@ impl Storage {
     /// This replaces the current database contents with the snapshot contents.
     /// Works for both in-memory and file-backed databases.
     pub fn restore_from(&mut self, path: &str) -> Result<()> {
-        let source = Connection::open(path)?;
+        // Read-only and without CREATE: a mistyped path is an error, rather
+        // than a new, empty file backed up over this database, and the
+        // snapshot itself is never written to.
+        let source = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         self.restore_from_connection(&source)
     }
 
@@ -1756,18 +1768,51 @@ impl Storage {
 
     /// Restore the database from another SQLite connection using the backup API.
     ///
-    /// Replaces the current database contents with the source connection's
-    /// contents, invalidates the metadata cache, and runs any migration the
-    /// restored schema version calls for.
+    /// The source is copied into a scratch in-memory database and brought up
+    /// to date there, as an open would bring a file an earlier build wrote;
+    /// only then does the copy replace this database's contents and the
+    /// metadata cache get cleared. A copy or migration that fails leaves this
+    /// database as it was. The scratch copy costs memory the size of the
+    /// snapshot for the length of the restore.
     pub fn restore_from_connection(&mut self, source: &Connection) -> Result<()> {
+        let staged = self.staged_copy(source)?;
         {
-            let backup = rusqlite::backup::Backup::new(source, &mut self.conn)?;
+            let backup = rusqlite::backup::Backup::new(&staged.conn, &mut self.conn)?;
             backup.run_to_completion(100, std::time::Duration::from_millis(0), None)?;
         }
         self.metadata_cache.borrow_mut().clear();
-        // A snapshot an earlier build took is brought up to date as an open
-        // would bring the file.
-        self.migrate_to_current()
+        Ok(())
+    }
+
+    /// Copy `source` into a fresh in-memory database and run every migration
+    /// its recorded schema version calls for, leaving this database untouched.
+    fn staged_copy(&self, source: &Connection) -> Result<Storage> {
+        let mut staged = Storage {
+            conn: Connection::open_in_memory()?,
+            metadata_cache: RefCell::new(HashMap::new()),
+            // A countdown armed on this database fires in the migration that
+            // stands in for it.
+            #[cfg(test)]
+            gsi_insert_fault: RefCell::new(self.gsi_insert_fault.take()),
+            #[cfg(test)]
+            item_size_fault: RefCell::new(self.item_size_fault.take()),
+            clock: Arc::clone(&self.clock),
+        };
+        let copied = match rusqlite::backup::Backup::new(source, &mut staged.conn) {
+            Ok(backup) => backup
+                .run_to_completion(100, std::time::Duration::from_millis(0), None)
+                .map_err(DynoxideError::from),
+            Err(e) => Err(e.into()),
+        };
+        let migrated = copied
+            .and_then(|()| Self::register_functions(&staged.conn))
+            .and_then(|()| staged.migrate_to_current());
+        #[cfg(test)]
+        {
+            *self.gsi_insert_fault.borrow_mut() = staged.gsi_insert_fault.take();
+            *self.item_size_fault.borrow_mut() = staged.item_size_fault.take();
+        }
+        migrated.map(|()| staged)
     }
 
     /// Get the database size in bytes for an arbitrary connection.
@@ -2477,7 +2522,9 @@ mod tests {
     ///   stores it.
     ///
     /// Three named items come first, then `extra` more carrying every key
-    /// attribute.
+    /// attribute. Table `Vec` has a vector index and one item, stored at the
+    /// size a build before the vector rule gave it, so the size recompute has a
+    /// row to rewrite.
     fn write_v9_database(path: &str, extra: usize) {
         {
             let db = crate::Database::new(path).unwrap();
@@ -2546,10 +2593,39 @@ mod tests {
                 )
                 .unwrap();
             }
+            db.create_table(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "Vec",
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "VectorIndexes": [{
+                        "IndexName": "vix",
+                        "VectorAttribute": {"AttributeName": "e"},
+                        "Dimensions": 3,
+                        "DistanceFunction": "COSINE",
+                        "Projection": {"ProjectionType": "KEYS_ONLY"}
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            db.put_item(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "Vec",
+                    "Item": {
+                        "pk": {"S": "v"},
+                        "e": {"L": [{"N": "0.125"}, {"N": "0.125"}, {"N": "0.125"}]}
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         }
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
-            "DELETE FROM \"Legacy::gsi::byKey\";
+            "UPDATE \"Vec\" SET item_size = item_size + 7;
+             DELETE FROM \"Legacy::gsi::byKey\";
              INSERT INTO \"Legacy::gsi::byKey\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json)
                 SELECT 'S:x', 'S:m', pk, sk, item_json FROM \"Legacy\";
              DELETE FROM \"Legacy::gsi::byTwoHash\";
@@ -2700,16 +2776,60 @@ mod tests {
         );
     }
 
+    fn vec_size(conn: &Connection) -> i64 {
+        conn.query_row("SELECT item_size FROM \"Vec\" WHERE pk = 'S:v'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
     #[test]
     fn a_second_open_runs_no_migration() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_str().unwrap().to_string();
         write_v9_database(&path, 0);
         drop(Storage::new(&path).unwrap());
-        // Either migration would fail at its first write, so an open that ran
-        // one fails.
+        // The fixture gives each migration a row to write, and either would
+        // fail at its first write, so an open that ran one fails.
         let storage = open_with_faults(&path, Some(0), Some(0)).unwrap();
         assert_eq!(recorded_version(storage.conn()), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn a_recompute_interrupted_after_the_rebuild_leaves_version_10() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        write_v9_database(&path, 0);
+        let stale_size = vec_size(&Connection::open(&path).unwrap());
+
+        // The GSI rebuild runs and commits; the size recompute then fails at
+        // its first row.
+        assert!(open_with_faults(&path, None, Some(0)).is_err());
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            recorded_version(&conn),
+            "10",
+            "the rebuild's step is kept and the recompute's is not"
+        );
+        assert_eq!(vec_size(&conn), stale_size, "the recompute is rolled back");
+        let composite = crate::actions::gsi::composite_key_string(&[
+            &AttributeValue::S("m".into()),
+            &AttributeValue::S("2".into()),
+        ])
+        .unwrap();
+        assert!(
+            gsi_rows(&conn, "byKey")
+                .iter()
+                .any(|[_, gsi_sk, _, _, _]| *gsi_sk == composite),
+            "the rebuilt index is kept"
+        );
+        drop(conn);
+
+        // The next open runs only the recompute.
+        let storage = open_with_faults(&path, Some(0), None).unwrap();
+        assert_eq!(recorded_version(storage.conn()), SCHEMA_VERSION.to_string());
+        assert_eq!(vec_size(storage.conn()), stale_size - 7);
     }
 
     #[test]
@@ -2778,6 +2898,81 @@ mod tests {
             .unwrap()
         };
         assert_eq!(sort_keys, vec![composite("2"), composite("1")]);
+    }
+
+    /// A table of this database's own, so a restore that should have left the
+    /// database alone can be seen to have done so.
+    fn mark_live(storage: &Storage) {
+        storage
+            .conn()
+            .execute_batch(
+                "CREATE TABLE live_marker (v TEXT); INSERT INTO live_marker VALUES ('live');",
+            )
+            .unwrap();
+    }
+
+    fn still_live(storage: &Storage) -> bool {
+        storage
+            .conn()
+            .query_row("SELECT v FROM live_marker", [], |r| r.get::<_, String>(0))
+            .map(|v| v == "live")
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn restoring_from_a_missing_file_errors_and_leaves_the_database_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-snapshot.db");
+        let missing = missing.to_str().unwrap();
+        let mut storage = Storage::memory().unwrap();
+        mark_live(&storage);
+
+        assert!(storage.restore_from(missing).is_err());
+        assert!(
+            !std::path::Path::new(missing).exists(),
+            "a mistyped path must not be created"
+        );
+        assert!(still_live(&storage), "the database must be left as it was");
+    }
+
+    #[test]
+    fn a_restore_whose_migration_fails_leaves_the_database_alone() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        write_v9_database(&path, 0);
+
+        let mut storage = Storage::memory().unwrap();
+        mark_live(&storage);
+        // The restored snapshot's GSI rebuild fails at its first insert.
+        storage.fail_gsi_insert_after(0);
+        assert!(storage.restore_from(&path).is_err());
+
+        assert!(still_live(&storage), "the database must be left as it was");
+        let legacy: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'Legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 0, "none of the snapshot may be left behind");
+        assert_eq!(recorded_version(storage.conn()), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn a_restore_leaves_its_source_file_unchanged() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        write_v9_database(&path, 0);
+        let before = std::fs::read(&path).unwrap();
+
+        let mut storage = Storage::memory().unwrap();
+        storage.restore_from(&path).unwrap();
+        drop(storage);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(recorded_version(&Connection::open(&path).unwrap()), "9");
     }
 
     #[test]

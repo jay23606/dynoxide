@@ -1300,7 +1300,10 @@ impl Database<RusqliteBackend> {
     ///
     /// Uses SQLite's backup API to replace the current database contents
     /// with the snapshot. Works for both in-memory and file-backed databases.
-    /// The backup is atomic: either all pages are copied or none are.
+    /// The snapshot is opened read-only, so a path that doesn't exist is an
+    /// error, and it is copied and brought up to date in a scratch in-memory
+    /// database before anything here changes: a missing file, a failed copy
+    /// or a failed migration leaves the current database as it was.
     pub fn restore_from(&self, path: &str) -> Result<()> {
         self.with_storage_mut(|s| s.restore_from(path))
     }

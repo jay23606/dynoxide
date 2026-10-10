@@ -105,6 +105,24 @@ impl WasmBridgeBackend {
     /// path still degrades to memory on its own when OPFS is unusable.
     pub async fn open_with(name: &str, ephemeral: bool) -> Result<Self, BackendError> {
         let handle = bridge_open(name, ephemeral).await.map_err(open_err)?;
+        match Self::finish_open(handle.clone()).await {
+            Ok(backend) => Ok(backend),
+            Err(e) => {
+                // An open that fails after the bridge opened still holds the
+                // connection, and on OPFS the pool's reference to it, so a
+                // retry or another tab could not acquire the file. Release
+                // both; the open's own error is the one worth reporting.
+                let _ = bridge_close(&handle).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Everything an open does once the bridge has opened the database:
+    /// bootstrap the schema, bring an earlier build's database up to date and
+    /// record the version. [`open_with`](Self::open_with) closes the handle
+    /// when this fails.
+    async fn finish_open(handle: JsValue) -> Result<Self, BackendError> {
         // The bridge reports which VFS it actually opened against; read it off
         // the handle before treating the handle as opaque.
         let persistence_mode = js_sys::Reflect::get(&handle, &JsValue::from_str("persistenceMode"))

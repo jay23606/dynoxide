@@ -55,7 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restoring a snapshot taken by an earlier version brings it up to date as
   opening the file would, running the schema migrations its recorded version
   calls for. It used to be restored as it was, so a snapshot from before a
-  schema change came back without that change.
+  schema change came back without that change. The copy is brought up to date
+  before it replaces anything, so a restore that fails leaves the database as
+  it was, and `Database::restore_from` opens the snapshot file read-only: a
+  path that doesn't exist is now an error, where it used to create an empty
+  file and restore that over the database.
 - A number whose exponent is too large for a 32-bit integer is range-checked
   rather than read with an exponent of 0. `1e99999999999` was stored as 1; it
   is now refused as an overflow, and `1e-99999999999` as an underflow, as
@@ -85,7 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an earlier version wrote, on disk or in the browser's OPFS storage (including
   one from Dynoxide 0.10 to 0.13, which recorded no schema version), such an
   index is rebuilt the first time the database is opened, in one transaction,
-  so an open interrupted part way leaves the database as it was. `UpdateTable` can now add one. CreateTable and UpdateTable
+  and an interrupted step leaves the database at the version before that step. `UpdateTable` can now add one. CreateTable and UpdateTable
   check such a key as DynamoDB does: at most four partition key and four sort
   key attributes, partition key attributes first, no name twice. A local
   secondary index still takes one sort key attribute. A PartiQL `SELECT` on such
