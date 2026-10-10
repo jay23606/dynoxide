@@ -1249,6 +1249,9 @@ fn sort_key_satisfies(
 /// (a map, a list, a set, BOOL, NULL, or the wrong scalar) is refused with one
 /// message, after the check that a BETWEEN's two values share a type. Captured
 /// in eu-west-2, us-east-1, us-west-2 and eu-central-1, 2026-10-09.
+///
+/// Each check runs over every condition before the next starts, so the answer
+/// doesn't depend on the order the conditions arrive in.
 fn check_legacy_key_condition_types(
     conditions: &HashMap<String, helpers::KeyCondition>,
     meta: &crate::storage::TableMetadata,
@@ -1259,20 +1262,23 @@ fn check_legacy_key_condition_types(
         .map_err(|e| {
         DynoxideError::InternalServerError(format!("Bad attribute definitions JSON: {e}"))
     })?;
-    for (name, condition) in conditions {
-        let Some(values) = condition.attribute_value_list.as_ref() else {
-            continue;
-        };
-        if values
+    let lists = || {
+        conditions
+            .iter()
+            .filter_map(|(name, condition)| Some((name, condition.attribute_value_list.as_ref()?)))
+    };
+    if lists().any(|(_, values)| {
+        values
             .windows(2)
             .any(|pair| std::mem::discriminant(&pair[0]) != std::mem::discriminant(&pair[1]))
-        {
-            return Err(DynoxideError::ValidationException(
-                "One or more parameter values were invalid: \
-                 AttributeValues inside AttributeValueList must be of same type"
-                    .to_string(),
-            ));
-        }
+    }) {
+        return Err(DynoxideError::ValidationException(
+            "One or more parameter values were invalid: \
+             AttributeValues inside AttributeValueList must be of same type"
+                .to_string(),
+        ));
+    }
+    for (name, values) in lists() {
         let Some(definition) = definitions.iter().find(|d| &d.attribute_name == name) else {
             continue;
         };

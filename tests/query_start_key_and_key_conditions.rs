@@ -614,3 +614,306 @@ fn a_multi_attribute_start_key_is_checked_on_every_key_attribute() {
         Ok(0)
     );
 }
+
+// ---- Paging one item at a time under every sort key condition ---------------
+
+/// The sort keys under partition `p`: strings in mixed case, so `begins_with`
+/// is seen to be case-sensitive, and bytes, compared unsigned.
+const S_KEYS: [&str; 10] = [
+    "APP", "Apple", "a", "ap", "apple", "apricot", "b", "c", "d", "e",
+];
+const B_KEYS: [&[u8]; 8] = [&[1], &[2], &[2, 1], &[2, 2], &[3], &[4], &[5], &[0x80]];
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn paging_tables() -> Database {
+    let db = Database::memory().unwrap();
+    for (table, key_type) in [("PagesS", "S"), ("PagesB", "B")] {
+        db.create_table(
+            serde_json::from_value::<CreateTableRequest>(json!({
+                "TableName": table,
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": key_type}
+                ],
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"}
+                ],
+                "BillingMode": "PAY_PER_REQUEST"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let put = |table: &str, sk: Value| {
+        db.put_item(
+            serde_json::from_value::<PutItemRequest>(json!({
+                "TableName": table,
+                "Item": {"pk": {"S": "p"}, "sk": sk}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    for key in S_KEYS {
+        put("PagesS", json!({"S": key}));
+    }
+    for key in B_KEYS {
+        put("PagesB", json!({"B": b64(key)}));
+    }
+    db
+}
+
+/// Whether a stored sort key, as bytes, satisfies a condition.
+type Holds = Box<dyn Fn(&[u8]) -> bool>;
+
+/// One sort key condition: its expression operator, its legacy operator, its
+/// operands, which stored keys it holds, and a key just outside it.
+struct SortCondition {
+    expression: &'static str,
+    legacy: &'static str,
+    operands: Vec<Value>,
+    holds: Holds,
+    outside: Value,
+}
+
+fn s_conditions() -> Vec<SortCondition> {
+    let s = |v: &str| json!({"S": v});
+    let c = |op: &'static str, legacy, operands: Vec<Value>, holds: Holds, outside| SortCondition {
+        expression: op,
+        legacy,
+        operands,
+        holds,
+        outside,
+    };
+    vec![
+        c("=", "EQ", vec![s("c")], Box::new(|k| k == b"c"), s("d")),
+        c("<", "LT", vec![s("c")], Box::new(|k| k < &b"c"[..]), s("c")),
+        c(
+            "<=",
+            "LE",
+            vec![s("c")],
+            Box::new(|k| k <= &b"c"[..]),
+            s("d"),
+        ),
+        c(">", "GT", vec![s("c")], Box::new(|k| k > &b"c"[..]), s("c")),
+        c(
+            ">=",
+            "GE",
+            vec![s("c")],
+            Box::new(|k| k >= &b"c"[..]),
+            s("b"),
+        ),
+        c(
+            "BETWEEN",
+            "BETWEEN",
+            vec![s("ap"), s("b")],
+            Box::new(|k| k >= &b"ap"[..] && k <= &b"b"[..]),
+            s("c"),
+        ),
+        c(
+            "begins_with",
+            "BEGINS_WITH",
+            vec![s("ap")],
+            Box::new(|k| k.starts_with(b"ap")),
+            s("Apple"),
+        ),
+    ]
+}
+
+fn b_conditions() -> Vec<SortCondition> {
+    let b = |v: &[u8]| json!({"B": b64(v)});
+    let c = |op: &'static str, legacy, operands: Vec<Value>, holds: Holds, outside| SortCondition {
+        expression: op,
+        legacy,
+        operands,
+        holds,
+        outside,
+    };
+    vec![
+        c("=", "EQ", vec![b(&[3])], Box::new(|k| k == [3]), b(&[4])),
+        c(
+            "<",
+            "LT",
+            vec![b(&[3])],
+            Box::new(|k| k < &[3][..]),
+            b(&[3]),
+        ),
+        c(
+            "<=",
+            "LE",
+            vec![b(&[3])],
+            Box::new(|k| k <= &[3][..]),
+            b(&[4]),
+        ),
+        c(
+            ">",
+            "GT",
+            vec![b(&[3])],
+            Box::new(|k| k > &[3][..]),
+            b(&[3]),
+        ),
+        c(
+            ">=",
+            "GE",
+            vec![b(&[3])],
+            Box::new(|k| k >= &[3][..]),
+            b(&[2, 2]),
+        ),
+        c(
+            "BETWEEN",
+            "BETWEEN",
+            vec![b(&[2]), b(&[4])],
+            Box::new(|k| k >= &[2][..] && k <= &[4][..]),
+            b(&[5]),
+        ),
+        c(
+            "begins_with",
+            "BEGINS_WITH",
+            vec![b(&[2])],
+            Box::new(|k| k.starts_with(&[2])),
+            b(&[3]),
+        ),
+    ]
+}
+
+/// The query for `condition`, in KeyConditionExpression form or as legacy
+/// KeyConditions.
+fn paging_query(table: &str, condition: &SortCondition, legacy: bool, forward: bool) -> Value {
+    let mut body = if legacy {
+        json!({
+            "TableName": table,
+            "KeyConditions": {
+                "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "p"}]},
+                "sk": {"ComparisonOperator": condition.legacy, "AttributeValueList": condition.operands}
+            }
+        })
+    } else {
+        let sort = match (condition.expression, condition.operands.len()) {
+            ("BETWEEN", _) => "sk BETWEEN :a AND :b".to_string(),
+            ("begins_with", _) => "begins_with(sk, :a)".to_string(),
+            (op, _) => format!("sk {op} :a"),
+        };
+        let mut values = json!({":pk": {"S": "p"}, ":a": condition.operands[0]});
+        if let Some(second) = condition.operands.get(1) {
+            values[":b"] = second.clone();
+        }
+        json!({
+            "TableName": table,
+            "KeyConditionExpression": format!("pk = :pk AND {sort}"),
+            "ExpressionAttributeValues": values
+        })
+    };
+    body["Limit"] = json!(1);
+    body["ScanIndexForward"] = json!(forward);
+    body
+}
+
+/// The sort key's bytes: a string's UTF-8 or a binary's decoded bytes.
+fn sort_key_bytes(sk: &Value) -> Vec<u8> {
+    use base64::Engine;
+    match (sk.get("S"), sk.get("B")) {
+        (Some(s), _) => s.as_str().unwrap().as_bytes().to_vec(),
+        (_, Some(b)) => base64::engine::general_purpose::STANDARD
+            .decode(b.as_str().unwrap())
+            .unwrap(),
+        _ => panic!("unexpected sort key {sk}"),
+    }
+}
+
+#[test]
+fn every_sort_key_condition_pages_one_item_at_a_time() {
+    let db = paging_tables();
+    let stored: [(&str, Vec<Vec<u8>>); 2] = [
+        (
+            "PagesS",
+            S_KEYS.iter().map(|k| k.as_bytes().to_vec()).collect(),
+        ),
+        ("PagesB", B_KEYS.iter().map(|k| k.to_vec()).collect()),
+    ];
+    for (table, conditions) in [("PagesS", s_conditions()), ("PagesB", b_conditions())] {
+        let keys = &stored.iter().find(|(t, _)| *t == table).unwrap().1;
+        for condition in &conditions {
+            for legacy in [false, true] {
+                for forward in [true, false] {
+                    let label = format!(
+                        "{table} {} legacy={legacy} forward={forward}",
+                        condition.expression
+                    );
+                    let mut expected: Vec<Vec<u8>> = keys
+                        .iter()
+                        .filter(|k| (condition.holds)(k))
+                        .cloned()
+                        .collect();
+                    expected.sort();
+                    if !forward {
+                        expected.reverse();
+                    }
+
+                    let mut seen = Vec::new();
+                    let mut start: Option<Value> = None;
+                    for _ in 0..=keys.len() + 1 {
+                        let mut body = paging_query(table, condition, legacy, forward);
+                        if let Some(esk) = start.take() {
+                            body["ExclusiveStartKey"] = esk;
+                        }
+                        let request: QueryRequest = serde_json::from_value(body).unwrap();
+                        let page = db.query(request).unwrap_or_else(|e| {
+                            panic!("{label}: a handed-out key was refused: {e}")
+                        });
+                        for item in page.items.unwrap_or_default() {
+                            let item = serde_json::to_value(item).unwrap();
+                            seen.push(sort_key_bytes(&item["sk"]));
+                        }
+                        match page.last_evaluated_key {
+                            Some(lek) => start = Some(serde_json::to_value(lek).unwrap()),
+                            None => break,
+                        }
+                    }
+                    assert_eq!(seen, expected, "{label}");
+
+                    let mut body = paging_query(table, condition, legacy, forward);
+                    body["ExclusiveStartKey"] = json!({"pk": {"S": "p"}, "sk": condition.outside});
+                    let request: QueryRequest = serde_json::from_value(body).unwrap();
+                    assert_eq!(
+                        db.query(request)
+                            .map(|r| r.count)
+                            .map_err(|e| e.to_string()),
+                        Err(
+                            "The provided starting key does not match the range key predicate"
+                                .to_string()
+                        ),
+                        "{label}: a start key just outside the condition"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// With two bad KeyConditions, one a BETWEEN of mixed types and the other the
+/// wrong schema type, the answer doesn't depend on which DynamoDB-side map
+/// order the conditions happen to come in: the mixed-type check runs over
+/// every condition first.
+#[test]
+fn two_bad_key_conditions_get_the_same_answer_every_time() {
+    let db = paging_tables();
+    for _ in 0..50 {
+        let request: QueryRequest = serde_json::from_value(json!({
+            "TableName": "PagesS",
+            "KeyConditions": {
+                "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"N": "1"}]},
+                "sk": {"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"S": "a"}, {"N": "2"}]}
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            db.query(request).map(|r| r.count).map_err(|e| e.to_string()),
+            Err("One or more parameter values were invalid: AttributeValues inside AttributeValueList must be of same type".to_string())
+        );
+    }
+}
