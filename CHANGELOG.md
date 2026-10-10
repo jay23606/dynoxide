@@ -142,6 +142,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `TransactGetItems` refuses an empty `ProjectionExpression` as `GetItem`
   does. Captured against eu-west-2 and us-east-1, the transactions also
   against ap-southeast-2 and eu-central-1.
+- A legacy `QueryFilter` or `ScanFilter` condition with a `ComparisonOperator`
+  DynamoDB doesn't have, such as `FOO`, or with none at all, was dropped, so
+  the Query or Scan ran without it, and one whose every condition dropped
+  returned every item. A lower-case `eq` ran as `EQ`. 1.2.1 did both. An
+  unknown operator, `eq` included, is now refused with `One or more parameter
+  values were invalid: Invalid comparison operator`, and a missing one with `1
+  validation error detected: Value null at
+  'scanFilter.a.member.comparisonOperator' failed to satisfy constraint:
+  Member must not be null` (`queryFilter` on a Query). `KeyConditions` takes
+  the same rule, where it also ran `eq` as `EQ` and refused an unknown or
+  missing operator in Dynoxide's own words. Captured against eu-west-2,
+  ap-southeast-2, eu-central-1 and us-east-1; us-east-1 answers an unknown
+  operator with the member's enum constraint instead, and the other three
+  regions are followed.
 - A legacy `QueryFilter` or `ScanFilter` condition whose value didn't read,
   such as `{"NULL": false}` or `{"BOOL": "maybe"}`, was dropped, so the Query
   or Scan ran without that condition and returned items it should have

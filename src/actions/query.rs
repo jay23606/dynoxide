@@ -137,6 +137,17 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
             errors.push(msg);
         }
 
+        // A KeyConditions or QueryFilter condition with no ComparisonOperator,
+        // as a ScanFilter's is refused (inferred, as is the order).
+        errors.extend(helpers::missing_comparison_operators(
+            raw.key_conditions.as_ref(),
+            "keyConditions",
+        ));
+        errors.extend(helpers::missing_comparison_operators(
+            raw.query_filter.as_ref(),
+            "queryFilter",
+        ));
+
         if let Some(msg) = format_validation_errors(&errors) {
             return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
         }
@@ -304,8 +315,8 @@ pub async fn execute<S: StorageBackend>(
     )?;
 
     // ---- Validate filter argument counts and type compatibility ----
-    helpers::validate_filter_condition_args(request.query_filter.as_ref())?;
-    helpers::validate_filter_condition_args(request.key_conditions.as_ref())?;
+    helpers::validate_filter_condition_args(request.query_filter.as_ref(), "queryFilter")?;
+    helpers::validate_filter_condition_args(request.key_conditions.as_ref(), "keyConditions")?;
 
     // ---- Validate duplicate AttributesToGet ----
     if let Some(ref attrs) = request.attributes_to_get {

@@ -1620,8 +1620,7 @@ pub fn validate_expected_conditions(expected: &HashMap<String, ExpectedCondition
                     // ahead of its arguments (captured eu-west-2 and
                     // us-east-1, 2026-10-10).
                     return Err(DynoxideError::ValidationException(
-                        "One or more parameter values were invalid: Invalid comparison operator"
-                            .to_string(),
+                        INVALID_COMPARISON_OPERATOR.to_string(),
                     ));
                 }
             }
@@ -1752,87 +1751,31 @@ pub fn convert_key_conditions(
         let name_ref = format!("#kc_{attr_name}");
         names.insert(name_ref.clone(), attr_name.clone());
 
-        let comp_op = cond.comparison_operator.to_uppercase();
-        match comp_op.as_str() {
-            "EQ" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} = {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "LE" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} <= {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "LT" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} < {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "GE" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} >= {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "GT" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} > {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "BETWEEN" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 2
-                {
-                    let v1 = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    let v2 = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} BETWEEN {v1} AND {v2}"));
-                    values.insert(v1, list[0].clone());
-                    values.insert(v2, list[1].clone());
-                }
-            }
-            "BEGINS_WITH" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":kc_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("begins_with({name_ref}, {val_name})"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            _ => {
+        // Operators are matched as written: DynamoDB refuses `eq`.
+        let op = cond.comparison_operator.as_str();
+        let count = match op {
+            "EQ" | "LE" | "LT" | "GE" | "GT" | "BEGINS_WITH" => 1,
+            "BETWEEN" => 2,
+            "NE" | "IN" | "NULL" | "NOT_NULL" | "CONTAINS" | "NOT_CONTAINS" => {
                 return Err(DynoxideError::ValidationException(format!(
-                    "Unsupported KeyConditions ComparisonOperator: {comp_op}"
+                    "Unsupported KeyConditions ComparisonOperator: {op}"
                 )));
             }
-        }
+            _ => {
+                return Err(DynoxideError::ValidationException(
+                    INVALID_COMPARISON_OPERATOR.to_string(),
+                ));
+            }
+        };
+        let refs = legacy_value_refs(
+            cond.attribute_value_list.as_deref(),
+            op,
+            count..=count,
+            "kc",
+            &mut val_idx,
+            &mut values,
+        )?;
+        parts.push(legacy_condition_text(op, &name_ref, &refs));
     }
 
     Ok(ConvertedCondition {
@@ -1878,94 +1821,30 @@ pub fn convert_filter_conditions(
         let name_ref = format!("#qf_{attr_name}");
         names.insert(name_ref.clone(), attr_name.clone());
 
-        let comp_op = cond.comparison_operator.to_uppercase();
-        match comp_op.as_str() {
-            "NULL" => {
-                parts.push(format!("attribute_not_exists({name_ref})"));
+        // Operators are matched as written: DynamoDB refuses `eq`. An unknown
+        // one is refused rather than skipped, which ran the read without it.
+        let op = cond.comparison_operator.as_str();
+        let counts = match op {
+            "NULL" | "NOT_NULL" => 0..=0,
+            "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "BEGINS_WITH" | "CONTAINS"
+            | "NOT_CONTAINS" => 1..=1,
+            "BETWEEN" => 2..=2,
+            "IN" => 1..=usize::MAX,
+            _ => {
+                return Err(DynoxideError::ValidationException(
+                    INVALID_COMPARISON_OPERATOR.to_string(),
+                ));
             }
-            "NOT_NULL" => {
-                parts.push(format!("attribute_exists({name_ref})"));
-            }
-            "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" => {
-                let op_str = match comp_op.as_str() {
-                    "EQ" => "=",
-                    "NE" => "<>",
-                    "LE" => "<=",
-                    "LT" => "<",
-                    "GE" => ">=",
-                    "GT" => ">",
-                    _ => unreachable!(),
-                };
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} {op_str} {val_name}"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "BETWEEN" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 2
-                {
-                    let v1 = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    let v2 = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("{name_ref} BETWEEN {v1} AND {v2}"));
-                    values.insert(v1, list[0].clone());
-                    values.insert(v2, list[1].clone());
-                }
-            }
-            "BEGINS_WITH" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("begins_with({name_ref}, {val_name})"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "CONTAINS" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("contains({name_ref}, {val_name})"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "NOT_CONTAINS" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && list.len() == 1
-                {
-                    let val_name = format!(":qf_v{val_idx}");
-                    val_idx += 1;
-                    parts.push(format!("NOT contains({name_ref}, {val_name})"));
-                    values.insert(val_name, list[0].clone());
-                }
-            }
-            "IN" => {
-                if let Some(ref list) = cond.attribute_value_list
-                    && !list.is_empty()
-                {
-                    let val_names: Vec<String> = list
-                        .iter()
-                        .map(|v| {
-                            let name = format!(":qf_v{val_idx}");
-                            val_idx += 1;
-                            values.insert(name.clone(), v.clone());
-                            name
-                        })
-                        .collect();
-                    parts.push(format!("{name_ref} IN ({})", val_names.join(", ")));
-                }
-            }
-            _ => {}
-        }
+        };
+        let refs = legacy_value_refs(
+            cond.attribute_value_list.as_deref(),
+            op,
+            counts,
+            "qf",
+            &mut val_idx,
+            &mut values,
+        )?;
+        parts.push(legacy_condition_text(op, &name_ref, &refs));
     }
 
     parts.sort();
@@ -1974,6 +1853,58 @@ pub fn convert_filter_conditions(
         attribute_values: values,
         attribute_names: names,
     })
+}
+
+/// Name each value of a legacy condition as an expression value,
+/// `:<prefix>_v<n>`, adding it to `values`. A list the operator can't take is
+/// refused with the argument count message, never dropped; the request's
+/// validation has already refused it, so this only guards against a caller
+/// that skipped it.
+fn legacy_value_refs(
+    list: Option<&[crate::types::AttributeValue]>,
+    op: &str,
+    counts: std::ops::RangeInclusive<usize>,
+    prefix: &str,
+    val_idx: &mut u32,
+    values: &mut HashMap<String, crate::types::AttributeValue>,
+) -> Result<Vec<String>> {
+    let list = list.unwrap_or_default();
+    if !counts.contains(&list.len()) {
+        return Err(DynoxideError::ValidationException(format!(
+            "One or more parameter values were invalid: Invalid number of argument(s) for the {op} ComparisonOperator"
+        )));
+    }
+    Ok(list
+        .iter()
+        .map(|value| {
+            let name = format!(":{prefix}_v{val_idx}");
+            *val_idx += 1;
+            values.insert(name.clone(), value.clone());
+            name
+        })
+        .collect())
+}
+
+/// A legacy condition as expression text over `name` and its value names,
+/// for an operator already checked to be one DynamoDB has.
+fn legacy_condition_text(op: &str, name: &str, refs: &[String]) -> String {
+    let comparison = |symbol: &str| format!("{name} {symbol} {}", refs[0]);
+    match op {
+        "NULL" => format!("attribute_not_exists({name})"),
+        "NOT_NULL" => format!("attribute_exists({name})"),
+        "EQ" => comparison("="),
+        "NE" => comparison("<>"),
+        "LE" => comparison("<="),
+        "LT" => comparison("<"),
+        "GE" => comparison(">="),
+        "GT" => comparison(">"),
+        "BETWEEN" => format!("{name} BETWEEN {} AND {}", refs[0], refs[1]),
+        "BEGINS_WITH" => format!("begins_with({name}, {})", refs[0]),
+        "CONTAINS" => format!("contains({name}, {})", refs[0]),
+        "NOT_CONTAINS" => format!("NOT contains({name}, {})", refs[0]),
+        // IN, the only operator left.
+        _ => format!("{name} IN ({})", refs.join(", ")),
+    }
 }
 
 /// Extract pk and sk strings from an item's key attributes.
@@ -2277,11 +2208,70 @@ pub(crate) fn attr_value_matches_scalar_type(
     )
 }
 
+/// DynamoDB's refusal of a legacy condition's `ComparisonOperator` that isn't
+/// one of its own. Operators are case-sensitive, so `eq` is refused too.
+/// Captured on ScanFilter and QueryFilter in eu-west-2, ap-southeast-2 and
+/// eu-central-1 (2026-10-10), and on Expected in eu-west-2 and us-east-1.
+/// us-east-1 answers a ScanFilter's with the member's enum constraint instead,
+/// `1 validation error detected: Value 'FOO' at
+/// 'scanFilter.a.member.comparisonOperator' failed to satisfy constraint:
+/// Member must satisfy enum value set: [IN, NULL, BETWEEN, ...]`; the majority
+/// is followed.
+pub(crate) const INVALID_COMPARISON_OPERATOR: &str =
+    "One or more parameter values were invalid: Invalid comparison operator";
+
+/// The member error for every condition in a legacy `QueryFilter`,
+/// `ScanFilter` or `KeyConditions` map with no `ComparisonOperator`, or a
+/// JSON null one, under `member` (`scanFilter`, `queryFilter`,
+/// `keyConditions`): `Value null at 'scanFilter.a.member.comparisonOperator'
+/// failed to satisfy constraint: Member must not be null` (ScanFilter captured
+/// in four regions, 2026-10-10; the other two inferred). An operator of
+/// another JSON type is left to the request's reader, which refuses it.
+pub(crate) fn missing_comparison_operators(
+    conditions: Option<&serde_json::Value>,
+    member: &str,
+) -> Vec<String> {
+    let Some(conditions) = conditions.and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    conditions
+        .iter()
+        .filter(|(_, condition)| {
+            condition.as_object().is_some_and(|condition| {
+                condition
+                    .get("ComparisonOperator")
+                    .is_none_or(serde_json::Value::is_null)
+            })
+        })
+        .map(|(name, _)| {
+            format!(
+                "Value null at '{member}.{name}.member.comparisonOperator' failed to satisfy \
+                 constraint: Member must not be null"
+            )
+        })
+        .collect()
+}
+
 /// Validate argument counts and type compatibility for each `ComparisonOperator`
-/// in a raw `QueryFilter`, `ScanFilter`, or `KeyConditions` JSON map.
+/// in a raw `QueryFilter`, `ScanFilter`, or `KeyConditions` JSON map, named by
+/// `member` as its errors name it (`scanFilter`, `queryFilter`,
+/// `keyConditions`).
+///
+/// A missing operator is a member error the request's reader reports with the
+/// request's others; it is refused here too for a request built in code. An
+/// operator DynamoDB doesn't have is refused, never skipped: skipping it ran
+/// the read without that condition.
 ///
 /// DynamoDB validates these BEFORE ExclusiveStartKey and expression syntax.
-pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Result<()> {
+pub fn validate_filter_condition_args(
+    value: Option<&serde_json::Value>,
+    member: &str,
+) -> Result<()> {
+    if let Some(message) =
+        crate::validation::format_validation_errors(&missing_comparison_operators(value, member))
+    {
+        return Err(DynoxideError::ValidationException(message));
+    }
     let val = match value {
         Some(v) if v.is_object() => v,
         _ => return Ok(()),
@@ -2294,6 +2284,7 @@ pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Resu
             None => continue,
         };
 
+        // Not a string: the request's reader refuses it.
         let comp_op = match cond_obj.get("ComparisonOperator").and_then(|v| v.as_str()) {
             Some(op) => op,
             None => continue,
@@ -2311,7 +2302,11 @@ pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Resu
             | "BEGINS_WITH" => (1, 1),
             "BETWEEN" => (2, 2),
             "IN" => (1, usize::MAX),
-            _ => continue,
+            _ => {
+                return Err(DynoxideError::ValidationException(
+                    INVALID_COMPARISON_OPERATOR.to_string(),
+                ));
+            }
         };
 
         if avl_len < min || avl_len > max {

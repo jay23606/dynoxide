@@ -158,6 +158,14 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             ));
         }
 
+        // A ScanFilter condition with no ComparisonOperator. Captured alone
+        // in four regions (2026-10-10); its place among the other member
+        // errors is inferred.
+        errors.extend(helpers::missing_comparison_operators(
+            raw.scan_filter.as_ref(),
+            "scanFilter",
+        ));
+
         match raw.table_name.as_deref() {
             None | Some("") => errors.extend(crate::validation::table_name_constraint_errors(
                 raw.table_name.as_deref(),
@@ -326,7 +334,7 @@ pub async fn execute<S: StorageBackend>(
     )?;
 
     // ---- Validate filter argument counts and type compatibility ----
-    helpers::validate_filter_condition_args(request.scan_filter.as_ref())?;
+    helpers::validate_filter_condition_args(request.scan_filter.as_ref(), "scanFilter")?;
 
     // ---- Validate duplicate AttributesToGet ----
     if let Some(ref attrs) = request.attributes_to_get {
