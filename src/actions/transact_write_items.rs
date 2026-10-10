@@ -195,6 +195,117 @@ fn empty_name_in_write_action(item: &TransactWriteItem) -> Result<()> {
     Ok(())
 }
 
+/// The action list as DynamoDB echoes it in a constraint message: each
+/// action's Java `toString`, every field named, in the form us-east-1,
+/// eu-west-1 and us-west-2 gave on 2026-10-10. eu-west-2 echoes no list
+/// (`Value at 'TransactItems'`), and some hosts print each attribute value as
+/// an object hash; the form most regions give is the one followed. Bounded by
+/// [`crate::actions::batch_write_item::ECHO_LIMIT`].
+fn items_echo(items: &[TransactWriteItem]) -> String {
+    let mut out = crate::actions::batch_write_item::BoundedEcho::new();
+    let _ = write_items(&mut out, items);
+    out.finish()
+}
+
+fn write_items(out: &mut dyn std::fmt::Write, items: &[TransactWriteItem]) -> std::fmt::Result {
+    use crate::actions::batch_write_item::{
+        write_java_item, write_java_names, write_java_text, write_java_values,
+    };
+    // The members every action shares, after its key or item.
+    let conditions = |out: &mut dyn std::fmt::Write,
+                      condition: Option<&str>,
+                      names: Option<&HashMap<String, String>>,
+                      values: Option<&HashMap<String, AttributeValue>>,
+                      return_values: Option<&str>|
+     -> std::fmt::Result {
+        out.write_str(", conditionExpression=")?;
+        write_java_text(out, condition)?;
+        out.write_str(", expressionAttributeNames=")?;
+        write_java_names(out, names)?;
+        out.write_str(", expressionAttributeValues=")?;
+        write_java_values(out, values)?;
+        out.write_str(", returnValuesOnConditionCheckFailure=")?;
+        write_java_text(out, return_values)?;
+        out.write_str(", workloadProfileName=null)")
+    };
+    out.write_str("[")?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        out.write_str("TransactWriteItem(conditionCheck=")?;
+        match item.condition_check {
+            Some(ref check) => {
+                out.write_str("ConditionCheck(key=")?;
+                write_java_item(out, &check.key)?;
+                write!(out, ", tableName={}", check.table_name)?;
+                conditions(
+                    out,
+                    Some(&check.condition_expression),
+                    check.expression_attribute_names.as_ref(),
+                    check.expression_attribute_values.as_ref(),
+                    check.return_values_on_condition_check_failure.as_deref(),
+                )?;
+            }
+            None => out.write_str("null")?,
+        }
+        out.write_str(", put=")?;
+        match item.put {
+            Some(ref put) => {
+                out.write_str("Put(item=")?;
+                write_java_item(out, &put.item)?;
+                write!(out, ", tableName={}", put.table_name)?;
+                conditions(
+                    out,
+                    put.condition_expression.as_deref(),
+                    put.expression_attribute_names.as_ref(),
+                    put.expression_attribute_values.as_ref(),
+                    put.return_values_on_condition_check_failure.as_deref(),
+                )?;
+            }
+            None => out.write_str("null")?,
+        }
+        out.write_str(", delete=")?;
+        match item.delete {
+            Some(ref delete) => {
+                out.write_str("Delete(key=")?;
+                write_java_item(out, &delete.key)?;
+                write!(out, ", tableName={}", delete.table_name)?;
+                conditions(
+                    out,
+                    delete.condition_expression.as_deref(),
+                    delete.expression_attribute_names.as_ref(),
+                    delete.expression_attribute_values.as_ref(),
+                    delete.return_values_on_condition_check_failure.as_deref(),
+                )?;
+            }
+            None => out.write_str("null")?,
+        }
+        out.write_str(", update=")?;
+        match item.update {
+            Some(ref update) => {
+                out.write_str("Update(key=")?;
+                write_java_item(out, &update.key)?;
+                write!(
+                    out,
+                    ", updateExpression={}, tableName={}",
+                    update.update_expression, update.table_name
+                )?;
+                conditions(
+                    out,
+                    update.condition_expression.as_deref(),
+                    update.expression_attribute_names.as_ref(),
+                    update.expression_attribute_values.as_ref(),
+                    update.return_values_on_condition_check_failure.as_deref(),
+                )?;
+            }
+            None => out.write_str("null")?,
+        }
+        out.write_str(")")?;
+    }
+    out.write_str("]")
+}
+
 /// The request-level checks, in the order DynamoDB reports them: the
 /// `TransactItems` length; then the request's own members, `ClientRequestToken`,
 /// `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`, reported together
@@ -222,16 +333,11 @@ pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
         ));
     }
 
-    // Validate: up to 100 actions.
-    // AWS surfaces this as the standard "1 validation error detected" envelope
-    // around `Value '[<dump>]' at 'transactItems'`. The conformance suite
-    // anchors a regex on the envelope and constraint phrase but leaves the
-    // dump body unconstrained.
+    // Validate: up to 100 actions, echoing the list as DynamoDB does.
     if items.len() > 100 {
-        // Bounded like the other echoes of a refused member.
-        let dump = crate::actions::batch_write_item::bounded_listing(items);
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{dump}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
+            "1 validation error detected: Value '{}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
+            items_echo(items)
         )));
     }
 

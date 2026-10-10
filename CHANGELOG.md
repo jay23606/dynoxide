@@ -726,10 +726,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can't be reproduced. Inferred rather than captured: a batch member's own
   errors following `ReturnConsumedCapacity`, and an empty transaction, or one
   of more than 100 statements, listed with the token and the statements rather
-  than answering after them, the over-100 error now worded in the same
-  `Value at 'transactStatements' ...` form as the empty one rather than as a
-  bare constraint. The MCP `execute_partiql`, `batch_execute_partiql` and
-  `execute_transaction_partiql` tools list a bad mode the same way.
+  than answering after them. The MCP `execute_partiql`, `batch_execute_partiql`
+  and `execute_transaction_partiql` tools list a bad mode the same way.
+- A transaction's list longer than DynamoDB allows is echoed as DynamoDB
+  echoes it: `ExecuteTransaction`'s statements as `ParameterizedStatement(...)`
+  and an empty list as `[]`, and the actions of `TransactWriteItems` and
+  `TransactGetItems` as `TransactWriteItem(...)` and `TransactGetItem(...)`,
+  every field named, where they echoed nothing or Dynoxide's own debugging
+  form. An attribute map in any of these echoes, and in `BatchWriteItem`'s,
+  lists its entries in the order of a Java hash map, as DynamoDB's do, rather
+  than by name. A statement's `ReturnValuesOnConditionCheckFailure` is echoed
+  as `null`, as Dynoxide doesn't read that member of a transaction's
+  statement. Captured against us-east-1, eu-west-1 and us-west-2 (eu-west-2
+  echoes no action list).
 - A PartiQL WHERE clause's alternatives are held to 16,384 condition slots
   between them, where each alternative was already held to 4,096. Every slot is
   evaluated against every item read, and a clause of a few hundred operators

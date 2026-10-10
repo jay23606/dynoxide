@@ -112,6 +112,37 @@ pub struct TransactGetResponse {
     pub item: Option<Item>,
 }
 
+/// The action list as DynamoDB echoes it in a constraint message: each
+/// action's Java `toString`, every field named, in the form us-east-1,
+/// eu-west-1 and us-west-2 gave on 2026-10-10. eu-west-2 echoes no list
+/// (`Value at 'TransactItems'`), and some hosts print each attribute value as
+/// an object hash; the form most regions give is the one followed. Bounded by
+/// [`crate::actions::batch_write_item::ECHO_LIMIT`].
+fn items_echo(items: &[TransactGetItem]) -> String {
+    let mut out = crate::actions::batch_write_item::BoundedEcho::new();
+    let _ = write_items(&mut out, items);
+    out.finish()
+}
+
+fn write_items(out: &mut dyn std::fmt::Write, items: &[TransactGetItem]) -> std::fmt::Result {
+    use crate::actions::batch_write_item::{write_java_item, write_java_names, write_java_text};
+    out.write_str("[")?;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        let get = &item.get;
+        out.write_str("TransactGetItem(get=Get(key=")?;
+        write_java_item(out, &get.key)?;
+        write!(out, ", tableName={}, projectionExpression=", get.table_name)?;
+        write_java_text(out, get.projection_expression.as_deref())?;
+        out.write_str(", expressionAttributeNames=")?;
+        write_java_names(out, get.expression_attribute_names.as_ref())?;
+        out.write_str(", workloadProfileName=null))")?;
+    }
+    out.write_str("]")
+}
+
 pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: TransactGetItemsRequest,
@@ -123,16 +154,11 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // Validate: up to 100 actions.
-    // AWS surfaces this as the standard "1 validation error detected" envelope
-    // around `Value '[<dump>]' at 'transactItems'`. The conformance suite
-    // anchors a regex on the envelope and constraint phrase but leaves the
-    // dump body unconstrained.
+    // Validate: up to 100 actions, echoing the list as DynamoDB does.
     if request.transact_items.len() > 100 {
-        // Bounded like the other echoes of a refused member.
-        let dump = crate::actions::batch_write_item::bounded_listing(&request.transact_items);
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '{dump}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
+            "1 validation error detected: Value '{}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
+            items_echo(&request.transact_items)
         )));
     }
 

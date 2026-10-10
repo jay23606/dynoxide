@@ -81,6 +81,51 @@ pub async fn execute<S: StorageBackend>(
     Ok(execute_cached(storage, request).await?.response)
 }
 
+/// The statement list as DynamoDB echoes it in a constraint message: each
+/// statement's Java `toString` (captured eu-west-2 and us-east-1, 2026-10-10;
+/// some hosts print an object hash per statement instead, and the form most
+/// give is the one followed). A statement's
+/// `ReturnValuesOnConditionCheckFailure` is echoed as `null`, as Dynoxide
+/// doesn't read that member of a transaction's statement. Bounded by
+/// [`crate::actions::batch_write_item::ECHO_LIMIT`].
+fn statements_echo(statements: &[ParameterizedStatement]) -> String {
+    let mut out = crate::actions::batch_write_item::BoundedEcho::new();
+    let _ = write_statements(&mut out, statements);
+    out.finish()
+}
+
+fn write_statements(
+    out: &mut dyn std::fmt::Write,
+    statements: &[ParameterizedStatement],
+) -> std::fmt::Result {
+    out.write_str("[")?;
+    for (i, statement) in statements.iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        write!(
+            out,
+            "ParameterizedStatement(statement={}, parameters=",
+            statement.statement
+        )?;
+        match statement.parameters {
+            Some(ref parameters) => {
+                out.write_str("[")?;
+                for (j, parameter) in parameters.iter().enumerate() {
+                    if j > 0 {
+                        out.write_str(", ")?;
+                    }
+                    crate::actions::batch_write_item::write_java_attribute_value(out, parameter)?;
+                }
+                out.write_str("]")?;
+            }
+            None => out.write_str("null")?,
+        }
+        out.write_str(", returnValuesOnConditionCheckFailure=null)")?;
+    }
+    out.write_str("]")
+}
+
 /// The request's member violations, listed as DynamoDB lists them: the
 /// token, then each statement's text and parameters by index, then
 /// ReturnConsumedCapacity (captured eu-west-2 and us-east-1, 2026-10-10, the
@@ -88,13 +133,9 @@ pub async fn execute<S: StorageBackend>(
 /// statement is parsed or the idempotency cache is consulted.
 ///
 /// The statement list's own length (empty, or more than 100) is listed with
-/// them, after the token and ahead of the statements. That is inferred, not
-/// captured: the batch lists its list-length error with its other members
-/// (captured), and the transaction's statements member sits between the token
-/// and the mode. The empty-list wording is the one this action used before;
-/// the over-100 wording is new (it used to be the bare "Member must have length
-/// less than or equal to 100"), written in the same form. Neither is captured,
-/// and DynamoDB may echo the list where these don't.
+/// them, after the token and ahead of the statements, echoing the list: `[]`
+/// when empty, each statement's Java `toString` when too long (captured
+/// eu-west-2 and us-east-1, 2026-10-10; the empty list in six regions).
 fn member_violations(request: &ExecuteTransactionRequest) -> Vec<String> {
     let mut violations = Vec::new();
     violations.extend(crate::token_constraint_error(
@@ -102,17 +143,17 @@ fn member_violations(request: &ExecuteTransactionRequest) -> Vec<String> {
     ));
     if request.transact_statements.is_empty() {
         violations.push(
-            "Value at 'transactStatements' failed to satisfy constraint: Member must have \
-             length greater than or equal to 1"
+            "Value '[]' at 'transactStatements' failed to satisfy constraint: Member must \
+             have length greater than or equal to 1"
                 .to_string(),
         );
     }
     if request.transact_statements.len() > 100 {
-        violations.push(
-            "Value at 'transactStatements' failed to satisfy constraint: Member must have \
-             length less than or equal to 100"
-                .to_string(),
-        );
+        violations.push(format!(
+            "Value '{}' at 'transactStatements' failed to satisfy constraint: Member must \
+             have length less than or equal to 100",
+            statements_echo(&request.transact_statements)
+        ));
     }
     for (i, statement) in request.transact_statements.iter().enumerate() {
         let member = format!("transactStatements.{}.member", i + 1);

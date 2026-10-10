@@ -612,15 +612,6 @@ impl std::fmt::Write for BoundedEcho {
     }
 }
 
-/// A list's `Debug` form wrapped in brackets, as the transaction operations
-/// echo an action list longer than 100, bounded by [`ECHO_LIMIT`] like the
-/// other echoes. Under the limit it is the text `format!("[{value:?}]")` gives.
-pub(crate) fn bounded_listing<T: std::fmt::Debug + ?Sized>(value: &T) -> String {
-    let mut out = BoundedEcho::new();
-    let _ = std::fmt::Write::write_fmt(&mut out, format_args!("[{value:?}]"));
-    out.finish()
-}
-
 /// Cut an echo already built to [`ECHO_LIMIT`], for an echo that is no larger
 /// than the request it comes from.
 pub(crate) fn bound_echo(echo: String) -> String {
@@ -633,9 +624,9 @@ pub(crate) fn bound_echo(echo: String) -> String {
 /// request object's Java `toString`, which names every field of every value.
 /// Eleven of twelve regions printed it this way on 2026-10-09; the other, and
 /// eu-west-2 on other days, print each attribute value as an object hash, so no
-/// echo matches every region byte for byte. Tables and attributes are in order
-/// of name, where DynamoDB's own order is its map's. Bounded by
-/// [`ECHO_LIMIT`].
+/// echo matches every region byte for byte. Tables are in order of name, where
+/// DynamoDB's own order is its map's; attributes follow the Java map's order.
+/// Bounded by [`ECHO_LIMIT`].
 fn request_items_echo(request_items: &HashMap<String, Vec<WriteRequest>>) -> String {
     let mut out = BoundedEcho::new();
     let _ = write_request_items(&mut out, request_items);
@@ -687,26 +678,81 @@ fn write_write_request(out: &mut dyn std::fmt::Write, request: &WriteRequest) ->
     out.write_str(")")
 }
 
-fn write_java_item(
+/// A map's names in the order the Java model prints them: a hash map's
+/// iteration order, sixteen buckets doubling whenever more than three quarters
+/// full (captured us-east-1, eu-west-1 and us-west-2, 2026-10-10, on a
+/// transaction's item). Names sharing a bucket would keep the order they were
+/// sent in, which a decoded map no longer holds; they are taken in order of
+/// name. A map's names are distinct already, so they are sorted once rather
+/// than run through [`crate::validation::java_hash_order`]'s deduplication,
+/// which is quadratic in their number.
+fn java_map_order<'a, I: Iterator<Item = &'a String>>(names: I) -> Vec<&'a str> {
+    let mut names: Vec<&str> = names.map(String::as_str).collect();
+    let mut capacity = 16usize;
+    while names.len() * 4 > capacity * 3 {
+        capacity *= 2;
+    }
+    names.sort_by_cached_key(|name| (crate::validation::java_hash_bucket(name, capacity), *name));
+    names
+}
+
+/// An attribute map, `{name=AttributeValue(...), ...}`, in the Java model's
+/// order.
+pub(crate) fn write_java_item(
     out: &mut dyn std::fmt::Write,
     item: &HashMap<String, AttributeValue>,
 ) -> std::fmt::Result {
-    let mut attributes: Vec<(&String, &AttributeValue)> = item.iter().collect();
-    attributes.sort_by(|a, b| a.0.cmp(b.0));
     out.write_str("{")?;
-    for (i, (name, value)) in attributes.into_iter().enumerate() {
+    for (i, name) in java_map_order(item.keys()).into_iter().enumerate() {
         if i > 0 {
             out.write_str(", ")?;
         }
         write!(out, "{name}=")?;
-        write_java_attribute_value(out, value)?;
+        write_java_attribute_value(out, &item[name])?;
     }
     out.write_str("}")
 }
 
+/// `ExpressionAttributeNames` as the Java model prints it, `{#n=a}`, or `null`.
+pub(crate) fn write_java_names(
+    out: &mut dyn std::fmt::Write,
+    names: Option<&HashMap<String, String>>,
+) -> std::fmt::Result {
+    let Some(names) = names else {
+        return out.write_str("null");
+    };
+    out.write_str("{")?;
+    for (i, name) in java_map_order(names.keys()).into_iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        write!(out, "{name}={}", names[name])?;
+    }
+    out.write_str("}")
+}
+
+/// An optional attribute map, such as `ExpressionAttributeValues`, or `null`.
+pub(crate) fn write_java_values(
+    out: &mut dyn std::fmt::Write,
+    values: Option<&HashMap<String, AttributeValue>>,
+) -> std::fmt::Result {
+    match values {
+        Some(values) => write_java_item(out, values),
+        None => out.write_str("null"),
+    }
+}
+
+/// An optional string member as the Java model prints it: the text, or `null`.
+pub(crate) fn write_java_text(
+    out: &mut dyn std::fmt::Write,
+    text: Option<&str>,
+) -> std::fmt::Result {
+    out.write_str(text.unwrap_or("null"))
+}
+
 /// One attribute value with all sixteen of the Java model's fields, the one in
-/// use filled in. Only the string form has been captured; the others follow the
-/// same model, with binary shown as Java prints a `ByteBuffer`.
+/// use filled in, binary shown as Java prints a `ByteBuffer` (every type
+/// captured us-east-1, eu-west-1 and us-west-2, 2026-10-10).
 pub(crate) fn write_java_attribute_value(
     out: &mut dyn std::fmt::Write,
     value: &AttributeValue,

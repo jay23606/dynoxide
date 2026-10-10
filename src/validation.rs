@@ -669,22 +669,23 @@ pub(crate) fn java_hash_order<'a>(names: &[&'a str], sized_to_count: bool) -> Ve
             capacity *= 2;
         }
     }
-    let java_hash = |name: &str| {
-        name.encode_utf16().fold(0u32, |h, unit| {
-            h.wrapping_mul(31).wrapping_add(u32::from(unit))
-        })
-    };
-    let bucket = |name: &str| {
-        let h = java_hash(name);
-        ((h ^ (h >> 16)) as usize) & (capacity - 1)
-    };
     let mut ordered: Vec<(usize, usize, &str)> = unique
         .iter()
         .enumerate()
-        .map(|(added, name)| (bucket(name), added, *name))
+        .map(|(added, name)| (java_hash_bucket(name, capacity), added, *name))
         .collect();
     ordered.sort_unstable();
     ordered.into_iter().map(|(_, _, name)| name).collect()
+}
+
+/// The bucket a name lands in in a Java hash table of `capacity` buckets (a
+/// power of two): `(h ^ (h >>> 16)) & (capacity - 1)` of its
+/// `String.hashCode()` `h`.
+pub(crate) fn java_hash_bucket(name: &str, capacity: usize) -> usize {
+    let h = name.encode_utf16().fold(0u32, |h, unit| {
+        h.wrapping_mul(31).wrapping_add(u32::from(unit))
+    });
+    ((h ^ (h >> 16)) as usize) & (capacity - 1)
 }
 
 /// The error for an index whose key schema names an attribute the request

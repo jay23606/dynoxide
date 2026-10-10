@@ -335,20 +335,31 @@ fn a_transactions_statement_count_is_listed_with_its_other_members() {
     assert_eq!(
         outcome(json!({"TransactStatements": [], "ClientRequestToken": token})),
         Err(format!(
-            "2 validation errors detected: {token_error}; Value at 'transactStatements' \
+            "2 validation errors detected: {token_error}; Value '[]' at 'transactStatements' \
              failed to satisfy constraint: Member must have length greater than or equal to 1"
         ))
     );
 
+    // The list is echoed in the Java form `tests/transaction_list_echoes.rs`
+    // pins against DynamoDB's own text.
+    let short = r#"SELECT * FROM "Members" WHERE pk = 'a'"#;
     let long = select_of_length(9_000);
-    let mut statements =
-        vec![json!({"Statement": r#"SELECT * FROM "Members" WHERE pk = 'a'"#}); 100];
+    let mut statements = vec![json!({"Statement": short}); 100];
     statements.push(json!({"Statement": long}));
+    let java = |statement: &str| {
+        format!(
+            "ParameterizedStatement(statement={statement}, parameters=null, \
+             returnValuesOnConditionCheckFailure=null)"
+        )
+    };
+    let mut echo = vec![java(short); 100];
+    echo.push(java(&long));
     assert_eq!(
         outcome(json!({"TransactStatements": statements})),
         Err(format!(
-            "2 validation errors detected: Value at 'transactStatements' failed to satisfy \
-             constraint: Member must have length less than or equal to 100; {}",
+            "2 validation errors detected: Value '[{}]' at 'transactStatements' failed to \
+             satisfy constraint: Member must have length less than or equal to 100; {}",
+            echo.join(", "),
             too_long(&long, "transactStatements.101.member.statement")
         ))
     );

@@ -191,7 +191,7 @@ fn a_transaction_write_listing_is_bounded() {
         .unwrap_err();
     let message = message(err);
     assert!(
-        message.starts_with("1 validation error detected: Value '[["),
+        message.starts_with("1 validation error detected: Value '[TransactWriteItem("),
         "unexpected message start: {}",
         &message[..message.len().min(200)]
     );
@@ -220,7 +220,7 @@ fn a_transaction_get_listing_is_bounded() {
         .unwrap_err();
     let message = message(err);
     assert!(
-        message.starts_with("1 validation error detected: Value '[["),
+        message.starts_with("1 validation error detected: Value '[TransactGetItem("),
         "unexpected message start: {}",
         &message[..message.len().min(200)]
     );
