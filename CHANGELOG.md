@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`aws-smithy-json` moves to 0.63.1** for GHSA-8ffr-xgwf-xj56. It reaches the
+  tree only through the AWS SDK the tests and the benchmarks use, never in a
+  released artefact, and the advisory covers smithy-rs generated servers,
+  which Dynoxide isn't. The fixed release needs a newer Rust than the crate's
+  1.88, so the test suite now needs Rust 1.94.1 or later. The crate, and every
+  build of it, still compiles on 1.88.
+
 ### Behaviour changes
 
 - A PartiQL `NextToken` is bound to its statement the way DynamoDB binds it:
