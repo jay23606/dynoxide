@@ -571,6 +571,11 @@ pub(crate) fn replay_response(
 /// None, ConditionalCheckFailed]`, `[ConditionalCheckFailed, DuplicateItem]`),
 /// so every statement runs even after one has failed. The SQLite transaction
 /// is rolled back on the error, so nothing any of them wrote is kept.
+///
+/// A failure of the storage itself (a full disk, an I/O error) is the
+/// exception: it stops the transaction there and is returned as it is. SQLite
+/// may already have rolled the whole transaction back for it, and a statement
+/// run after that would commit on its own.
 async fn execute_within_transaction<S: StorageBackend>(
     storage: &S,
     parsed: &[(partiql::parser::Statement, Vec<AttributeValue>)],
@@ -690,9 +695,12 @@ async fn execute_within_transaction<S: StorageBackend>(
                 });
             }
             Err(e) => {
+                let Some(code) = outcome_code(&e) else {
+                    return Err(e);
+                };
                 failed = true;
                 responses.push(ItemResponse { item: None });
-                cancellation_reasons.push(failure_reason(e));
+                cancellation_reasons.push(failure_reason(code, e));
             }
         }
     }
@@ -712,29 +720,37 @@ fn no_reason() -> CancellationReason {
     }
 }
 
-/// The reason a failed statement is given, with the item its condition was
-/// evaluated against when it asked for it.
-fn failure_reason(e: DynoxideError) -> CancellationReason {
-    let message = Some(e.to_string());
-    let (code, item) = match e {
-        DynoxideError::ConditionalCheckFailedException(_, item) => {
-            ("ConditionalCheckFailed".to_string(), item)
-        }
-        DynoxideError::DuplicateItemException(_) => ("DuplicateItem".to_string(), None),
+/// The cancellation code for a statement that failed, or `None` when the
+/// error is not the statement's outcome but a failure of the storage under it,
+/// which stops the transaction instead.
+fn outcome_code(e: &DynoxideError) -> Option<&'static str> {
+    match e {
+        DynoxideError::ConditionalCheckFailedException(..) => Some("ConditionalCheckFailed"),
+        DynoxideError::DuplicateItemException(_) => Some("DuplicateItem"),
         // A statement against a table that does not exist cancels the
         // transaction with this reason (captured eu-west-2 and us-east-1,
         // 2026-10-09).
-        DynoxideError::ResourceNotFoundException(_) => ("ResourceNotFound".to_string(), None),
+        DynoxideError::ResourceNotFoundException(_) => Some("ResourceNotFound"),
         // Group KeyEmptyValueValidation with ValidationException so an
-        // empty-value key keeps the "ValidationError" reason instead of
-        // falling through to InternalError (#95).
+        // empty-value key keeps the "ValidationError" reason (#95).
         DynoxideError::ValidationException(_) | DynoxideError::KeyEmptyValueValidation(_) => {
-            ("ValidationError".to_string(), None)
+            Some("ValidationError")
         }
-        _ => ("InternalError".to_string(), None),
+        _ => None,
+    }
+}
+
+/// The reason a failed statement is given, under the code
+/// [`outcome_code`] found for it, with the item its condition was evaluated
+/// against when it asked for it.
+fn failure_reason(code: &str, e: DynoxideError) -> CancellationReason {
+    let message = Some(e.to_string());
+    let item = match e {
+        DynoxideError::ConditionalCheckFailedException(_, item) => item,
+        _ => None,
     };
     CancellationReason {
-        code,
+        code: code.to_string(),
         message,
         item,
     }

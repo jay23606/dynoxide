@@ -1931,6 +1931,11 @@ mod tests {
 #[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
 mod ttl_sweep_tests;
 
+/// Transactions that SQLite fails part way through, on a database that can't
+/// grow.
+#[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
+mod transaction_storage_error_tests;
+
 /// Cache primitives and the asynchronous driver.
 ///
 /// These are private, so they are exercised here rather than from an

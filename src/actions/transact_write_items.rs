@@ -607,6 +607,13 @@ pub(crate) fn replay_response(cached: &CachedWrite, mode: &Option<String>) -> Ca
 ///
 /// The records are only meaningful when the whole transaction commits; a
 /// cancellation returns an error and reports no capacity at all.
+///
+/// Every action runs even after one has failed, so the cancellation gives a
+/// reason for each. A failure of the storage itself (a full disk, an I/O
+/// error, anything not reported as a failed condition or a validation error)
+/// stops the transaction there and is returned as it is: SQLite may already
+/// have rolled the whole transaction back for it, and an action run after
+/// that would commit on its own.
 async fn execute_within_transaction<S: StorageBackend>(
     storage: &S,
     items: &[TransactWriteItem],
@@ -634,15 +641,15 @@ async fn execute_within_transaction<S: StorageBackend>(
                 if matches!(e, DynoxideError::KeyEmptyValueValidation(_)) {
                     return Err(e);
                 }
-                has_failure = true;
                 let message = Some(e.to_string());
                 let (code, item) = match e {
                     DynoxideError::ConditionalCheckFailedException(_, item) => {
                         ("ConditionalCheckFailed".to_string(), item)
                     }
                     DynoxideError::ValidationException(_) => ("ValidationError".to_string(), None),
-                    _ => ("InternalError".to_string(), None),
+                    storage_failure => return Err(storage_failure),
                 };
+                has_failure = true;
                 cancellation_reasons.push(CancellationReason {
                     code,
                     message,

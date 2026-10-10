@@ -128,6 +128,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing when the transaction commits, as before, and is reported as a failed
   condition, with no item, when the transaction is cancelled. Captured against
   eu-west-2 and us-east-1.
+- A `TransactWriteItems` that SQLite failed part way through, on a full disk
+  or an I/O error, could keep the actions that came after the failure. SQLite
+  rolls the whole transaction back on such an error, so each later action
+  committed on its own and the transaction's own rollback then failed. A
+  storage failure now stops the transaction where it happens and is returned
+  as an internal error, so nothing the transaction wrote is kept.
+  `ExecuteTransaction` does the same.
 
 - Restoring a snapshot taken by an earlier version brings it up to date as
   opening the file would, running the schema migrations its recorded version
