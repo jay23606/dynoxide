@@ -2658,13 +2658,24 @@ impl ConditionFunction {
                     BoolExpr::Or(both)
                 })
             }
-            _ => Err("Comparing a condition function with a parameter is not supported".into()),
+            _ => Err(CONDITION_FUNCTION_COMPARED.into()),
         }
     }
 
-    /// The call in a list: true when the list holds the boolean it is.
-    fn listed(&self, values: &[PartiqlValue]) -> Result<BoolExpr, String> {
-        let has = |b: bool| values.contains(&PartiqlValue::Literal(AttributeValue::BOOL(b)));
+    /// The call in a list: true when the list holds the boolean it is. A
+    /// member that is a path or a size is refused as a comparison with one is.
+    fn listed(&self, members: &[Operand]) -> Result<BoolExpr, String> {
+        if members
+            .iter()
+            .any(|m| matches!(m, Operand::Path(_) | Operand::Size(_)))
+        {
+            return Err(CONDITION_FUNCTION_COMPARED.into());
+        }
+        let has = |b: bool| {
+            members.contains(&Operand::Value(PartiqlValue::Literal(
+                AttributeValue::BOOL(b),
+            )))
+        };
         let both = vec![self.condition(true)?, self.condition(false)?];
         Ok(match (has(true), has(false)) {
             (true, true) => BoolExpr::Or(both),
@@ -2674,6 +2685,13 @@ impl ConditionFunction {
         })
     }
 }
+
+/// Dynoxide's refusal of a condition function compared with, or listed
+/// beside, a path, a size or a parameter: it evaluates the call as a boolean
+/// at parse time, so it can't compare it with a value read from the item or
+/// bound later. DynamoDB's answer for these shapes is uncaptured.
+const CONDITION_FUNCTION_COMPARED: &str =
+    "Comparing a condition function with a path or a parameter is not supported";
 
 /// DynamoDB's refusal of a boolean as the operand of `op`.
 fn bool_operand_refusal(op: &str) -> String {
@@ -2799,10 +2817,12 @@ fn condition_function_tail(
         parse_bound(t, depth)?;
         return Ok(refused_condition());
     }
+    // Members read as any IN's do, so a bare name is an attribute rather than
+    // a string. Inferred, not captured for a condition function's list.
     if is_keyword(&next, "IN") {
         t.next_token()?;
-        let values = parse_in_list(t, depth, parse_bound)?;
-        return function.listed(&values);
+        let members = parse_in_list(t, depth, parse_bound_operand)?;
+        return function.listed(&members);
     }
     function.condition(true)
 }

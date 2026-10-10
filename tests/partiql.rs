@@ -2176,6 +2176,66 @@ fn test_batch_execute_unparseable_does_not_mask_the_top_level_checks() {
     );
 }
 
+/// A member whose parameter DynamoDB can't store (here an empty string set)
+/// fails on its own and takes no part in the batch's read/write
+/// classification or duplicate detection, as the captured deep and empty-name
+/// parameters don't. Inferred, not captured: no capture holds an unstorable
+/// parameter value beside a read or beside a second statement on its item.
+#[test]
+fn test_batch_member_with_an_unstorable_parameter_drops_out_of_the_batch_checks() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    let with_parameters = |statement: &str, parameters: Vec<AttributeValue>| {
+        let mut req = batch_stmt(statement.to_string());
+        req.parameters = Some(parameters);
+        req
+    };
+    let empty_set = || vec![AttributeValue::SS(vec![])];
+
+    // A write with a bad value beside a read: not refused as mixed.
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                batch_stmt("SELECT * FROM \"Users\" WHERE pk = 'a'".to_string()),
+                with_parameters(
+                    "INSERT INTO \"Users\" VALUE {'pk': 'b', 's': ?}",
+                    empty_set(),
+                ),
+            ],
+        })
+        .expect("the member with the bad value fails on its own");
+    assert_eq!(resp.responses.len(), 2);
+    assert!(resp.responses[0].error.is_none(), "the read still runs");
+    assert_eq!(
+        resp.responses[1].error.as_ref().map(|e| e.code.as_str()),
+        Some("ValidationError")
+    );
+
+    // Two updates of one item, one with a bad value: not refused as
+    // duplicates, and the other one runs.
+    db.execute_statement(ExecuteStatementRequest {
+        statement: "INSERT INTO \"Users\" VALUE {'pk': 'same'}".to_string(),
+        ..Default::default()
+    })
+    .expect("the item to update is inserted");
+    let resp = db
+        .batch_execute_statement(BatchExecuteStatementRequest {
+            return_consumed_capacity: None,
+            statements: vec![
+                with_parameters("UPDATE \"Users\" SET s = ? WHERE pk = 'same'", empty_set()),
+                batch_stmt("UPDATE \"Users\" SET name = 'x' WHERE pk = 'same'".to_string()),
+            ],
+        })
+        .expect("the member with the bad value fails on its own");
+    assert_eq!(resp.responses.len(), 2);
+    assert_eq!(
+        resp.responses[0].error.as_ref().map(|e| e.code.as_str()),
+        Some("ValidationError")
+    );
+    assert!(resp.responses[1].error.is_none(), "the other update runs");
+}
+
 #[test]
 fn test_batch_execute_rejects_duplicate_item_keys() {
     // Captured against real DynamoDB: two statements against one item are

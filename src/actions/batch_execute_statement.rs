@@ -526,7 +526,11 @@ struct Prepared {
 /// COUNT projection (refused before parsing with the bare message captured on
 /// ExecuteStatement) and an empty attribute name in a parameter. Each is
 /// reported against that member while the rest run (captured eu-west-2 and
-/// us-east-1, 2026-10-09, and the empty name in ten regions).
+/// us-east-1, 2026-10-09, and the empty name in ten regions). That an
+/// unstorable value drops the member out of the read/write and duplicate
+/// checks is inferred, not captured. For a COUNT projection the exclusion
+/// changes nothing: COUNT doesn't parse, so the member was already outside both
+/// checks.
 fn own_refusal(stmt_req: &BatchStatementRequest) -> Option<String> {
     if let Some(rejection) = &stmt_req.parameter_rejection {
         return Some(rejection.clone());

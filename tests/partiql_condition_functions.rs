@@ -184,6 +184,32 @@ fn a_condition_function_compares_with_a_boolean() {
     }
 }
 
+/// A condition function's IN list reads its members as every other IN list
+/// does: a bare name is an attribute, not a string. Dynoxide can't compare the
+/// call with a value read from the item, so it refuses that, as it refuses
+/// `attribute_exists(ss) = b`, rather than comparing with the string `'b'`.
+/// Inferred, not captured: DynamoDB's answer for a path in the list is
+/// unknown. A boolean member works as before.
+#[test]
+fn a_condition_functions_in_list_reads_names_as_attributes() {
+    let db = db();
+    let statement = "SELECT pk FROM \"Things\" WHERE pk = 'a1' AND attribute_exists(ss) IN [b]";
+    let message = refusal(&db, statement, None);
+    assert!(
+        message
+            .contains("Comparing a condition function with a path or a parameter is not supported"),
+        "{message}"
+    );
+    for (condition, expected) in [
+        ("attribute_exists(ss) IN [true]", "a1"),
+        ("attribute_exists(ss) IN [false]", ""),
+        ("attribute_exists(nope) IN [false, 1]", "a1"),
+    ] {
+        let statement = format!("SELECT pk FROM \"Things\" WHERE pk = 'a1' AND {condition}");
+        assert_eq!(pks(&db, &statement), expected, "{statement}");
+    }
+}
+
 #[test]
 fn a_condition_function_is_a_write_condition() {
     let db = db();

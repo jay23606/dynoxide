@@ -3,9 +3,10 @@
 //! Captured eu-west-2 and us-east-1, 2026-10-10, on a table keyed `pk` alone
 //! holding three items of about 30,000 bytes: `WHERE pk IN ['a']` returns item
 //! a for 4 read units through ExecuteStatement and BatchExecuteStatement and 16
-//! through ExecuteTransaction, the same as `pk = 'a'`, where a scan of the
-//! three items costs 11 and 44. Two statements naming item a, by `IN ['a']`
-//! twice or by `=` and `IN`, are duplicates in a batch and a transaction.
+//! through ExecuteTransaction, the same as `pk = 'a'`. Dynoxide scanned the
+//! three items before this change, for 11 and 44 units (Dynoxide's own figures,
+//! not captured). Two statements naming item a, by `IN ['a']` twice or by `=`
+//! and `IN`, are duplicates in a batch and a transaction.
 
 use dynoxide::Database;
 use dynoxide::errors::DynoxideError;
@@ -101,9 +102,11 @@ fn a_one_value_in_on_the_partition_key_is_read_like_an_equality() {
 
 #[test]
 fn a_one_value_in_on_the_sort_key_costs_what_an_equality_costs() {
-    // Captured 2026-10-10: on a table keyed pk and sk, `pk = 'a' AND sk IN
-    // ['1']` costs the same units as `pk = 'a' AND sk = '1'`. Here partition a
-    // holds three large items, so reading the whole partition would cost more.
+    // On a table keyed pk and sk, `pk = 'a' AND sk IN ['1']` costs the same
+    // units as `pk = 'a' AND sk = '1'`. Captured 2026-10-10 through
+    // BatchExecuteStatement and ExecuteTransaction only; the ExecuteStatement
+    // charge measured here is inferred from those. Here partition a holds three
+    // large items, so reading the whole partition would cost more.
     let db = Database::memory().unwrap();
     db.create_table(
         serde_json::from_value(serde_json::json!({

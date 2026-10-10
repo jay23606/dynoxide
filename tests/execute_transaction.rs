@@ -995,7 +995,7 @@ fn test_duplicate_check_takes_the_key_an_update_writes() {
                 statement: format!("INSERT INTO \"OrGroup\" VALUE {item}"),
                 ..Default::default()
             })
-            .ok();
+            .unwrap_or_else(|e| panic!("seeding {item}: {e}"));
         }
     };
     seed(&db);

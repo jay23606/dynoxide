@@ -337,7 +337,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <line>:<column>:<length>` before the table is looked up; `EXISTS(path)` used
   to run as `attribute_exists`. An OR with no key condition under it no longer
   counts as a second key range for the overlap check, so `pk = 'a' AND (x = 1
-  OR x = 2)` runs.
+  OR x = 2)` runs. A condition function's IN list reads a bare name as an
+  attribute, as every other IN list does, and a condition function compared
+  with or listed beside an attribute is refused as unsupported rather than
+  compared with the string of its name (inferred, not captured).
 - PartiQL's `set_add` and `set_delete` work in an UPDATE's SET clause, as in
   DynamoDB, where they used to fail with `Unexpected token after expression`.
   A malformed call is refused with DynamoDB's message and position before the

@@ -736,6 +736,16 @@ fn size_takes_a_numbers_type_checks() {
          bound; lower bound operand: AttributeValue: {N:10}, upper bound operand: \
          AttributeValue: {N:1}"
     );
+    // Inferred, not captured: a NOT in front of either is checked as the
+    // condition without it, as other conditions with no negated form of their
+    // own are. No capture holds a refused negated size.
+    assert_eq!(where_refusal(&db, "NOT size(s) < true"), operand("<"));
+    assert_eq!(
+        where_refusal(&db, "NOT (size(s) BETWEEN 10 AND 1)"),
+        "The BETWEEN operator requires upper bound to be greater than or equal to lower \
+         bound; lower bound operand: AttributeValue: {N:10}, upper bound operand: \
+         AttributeValue: {N:1}"
+    );
 
     assert_eq!(keys_where(&db, "size(s) = true"), NONE);
     assert_eq!(keys_where(&db, "size(s) < 'x'"), NONE);

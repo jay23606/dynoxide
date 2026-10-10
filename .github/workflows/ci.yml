@@ -48,6 +48,26 @@ jobs:
       - name: Test
         run: cargo test ${{ matrix.flags }}
 
+  # serde_json keeps an object's keys in insertion order when any crate in a
+  # build turns on its preserve_order feature, and a HashMap's insertion order
+  # differs between two maps holding the same entries. The idempotency hash
+  # and the PartiQL NextToken fingerprint sort keys themselves so they don't
+  # depend on that. Their tests can only fail with the feature on, so they run
+  # here with it.
+  map-key-order:
+    name: Map key order (serde_json preserve_order)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Hashes ignore map key order
+        run: >-
+          cargo test --lib --features serde_json/preserve_order --
+          a_request_hash_ignores_map_key_order
+          a_map_parameter_fingerprints_alike_whatever_its_key_order
+
   # The listener bind path is platform-specific (SO_REUSEADDR on Unix,
   # SO_EXCLUSIVEADDRUSE on Windows), so the unit tests need a Windows run;
   # test-build.yml only builds there.

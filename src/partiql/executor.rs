@@ -1249,7 +1249,8 @@ fn validate_operand_types(
                 check_attribute_type_parameter(kind, parameters, reject)?;
             }
             // A condition with no negated form of its own is checked as it
-            // would be without the NOT.
+            // would be without the NOT. Inferred, not captured: no capture
+            // holds a refused negated size or BETWEEN.
             WhereCondition::Not(inner) => check(inner, parameters)?,
             // `begins_with` takes a string or binary operand (captured
             // eu-west-2 and us-east-1, 2026-10-09).
@@ -2409,8 +2410,10 @@ fn translate_sk_conditions(
                     prefix,
                 ));
             }
-            // An IN with one value is read as `=`, as DynamoDB reads it
-            // (captured eu-west-2 and us-east-1, 2026-10-10).
+            // An IN with one value is read as `=`, as DynamoDB reads it.
+            // Captured eu-west-2 and us-east-1, 2026-10-10, for the sort key
+            // through BatchExecuteStatement and ExecuteTransaction; the
+            // ExecuteStatement charge is inferred from those.
             WhereCondition::In(path, values) if path == sk_name && values.len() == 1 => {
                 let value = resolve_value(&values[0], parameters).ok()?;
                 value.to_key_string()?;
@@ -2447,9 +2450,9 @@ fn translate_sk_conditions(
 /// query and a scan and so whether an unprojected filter attribute is rejected.
 ///
 /// Broader than `find_pk_condition` on one axis and identical on the other. An
-/// `IN` on the index partition key counts, even though the read cannot push it
-/// down as a single key and still scans; AWS rejects an unprojected filter
-/// alongside it. An index key reached through OR does not count, and AWS
+/// `IN` on the index partition key counts: one value reads as `=` and queries
+/// the index, while several can't be pushed down as a single key and still
+/// scan; AWS rejects an unprojected filter alongside either. An index key reached through OR does not count, and AWS
 /// accepts an unprojected filter there. Captured eu-west-2 2026-08-15.
 ///
 /// "Reached through OR" is the presence of an alternation, not the absence of
@@ -3277,7 +3280,6 @@ fn find_comparison<'a>(
     })
 }
 
-/// Resolve a PartiqlValue to a concrete AttributeValue.
 /// Whether `value` starts with `prefix`: a string by its characters, a binary
 /// value by its bytes. Values of different types never match, so a binary
 /// prefix doesn't match a string that spells the same bytes (captured
@@ -3290,6 +3292,7 @@ fn begins_with(value: &AttributeValue, prefix: &AttributeValue) -> bool {
     }
 }
 
+/// Resolve a PartiqlValue to a concrete AttributeValue.
 fn resolve_value(val: &PartiqlValue, parameters: &[AttributeValue]) -> Result<AttributeValue> {
     match val {
         PartiqlValue::Literal(av) => Ok(av.clone()),
