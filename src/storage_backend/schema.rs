@@ -27,9 +27,9 @@ pub struct OpenMigrations {
     pub rebuild_multi_attribute_gsis: bool,
     /// Recompute the stored item sizes of every table with a vector index.
     pub recompute_vector_sizes: bool,
-    /// The database was written by a newer build than this one. Nothing is
-    /// migrated; an open that should refuse such a file checks this.
-    pub newer_than_this_build: bool,
+    /// The version a newer build than this one recorded, when one did.
+    /// Nothing is migrated, and the open refuses the file.
+    pub newer_than_this_build: Option<u32>,
 }
 
 /// The open-time migrations a database recorded at `recorded` needs.
@@ -43,14 +43,34 @@ pub fn open_migrations(recorded: Option<u32>) -> OpenMigrations {
         None => OpenMigrations {
             rebuild_multi_attribute_gsis: true,
             recompute_vector_sizes: true,
-            newer_than_this_build: false,
+            newer_than_this_build: None,
         },
         Some(version) => OpenMigrations {
             rebuild_multi_attribute_gsis: version < MULTI_ATTRIBUTE_KEYS,
             recompute_vector_sizes: version < VECTOR_BILLED_SIZES,
-            newer_than_this_build: version > SCHEMA_VERSION,
+            newer_than_this_build: (version > SCHEMA_VERSION).then_some(version),
         },
     }
+}
+
+/// Refuse a database a newer build wrote: one whose recorded version is past
+/// [`SCHEMA_VERSION`]. This build can't know what that build changed, so it
+/// neither reads nor migrates such a file. Both backends check this before an
+/// open writes anything, so a refused file is left as it was found.
+pub fn refuse_newer(recorded: Option<u32>) -> Result<(), String> {
+    match recorded {
+        Some(version) if version > SCHEMA_VERSION => Err(newer_than_this_build(version)),
+        _ => Ok(()),
+    }
+}
+
+/// What an open says of a database a newer build wrote at `version`.
+pub fn newer_than_this_build(version: u32) -> String {
+    format!(
+        "this database was written by a newer version of Dynoxide (schema version \
+         {version}; this build reads up to schema version {SCHEMA_VERSION}). Upgrade \
+         Dynoxide to open it. The file has not been changed."
+    )
 }
 
 /// Read a recorded schema version. A value that isn't a number reads as no
@@ -66,7 +86,7 @@ mod tests {
     const BOTH: OpenMigrations = OpenMigrations {
         rebuild_multi_attribute_gsis: true,
         recompute_vector_sizes: true,
-        newer_than_this_build: false,
+        newer_than_this_build: None,
     };
 
     #[test]
@@ -88,7 +108,7 @@ mod tests {
             OpenMigrations {
                 rebuild_multi_attribute_gsis: false,
                 recompute_vector_sizes: true,
-                newer_than_this_build: false,
+                newer_than_this_build: None,
             }
         );
     }
@@ -100,7 +120,7 @@ mod tests {
             OpenMigrations {
                 rebuild_multi_attribute_gsis: false,
                 recompute_vector_sizes: false,
-                newer_than_this_build: false,
+                newer_than_this_build: None,
             }
         );
     }
@@ -112,8 +132,25 @@ mod tests {
             OpenMigrations {
                 rebuild_multi_attribute_gsis: false,
                 recompute_vector_sizes: false,
-                newer_than_this_build: true,
+                newer_than_this_build: Some(SCHEMA_VERSION + 1),
             }
+        );
+    }
+
+    #[test]
+    fn only_a_version_past_this_one_is_refused() {
+        for recorded in [None, Some(1), Some(SCHEMA_VERSION)] {
+            assert_eq!(refuse_newer(recorded), Ok(()), "{recorded:?}");
+        }
+        let message = refuse_newer(Some(SCHEMA_VERSION + 1)).unwrap_err();
+        assert_eq!(
+            message,
+            format!(
+                "this database was written by a newer version of Dynoxide (schema version \
+                 {}; this build reads up to schema version {SCHEMA_VERSION}). Upgrade \
+                 Dynoxide to open it. The file has not been changed.",
+                SCHEMA_VERSION + 1
+            )
         );
     }
 

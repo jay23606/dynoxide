@@ -129,6 +129,9 @@ impl WasmBridgeBackend {
             .ok()
             .and_then(|v| v.as_string())
             .unwrap_or_else(|| "unknown".to_string());
+        // A database a newer build wrote is refused before anything here
+        // writes to it, so it is left as it was found.
+        refuse_newer_schema(&handle).await?;
         // Bootstrap the same metadata/config/stream schema the native backend
         // creates in `initialize`. `INIT_SCHEMA` is a multi-statement batch;
         // the bridge runs each statement in turn.
@@ -313,6 +316,36 @@ impl WasmBridgeBackend {
         self.exec(&sql, params).await?;
         Ok(old_item)
     }
+}
+
+/// Refuse a database a newer build wrote, reading it and nothing more (see
+/// `schema::refuse_newer`). A database with no `_config` table yet records no
+/// version.
+async fn refuse_newer_schema(handle: &JsValue) -> Result<(), BackendError> {
+    let config: js_sys::Array = bridge_query(
+        handle,
+        sql_builders::TABLE_EXISTS,
+        params_to_js(&[SqlParam::text("_config")]),
+    )
+    .await
+    .map_err(js_err)?
+    .unchecked_into();
+    if config.length() == 0 || col_i64(&config.get(0).unchecked_into(), 0) != 1 {
+        return Ok(());
+    }
+    let rows = bridge_query(
+        handle,
+        sql_builders::GET_SCHEMA_VERSION,
+        js_sys::Array::new(),
+    )
+    .await
+    .map_err(js_err)?;
+    let value = js_sys::Array::from(&rows)
+        .iter()
+        .next()
+        .and_then(|row| col_text(&js_sys::Array::from(&row), 0));
+    super::schema::refuse_newer(super::schema::parse_recorded(value.as_deref()))
+        .map_err(BackendError::Other)
 }
 
 // --- JS <-> SqlParam conversion and row readers -------------------------

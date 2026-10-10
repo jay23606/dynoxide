@@ -157,6 +157,12 @@ pub fn set_schema_version(version: u32) -> (String, Vec<SqlParam<'static>>) {
 /// The recorded schema version, if any.
 pub const GET_SCHEMA_VERSION: &str = "SELECT value FROM _config WHERE key = 'schema_version'";
 
+/// Whether the database holds a table named `?1`, as `0` or `1`. An open asks
+/// before it creates anything: whether there is a `_config` to read a version
+/// from, and whether the database is new.
+pub const TABLE_EXISTS: &str =
+    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)";
+
 /// Idempotent schema bootstrap shared by both backends: the metadata, config,
 /// and stream-record tables at the current schema version. Native
 /// `Storage::initialize` runs this (then layers WAL, custom functions, and

@@ -394,6 +394,9 @@ impl Storage {
 
     /// Initialize the database: WAL mode, metadata tables, config.
     fn initialize(&mut self) -> Result<()> {
+        // Ahead of everything here that writes, the journal mode included, so
+        // a file a newer build wrote is refused as it was found.
+        refuse_newer_schema(&self.conn)?;
         // Enable WAL mode for better concurrency
         self.conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::register_functions(&self.conn)?;
@@ -1787,6 +1790,7 @@ impl Storage {
     /// its own size in memory, and never reaches the disk unencrypted.
     pub fn restore_from_connection(&mut self, source: &Connection) -> Result<()> {
         ensure_snapshot(source)?;
+        refuse_newer_schema(source)?;
         let staged = self.staged_copy(source)?;
         {
             let backup = rusqlite::backup::Backup::new(&staged.conn, &mut self.conn)?;
@@ -2326,18 +2330,38 @@ fn backup_step(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<BackupStep> 
 /// with an empty one.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 fn ensure_snapshot(source: &Connection) -> Result<()> {
-    let has_tables: bool = source.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_tables')",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_tables {
+    if table_exists(source, "_tables")? {
         Ok(())
     } else {
         Err(DynoxideError::ValidationException(
             "not a Dynoxide snapshot: it has no table metadata".to_string(),
         ))
     }
+}
+
+/// Whether the database at `conn` holds a table called `name`.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn.query_row(sql_builders::TABLE_EXISTS, [name], |row| row.get(0))?)
+}
+
+/// Refuse a database a newer build wrote, reading it and nothing more: a
+/// version it records must be one this build knows. An open and a restore
+/// check this before they write anything, so a refused file, or a refused
+/// snapshot and the database it would have replaced, is left as it was.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+fn refuse_newer_schema(conn: &Connection) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    if !table_exists(conn, "_config")? {
+        return Ok(());
+    }
+    let value: Option<String> = conn
+        .query_row(sql_builders::GET_SCHEMA_VERSION, [], |row| row.get(0))
+        .optional()?;
+    crate::storage_backend::schema::refuse_newer(crate::storage_backend::schema::parse_recorded(
+        value.as_deref(),
+    ))
+    .map_err(DynoxideError::InternalServerError)
 }
 
 #[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
@@ -3451,6 +3475,93 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(recorded_version(&Connection::open(&path).unwrap()), "9");
+    }
+
+    /// Record a version one past this build's in the database at `conn`, as a
+    /// newer build would have, and fold the WAL into the file, so the file's
+    /// bytes are the whole database.
+    fn stamp_newer(conn: &Connection) {
+        conn.execute(
+            "UPDATE _config SET value = ?1 WHERE key = 'schema_version'",
+            [(SCHEMA_VERSION + 1).to_string()],
+        )
+        .unwrap();
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+    }
+
+    /// A database at `path` as a newer build would have left it.
+    fn write_newer_database(path: &str) {
+        drop(crate::Database::new(path).unwrap());
+        stamp_newer(&Connection::open(path).unwrap());
+    }
+
+    fn assert_refused_as_newer(err: DynoxideError) {
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            crate::storage_backend::schema::newer_than_this_build(SCHEMA_VERSION + 1)
+        );
+        assert!(
+            message.contains(&format!("schema version {}", SCHEMA_VERSION + 1))
+                && message.contains(&format!("up to schema version {SCHEMA_VERSION}")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_database_a_newer_build_wrote_is_refused_and_left_as_it_was() {
+        let (_dir, path) = v9_snapshot_path();
+        write_newer_database(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        assert_refused_as_newer(Storage::new(&path).map(drop).unwrap_err());
+        assert_refused_as_newer(crate::Database::new(&path).map(drop).unwrap_err());
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            recorded_version(&Connection::open(&path).unwrap()),
+            (SCHEMA_VERSION + 1).to_string()
+        );
+    }
+
+    #[cfg(feature = "_has-encryption")]
+    #[test]
+    fn an_encrypted_database_a_newer_build_wrote_is_refused_and_left_as_it_was() {
+        const KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let (_dir, path) = v9_snapshot_path();
+        drop(crate::Database::new_encrypted(&path, KEY).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "key", format!("x'{KEY}'"))
+                .unwrap();
+            stamp_newer(&conn);
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        assert_refused_as_newer(
+            crate::Database::new_encrypted(&path, KEY)
+                .map(drop)
+                .unwrap_err(),
+        );
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_restore_refuses_a_snapshot_a_newer_build_wrote() {
+        let (_dir, path) = v9_snapshot_path();
+        write_newer_database(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        let mut storage = Storage::memory().unwrap();
+        mark_live(&storage);
+        assert_refused_as_newer(storage.restore_from(&path).unwrap_err());
+        assert!(still_live(&storage), "the database must be left as it was");
+        assert_eq!(recorded_version(storage.conn()), SCHEMA_VERSION.to_string());
+        drop(storage);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]

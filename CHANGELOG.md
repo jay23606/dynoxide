@@ -65,6 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Limit`, the statement, `ReturnConsumedCapacity`, then the parameters.
   Captured against eu-west-2 and us-east-1; this corrects the 1.0.0 entry
   that found the option inert on a batch.
+- Opening a database brings it up to schema version 11, and the upgrade is
+  one way: once 1.3.0 has opened a file, don't open it with an older
+  Dynoxide. Earlier versions don't check the version a file records, so one
+  would open it and could read its multi-attribute indexes and vector table
+  sizes wrongly. Keep a copy or a snapshot of a file you may need to take
+  back. From this release a file written by a newer Dynoxide is refused,
+  with an error naming its schema version and the newest this build reads,
+  and is left unchanged, where it used to be opened as it was. That covers
+  `Database::new`, an encrypted open, the snapshot a restore reads from, and
+  the browser build's database.
 
 ### Added
 

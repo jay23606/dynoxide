@@ -4,13 +4,13 @@
 use std::future::Future;
 
 use super::helpers::with_write_transaction;
-use crate::errors::Result;
+use crate::errors::{DynoxideError, Result};
 use crate::storage_backend::StorageBackend;
 use crate::storage_backend::schema::{self, OpenMigrations};
 
 /// Bring a database an earlier build wrote up to date, as `plan` says: rebuild
 /// its multi-attribute GSIs, then recompute the stored sizes of its vector
-/// tables.
+/// tables. A database a newer build wrote is refused.
 ///
 /// Each step is one write transaction that records the step's version as it
 /// commits, so an open that fails part way leaves the database as the last
@@ -19,6 +19,13 @@ pub(crate) async fn run_open_migrations<S: StorageBackend>(
     storage: &S,
     plan: OpenMigrations,
 ) -> Result<()> {
+    // Both opens refuse such a file before they write to it; this keeps a
+    // caller that skipped that check from running on it.
+    if let Some(version) = plan.newer_than_this_build {
+        return Err(DynoxideError::InternalServerError(
+            schema::newer_than_this_build(version),
+        ));
+    }
     if plan.rebuild_multi_attribute_gsis {
         migrate_step(storage, schema::MULTI_ATTRIBUTE_KEYS, || async {
             super::gsi::rebuild_multi_attribute_gsis(storage)
