@@ -2839,8 +2839,9 @@ fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> 
 }
 
 /// A condition on a path, or one of the other single conditions. The only
-/// wrapped negation it reads is `x NOT IN [...]`, which becomes the tree
-/// `NOT x IN [...]` builds, so the two forms evaluate alike.
+/// wrapped negations it reads are `x NOT IN [...]` and `x NOT BETWEEN lo AND
+/// hi`, which become the trees `NOT x IN [...]` and `NOT x BETWEEN lo AND hi`
+/// build, so the two forms of each evaluate alike.
 fn single_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     Ok(match parse_single_condition(t, depth)? {
         WhereCondition::Not(inner) => BoolExpr::Not(Box::new(BoolExpr::Leaf(*inner))),
@@ -2869,6 +2870,17 @@ fn condition_function_tail(
         let right = parse_operand(t, depth)?;
         return function.compared(t, &next, right);
     }
+    // `NOT BETWEEN` takes BETWEEN's refusal and `NOT IN` is the negation of
+    // IN (captured eu-west-2 and us-east-1, 2026-10-10).
+    let negated = is_keyword(&next, "NOT")
+        && t.peek_token_at(1)?
+            .is_some_and(|op| is_any(&op, &["BETWEEN", "IN"]));
+    let next = if negated {
+        t.next_token()?;
+        t.peek_token()?.unwrap_or_default()
+    } else {
+        next
+    };
     if is_keyword(&next, "BETWEEN") {
         t.note_operand_refusal(bool_operand_refusal("BETWEEN"));
         t.next_token()?;
@@ -2882,7 +2894,12 @@ fn condition_function_tail(
     if is_keyword(&next, "IN") {
         t.next_token()?;
         let members = parse_in_list(t, depth, parse_bound_operand)?;
-        return function.listed(&members);
+        let listed = function.listed(&members)?;
+        return Ok(if negated {
+            BoolExpr::Not(Box::new(listed))
+        } else {
+            listed
+        });
     }
     function.condition(true)
 }
@@ -3090,9 +3107,14 @@ fn parse_bound(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
     parse_value(t, depth)
 }
 
-/// The AND between BETWEEN's bounds, with something after it.
+/// The AND between BETWEEN's bounds, with something after it. Anything else
+/// where the AND should be is `Expected AND keyword`, as for a statement with
+/// no verb (captured eu-west-2 and us-east-1, 2026-10-10, for `x NOT BETWEEN
+/// 1`).
 fn expect_between_and(t: &mut Tokenizer) -> Result<(), String> {
-    expect_keyword(t, "AND")?;
+    if !t.next_token()?.is_some_and(|tok| is_keyword(&tok, "AND")) {
+        return Err("Expected AND keyword".to_string());
+    }
     match t.peek_token()?.as_deref() {
         None | Some(";") => Err("Expected expression after AND".to_string()),
         Some(_) => Ok(()),
@@ -3157,9 +3179,11 @@ fn all_values(operands: &[Operand]) -> Option<Vec<PartiqlValue>> {
 }
 
 /// Read what follows the left operand of a comparison that isn't on a path:
-/// a comparison, BETWEEN or IN. A size on its own isn't a condition, and DynamoDB
-/// says so by naming the operator it stands under once the clause is read
-/// (captured eu-west-2 and us-east-1, 2026-10-09).
+/// a comparison, BETWEEN or IN, or NOT BETWEEN or NOT IN as their negations
+/// (captured eu-west-2 and us-east-1, 2026-10-10, for a size and a literal; a
+/// parameter is read the same way). A size on its own isn't a condition, and
+/// DynamoDB says so by naming the operator it stands under once the clause is
+/// read (captured eu-west-2 and us-east-1, 2026-10-09).
 fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<BoolExpr, String> {
     // Arithmetic on a size is refused term by term; a loop, so a long run of
     // `+ 1` reads in constant stack.
@@ -3174,6 +3198,14 @@ fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<B
     }
     let next = t.peek_token()?;
     match next.as_deref() {
+        Some(tok)
+            if is_keyword(tok, "NOT")
+                && t.peek_token_at(1)?
+                    .is_some_and(|op| is_any(&op, &["BETWEEN", "IN"])) =>
+        {
+            t.next_token()?; // consume NOT
+            Ok(BoolExpr::Not(Box::new(finish_comparison(t, depth, left)?)))
+        }
         Some(op) if is_comparison_operator(op) => {
             let op_tok = t.next_token()?.unwrap_or_default();
             let op = comparison_operator(&op_tok)?;
@@ -3668,38 +3700,38 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                 // comparison of operands, read item by item.
                 "BETWEEN" => {
                     t.next_token()?; // consume BETWEEN
-                    let low = parse_bound_operand(t, depth)?;
-                    expect_between_and(t)?;
-                    let high = parse_bound_operand(t, depth)?;
-                    if names_path(&[&low, &high], &path) {
-                        t.note_operand_refusal(not_distinct("BETWEEN", &path));
-                        return Ok(WhereCondition::Exists(String::new()));
-                    }
-                    Ok(match (low, high) {
-                        (Operand::Value(low), Operand::Value(high)) => {
-                            WhereCondition::Between(path, low, high)
-                        }
-                        (low, high) => {
-                            WhereCondition::CompareBetween(Operand::Path(path), low, high)
-                        }
-                    })
+                    path_between(t, depth, path)
                 }
                 "IN" => {
                     t.next_token()?; // consume IN
                     let members = parse_in_list(t, depth, parse_bound_operand)?;
                     Ok(path_in(t, path, members))
                 }
-                // `x NOT IN [...]` reads as `NOT x IN [...]` (DynamoDB runs it:
-                // captured eu-west-2 and us-east-1, 2026-10-10); the caller
-                // turns the wrapper into the same tree the leading NOT builds.
-                "NOT"
-                    if t.peek_token_at(1)?
-                        .is_some_and(|tok| is_keyword(&tok, "IN")) =>
-                {
-                    t.next_token()?; // consume NOT
-                    t.next_token()?; // consume IN
-                    let members = parse_in_list(t, depth, parse_bound_operand)?;
-                    Ok(WhereCondition::Not(Box::new(path_in(t, path, members))))
+                // `x NOT IN [...]` and `x NOT BETWEEN lo AND hi` read as
+                // `NOT x IN [...]` and `NOT x BETWEEN lo AND hi` (DynamoDB runs
+                // both: captured eu-west-2 and us-east-1, 2026-10-10); the
+                // caller turns the wrapper into the same tree the leading NOT
+                // builds. Any other word after the NOT ends the expression
+                // there: `x NOT NOT BETWEEN ...` is an unexpected token
+                // (captured), and so, inferred from it, is `x NOT = 1`. `x NOT
+                // LIKE` is left as it was, since LIKE isn't one DynamoDB was
+                // asked about.
+                "NOT" => {
+                    let after = t.peek_token_at(1)?.unwrap_or_default();
+                    if is_keyword(&after, "IN") {
+                        t.next_token()?; // consume NOT
+                        t.next_token()?; // consume IN
+                        let members = parse_in_list(t, depth, parse_bound_operand)?;
+                        Ok(WhereCondition::Not(Box::new(path_in(t, path, members))))
+                    } else if is_keyword(&after, "BETWEEN") {
+                        t.next_token()?; // consume NOT
+                        t.next_token()?; // consume BETWEEN
+                        Ok(WhereCondition::Not(Box::new(path_between(t, depth, path)?)))
+                    } else if is_keyword(&after, "LIKE") {
+                        Err("Unknown operator: NOT".to_string())
+                    } else {
+                        Err("Unexpected token after expression".to_string())
+                    }
                 }
                 "IS" => {
                     t.next_token()?; // consume IS
@@ -3740,6 +3772,24 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
             }
         }
     }
+}
+
+/// `path BETWEEN lo AND hi`, BETWEEN already read: bounds that are both
+/// values keep the form the key pushdown reads; a path or size among them
+/// makes it a comparison of operands, read item by item. The path itself as a
+/// bound is refused.
+fn path_between(t: &mut Tokenizer, depth: usize, path: String) -> Result<WhereCondition, String> {
+    let low = parse_bound_operand(t, depth)?;
+    expect_between_and(t)?;
+    let high = parse_bound_operand(t, depth)?;
+    if names_path(&[&low, &high], &path) {
+        t.note_operand_refusal(not_distinct("BETWEEN", &path));
+        return Ok(WhereCondition::Exists(String::new()));
+    }
+    Ok(match (low, high) {
+        (Operand::Value(low), Operand::Value(high)) => WhereCondition::Between(path, low, high),
+        (low, high) => WhereCondition::CompareBetween(Operand::Path(path), low, high),
+    })
 }
 
 /// `path IN [...]`: members that are all values keep the form the key

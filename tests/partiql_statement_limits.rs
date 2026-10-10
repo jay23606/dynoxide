@@ -214,6 +214,8 @@ fn comparisons_and_function_calls_count_toward_the_operator_limit() {
         (" AND x IS NOT NULL", 99),
         (" AND x IS NOT MISSING", 99),
         (" AND x NOT IN [1, 2]", 99),
+        (" AND x NOT BETWEEN 1 AND 3", 99),
+        (" AND NOT x BETWEEN 1 AND 3", 99),
     ] {
         let statement = |copies: usize| {
             format!(
@@ -230,6 +232,43 @@ fn comparisons_and_function_calls_count_toward_the_operator_limit() {
             single(&db, &statement(last_run + 1)),
             Err(message.to_string()),
             "{copy} x {}",
+            last_run + 1
+        );
+    }
+}
+
+/// An UPDATE's or a DELETE's WHERE clause is held to the same 300 operators,
+/// counted the same way (inferred: only SELECT was captured, and DynamoDB
+/// reads every WHERE clause with the one parser).
+#[test]
+fn an_update_or_delete_where_clause_counts_toward_the_operator_limit() {
+    let db = setup();
+    let message = "The expression contains too many operators; operator count: 301";
+    for (verb, copy, last_run) in [
+        ("UPDATE \"Limits\" SET y = 1", " AND x = 1", 149),
+        ("UPDATE \"Limits\" SET y = 1", " AND x NOT IN [1, 2]", 99),
+        (
+            "UPDATE \"Limits\" SET y = 1",
+            " AND x NOT BETWEEN 1 AND 3",
+            99,
+        ),
+        ("DELETE FROM \"Limits\"", " AND x = 1", 149),
+        ("DELETE FROM \"Limits\"", " AND x IS NOT NULL", 99),
+        ("DELETE FROM \"Limits\"", " AND x BETWEEN 1 AND 2", 149),
+    ] {
+        let statement = |copies: usize| format!("{verb} WHERE pk = 'a'{}", copy.repeat(copies));
+        // The item is missing, so the UPDATE's condition fails; the DELETE
+        // does nothing. Either way the statement ran.
+        let ran = single(&db, &statement(last_run));
+        assert!(
+            ran.as_ref()
+                .map_or_else(|e| e.contains("The conditional request failed"), |_| true),
+            "{verb}{copy} x {last_run}: {ran:?}"
+        );
+        assert_eq!(
+            single(&db, &statement(last_run + 1)),
+            Err(message.to_string()),
+            "{verb}{copy} x {}",
             last_run + 1
         );
     }

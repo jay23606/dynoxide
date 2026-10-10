@@ -710,8 +710,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   members and a bag literal's `<<` and `>>` count nothing. A run of NOTs no
   longer counts as nesting, so one that was refused as nested too deeply now
   runs. Captured against eu-west-2 and us-east-1.
-- PartiQL accepts `x NOT IN [...]`, read as `NOT x IN [...]`; it was refused
-  as an unknown operator. Captured against eu-west-2 and us-east-1.
+- PartiQL accepts `x NOT IN [...]` and `x NOT BETWEEN lo AND hi`, read as
+  `NOT x IN [...]` and `NOT x BETWEEN lo AND hi`, so an item missing `x`, or
+  holding a value of another type, matches a numeric range's negation; both
+  were refused as an unknown operator. They also follow a `size()`, a literal
+  or a parameter, and `NOT IN` follows a condition function, where `NOT
+  BETWEEN` takes the same refusal as `BETWEEN`. A sort key read with `NOT
+  BETWEEN` reads the range's complement, as `NOT sk BETWEEN` does. A missing
+  AND in a WHERE clause's `BETWEEN` is now "Expected AND keyword", and `x NOT`
+  followed by anything but `IN`, `BETWEEN` or `LIKE` is an unexpected token
+  rather than an unknown operator. Captured against eu-west-2 and us-east-1.
 - A PartiQL `IN` or `BETWEEN` on a path that also stands among its own
   members or bounds, such as `x IN [1, x]` or `x BETWEEN 1 AND x`, is refused
   with DynamoDB's "The first operand must be distinct from the remaining
