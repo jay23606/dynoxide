@@ -80,8 +80,8 @@ Fixed sections list each one.
 `partiql` modules are no longer public. `ParameterizedStatement`,
 `ExecuteStatementRequest` and `BatchStatementError` gained fields, so struct
 literals of them need the new field or `..Default::default()`. The minimum
-supported Rust version is now 1.94.1. The changelog's Breaking (Rust API)
-section lists each change.
+supported Rust version stays 1.88. The changelog's Breaking (Rust API) section
+lists each change.
 
 ## Upgrading to 1.0.0
 
