@@ -193,13 +193,22 @@ fn a_condition_function_compares_with_a_boolean() {
 #[test]
 fn a_condition_functions_in_list_reads_names_as_attributes() {
     let db = db();
-    let statement = "SELECT pk FROM \"Things\" WHERE pk = 'a1' AND attribute_exists(ss) IN [b]";
-    let message = refusal(&db, statement, None);
-    assert!(
-        message
-            .contains("Comparing a condition function with a path or a parameter is not supported"),
-        "{message}"
-    );
+    for (member, parameters) in [
+        ("b", None),
+        ("size(ss)", None),
+        ("?", Some(vec![AttributeValue::BOOL(true)])),
+    ] {
+        let statement = format!(
+            "SELECT pk FROM \"Things\" WHERE pk = 'a1' AND attribute_exists(ss) IN [{member}]"
+        );
+        let message = refusal(&db, &statement, parameters);
+        assert!(
+            message.contains(
+                "Comparing a condition function with a path or a parameter is not supported"
+            ),
+            "{statement}: {message}"
+        );
+    }
     for (condition, expected) in [
         ("attribute_exists(ss) IN [true]", "a1"),
         ("attribute_exists(ss) IN [false]", ""),

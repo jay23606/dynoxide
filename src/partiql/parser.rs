@@ -2663,12 +2663,15 @@ impl ConditionFunction {
     }
 
     /// The call in a list: true when the list holds the boolean it is. A
-    /// member that is a path or a size is refused as a comparison with one is.
+    /// member that is a path, a size or a parameter is refused as a comparison
+    /// with one is.
     fn listed(&self, members: &[Operand]) -> Result<BoolExpr, String> {
-        if members
-            .iter()
-            .any(|m| matches!(m, Operand::Path(_) | Operand::Size(_)))
-        {
+        if members.iter().any(|m| {
+            matches!(
+                m,
+                Operand::Path(_) | Operand::Size(_) | Operand::Value(PartiqlValue::Parameter(_))
+            )
+        }) {
             return Err(CONDITION_FUNCTION_COMPARED.into());
         }
         let has = |b: bool| {

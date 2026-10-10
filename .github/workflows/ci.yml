@@ -62,11 +62,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # libtest exits 0 when its filters match nothing, so a renamed test would
+      # turn this job into a silent no-op; the count check catches that.
       - name: Hashes ignore map key order
-        run: >-
-          cargo test --lib --features serde_json/preserve_order --
-          a_request_hash_ignores_map_key_order
-          a_map_parameter_fingerprints_alike_whatever_its_key_order
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --lib --features serde_json/preserve_order -- \
+            a_request_hash_ignores_map_key_order \
+            a_map_parameter_fingerprints_alike_whatever_its_key_order \
+            | tee map-key-order.log
+          grep -q 'test result: ok. 2 passed' map-key-order.log
 
   # The listener bind path is platform-specific (SO_REUSEADDR on Unix,
   # SO_EXCLUSIVEADDRUSE on Windows), so the unit tests need a Windows run;
