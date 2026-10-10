@@ -53,6 +53,15 @@ fn statements() -> Vec<(&'static str, String)> {
             format!(r#"SELECT * FROM "Tbl" WHERE {}pk = 'a'"#, "(".repeat(8000)),
         ),
         (
+            "NOT runs between brackets",
+            format!(
+                r#"SELECT * FROM "Tbl" WHERE {}{}pk = 'a'{}"#,
+                format!("{}(", "NOT ".repeat(30)).repeat(64),
+                "NOT ".repeat(30),
+                ")".repeat(64)
+            ),
+        ),
+        (
             "a SET value",
             format!(
                 r#"UPDATE "Tbl" SET v = {} WHERE pk = 'a'"#,

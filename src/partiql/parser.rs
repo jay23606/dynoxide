@@ -1246,7 +1246,7 @@ fn read_operand(t: &mut Tokenizer, read: fn(&mut Tokenizer) -> ExprResult) -> Ex
 /// statement of 8,192 `(` (captured eu-west-2 and us-east-1, 2026-10-10);
 /// refusing it is a deliberate difference.
 fn nested(t: &mut Tokenizer, read: impl FnOnce(&mut Tokenizer) -> ExprResult) -> ExprResult {
-    if t.depth >= MAX_EXPR_DEPTH {
+    if t.depth > MAX_EXPR_DEPTH {
         return Err(TOO_DEEP.to_string());
     }
     t.depth += 1;
@@ -2452,10 +2452,9 @@ fn require_right_hand_side(t: &mut Tokenizer) -> Result<(), String> {
     }
 }
 
+/// Only reached from `parse_and_expr`, under a `parse_or_expr` that has
+/// already checked `depth`.
 fn parse_not_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
-    if depth > MAX_EXPR_DEPTH {
-        return Err(TOO_DEEP.to_string());
-    }
     // `NOT BEGINS_WITH(x, y)` is a single condition with its own variant, so it
     // belongs to parse_single_condition and is left to it. A `NOT` in front of
     // anything else is the boolean operator.
@@ -2470,9 +2469,16 @@ fn parse_not_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
         nots += 1;
     }
     let mut expr = parse_primary(t, depth)?;
-    // Past the operator limit the statement is refused once it has parsed,
-    // so the NOTs beyond it needn't be built.
-    for _ in 0..nots.min(MAX_OPERATORS + 1) {
+    // Only the run's parity changes the meaning, and every NOT has already
+    // been counted against the operator limit, so at most two are built.
+    // Building one per NOT let runs separated by brackets stack into a chain
+    // far deeper than the bracket limit.
+    let wraps = match nots {
+        0 => 0,
+        n if n % 2 == 1 => 1,
+        _ => 2,
+    };
+    for _ in 0..wraps {
         expr = BoolExpr::Not(Box::new(expr));
     }
     Ok(expr)
@@ -3207,13 +3213,17 @@ const MAX_OR_GROUPS: usize = 256;
 /// How deeply a statement may nest.
 ///
 /// The companion to `MAX_OR_GROUPS`, which bounds a clause that expands rather
-/// than one that nests. Both the boolean-expression parser and the value parser
-/// are recursive descents, so a WHERE clause written with hundreds of
-/// parentheses or `NOT`s, or an item literal holding hundreds of nested maps,
-/// recurses until the stack runs out. That is not a failure the engine can
-/// report: the release profile aborts on panic, so a stack overflow takes the
-/// whole host process down rather than the one statement. The budget keeps a
-/// pathological statement a rejection.
+/// than one that nests. The boolean-expression parser, the value and operand
+/// parsers and the reader for a statement with no verb are recursive descents,
+/// so a WHERE clause written with hundreds of parentheses, or an item literal
+/// holding hundreds of nested maps, would recurse until the stack runs out.
+/// That is not a failure the engine can report: the release profile aborts on
+/// panic, so a stack overflow takes the whole host process down rather than the
+/// one statement. The budget keeps a pathological statement a rejection.
+///
+/// Every descent counts from 0 and refuses once its depth passes this value, so
+/// a statement may nest 65 levels. Runs of NOT and chains of AND, OR or signs
+/// are read in loops and don't spend depth.
 const MAX_EXPR_DEPTH: usize = 64;
 
 /// How many conditions a flattened clause may hold in total.
@@ -3230,7 +3240,7 @@ const MAX_TOTAL_CONDITIONS: usize = 4096;
 /// The rejection every clause-complexity budget shares.
 const TOO_COMPLEX: &str = "WHERE clause is too complex to evaluate";
 
-/// The rejection both descents share when they run past `MAX_EXPR_DEPTH`.
+/// The rejection every descent shares when it runs past `MAX_EXPR_DEPTH`.
 const TOO_DEEP: &str = "Statement is nested too deeply to parse";
 
 /// How many operators a WHERE clause may hold: DynamoDB refuses the 301st
@@ -4954,6 +4964,51 @@ mod tests {
                 "The expression contains too many operators; operator count: 301"
             ),
             other => panic!("expected the operator limit, got {other:?}"),
+        }
+    }
+
+    /// Runs of NOT between brackets mustn't stack into one chain deeper than
+    /// the bracket limit: each run is read in a loop, and only its parity
+    /// matters, so the tree that reaches De Morgan stays shallow. Through the
+    /// uncapped parser this shape once built a chain about 19,500 deep, which
+    /// a recursive walk couldn't survive on a 2 MB stack.
+    #[test]
+    fn runs_of_not_between_brackets_stay_shallow() {
+        let run = "NOT ".repeat(MAX_OPERATORS + 1);
+        let statement = format!(
+            r#"SELECT * FROM "t" WHERE {}{}a=1{}"#,
+            format!("{run}(").repeat(MAX_EXPR_DEPTH),
+            run,
+            ")".repeat(MAX_EXPR_DEPTH)
+        );
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || parse(&statement).map(|_| ()).map_err(|e| e.to_string()))
+            .unwrap()
+            .join()
+            .expect("the parser ran out of stack");
+        let err = outcome.expect_err("past the operator limit");
+        assert!(err.contains("too many operators"), "got {err}");
+    }
+
+    /// A NOT run keeps its parity: an odd run negates, an even one doesn't.
+    #[test]
+    fn a_run_of_nots_keeps_its_parity() {
+        for (nots, negated) in [(1, true), (2, false), (3, true), (4, false)] {
+            let statement = format!(r#"SELECT * FROM "t" WHERE {}a=1"#, "NOT ".repeat(nots));
+            let Statement::Select {
+                where_clause: Some(wc),
+                ..
+            } = parse(&statement).unwrap()
+            else {
+                panic!("expected a SELECT with WHERE");
+            };
+            let is_negated = match &wc.groups[0][0] {
+                WhereCondition::Comparison(_) => false,
+                WhereCondition::NotComparison(_) => true,
+                other => panic!("{nots} NOTs: {other:?}"),
+            };
+            assert_eq!(is_negated, negated, "{nots} NOTs");
         }
     }
 
