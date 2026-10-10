@@ -153,48 +153,26 @@ impl WasmBridgeBackend {
             .await
             .map_err(js_err)?;
         }
-        // The version an earlier build recorded, read before this open stamps
-        // its own. None for a database this open is creating.
-        let recorded = bridge_query(
-            &handle,
-            sql_builders::GET_SCHEMA_VERSION,
-            js_sys::Array::new(),
-        )
-        .await
-        .map_err(js_err)?;
-        let recorded_version: Option<u32> = js_sys::Array::from(&recorded)
-            .iter()
-            .next()
-            .and_then(|row| col_text(&js_sys::Array::from(&row), 0))
-            .and_then(|v| v.parse().ok());
         let backend = Self {
             handle,
             persistence_mode,
             clock: SystemClock::arc(),
         };
+        // The version an earlier build recorded, read before this open records
+        // its own. None for a database this open is creating, and for one the
+        // wasm backend wrote before it began recording a version (v0.10 to
+        // v0.13), which may need either migration.
+        let recorded_version = backend.recorded_schema_version().await?;
         // A database an earlier build wrote may hold a multi-attribute GSI keyed
         // on its first attributes only, and number-rule sizes for the items of
-        // a vector table. Bring both up to date through the paths the native
-        // migrations take, then record the version so each runs once.
-        if let Some(recorded) = recorded_version {
-            if recorded < crate::actions::gsi::MULTI_ATTRIBUTE_KEY_SCHEMA_VERSION {
-                crate::actions::gsi::rebuild_multi_attribute_gsis(&backend)
-                    .await
-                    .map_err(|e| {
-                        BackendError::Io(format!("rebuilding multi-attribute indexes: {e}"))
-                    })?;
-            }
-            if recorded < crate::actions::vector_index::VECTOR_BILLED_SIZE_SCHEMA_VERSION {
-                crate::actions::vector_index::recompute_vector_table_sizes(&backend)
-                    .await
-                    .map_err(|e| {
-                        BackendError::Io(format!("recomputing vector table sizes: {e}"))
-                    })?;
-                backend
-                    .record_schema_version(sql_builders::SCHEMA_VERSION)
-                    .await?;
-            }
-        }
+        // a vector table. Bring both up to date through the steps the native
+        // open runs, each in its own write transaction that records its version.
+        crate::actions::schema_migrations::run_open_migrations(
+            &backend,
+            super::schema::open_migrations(recorded_version),
+        )
+        .await
+        .map_err(|e| BackendError::Io(format!("bringing the database up to date: {e}")))?;
         // Record the schema version (if none is recorded yet) so future wasm
         // schema changes can migrate versioned, as the native backend does,
         // instead of accreting one unconditional ALTER per column.
@@ -209,16 +187,6 @@ impl WasmBridgeBackend {
     /// The active persistence mode: `"opfs"`, `"memory"`, or `"unknown"`.
     pub fn persistence_mode(&self) -> &str {
         &self.persistence_mode
-    }
-
-    /// Record `version` as the database's schema version, replacing any
-    /// recorded one.
-    pub(crate) async fn record_schema_version(&self, version: &str) -> Result<(), BackendError> {
-        let (sql, params) = sql_builders::set_schema_version(version);
-        bridge_exec(&self.handle, &sql, params_to_js(&params))
-            .await
-            .map_err(js_err)?;
-        Ok(())
     }
 
     /// Close the underlying SQLite connection. The wasm engine calls this
@@ -1030,6 +998,28 @@ impl StorageBackend for WasmBridgeBackend {
 
     async fn rollback(&self) -> Result<(), BackendError> {
         self.exec(sql_builders::ROLLBACK, Vec::new()).await
+    }
+
+    // --- Schema version --------------------------------------------------
+
+    async fn recorded_schema_version(&self) -> Result<Option<u32>, BackendError> {
+        let rows = bridge_query(
+            &self.handle,
+            sql_builders::GET_SCHEMA_VERSION,
+            js_sys::Array::new(),
+        )
+        .await
+        .map_err(js_err)?;
+        let value = js_sys::Array::from(&rows)
+            .iter()
+            .next()
+            .and_then(|row| col_text(&js_sys::Array::from(&row), 0));
+        Ok(super::schema::parse_recorded(value.as_deref()))
+    }
+
+    async fn record_schema_version(&self, version: u32) -> Result<(), BackendError> {
+        let (sql, params) = sql_builders::set_schema_version(version);
+        self.exec(&sql, params).await
     }
 
     // Bulk-loading PRAGMAs do not apply to the OPFS SAHPool VFS; treat the

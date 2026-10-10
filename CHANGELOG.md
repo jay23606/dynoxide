@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restoring a snapshot taken by an earlier version brings it up to date as
+  opening the file would, running the schema migrations its recorded version
+  calls for. It used to be restored as it was, so a snapshot from before a
+  schema change came back without that change.
 - A number whose exponent is too large for a 32-bit integer is range-checked
   rather than read with an exponent of 0. `1e99999999999` was stored as 1; it
   is now refused as an overflow, and `1e-99999999999` as an underflow, as
@@ -78,8 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named, and `LastEvaluatedKey` carries every key attribute. Such an index used
   to sort and filter on its first sort key attribute alone, index items missing
   a later one, and refuse any key condition with three clauses. In a database
-  an earlier version wrote, on disk or in the browser's OPFS storage, such an
-  index is rebuilt the first time the database is opened. `UpdateTable` can now add one. CreateTable and UpdateTable
+  an earlier version wrote, on disk or in the browser's OPFS storage (including
+  one from Dynoxide 0.10 to 0.13, which recorded no schema version), such an
+  index is rebuilt the first time the database is opened, in one transaction,
+  so an open interrupted part way leaves the database as it was. `UpdateTable` can now add one. CreateTable and UpdateTable
   check such a key as DynamoDB does: at most four partition key and four sort
   key attributes, partition key attributes first, no name twice. A local
   secondary index still takes one sort key attribute. A PartiQL `SELECT` on such
@@ -182,8 +188,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by its numbers, which is DynamoDB's rule for those, and so do a GSI's and an
   LSI's share of the write and their `IndexSizeBytes`, even when the index
   projects the vector. A database written by an earlier version has its vector
-  tables' sizes recomputed once when it is opened, and creating or deleting a
-  vector index recomputes that table's.
+  tables' sizes recomputed once when it is opened, in one transaction, and
+  creating or deleting a vector index recomputes that table's.
 - `Database::sweep_ttl`, and the MCP `sweep_ttl` tool that calls it, no longer
   hold the database lock for the whole sweep. The sweep takes the lock a page of
   25 items at a time and lets requests already waiting for it go first between

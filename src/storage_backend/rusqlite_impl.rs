@@ -267,6 +267,8 @@ impl StorageBackend for Storage {
         index_name: &str,
         rows: &[GsiItemRow],
     ) -> Result<(), BackendError> {
+        #[cfg(test)]
+        self.check_gsi_insert_fault().map_err(dyno_to_backend)?;
         Storage::insert_gsi_items(self, table_name, index_name, rows).map_err(dyno_to_backend)
     }
 
@@ -357,6 +359,14 @@ impl StorageBackend for Storage {
 
     async fn rollback(&self) -> Result<(), BackendError> {
         Storage::rollback(self).map_err(dyno_to_backend)
+    }
+
+    async fn recorded_schema_version(&self) -> Result<Option<u32>, BackendError> {
+        Storage::recorded_schema_version(self).map_err(dyno_to_backend)
+    }
+
+    async fn record_schema_version(&self, version: u32) -> Result<(), BackendError> {
+        Storage::record_schema_version(self, version).map_err(dyno_to_backend)
     }
 
     async fn enable_bulk_loading(&self) -> Result<(), BackendError> {

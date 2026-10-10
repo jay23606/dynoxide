@@ -334,6 +334,14 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn recorded_schema_version(&self) -> Result<Option<u32>, BackendError> {
+        unimplemented!()
+    }
+
+    async fn record_schema_version(&self, _version: u32) -> Result<(), BackendError> {
+        unimplemented!()
+    }
+
     async fn enable_bulk_loading(&self) -> Result<(), BackendError> {
         unimplemented!()
     }

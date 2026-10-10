@@ -323,7 +323,7 @@ async fn run_legacy_gsi() -> std::result::Result<String, String> {
     be.insert_gsi_items(TABLE, INDEX, &rows)
         .await
         .map_err(|e| e.to_string())?;
-    be.record_schema_version("9")
+    be.record_schema_version(9)
         .await
         .map_err(|e| e.to_string())?;
     be.close().await.map_err(|e| e.to_string())?;

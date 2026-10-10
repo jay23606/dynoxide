@@ -101,12 +101,12 @@ pub(crate) const TABLE_METADATA_COLUMNS: &str = "table_name, key_schema, attribu
      sse_specification, table_class, deletion_protection_enabled, on_demand_throughput, table_id, \
      vector_index_definitions";
 
-/// Current schema version, shared by both backends. The native backend stamps
-/// it in `_config` from `Storage::initialize` and drives its versioned
-/// migration chain off it; the wasm backend records it on open (see
-/// [`init_schema_version`]) so future wasm schema changes can migrate
-/// versioned instead of accreting one unconditional ALTER per column.
-pub const SCHEMA_VERSION: &str = "11";
+/// The schema version this build writes, shared by both backends: the version
+/// its last migration records. Each backend reads the recorded version on
+/// open and runs the migrations it calls for (see
+/// `storage_backend::schema::open_migrations`), then records this one. Every
+/// place that stamps or compares the current version uses this constant.
+pub const SCHEMA_VERSION: u32 = super::schema::VECTOR_BILLED_SIZES;
 
 /// Add the `vector_index_definitions` column to `_tables`.
 ///
@@ -138,19 +138,19 @@ pub fn is_duplicate_column_error(message: &str) -> bool {
 /// Record the schema version if none is recorded yet (`INSERT OR IGNORE`,
 /// mirroring the native `initialize` step). Never downgrades a version a
 /// newer build has already stamped.
-pub fn init_schema_version(version: &str) -> (String, Vec<SqlParam<'_>>) {
+pub fn init_schema_version(version: u32) -> (String, Vec<SqlParam<'static>>) {
     (
         "INSERT OR IGNORE INTO _config (key, value) VALUES ('schema_version', ?1)".to_string(),
-        vec![SqlParam::text(version)],
+        vec![SqlParam::text(version.to_string())],
     )
 }
 
 /// Record `version` as the schema version, replacing any recorded one. A
 /// migration stamps this once it has finished, so an interrupted one runs again.
-pub fn set_schema_version(version: &str) -> (String, Vec<SqlParam<'_>>) {
+pub fn set_schema_version(version: u32) -> (String, Vec<SqlParam<'static>>) {
     (
         "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', ?1)".to_string(),
-        vec![SqlParam::text(version)],
+        vec![SqlParam::text(version.to_string())],
     )
 }
 
@@ -1855,7 +1855,7 @@ mod tests {
     #[test]
     fn init_schema_version_is_pinned() {
         assert_eq!(
-            init_schema_version("9"),
+            init_schema_version(9),
             (
                 "INSERT OR IGNORE INTO _config (key, value) VALUES ('schema_version', ?1)"
                     .to_string(),
@@ -1867,7 +1867,7 @@ mod tests {
     #[test]
     fn set_schema_version_replaces_the_recorded_one() {
         assert_eq!(
-            set_schema_version("10"),
+            set_schema_version(10),
             (
                 "INSERT OR REPLACE INTO _config (key, value) VALUES ('schema_version', ?1)"
                     .to_string(),

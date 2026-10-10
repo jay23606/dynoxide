@@ -376,20 +376,17 @@ pub fn parse_gsi_key_attrs(
     Ok((gsi.hash_attrs, gsi.range_attrs))
 }
 
-/// The schema version that first keys a multi-attribute GSI on every key
-/// attribute. A database recorded at an earlier version may hold such an index
-/// keyed on the first attribute of each kind, and is rebuilt on open.
-pub(crate) const MULTI_ATTRIBUTE_KEY_SCHEMA_VERSION: u32 = 10;
-
 /// Rebuild every GSI whose key has more than one partition key or sort key
 /// attribute from its base table, returning how many were rebuilt.
 ///
 /// Earlier versions accepted such an index but keyed its rows on the first
 /// attribute of each kind, so items sorted on the first sort key attribute
 /// alone and an item missing a later key attribute was indexed. Both backends
-/// run this when they open a database recorded at an earlier schema version:
-/// native from its migration chain, wasm from its open. Single-attribute
-/// indexes are stored the same way as before and are left alone.
+/// run this when they open a database recorded before
+/// [`MULTI_ATTRIBUTE_KEYS`](crate::storage_backend::schema::MULTI_ATTRIBUTE_KEYS),
+/// through [`run_open_migrations`](super::schema_migrations::run_open_migrations).
+/// Single-attribute indexes are stored the same way as before and are left
+/// alone.
 pub(crate) async fn rebuild_multi_attribute_gsis<S: StorageBackend>(storage: &S) -> Result<usize> {
     let mut rebuilt = 0;
     for table_name in storage.list_table_names().await? {

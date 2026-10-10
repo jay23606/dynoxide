@@ -31,11 +31,6 @@ pub fn parse_vector_defs(meta: &TableMetadata) -> Result<Vec<VectorIndex>> {
     }
 }
 
-/// The schema version that first records a vector table's items at their
-/// billed size. A database recorded at an earlier version holds number-rule
-/// sizes for those items, and is recomputed on open.
-pub(crate) const VECTOR_BILLED_SIZE_SCHEMA_VERSION: u32 = 11;
-
 /// Rewrite the stored `item_size` of every item in `table_name` to its billed
 /// size under `vector_indexes`, returning how many rows were rewritten.
 ///
@@ -90,10 +85,11 @@ pub(crate) async fn recompute_billed_sizes<S: StorageBackend>(
 }
 
 /// Recompute the stored sizes of every table that has a vector index, for a
-/// database recorded before [`VECTOR_BILLED_SIZE_SCHEMA_VERSION`]. Tables
-/// without one are billed as they always were and are left alone. Both
-/// backends run this on open: native from its migration chain, wasm from its
-/// open.
+/// database recorded before
+/// [`VECTOR_BILLED_SIZES`](crate::storage_backend::schema::VECTOR_BILLED_SIZES).
+/// Tables without one are billed as they always were and are left alone. Both
+/// backends run this on open, through
+/// [`run_open_migrations`](super::schema_migrations::run_open_migrations).
 pub(crate) async fn recompute_vector_table_sizes<S: StorageBackend>(storage: &S) -> Result<usize> {
     let mut tables = 0;
     for table_name in storage.list_table_names().await? {

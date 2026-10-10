@@ -29,6 +29,8 @@ pub mod error;
 // is not a stable API, hence `#[doc(hidden)]`.
 #[doc(hidden)]
 pub mod sql_builders;
+// Schema versions and the migrations a recorded version calls for on open.
+pub(crate) mod schema;
 // The native rusqlite-backed `Storage` exists whenever either SQLite backend
 // feature is on (the crate refuses to build with neither), and the handlers
 // now consume `StorageBackend` through it, so the impl must track the same
@@ -663,6 +665,18 @@ pub trait StorageBackend: private::Sealed {
     async fn begin_transaction(&self) -> Result<(), BackendError>;
     async fn commit(&self) -> Result<(), BackendError>;
     async fn rollback(&self) -> Result<(), BackendError>;
+
+    // -----------------------------------------------------------------------
+    // Schema version
+    // -----------------------------------------------------------------------
+
+    /// The schema version the database records, or `None` when it records
+    /// none, or one that isn't a number.
+    async fn recorded_schema_version(&self) -> Result<Option<u32>, BackendError>;
+
+    /// Record `version` as the database's schema version, replacing any
+    /// recorded one.
+    async fn record_schema_version(&self, version: u32) -> Result<(), BackendError>;
 
     // -----------------------------------------------------------------------
     // Bulk-loading PRAGMAs

@@ -10,11 +10,10 @@ use rusqlite::{Connection, params};
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
-/// Current schema version. Stored in the `_config` table for future migrations.
-/// The value itself lives in `sql_builders` so the wasm backend records the
-/// same version on open.
+// The schema version this build writes. It lives in `sql_builders` so the
+// wasm backend records the same version on open.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-const SCHEMA_VERSION: &str = sql_builders::SCHEMA_VERSION;
+use crate::storage_backend::sql_builders::SCHEMA_VERSION;
 
 /// Number of hash buckets used for parallel scan segment assignment.
 /// Matches dynalite's implementation.
@@ -259,6 +258,11 @@ pub struct Storage {
     /// out of every build but the crate's own unit tests.
     #[cfg(test)]
     gsi_insert_fault: RefCell<Option<u32>>,
+    /// Countdown to a forced failure rewriting one row's stored size, for
+    /// tests that need a size recompute to fail part way through. `None` never
+    /// fires. Compiled out of every build but the crate's own unit tests.
+    #[cfg(test)]
+    item_size_fault: RefCell<Option<u32>>,
 }
 
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
@@ -271,6 +275,8 @@ impl Storage {
             metadata_cache: RefCell::new(HashMap::new()),
             #[cfg(test)]
             gsi_insert_fault: RefCell::new(None),
+            #[cfg(test)]
+            item_size_fault: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
         storage.initialize().map_err(Self::maybe_encrypted_error)?;
@@ -289,10 +295,15 @@ impl Storage {
     /// Consume one step of the armed countdown, erroring when it reaches zero.
     #[cfg(test)]
     pub(crate) fn check_gsi_insert_fault(&self) -> Result<()> {
-        let mut fault = self.gsi_insert_fault.borrow_mut();
+        Self::count_down(&self.gsi_insert_fault, "injected GSI insert failure")
+    }
+
+    #[cfg(test)]
+    fn count_down(fault: &RefCell<Option<u32>>, message: &str) -> Result<()> {
+        let mut fault = fault.borrow_mut();
         match fault.as_mut() {
             Some(0) => Err(crate::errors::DynoxideError::InternalServerError(
-                "injected GSI insert failure".to_string(),
+                message.to_string(),
             )),
             Some(remaining) => {
                 *remaining -= 1;
@@ -357,6 +368,8 @@ impl Storage {
             metadata_cache: RefCell::new(HashMap::new()),
             #[cfg(test)]
             gsi_insert_fault: RefCell::new(None),
+            #[cfg(test)]
+            item_size_fault: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
         storage.initialize()?;
@@ -371,6 +384,8 @@ impl Storage {
             metadata_cache: RefCell::new(HashMap::new()),
             #[cfg(test)]
             gsi_insert_fault: RefCell::new(None),
+            #[cfg(test)]
+            item_size_fault: RefCell::new(None),
             clock: Arc::new(SystemClock),
         };
         storage.initialize()?;
@@ -409,6 +424,13 @@ impl Storage {
             },
         )?;
 
+        self.migrate_to_current()
+    }
+
+    /// Create the metadata tables if they are missing and run every migration
+    /// the recorded schema version calls for. Runs on open, and after a restore
+    /// replaces the database with a snapshot an earlier build may have taken.
+    fn migrate_to_current(&self) -> Result<()> {
         // Create metadata tables (schema shared with the wasm backend).
         self.conn.execute_batch(sql_builders::INIT_SCHEMA)?;
 
@@ -424,17 +446,8 @@ impl Storage {
             rusqlite::params_from_iter(version_params.iter()),
         )?;
 
-        // Run schema migrations
-        let version: i32 = self
-            .conn
-            .query_row(
-                "SELECT value FROM _config WHERE key = 'schema_version'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .unwrap_or_else(|_| "1".to_string())
-            .parse()
-            .unwrap_or(1);
+        // Run schema migrations. A version that isn't a number runs them all.
+        let version = self.recorded_schema_version()?.unwrap_or(1);
 
         if version < 2 {
             self.migrate_v1_to_v2()?;
@@ -460,14 +473,13 @@ impl Storage {
         if version < 9 {
             self.migrate_v8_to_v9()?;
         }
-        if version < 10 {
-            self.migrate_v9_to_v10()?;
-        }
-        if version < 11 {
-            self.migrate_v10_to_v11()?;
-        }
-
-        Ok(())
+        // The steps from version 10 on are shared with the wasm backend and run
+        // each in its own write transaction. The native futures never suspend,
+        // so `block_on` returns as soon as they do.
+        pollster::block_on(crate::actions::schema_migrations::run_open_migrations(
+            self,
+            crate::storage_backend::schema::open_migrations(Some(version)),
+        ))
     }
 
     /// Migrate from schema v1 to v2: add `cached_at REAL` column to all data tables.
@@ -675,36 +687,6 @@ impl Storage {
             [],
         )?;
 
-        Ok(())
-    }
-
-    /// Migrate from schema v9 to v10: rebuild every GSI whose key has more than
-    /// one partition key or sort key attribute, through the same path the wasm
-    /// backend takes on open. See
-    /// [`rebuild_multi_attribute_gsis`](crate::actions::gsi::rebuild_multi_attribute_gsis).
-    /// The native backend's futures never suspend, so `block_on` returns as
-    /// soon as the rebuild does.
-    fn migrate_v9_to_v10(&self) -> Result<()> {
-        pollster::block_on(crate::actions::gsi::rebuild_multi_attribute_gsis(self))?;
-        let version = crate::actions::gsi::MULTI_ATTRIBUTE_KEY_SCHEMA_VERSION.to_string();
-        let (sql, params) = sql_builders::set_schema_version(&version);
-        self.conn
-            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
-        Ok(())
-    }
-
-    /// Migrate from schema v10 to v11: recompute the stored size of every item
-    /// in a table with a vector index, which earlier versions recorded by the
-    /// number rule. See
-    /// [`recompute_vector_table_sizes`](crate::actions::vector_index::recompute_vector_table_sizes).
-    fn migrate_v10_to_v11(&self) -> Result<()> {
-        pollster::block_on(crate::actions::vector_index::recompute_vector_table_sizes(
-            self,
-        ))?;
-        let version = crate::actions::vector_index::VECTOR_BILLED_SIZE_SCHEMA_VERSION.to_string();
-        let (sql, params) = sql_builders::set_schema_version(&version);
-        self.conn
-            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
         Ok(())
     }
 
@@ -1331,6 +1313,28 @@ impl Storage {
         Ok(())
     }
 
+    /// The schema version the database records, or `None` when it records
+    /// none, or one that isn't a number.
+    pub(crate) fn recorded_schema_version(&self) -> Result<Option<u32>> {
+        use rusqlite::OptionalExtension;
+        let value: Option<String> = self
+            .conn
+            .query_row(sql_builders::GET_SCHEMA_VERSION, [], |r| r.get(0))
+            .optional()?;
+        Ok(crate::storage_backend::schema::parse_recorded(
+            value.as_deref(),
+        ))
+    }
+
+    /// Record `version` as the database's schema version, replacing any
+    /// recorded one.
+    pub(crate) fn record_schema_version(&self, version: u32) -> Result<()> {
+        let (sql, params) = sql_builders::set_schema_version(version);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        Ok(())
+    }
+
     /// Set aggressive PRAGMAs for bulk loading.
     ///
     /// Disables fsync, increases cache, and enables memory-mapped I/O.
@@ -1592,6 +1596,8 @@ impl Storage {
         sizes: &[(String, String, usize)],
     ) -> Result<()> {
         for (pk, sk, size) in sizes {
+            #[cfg(test)]
+            Self::count_down(&self.item_size_fault, "injected item size write failure")?;
             let (sql, params) = sql_builders::set_item_size(table_name, pk, sk, *size);
             self.conn
                 .prepare_cached(&sql)?
@@ -1751,12 +1757,17 @@ impl Storage {
     /// Restore the database from another SQLite connection using the backup API.
     ///
     /// Replaces the current database contents with the source connection's
-    /// contents. Invalidates the metadata cache.
+    /// contents, invalidates the metadata cache, and runs any migration the
+    /// restored schema version calls for.
     pub fn restore_from_connection(&mut self, source: &Connection) -> Result<()> {
-        let backup = rusqlite::backup::Backup::new(source, &mut self.conn)?;
-        backup.run_to_completion(100, std::time::Duration::from_millis(0), None)?;
+        {
+            let backup = rusqlite::backup::Backup::new(source, &mut self.conn)?;
+            backup.run_to_completion(100, std::time::Duration::from_millis(0), None)?;
+        }
         self.metadata_cache.borrow_mut().clear();
-        Ok(())
+        // A snapshot an earlier build took is brought up to date as an open
+        // would bring the file.
+        self.migrate_to_current()
     }
 
     /// Get the database size in bytes for an arbitrary connection.
@@ -2109,7 +2120,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, SCHEMA_VERSION.to_string());
     }
 
     #[test]
@@ -2175,7 +2186,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, SCHEMA_VERSION.to_string());
 
         // The pre-existing row survives and reads back through row_to_metadata,
         // with the new column present and NULL.
@@ -2258,7 +2269,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, SCHEMA_VERSION.to_string());
 
         // The legacy row was backfilled with a non-empty table_id, and it reads
         // back through row_to_metadata.
@@ -2337,7 +2348,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, SCHEMA_VERSION.to_string());
 
         // The pre-existing row survives and reads back with the new column
         // present and NULL.
@@ -2426,7 +2437,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, SCHEMA_VERSION.to_string());
         let rows: Vec<(String, String)> = {
             let mut stmt = storage
                 .conn()
@@ -2453,6 +2464,320 @@ mod tests {
                 ("S:1".to_string(), expected_key("2")),
             ]
         );
+    }
+
+    /// Write a database the way a v9 build left it at `path`. Table `Legacy`
+    /// has three GSIs:
+    ///
+    /// - `byKey`, one HASH and two RANGE attributes, keyed on the first of
+    ///   each kind and holding the item that lacks its second RANGE attribute;
+    /// - `byTwoHash`, two HASH and one RANGE attribute, keyed on the first
+    ///   HASH attribute alone;
+    /// - `bySingle`, one attribute of each kind, stored as every version
+    ///   stores it.
+    ///
+    /// Three named items come first, then `extra` more carrying every key
+    /// attribute.
+    fn write_v9_database(path: &str, extra: usize) {
+        {
+            let db = crate::Database::new(path).unwrap();
+            db.create_table(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "Legacy",
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "AttributeDefinitions": [
+                        {"AttributeName": "pk", "AttributeType": "S"},
+                        {"AttributeName": "h", "AttributeType": "S"},
+                        {"AttributeName": "h2", "AttributeType": "S"},
+                        {"AttributeName": "a", "AttributeType": "S"},
+                        {"AttributeName": "b", "AttributeType": "S"}
+                    ],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "GlobalSecondaryIndexes": [
+                        {
+                            "IndexName": "byKey",
+                            "KeySchema": [
+                                {"AttributeName": "h", "KeyType": "HASH"},
+                                {"AttributeName": "a", "KeyType": "RANGE"},
+                                {"AttributeName": "b", "KeyType": "RANGE"}
+                            ],
+                            "Projection": {"ProjectionType": "ALL"}
+                        },
+                        {
+                            "IndexName": "byTwoHash",
+                            "KeySchema": [
+                                {"AttributeName": "h", "KeyType": "HASH"},
+                                {"AttributeName": "h2", "KeyType": "HASH"},
+                                {"AttributeName": "a", "KeyType": "RANGE"}
+                            ],
+                            "Projection": {"ProjectionType": "ALL"}
+                        },
+                        {
+                            "IndexName": "bySingle",
+                            "KeySchema": [
+                                {"AttributeName": "h", "KeyType": "HASH"},
+                                {"AttributeName": "a", "KeyType": "RANGE"}
+                            ],
+                            "Projection": {"ProjectionType": "KEYS_ONLY"}
+                        }
+                    ]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let named = [
+                serde_json::json!({"pk": {"S": "1"}, "h": {"S": "x"}, "h2": {"S": "y"}, "a": {"S": "m"}, "b": {"S": "2"}}),
+                serde_json::json!({"pk": {"S": "2"}, "h": {"S": "x"}, "h2": {"S": "y"}, "a": {"S": "m"}, "b": {"S": "1"}}),
+                serde_json::json!({"pk": {"S": "3"}, "h": {"S": "x"}, "h2": {"S": "y"}, "a": {"S": "m"}}),
+            ];
+            let extras = (0..extra).map(|i| {
+                serde_json::json!({
+                    "pk": {"S": format!("e{i:05}")},
+                    "h": {"S": "x"}, "h2": {"S": "y"}, "a": {"S": "m"},
+                    "b": {"S": format!("{i:05}")}
+                })
+            });
+            for item in named.into_iter().chain(extras) {
+                db.put_item(
+                    serde_json::from_value(
+                        serde_json::json!({"TableName": "Legacy", "Item": item}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DELETE FROM \"Legacy::gsi::byKey\";
+             INSERT INTO \"Legacy::gsi::byKey\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json)
+                SELECT 'S:x', 'S:m', pk, sk, item_json FROM \"Legacy\";
+             DELETE FROM \"Legacy::gsi::byTwoHash\";
+             INSERT INTO \"Legacy::gsi::byTwoHash\" (gsi_pk, gsi_sk, table_pk, table_sk, item_json)
+                SELECT 'S:x', 'S:m', pk, sk, item_json FROM \"Legacy\";
+             UPDATE _config SET value = '9' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    }
+
+    /// Every column of every row of a GSI table, in base key order.
+    fn gsi_rows(conn: &Connection, index: &str) -> Vec<[String; 5]> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT gsi_pk, gsi_sk, table_pk, table_sk, item_json \
+                 FROM \"Legacy::gsi::{index}\" ORDER BY table_pk, table_sk"
+            ))
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?])
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn recorded_version(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT value FROM _config WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Open `path` as [`Storage::new`] does, with the GSI insert and item
+    /// size countdowns armed before the open's migrations run.
+    fn open_with_faults(
+        path: &str,
+        gsi_insert: Option<u32>,
+        item_size: Option<u32>,
+    ) -> Result<Storage> {
+        let mut storage = Storage {
+            conn: Connection::open(path)?,
+            metadata_cache: RefCell::new(HashMap::new()),
+            gsi_insert_fault: RefCell::new(gsi_insert),
+            item_size_fault: RefCell::new(item_size),
+            clock: Arc::new(SystemClock),
+        };
+        storage.initialize()?;
+        Ok(storage)
+    }
+
+    #[test]
+    fn an_interrupted_gsi_rebuild_leaves_the_database_as_it_was() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        write_v9_database(&path, 0);
+        let before = {
+            let conn = Connection::open(&path).unwrap();
+            (gsi_rows(&conn, "byKey"), gsi_rows(&conn, "byTwoHash"))
+        };
+
+        // The first index insert of the rebuild fails, after the rebuild has
+        // already dropped and recreated the index it was filling.
+        assert!(open_with_faults(&path, Some(0), None).is_err());
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(recorded_version(&conn), "9");
+        assert_eq!(
+            (gsi_rows(&conn, "byKey"), gsi_rows(&conn, "byTwoHash")),
+            before,
+            "an interrupted rebuild must leave every index as it found it"
+        );
+        drop(conn);
+
+        // The next open runs the rebuild from the start.
+        let storage = Storage::new(&path).unwrap();
+        assert_eq!(recorded_version(storage.conn()), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn an_interrupted_size_recompute_leaves_the_database_as_it_was() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        {
+            let db = crate::Database::new(&path).unwrap();
+            db.create_table(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "Vec",
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "VectorIndexes": [{
+                        "IndexName": "vix",
+                        "VectorAttribute": {"AttributeName": "e"},
+                        "Dimensions": 3,
+                        "DistanceFunction": "COSINE",
+                        "Projection": {"ProjectionType": "KEYS_ONLY"}
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            for pk in ["a", "b", "c"] {
+                db.put_item(
+                    serde_json::from_value(serde_json::json!({
+                        "TableName": "Vec",
+                        "Item": {
+                            "pk": {"S": pk},
+                            "e": {"L": [{"N": "0.125"}, {"N": "0.125"}, {"N": "0.125"}]}
+                        }
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        // Back to how a v10 build stored them: a different size per row.
+        let sizes = |conn: &Connection| -> Vec<(String, i64)> {
+            let mut stmt = conn
+                .prepare("SELECT pk, item_size FROM \"Vec\" ORDER BY pk")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let before = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "UPDATE \"Vec\" SET item_size = item_size + 7;
+                 UPDATE _config SET value = '10' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+            sizes(&conn)
+        };
+
+        // One row is rewritten, then the second rewrite fails.
+        assert!(open_with_faults(&path, None, Some(1)).is_err());
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(recorded_version(&conn), "10");
+        assert_eq!(
+            sizes(&conn),
+            before,
+            "an interrupted recompute must leave every stored size as it found it"
+        );
+    }
+
+    #[test]
+    fn a_second_open_runs_no_migration() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        write_v9_database(&path, 0);
+        drop(Storage::new(&path).unwrap());
+        // Either migration would fail at its first write, so an open that ran
+        // one fails.
+        let storage = open_with_faults(&path, Some(0), Some(0)).unwrap();
+        assert_eq!(recorded_version(storage.conn()), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn the_rebuild_keeps_single_attribute_indexes_and_keys_every_hash_attribute() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        write_v9_database(&path, 0);
+        let single_before = gsi_rows(&Connection::open(&path).unwrap(), "bySingle");
+
+        let storage = Storage::new(&path).unwrap();
+        assert_eq!(
+            gsi_rows(storage.conn(), "bySingle"),
+            single_before,
+            "a single-attribute index is stored the same way and is left alone"
+        );
+        let two_hash = crate::actions::gsi::composite_key_string(&[
+            &AttributeValue::S("x".into()),
+            &AttributeValue::S("y".into()),
+        ])
+        .unwrap();
+        let keys: Vec<(String, String)> = gsi_rows(storage.conn(), "byTwoHash")
+            .into_iter()
+            .map(|[gsi_pk, _, table_pk, _, _]| (gsi_pk, table_pk))
+            .collect();
+        assert_eq!(
+            keys,
+            ["S:1", "S:2", "S:3"]
+                .map(|pk| (two_hash.clone(), pk.to_string()))
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn the_rebuild_runs_past_the_first_backfill_batch() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        // The backfill reads the base table 1,000 rows at a time.
+        write_v9_database(&path, 1_005);
+
+        let storage = Storage::new(&path).unwrap();
+        // Every item but the one lacking `b` is in `byKey`; every item is in
+        // `byTwoHash`.
+        assert_eq!(gsi_rows(storage.conn(), "byKey").len(), 2 + 1_005);
+        assert_eq!(gsi_rows(storage.conn(), "byTwoHash").len(), 3 + 1_005);
+    }
+
+    #[test]
+    fn a_restored_snapshot_from_an_earlier_version_is_brought_up_to_date() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        write_v9_database(&path, 0);
+
+        let mut storage = Storage::memory().unwrap();
+        storage.restore_from(&path).unwrap();
+
+        assert_eq!(recorded_version(storage.conn()), SCHEMA_VERSION.to_string());
+        let sort_keys: Vec<String> = gsi_rows(storage.conn(), "byKey")
+            .into_iter()
+            .map(|[_, gsi_sk, _, _, _]| gsi_sk)
+            .collect();
+        let composite = |b: &str| {
+            crate::actions::gsi::composite_key_string(&[
+                &AttributeValue::S("m".into()),
+                &AttributeValue::S(b.into()),
+            ])
+            .unwrap()
+        };
+        assert_eq!(sort_keys, vec![composite("2"), composite("1")]);
     }
 
     #[test]
