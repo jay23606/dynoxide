@@ -15,8 +15,11 @@
 //!   becomes the wire-invisible `DynoxideError::EnvelopedValidation`, which
 //!   the server dispatch envelopes on those two operations and untags on
 //!   every other one.
+//! - `SERIALIZATION:` maps to a `SerializationException` carrying the rest of
+//!   the message as DynamoDB words it, for a value the decoder has already
+//!   classified (an empty rest is a `SerializationException` with no message).
 //!
-//! Neither marker may ever reach the wire. Callers that decode raw serde
+//! No marker may ever reach the wire. Callers that decode raw serde
 //! messages by hand go through [`clean_serde_message`], which strips both
 //! markers along with serde_json's position suffix.
 
@@ -58,12 +61,18 @@ pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(body: &str) -> crate::
 /// marker and serde_json's position suffix.
 ///
 /// `VALIDATION_REQUEST:` becomes the wire-invisible
-/// [`EnvelopedValidation`](crate::DynoxideError::EnvelopedValidation) tag and
-/// `VALIDATION:` a bare `ValidationException`; an unmarked message returns
+/// [`EnvelopedValidation`](crate::DynoxideError::EnvelopedValidation) tag,
+/// `VALIDATION:` a bare `ValidationException` and `SERIALIZATION:` a
+/// `SerializationException`; an unmarked message returns
 /// `None` for the caller to classify. This is the single owner of the
 /// marker-to-variant mapping, shared by [`deserialize`] and callers that
 /// decode via `serde_json::from_value` (the MCP surface).
 pub(crate) fn classify_marked_serde_error(msg: &str) -> Option<crate::DynoxideError> {
+    if let Some(stripped) = msg.strip_prefix(SERIALIZATION_MARKER) {
+        return Some(crate::DynoxideError::SerializationException(
+            strip_position(stripped).to_string(),
+        ));
+    }
     if let Some(stripped) = msg.strip_prefix(REQUEST_VALIDATION_MARKER) {
         return Some(crate::DynoxideError::EnvelopedValidation(
             strip_position(stripped).to_string(),
@@ -80,6 +89,11 @@ pub(crate) fn classify_marked_serde_error(msg: &str) -> Option<crate::DynoxideEr
 /// Marker prefix for validation rejections raised inside serde
 /// deserialisation, mapped to a bare `ValidationException`.
 pub(crate) const VALIDATION_MARKER: &str = "VALIDATION:";
+
+/// Marker prefix for a malformed value classified inside serde
+/// deserialisation, mapped to a `SerializationException` whose message is the
+/// rest of the text.
+pub(crate) const SERIALIZATION_MARKER: &str = "SERIALIZATION:";
 
 /// Marker prefix for the request-validation class raised inside serde
 /// deserialisation, mapped to the wire-invisible `EnvelopedValidation` tag
@@ -98,8 +112,8 @@ fn strip_position(msg: &str) -> &str {
     msg
 }
 
-/// Strip serde_json's position suffix and either marker prefix from a raw
-/// serde error message.
+/// Strip serde_json's position suffix and any marker prefix from a raw serde
+/// error message.
 ///
 /// Hand-rolled decoders that pattern-match serde messages route through this
 /// so no marker class can ever leak into a wire message.
@@ -108,6 +122,7 @@ pub(crate) fn clean_serde_message(msg: &str) -> &str {
     clean
         .strip_prefix(REQUEST_VALIDATION_MARKER)
         .or_else(|| clean.strip_prefix(VALIDATION_MARKER))
+        .or_else(|| clean.strip_prefix(SERIALIZATION_MARKER))
         .unwrap_or(clean)
 }
 

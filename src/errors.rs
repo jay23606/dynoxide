@@ -317,7 +317,11 @@ impl DynoxideError {
                     "__type".to_string(),
                     serde_json::Value::String(error_type.to_string()),
                 );
-                m.insert("Message".to_string(), serde_json::Value::String(message));
+                // DynamoDB leaves the message out altogether when it has none
+                // to give, as for a list where a boolean belongs.
+                if !message.is_empty() {
+                    m.insert("Message".to_string(), serde_json::Value::String(message));
+                }
                 serde_json::to_string(&m).unwrap_or_default()
             }
             _ => {

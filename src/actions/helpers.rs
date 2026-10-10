@@ -1004,6 +1004,12 @@ pub fn parse_expression_attribute_values_raw(
             }
             Err(e) => {
                 let msg = e.to_string();
+                // A malformed value fails the request as it is read, before
+                // any key is named.
+                if msg.starts_with(crate::serde_errors::SERIALIZATION_MARKER) {
+                    return Err(crate::serde_errors::classify_marked_serde_error(&msg)
+                        .unwrap_or_else(|| DynoxideError::SerializationException(msg.clone())));
+                }
                 // Strip the serde position suffix and any internal marker
                 let inner = crate::serde_errors::clean_serde_message(&msg);
 
@@ -1039,6 +1045,16 @@ pub fn parse_expression_attribute_values_raw(
                             ))
                         }
                     });
+                } else if inner.contains("Null attribute value types must have the value of true")
+                    && !msg.starts_with(crate::serde_errors::REQUEST_VALIDATION_MARKER)
+                {
+                    // A NULL refused as it was parsed (a string that reads as
+                    // false, or false beside another member) is named by key,
+                    // as an empty value is (captured eu-west-2 and us-east-1,
+                    // 2026-10-10, on UpdateItem, DeleteItem and Query).
+                    return Err(DynoxideError::ValidationException(format!(
+                        "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
+                    )));
                 } else if inner.contains("Null attribute value types must have the value of true") {
                     // A rejected {"NULL": false} fails to deserialise here with a
                     // marker-prefixed message. Real DynamoDB rejects it with the
@@ -1996,6 +2012,12 @@ pub fn parse_exclusive_start_key(
         Ok(map) => map,
         Err(e) => {
             let msg = e.to_string();
+            // A malformed value fails the request as it is read, as it does
+            // in an expression value (not captured for a starting key).
+            if msg.starts_with(crate::serde_errors::SERIALIZATION_MARKER) {
+                return Err(crate::serde_errors::classify_marked_serde_error(&msg)
+                    .unwrap_or_else(|| DynoxideError::SerializationException(msg.clone())));
+            }
             // Strip the serde position suffix and any internal marker
             let inner = crate::serde_errors::clean_serde_message(&msg);
 

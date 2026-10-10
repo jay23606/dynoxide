@@ -22,7 +22,11 @@ struct QueryRequestRaw {
     projection_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues", default)]
+    #[serde(
+        rename = "ExpressionAttributeValues",
+        default,
+        deserialize_with = "crate::types::deserialize_named_empty_and_null_refusals"
+    )]
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ScanIndexForward", default = "default_true")]
     scan_index_forward: bool,

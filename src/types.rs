@@ -223,12 +223,14 @@ impl<'de> Deserialize<'de> for AttributeValue {
             return Err(de::Error::custom("empty AttributeValue object"));
         }
 
-        // Collect known type keys
+        // Collect known type keys. A member set to JSON null counts as absent:
+        // `{"S": null}` is an empty value and `{"S": "a", "N": null}` a string
+        // (captured eu-west-2 and us-east-1, 2026-10-10).
         let known_types = ["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS", "L", "M"];
         let present: Vec<&str> = obj
-            .keys()
-            .filter(|k| known_types.contains(&k.as_str()))
-            .map(|k| k.as_str())
+            .iter()
+            .filter(|(k, v)| known_types.contains(&k.as_str()) && !v.is_null())
+            .map(|(k, _)| k.as_str())
             .collect();
 
         if present.is_empty() {
@@ -236,6 +238,18 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
             ));
         }
+
+        // BOOL and NULL members are read first, as booleans: a malformed one
+        // fails the request ahead of anything else about the value, a second
+        // member included (captured eu-west-2 and us-east-1, 2026-10-10).
+        let boolean = match obj.get("BOOL").filter(|v| !v.is_null()) {
+            Some(v) => Some(read_lenient_bool(v).map_err(de::Error::custom)?),
+            None => None,
+        };
+        let null = match obj.get("NULL").filter(|v| !v.is_null()) {
+            Some(v) => Some(read_lenient_bool(v).map_err(de::Error::custom)?),
+            None => None,
+        };
 
         // Validate numbers in ALL type keys before checking for multi-type.
         // DynamoDB validates number format before rejecting multi-type.
@@ -257,6 +271,28 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 }
                 _ => {}
             }
+        }
+
+        // A NULL must read as true. JSON false on its own is refused by the
+        // request's validation, in the envelope PutItem, UpdateItem and
+        // DeleteItem give it, so it carries the request-validation marker. A
+        // string that reads as false, or a false NULL beside another member,
+        // is refused as the value is parsed: bare, and ahead of the check for
+        // more than one member (captured eu-west-2 and us-east-1, 2026-10-10).
+        if let Some(LenientBool {
+            value: false,
+            from_string,
+        }) = null
+        {
+            let marker = if from_string || present.len() > 1 {
+                crate::serde_errors::VALIDATION_MARKER
+            } else {
+                crate::serde_errors::REQUEST_VALIDATION_MARKER
+            };
+            return Err(de::Error::custom(format!(
+                "{marker}One or more parameter values were invalid: \
+                 Null attribute value types must have the value of true"
+            )));
         }
 
         // Check for multiple type keys
@@ -292,29 +328,9 @@ impl<'de> Deserialize<'de> for AttributeValue {
                     .map_err(|e| de::Error::custom(format!("invalid base64: {e}")))?;
                 Ok(AttributeValue::B(bytes))
             }
-            "BOOL" => {
-                let b = val
-                    .as_bool()
-                    .ok_or_else(|| de::Error::custom("expected boolean for BOOL"))?;
-                Ok(AttributeValue::BOOL(b))
-            }
-            "NULL" => {
-                // AWS requires the NULL member to be exactly `true`; `{"NULL": false}`
-                // and non-boolean values (e.g. `{"NULL": "no"}`) are both rejected.
-                // dynoxide previously normalised `false` to `true` (#62/#74); real
-                // DynamoDB (eu-west-2) rejects it, so we match that here. The
-                // VALIDATION_REQUEST marker puts the rejection in the
-                // request-validation class that PutItem and UpdateItem envelope
-                // (see `crate::serde_errors`); other operations report it bare.
-                if val.as_bool() != Some(true) {
-                    return Err(de::Error::custom(format!(
-                        "{}One or more parameter values were invalid: \
-                         Null attribute value types must have the value of true",
-                        crate::serde_errors::REQUEST_VALIDATION_MARKER
-                    )));
-                }
-                Ok(AttributeValue::NULL(true))
-            }
+            // Both were read above; a NULL that reached here reads as true.
+            "BOOL" => Ok(AttributeValue::BOOL(boolean.is_some_and(|b| b.value))),
+            "NULL" => Ok(AttributeValue::NULL(true)),
             "SS" => {
                 let arr = val
                     .as_array()
@@ -384,6 +400,51 @@ impl<'de> Deserialize<'de> for AttributeValue {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+/// A BOOL or NULL member's value read as a boolean, and whether it was
+/// written as a string.
+#[derive(Clone, Copy)]
+struct LenientBool {
+    value: bool,
+    from_string: bool,
+}
+
+/// Read a BOOL or NULL member's value the way DynamoDB does: JSON `true` and
+/// `false`, or one of the strings it takes for them in any case (`true`, `t`,
+/// `yes`, `y` and `1`; `false`, `f`, `no`, `n` and `0`). Anything else is a
+/// malformed request, in DynamoDB's words for what was found: another string,
+/// a number, a list (no message at all) or a map (captured eu-west-2 and
+/// us-east-1, 2026-10-10). The error carries the serialisation marker.
+fn read_lenient_bool(value: &serde_json::Value) -> Result<LenientBool, String> {
+    let refused = |message: &str| format!("{}{message}", crate::serde_errors::SERIALIZATION_MARKER);
+    match value {
+        serde_json::Value::Bool(value) => Ok(LenientBool {
+            value: *value,
+            from_string: false,
+        }),
+        serde_json::Value::String(text) => match text.to_ascii_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" | "1" => Ok(LenientBool {
+                value: true,
+                from_string: true,
+            }),
+            "false" | "f" | "no" | "n" | "0" => Ok(LenientBool {
+                value: false,
+                from_string: true,
+            }),
+            _ => Err(refused("Unexpected token received from parser")),
+        },
+        serde_json::Value::Number(n) if n.is_f64() => {
+            Err(refused("DECIMAL_VALUE cannot be converted to Boolean"))
+        }
+        serde_json::Value::Number(_) => Err(refused("NUMBER_VALUE cannot be converted to Boolean")),
+        serde_json::Value::Array(_) => Err(refused("")),
+        serde_json::Value::Object(_) => Err(refused(
+            "Start of structure or map found where not expected",
+        )),
+        // A null member counts as absent and is never read.
+        serde_json::Value::Null => Err(refused("Unexpected token received from parser")),
     }
 }
 
@@ -522,6 +583,69 @@ pub(crate) fn deserialize_older_expression_values<'de, D: serde::Deserializer<'d
                     || inner.contains("Number overflow")
                     || inner.contains("Number underflow");
                 return Err(de::Error::custom(if number {
+                    format!(
+                        "{}ExpressionAttributeValues contains invalid value: {inner} for key {key}",
+                        crate::serde_errors::VALIDATION_MARKER
+                    )
+                } else {
+                    msg
+                }));
+            }
+        }
+    }
+    Ok(Some(values))
+}
+
+/// Deserialise UpdateItem's `ExpressionAttributeValues`, naming the key of a
+/// NULL refused as it was parsed (a string that reads as false, or false
+/// beside another member) the way DynamoDB does: `ExpressionAttributeValues
+/// contains invalid value: ... for key :v` (captured eu-west-2 and us-east-1,
+/// 2026-10-10). Every other value error passes through as it is.
+pub(crate) fn deserialize_named_null_refusals<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
+    deserialize_named_refusals(deserializer, false)
+}
+
+/// Deserialise Query's `ExpressionAttributeValues`, naming the key of an empty
+/// value as well as of a NULL refused as it was parsed (captured eu-west-2 and
+/// us-east-1, 2026-10-10: `{":v": {"S": null}}` and `{":v": {"NULL": "no"}}`).
+pub(crate) fn deserialize_named_empty_and_null_refusals<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
+    deserialize_named_refusals(deserializer, true)
+}
+
+fn deserialize_named_refusals<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    name_empty: bool,
+) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
+    let Some(raw) =
+        Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    let mut values = HashMap::with_capacity(raw.len());
+    for (key, value) in raw {
+        match serde_json::from_value::<AttributeValue>(value) {
+            Ok(av) => {
+                values.insert(key, av);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let inner = crate::serde_errors::clean_serde_message(&msg);
+                let parsed_null = msg.starts_with(crate::serde_errors::VALIDATION_MARKER)
+                    && inner.contains("Null attribute value types must have the value of true");
+                let empty = name_empty
+                    && (inner.contains("empty AttributeValue")
+                        || inner.starts_with("Supplied AttributeValue is empty"));
+                return Err(de::Error::custom(if parsed_null || empty {
+                    let inner = if empty {
+                        "Supplied AttributeValue is empty, must contain exactly one of the \
+                         supported datatypes"
+                    } else {
+                        inner
+                    };
                     format!(
                         "{}ExpressionAttributeValues contains invalid value: {inner} for key {key}",
                         crate::serde_errors::VALIDATION_MARKER

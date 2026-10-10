@@ -624,6 +624,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExecuteStatement`, `BatchExecuteStatement` and `ExecuteTransaction`. The
   limit counts characters, not bytes. Captured against eu-west-2 and
   us-east-1.
+- A `BOOL` or `NULL` member's value is read as DynamoDB reads it. The
+  strings `true`, `t`, `yes`, `y` and `1`, and `false`, `f`, `no`, `n` and
+  `0`, in any case, are taken as the booleans they spell, so `{"BOOL": "no"}`
+  stores `false` and `{"NULL": "yes"}` stores a NULL, where both used to be
+  refused. Any other string is refused with `Unexpected token received from
+  parser`, a number with `NUMBER_VALUE` (or `DECIMAL_VALUE`) `cannot be
+  converted to Boolean`, and a list with a `SerializationException` that has
+  no message. A `NULL` that reads as false is refused bare as the value is
+  read, and named by key in an expression value on `UpdateItem`, `DeleteItem`
+  and `Query`, when it was a string or sits beside another member; a lone
+  `{"NULL": false}` keeps the envelope. A member set to JSON `null` counts as
+  absent, so `{"S": null}` is an empty value and `{"S": "a", "N": null}` a
+  string, and `Query` names the key of an empty expression value. Captured
+  against eu-west-2 and us-east-1.
 - A PartiQL statement that reads or writes by a key longer than a key can be
   is refused with DynamoDB's words, where it used to run and find nothing: a
   partition key over 2,048 bytes with `Size of hashkey has exceeded the
