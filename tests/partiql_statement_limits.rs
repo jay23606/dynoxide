@@ -138,7 +138,9 @@ fn a_where_clause_past_300_operators_is_refused() {
 /// it holds. Every row is the last count DynamoDB runs and the first it
 /// refuses (captured eu-west-2 and us-east-1, 2026-10-10), except the
 /// `NOT begins_with` row, which follows from the same counts: its NOT counts
-/// as any other does.
+/// as any other does. A bag literal counts nothing: its `<<` and `>>` are
+/// brackets, not comparisons, so ` AND s = <<'x'>>` costs two like
+/// ` AND x = 1` (captured eu-west-2, 2026-10-10).
 #[test]
 fn comparisons_and_function_calls_count_toward_the_operator_limit() {
     let db = setup();
@@ -151,6 +153,7 @@ fn comparisons_and_function_calls_count_toward_the_operator_limit() {
         (" AND x < 9", 149),
         (" OR x = 1", 149),
         (" AND NOT begins_with(s, 'a')", 99),
+        (" AND s = <<'x'>>", 149),
     ] {
         let statement = |copies: usize| {
             format!(

@@ -32,11 +32,9 @@ fn an_empty_expected_value_is_refused_in_dynamodbs_words() {
     }))
     .unwrap();
     let err = db.put_item(request).unwrap_err().to_string();
-    assert!(
-        err.contains(
-            "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
-        ),
-        "{err}"
+    assert_eq!(
+        err,
+        "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
     );
     let read: GetItemRequest = serde_json::from_value(json!({
         "TableName": "Expected",

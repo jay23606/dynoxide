@@ -2829,11 +2829,13 @@ fn parse_condition_function(
         t.next_token()?;
     } else {
         loop {
-            let tok = t.next_token()?.ok_or(UNEXPECTED_TERM)?;
+            // Peeked, not read and stepped back over, so a value operand's
+            // first token is read once and counted once.
+            let tok = t.peek_token()?.ok_or(UNEXPECTED_TERM)?;
             if is_name(&tok) {
+                t.next_token()?;
                 operands.push(Some(parse_dotted_path_from_token(&tok, t)?));
             } else {
-                t.pos -= 1;
                 parse_value(t, depth)?;
                 operands.push(None);
             }
@@ -3390,27 +3392,27 @@ fn slots(groups: &Groups) -> usize {
 
 /// Flatten an AND/OR tree into the OR-of-ANDs the rest of the engine reads.
 ///
-/// Every step works out how many groups and condition slots its result will
-/// hold before building it, and refuses a clause past `MAX_OR_GROUPS` or
-/// `MAX_TOTAL_CONDITIONS` then, so nothing larger than the budget is ever
-/// built only to be thrown away. The conditions themselves are shared, so a
-/// slot costs a pointer however long the path or literal it names.
+/// An AND works out how many groups and condition slots its product will hold
+/// before building it, and refuses a clause past `MAX_OR_GROUPS` or
+/// `MAX_TOTAL_CONDITIONS` then, so no product larger than the budget is ever
+/// built only to be thrown away. An OR caps only its groups: its arms are
+/// already within the slot budget each. The conditions themselves are shared,
+/// so a slot costs a pointer however long the path or literal it names.
 fn to_dnf(tree: &ConditionTree) -> Result<Groups, String> {
     let too_complex = || Err(TOO_COMPLEX.to_string());
     match tree {
         ConditionTree::Leaf(cond) => Ok(vec![vec![Arc::clone(cond)]]),
         ConditionTree::Or(terms) => {
+            // Only the groups are capped here. Each arm has already held its
+            // own slots to the budget, and alternatives side by side are no
+            // reason to refuse: DynamoDB runs far wider alternations (captured
+            // eu-west-2, 2026-10-10).
             let mut out: Groups = Vec::new();
-            let mut held = 0usize;
             for term in terms {
                 let term_groups = to_dnf(term)?;
-                let term_slots = slots(&term_groups);
-                if out.len().saturating_add(term_groups.len()) > MAX_OR_GROUPS
-                    || held.saturating_add(term_slots) > MAX_TOTAL_CONDITIONS
-                {
+                if out.len().saturating_add(term_groups.len()) > MAX_OR_GROUPS {
                     return too_complex();
                 }
-                held += term_slots;
                 out.extend(term_groups);
             }
             Ok(out)
@@ -3638,7 +3640,16 @@ fn expect_char(t: &mut Tokenizer, expected: &str) -> Result<(), String> {
 
 /// `depth` counts the collection levels above this value, so a literal nested
 /// past `MAX_EXPR_DEPTH` is a rejection rather than a stack overflow.
+///
+/// Nothing read inside the value counts toward a WHERE clause's operators.
 fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> {
+    t.reading_literal += 1;
+    let value = read_value(t, depth);
+    t.reading_literal -= 1;
+    value
+}
+
+fn read_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> {
     if depth > MAX_EXPR_DEPTH {
         return Err(TOO_DEEP.to_string());
     }
@@ -4522,6 +4533,10 @@ struct Tokenizer {
     /// operators and function calls count against `MAX_OPERATORS` as they
     /// are consumed.
     reading_where: bool,
+    /// How many literal values are being read, nested. A literal's tokens
+    /// count no operators: a bag's `<<` and `>>` reach the parser as `<` and
+    /// `>`, and are brackets, not comparisons.
+    reading_literal: usize,
 }
 
 /// One refusal DynamoDB makes as it reads a statement's terms.
@@ -4561,6 +4576,7 @@ impl Tokenizer {
             depth: 0,
             operators: 0,
             reading_where: false,
+            reading_literal: 0,
         })
     }
 
@@ -4765,8 +4781,10 @@ impl Tokenizer {
         self.pos += 1;
         // A comparison operator or a call to a WHERE function is an operator
         // DynamoDB counts, as AND, OR and NOT are, wherever the condition
-        // parser reads it (captured eu-west-2 and us-east-1, 2026-10-10).
-        if self.reading_where {
+        // parser reads it (captured eu-west-2 and us-east-1, 2026-10-10). A
+        // literal's own tokens are not: ` AND s = <<'x'>>` costs two, as
+        // ` AND x = 1` does (captured eu-west-2, 2026-10-10).
+        if self.reading_where && self.reading_literal == 0 {
             let calls = self.tokens.get(self.pos).is_some_and(|next| next == "(");
             if is_comparison_operator(&tok)
                 || (calls && WHERE_FUNCTIONS.iter().any(|f| tok.eq_ignore_ascii_case(f)))
@@ -5136,6 +5154,28 @@ mod tests {
             .expect("the parser ran out of stack");
         let err = outcome.expect_err("past the operator limit");
         assert!(err.contains("too many operators"), "got {err}");
+    }
+
+    /// The operators a WHERE clause is charged, read the way a statement's
+    /// clause is.
+    fn operators_in(clause: &str) -> usize {
+        let mut t = Tokenizer::new(clause).unwrap();
+        let _ = parse_conditions_with_or(&mut t);
+        t.operators
+    }
+
+    /// A bag literal's `<<` and `>>` are brackets, not comparisons, so a bag
+    /// counts nothing toward the operator limit wherever it's written:
+    /// ` AND s = <<'x'>>` costs its AND and its `=` (captured eu-west-2,
+    /// 2026-10-10), and a bag handed to a condition function costs nothing
+    /// beyond the call. The function's operand is read once, so its bag isn't
+    /// charged twice either.
+    #[test]
+    fn a_bag_literal_counts_no_operators() {
+        assert_eq!(operators_in("pk = 'a' AND s = <<'x'>>"), 3);
+        assert_eq!(operators_in("pk = 'a' AND s = <<'x', 'y'>>"), 3);
+        assert_eq!(operators_in("pk = 'a' AND attribute_exists(<<'x'>>)"), 3);
+        assert_eq!(operators_in("pk = 'a' AND s IN [<<'x'>>, <<'y'>>]"), 2);
     }
 
     /// A NOT run keeps its parity: an odd run negates, an even one doesn't.
