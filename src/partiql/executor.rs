@@ -3477,10 +3477,65 @@ fn matches_where(
         None => return true,
     };
 
+    // A placeholder with no parameter to fill it decides nothing: several
+    // conditions hold of an item that lacks the attribute (`<>` and the
+    // negated forms), and a statement short of its parameters mustn't read or
+    // delete an item on that account.
+    if wc
+        .groups
+        .iter()
+        .flatten()
+        .any(|condition| has_unbound_parameter(condition, parameters.len()))
+    {
+        return false;
+    }
+
     // OR semantics: any group matching is sufficient
     wc.groups
         .iter()
         .any(|group| matches_conditions(item, group, parameters))
+}
+
+/// Whether `condition` names a parameter at or past `bound`, the number
+/// supplied. Every variant is listed, so a new one has to say how it reads
+/// parameters.
+fn has_unbound_parameter(condition: &WhereCondition, bound: usize) -> bool {
+    fn value(v: &PartiqlValue, bound: usize) -> bool {
+        matches!(v, PartiqlValue::Parameter(i) if *i >= bound)
+    }
+    fn operand(o: &Operand, bound: usize) -> bool {
+        match o {
+            Operand::Path(_) => false,
+            Operand::Value(v) => value(v, bound),
+            Operand::Size(inner) => operand(inner, bound),
+        }
+    }
+    match condition {
+        WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => value(&c.value, bound),
+        WhereCondition::Exists(_)
+        | WhereCondition::NotExists(_)
+        | WhereCondition::IsMissing(_)
+        | WhereCondition::IsNotMissing(_)
+        | WhereCondition::IsType(..)
+        | WhereCondition::IsNotType(..) => false,
+        WhereCondition::BeginsWith(_, v)
+        | WhereCondition::NotBeginsWith(_, v)
+        | WhereCondition::Contains(_, v)
+        | WhereCondition::NotContains(_, v) => value(v, bound),
+        WhereCondition::Between(_, low, high) | WhereCondition::NotBetween(_, low, high) => {
+            value(low, bound) || value(high, bound)
+        }
+        WhereCondition::In(_, values) => values.iter().any(|v| value(v, bound)),
+        WhereCondition::Compare(left, _, right) => operand(left, bound) || operand(right, bound),
+        WhereCondition::CompareBetween(o, low, high) => {
+            operand(o, bound) || operand(low, bound) || operand(high, bound)
+        }
+        WhereCondition::CompareIn(o, list) => {
+            operand(o, bound) || list.iter().any(|m| operand(m, bound))
+        }
+        WhereCondition::AttributeType(o, kind) => operand(o, bound) || value(kind, bound),
+        WhereCondition::Not(inner) => has_unbound_parameter(inner, bound),
+    }
 }
 
 /// Check if an item matches all conditions in a group (AND semantics).

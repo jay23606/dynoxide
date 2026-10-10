@@ -105,3 +105,78 @@ fn a_deeply_nested_statement_is_refused_on_every_partiql_operation() {
         assert!(refused, "BatchExecuteStatement, {what}: {answer:?}");
     }
 }
+
+/// `size(` nests through its argument, and a run of `+ 1` after a size is
+/// refused term by term: neither may spend the stack. Within the statement
+/// limit that is about 1,350 nested calls or 2,000 terms.
+#[test]
+fn nested_size_calls_and_size_arithmetic_are_refused_on_every_partiql_operation() {
+    let db = Database::memory().unwrap();
+    let calls = (LIMIT - 64) / 6;
+    let nested = |what: &str| {
+        format!(
+            r#"SELECT * FROM "Tbl" WHERE {what}{}a{} = 1"#,
+            "size(".repeat(calls),
+            ")".repeat(calls)
+        )
+    };
+    let statements = [
+        ("nested size", nested("")),
+        (
+            "size arithmetic",
+            format!(
+                r#"SELECT * FROM "Tbl" WHERE size(a){} = 1"#,
+                " + 1".repeat((LIMIT - 64) / 4)
+            ),
+        ),
+        (
+            "nested size in attribute_type",
+            format!(
+                r#"SELECT * FROM "Tbl" WHERE attribute_type({}a{}, 'S')"#,
+                "size(".repeat(calls - 8),
+                ")".repeat(calls - 8)
+            ),
+        ),
+    ];
+    for (what, statement) in statements {
+        assert!(statement.chars().count() <= LIMIT, "{what} fits the limit");
+        let single: ExecuteStatementRequest =
+            serde_json::from_value(json!({"Statement": statement})).unwrap();
+        assert!(
+            matches!(
+                db.execute_statement(single),
+                Err(DynoxideError::ValidationException(_))
+            ),
+            "ExecuteStatement, {what}"
+        );
+        let transaction: ExecuteTransactionRequest = serde_json::from_value(json!({
+            "TransactStatements": [{"Statement": statement}]
+        }))
+        .unwrap();
+        assert!(
+            db.execute_transaction(transaction).is_err(),
+            "ExecuteTransaction, {what}"
+        );
+        let batch: BatchExecuteStatementRequest = serde_json::from_value(json!({
+            "Statements": [{"Statement": statement}]
+        }))
+        .unwrap();
+        let answer = db.batch_execute_statement(batch);
+        assert!(
+            answer.is_err() || answer.unwrap().responses.iter().all(|r| r.error.is_some()),
+            "BatchExecuteStatement, {what}"
+        );
+    }
+}
+
+/// The parser itself holds nested `size(` calls to its depth limit, so a
+/// caller that skips the request's length limit can't overflow the stack.
+#[test]
+fn the_parser_refuses_nested_size_calls_without_the_length_limit() {
+    let statement = format!(
+        r#"SELECT * FROM "Tbl" WHERE {}a{} = 1"#,
+        "size(".repeat(10_000),
+        ")".repeat(10_000)
+    );
+    assert!(dynoxide::partiql::parser::parse(&statement).is_err());
+}

@@ -2806,7 +2806,7 @@ fn parse_attribute_type(
     t: &mut Tokenizer,
     depth: usize,
 ) -> Result<Option<(Operand, PartiqlValue)>, String> {
-    let mut operands = call_operands(t, depth)?;
+    let mut operands = call_operands(t, depth + 1)?;
     if operands.len() != 2 {
         t.note_operand_refusal(operand_count_refusal("attribute_type", operands.len()));
         return Ok(None);
@@ -2860,6 +2860,11 @@ pub(crate) fn attribute_type_name_refusal(name: &str) -> Option<String> {
 /// literal or a parameter. Nothing where it should be is an infix operator
 /// missing its right-hand side.
 fn parse_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
+    // `size(` and `attribute_type(` come back here for their arguments, so a
+    // run of nested calls is held to the same depth as nested brackets.
+    if depth > MAX_EXPR_DEPTH {
+        return Err(TOO_DEEP.to_string());
+    }
     let tok = match t.peek_token()? {
         None => return Err(MISSING_RIGHT_HAND_SIDE.to_string()),
         Some(tok) if tok == ";" => return Err(MISSING_RIGHT_HAND_SIDE.to_string()),
@@ -2873,7 +2878,7 @@ fn parse_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
         ))));
     }
     if is_keyword(&tok, "size") && t.peek_token_at(1)?.as_deref() == Some("(") {
-        let mut operands = call_operands(t, depth)?;
+        let mut operands = call_operands(t, depth + 1)?;
         if operands.len() != 1 {
             t.note_operand_refusal(operand_count_refusal("size", operands.len()));
             return Ok(Operand::Value(PartiqlValue::Literal(AttributeValue::NULL(
@@ -2942,6 +2947,17 @@ fn parse_in_list(t: &mut Tokenizer, depth: usize) -> Result<Vec<PartiqlValue>, S
 /// says so by naming the operator it stands under once the clause is read
 /// (captured eu-west-2 and us-east-1, 2026-10-09).
 fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<BoolExpr, String> {
+    // Arithmetic on a size is refused term by term; a loop, so a long run of
+    // `+ 1` reads in constant stack.
+    if matches!(left, Operand::Size(_)) {
+        while let Some(op) = t.peek_token()?.filter(|op| op == "+" || op == "-") {
+            t.note_operand_refusal(format!(
+                "Unsupported operator in Condition Expression. Operator: {op}"
+            ));
+            t.next_token()?;
+            parse_operand(t, depth)?;
+        }
+    }
     let next = t.peek_token()?;
     match next.as_deref() {
         Some(op) if is_comparison_operator(op) => {
@@ -2979,14 +2995,6 @@ fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<B
             }
             read_type_name(t)?;
             Ok(refused_condition())
-        }
-        Some(op) if matches!(left, Operand::Size(_)) && (op == "+" || op == "-") => {
-            t.note_operand_refusal(format!(
-                "Unsupported operator in Condition Expression. Operator: {op}"
-            ));
-            t.next_token()?;
-            parse_operand(t, depth)?;
-            finish_comparison(t, depth, left)
         }
         _ if matches!(left, Operand::Size(_)) => Ok(BoolExpr::NonBoolean("N")),
         _ => Err("Expected operator after attribute path".to_string()),

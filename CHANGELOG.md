@@ -570,6 +570,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DynamoDB's "The expression contains too many operators" message. A run of
   NOTs no longer counts as nesting, so one that was refused as nested too
   deeply now runs. Captured against eu-west-2 and us-east-1.
+- PartiQL `size()` calls nested inside one another, and arithmetic after a
+  `size()`, are held to the same depth as nested brackets.
+- A PartiQL condition whose `?` has no parameter to fill it no longer
+  matches an item. `flag <> ?` with no parameters used to hold for every item
+  without `flag`, so a `DELETE` or `UPDATE` short of its parameters could
+  delete or change it.
 
 ## [1.2.1] - 2026-09-20
 
