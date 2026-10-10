@@ -75,6 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and is left unchanged, where it used to be opened as it was. That covers
   `Database::new`, an encrypted open, the snapshot a restore reads from, and
   the browser build's database.
+- A database file waits up to 30 seconds for a lock another process holds,
+  where it gave up after five, so a second Dynoxide opening a file while the
+  first brings it up to date waits for it and then finds the work done. A
+  restore still gives up on a busy snapshot after five seconds, and an
+  in-memory database is unchanged.
 
 ### Added
 

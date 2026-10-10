@@ -15,6 +15,15 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use crate::storage_backend::sql_builders::SCHEMA_VERSION;
 
+/// How long a connection to a database file waits for a lock another
+/// process holds before it reports the database locked. Another Dynoxide
+/// opening the same file holds its write lock while it brings the file up to
+/// date, which can take longer than SQLite's usual five seconds on a large
+/// file. An in-memory database has no other process to wait for and keeps the
+/// default.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+const FILE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Number of hash buckets used for parallel scan segment assignment.
 /// Matches dynalite's implementation.
 pub(crate) const HASH_BUCKETS: u32 = 4096;
@@ -270,6 +279,7 @@ impl Storage {
     /// Open a persistent database at the given path.
     pub fn new(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(FILE_BUSY_TIMEOUT)?;
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
@@ -354,6 +364,7 @@ impl Storage {
         use zeroize::Zeroize;
 
         let conn = Connection::open(path)?;
+        conn.busy_timeout(FILE_BUSY_TIMEOUT)?;
         // Safety: key is validated to be exactly 64 hex characters [0-9a-fA-F]
         // by Database::new_encrypted(), so no injection is possible in the
         // x'...' hex literal format. Note: pragma_update does NOT use parameter
@@ -3493,6 +3504,80 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(recorded_version(&Connection::open(&path).unwrap()), "9");
+    }
+
+    fn busy_timeout_ms(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_database_file_waits_thirty_seconds_for_a_lock() {
+        let (_dir, path) = v9_snapshot_path();
+        assert_eq!(busy_timeout_ms(Storage::new(&path).unwrap().conn()), 30_000);
+        // An in-memory database has no other process to wait for, and keeps
+        // the connection's default.
+        assert_eq!(busy_timeout_ms(Storage::memory().unwrap().conn()), 5_000);
+    }
+
+    #[cfg(feature = "_has-encryption")]
+    #[test]
+    fn an_encrypted_database_file_waits_thirty_seconds_for_a_lock() {
+        const KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let (_dir, path) = v9_snapshot_path();
+        let storage = Storage::new_encrypted(&path, KEY).unwrap();
+        assert_eq!(busy_timeout_ms(storage.conn()), 30_000);
+    }
+
+    /// A second process opening a file while the first holds its write lock
+    /// part way through a migration waits for the lock, then finds the
+    /// migration done and leaves it alone. The pause before the first commits
+    /// only makes it likely the second is already waiting; the outcome is the
+    /// same either way, and how long the second will wait is the test above.
+    #[test]
+    fn a_second_open_waits_for_a_migration_another_holds_then_finds_it_done() {
+        let (_dir, path) = v9_snapshot_path();
+        write_v9_database(&path, 0);
+        let stale_index = gsi_rows(&Connection::open(&path).unwrap(), "byKey");
+
+        // The first open, part way through: it holds the write lock and has
+        // finished the work and recorded the version, but not yet committed.
+        // Its work leaves a size no recompute would give, so a second
+        // recompute would show.
+        let first = Connection::open(&path).unwrap();
+        first.execute_batch("BEGIN IMMEDIATE").unwrap();
+        first
+            .execute_batch(&format!(
+                "UPDATE \"Vec\" SET item_size = 1;
+                 UPDATE _config SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version';"
+            ))
+            .unwrap();
+
+        let (started, starting) = std::sync::mpsc::channel();
+        let second_path = path.clone();
+        let second = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let storage = Storage::new(&second_path)?;
+            Ok::<_, DynoxideError>((
+                recorded_version(storage.conn()),
+                vec_size(storage.conn()),
+                gsi_rows(storage.conn(), "byKey"),
+            ))
+        });
+        starting.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        first.execute_batch("COMMIT").unwrap();
+
+        let (version, size, index) = second.join().unwrap().unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+        assert_eq!(
+            size, 1,
+            "the second open must not recompute the sizes again"
+        );
+        assert_eq!(
+            index, stale_index,
+            "the second open must not rebuild the index the first left"
+        );
     }
 
     /// A database that records no version, as the browser build left one
