@@ -500,6 +500,85 @@ mod tests {
                 "{} vs {}", a, b
             );
         }
+
+        // Digits drawn from 0 and 1 with small exponents, so numbers of equal
+        // magnitude sharing a prefix (1.5 against 1.50 or 1.51, 1.0 against 1,
+        // 10 against 1e1) come up often: the branches where one number has
+        // digits left and the other has run out.
+        #[test]
+        fn reading_a_number_in_place_orders_shared_prefixes_as_its_sort_key_does(
+            a_neg in proptest::bool::ANY, a_int in "[01]{0,5}", a_frac in proptest::option::of("[01]{0,5}"),
+            a_exp in proptest::option::of(-3i64..3),
+            b_neg in proptest::bool::ANY, b_int in "[01]{0,5}", b_frac in proptest::option::of("[01]{0,5}"),
+            b_exp in proptest::option::of(-3i64..3),
+        ) {
+            let write = |neg: bool, int: &str, frac: &Option<String>, exp: Option<i64>| {
+                let mut s = String::new();
+                if neg { s.push('-'); }
+                s.push_str(if int.is_empty() && frac.as_deref().unwrap_or("").is_empty() { "0" } else { int });
+                if let Some(f) = frac { s.push('.'); s.push_str(f); }
+                if let Some(e) = exp { s.push_str(&format!("e{e}")); }
+                s
+            };
+            let a = write(a_neg, &a_int, &a_frac, a_exp);
+            let b = write(b_neg, &b_int, &b_frac, b_exp);
+            let (x, y) = (Number::read(&a).unwrap(), Number::read(&b).unwrap());
+            proptest::prop_assert_eq!(
+                x.cmp_value(&y),
+                normalize_number_for_sort(&a).cmp(&normalize_number_for_sort(&b)),
+                "{} vs {}", a, b
+            );
+        }
+    }
+
+    /// Pairs the generators rarely or never reach: equal values written
+    /// differently, 38-digit values that differ only in their last digit, and
+    /// the ends of DynamoDB's number range.
+    #[test]
+    fn reading_a_number_in_place_orders_edge_pairs_as_its_sort_key_does() {
+        let pairs = [
+            ("1.5", "1.50"),
+            ("1.5", "1.51"),
+            ("1.0", "1"),
+            ("10", "1e1"),
+            ("-0", "0"),
+            ("0.0", "0e5"),
+            ("-1.5", "-1.51"),
+            (
+                "12345678901234567890123456789012345678",
+                "12345678901234567890123456789012345677",
+            ),
+            (
+                "-12345678901234567890123456789012345678",
+                "-12345678901234567890123456789012345677",
+            ),
+            (
+                "0.12345678901234567890123456789012345678",
+                "0.12345678901234567890123456789012345679",
+            ),
+            ("1e-130", "2e-130"),
+            ("1e-130", "1E-130"),
+            ("-1e-130", "1e-130"),
+            (
+                "9.9999999999999999999999999999999999999E+125",
+                "9.9999999999999999999999999999999999998E+125",
+            ),
+            (
+                "-9.9999999999999999999999999999999999999E+125",
+                "-9.9999999999999999999999999999999999998E+125",
+            ),
+            ("9.9999999999999999999999999999999999999E+125", "1e-130"),
+        ];
+        for (a, b) in pairs {
+            for (a, b) in [(a, b), (b, a)] {
+                let (x, y) = (Number::read(a).unwrap(), Number::read(b).unwrap());
+                assert_eq!(
+                    x.cmp_value(&y),
+                    normalize_number_for_sort(a).cmp(&normalize_number_for_sort(b)),
+                    "{a} vs {b}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -524,7 +603,9 @@ mod tests {
         use crate::actions::*;
         use serde_json::{Value, to_value};
 
-        let members = strings(&["1", "2", "3"]);
+        // Stored out of order, as a row an earlier build wrote may be, so a
+        // numeric-order field has to sort it rather than pass it through.
+        let members = strings(&["3", "1", "2"]);
         let numeric: Vec<&str> = vec!["1", "2", "3"];
         let hash: Vec<&str> = java_hash_order(&members);
         assert_ne!(

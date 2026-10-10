@@ -1742,15 +1742,21 @@ mod tests {
         )
         .unwrap();
         // As a build before sets were sorted would have stored it.
-        let changed = db
+        let stored: String = db
             .with_storage(|s| {
-                Ok(s.conn().execute(
-                    "UPDATE \"tbl\" SET item_json = replace(item_json, '\"SS\":[\"a\",\"b\"]', '\"SS\":[\"b\",\"a\"]')",
+                s.conn().execute(
+                    "UPDATE \"tbl\" SET item_json = replace(item_json, '\"SS\":[\"a\",\"b\"]', '\"SS\":[\"b\",\"a\"]') \
+                     WHERE item_json LIKE '%\"SS\":[\"a\",\"b\"]%'",
                     [],
-                )?)
+                )?;
+                Ok(s.conn()
+                    .query_row("SELECT item_json FROM \"tbl\"", [], |row| row.get(0))?)
             })
             .unwrap();
-        assert_eq!(changed, 1, "the fixture must hold an unsorted set");
+        assert!(
+            stored.contains(r#""SS":["b","a"]"#),
+            "the fixture must hold an unsorted set: {stored}"
+        );
         // `g` becomes a GSI key; the set is the wrong type for it, so the
         // backfill leaves the item out of the index.
         db.update_table(
