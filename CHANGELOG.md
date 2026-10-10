@@ -381,6 +381,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to compare with the string `'n'`, and `n BETWEEN size(s) AND 10` parses
   (captured against eu-west-2 and us-east-1 for a size on either side; a
   path between path bounds follows the same reading, not yet captured).
+- A PartiQL `IN` with one value on a key attribute is read as `=`, as
+  DynamoDB reads it: `WHERE pk IN ['a']` reads item a by its key and is
+  charged what `pk = 'a'` is, where it used to scan the table, and two
+  statements naming the same item that way are duplicates in a batch or a
+  transaction (captured against eu-west-2 and us-east-1).
 - PartiQL refuses a bag it can't store with DynamoDB's messages and positions:
   one that starts with a string at its first member that isn't one, one that
   starts with a number without a position, and a parameter, `null` or Ion

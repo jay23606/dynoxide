@@ -1793,7 +1793,7 @@ async fn evaluate_window<S: StorageBackend>(
     // A partition key value no key can have only gets this far when the clause
     // isn't read by key (see `check_read_key_types`), and it matches no row.
     let pk_key = match pk_condition {
-        Some(cond) => Some(resolve_value(&cond.value, parameters)?.to_key_string()),
+        Some(value) => Some(resolve_value(value, parameters)?.to_key_string()),
         None => None,
     };
 
@@ -2398,6 +2398,13 @@ fn translate_sk_conditions(
                     prefix,
                 ));
             }
+            // An IN with one value is read as `=`, as DynamoDB reads it
+            // (captured eu-west-2 and us-east-1, 2026-10-10).
+            WhereCondition::In(path, values) if path == sk_name && values.len() == 1 => {
+                let value = resolve_value(&values[0], parameters).ok()?;
+                value.to_key_string()?;
+                resolved.push(ResolvedSortKeyCondition::Eq(sk_name.to_string(), value));
+            }
             // Any other condition shape on the sort key (IN, contains, a
             // negated comparison, negated begins_with, the existence checks) has
             // no key-condition equivalent, so nothing at all is pushed down for
@@ -2454,10 +2461,11 @@ fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
     })
 }
 
-fn find_pk_condition<'a>(
-    wc: &'a WhereClause,
-    pk_name: &str,
-) -> Option<&'a crate::partiql::parser::Condition> {
+/// The one value a single-group WHERE clause pins the partition key to, when
+/// it pins one: an `=`, or an `IN` with one value, which DynamoDB reads exactly
+/// as `=` (captured eu-west-2 and us-east-1, 2026-10-10: `pk IN ['a']` costs
+/// what `pk = 'a'` costs, where a scan costs more).
+fn find_pk_condition<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a PartiqlValue> {
     // Only optimise to a Query when there is a single OR group
     // (multi-group OR with pk in only one group would need a union approach).
     // A partition key named by more than one condition isn't a key read either
@@ -2468,16 +2476,20 @@ fn find_pk_condition<'a>(
     };
     let mut pinning = group.iter().filter_map(|c| match &**c {
         WhereCondition::Comparison(cond) if cond.path == pk_name && cond.op == CompOp::Eq => {
-            Some((Some(cond), std::slice::from_ref(&cond.value)))
+            Some(std::slice::from_ref(&cond.value))
         }
-        WhereCondition::In(path, values) if path == pk_name => Some((None, values.as_slice())),
+        WhereCondition::In(path, values) if path == pk_name => Some(values.as_slice()),
         _ => None,
     });
-    let (first, values) = pinning.next()?;
-    if pinning.any(|(_, other)| other != values) {
+    let values = pinning.next()?;
+    if pinning.any(|other| other != values) {
         return None;
     }
-    first
+    // An IN with several values names several partitions; it stays a scan.
+    match values {
+        [value] => Some(value),
+        _ => None,
+    }
 }
 
 /// A table's metadata and its parsed key schema, worked out once.
@@ -2559,11 +2571,14 @@ fn statement_key(
         Some((pk, sk))
     };
 
+    // A SELECT's key may be pinned by `=` or by an IN with one value, which
+    // DynamoDB treats as the same item (captured eu-west-2 and us-east-1,
+    // 2026-10-10: `pk IN ['a']` twice, or beside `pk = 'a'`, is a duplicate).
     let from_where = |where_clause: &Option<WhereClause>| -> Option<(String, String)> {
         let wc = where_clause.as_ref()?;
         key_of(&|name: &str| {
-            find_comparison_in_groups(&wc.groups, name)
-                .and_then(|cond| resolve_value(&cond.value, parameters).ok())
+            find_key_value_in_groups(&wc.groups, name)
+                .and_then(|value| resolve_value(value, parameters).ok())
         })
     };
 
@@ -3221,18 +3236,21 @@ fn mandatory_key_equality() -> DynoxideError {
     )
 }
 
-/// Find a comparison condition matching a given path with Eq operator,
-/// searching across all OR groups.
-fn find_comparison_in_groups<'a>(
+/// Find the value a key attribute is pinned to by an `=` or an IN with one
+/// value, searching across all OR groups.
+fn find_key_value_in_groups<'a>(
     groups: &'a [Vec<Arc<WhereCondition>>],
     path: &str,
-) -> Option<&'a crate::partiql::parser::Condition> {
-    for group in groups {
-        if let Some(cond) = find_comparison(group, path) {
-            return Some(cond);
-        }
-    }
-    None
+) -> Option<&'a PartiqlValue> {
+    groups.iter().find_map(|group| {
+        group.iter().find_map(|c| match &**c {
+            WhereCondition::Comparison(cond) if cond.path == path && cond.op == CompOp::Eq => {
+                Some(&cond.value)
+            }
+            WhereCondition::In(p, values) if p == path && values.len() == 1 => Some(&values[0]),
+            _ => None,
+        })
+    })
 }
 
 /// Find a comparison condition matching a given path with Eq operator.
