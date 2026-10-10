@@ -47,12 +47,12 @@ npm run build:wasm
 
 | File | Size | What |
 |---|---|---|
-| `dynoxide_bg.wasm` | ~1.2 MB | the engine (release, wasm-opt) |
-| `sqlite3.wasm` | ~845 KB | SQLite (the official @sqlite.org/sqlite-wasm build) |
-| `dynoxide-worker.js` | ~225 KB | the bundled Web Worker (engine glue + bridge, fully minified) |
+| `dynoxide_bg.wasm` | ~1.9 MB | the engine (release, wasm-opt) |
+| `sqlite3.wasm` | ~865 KB | SQLite (the official @sqlite.org/sqlite-wasm build) |
+| `dynoxide-worker.js` | ~230 KB | the bundled Web Worker (engine glue + bridge, fully minified) |
 | `manifest.json` | <1 KB | engine version, contract version, file list |
 
-About 2.3 MB raw, but that's not the number that reaches a browser. The `.wasm` and the Worker JS all compress well, so served with gzip it's around 915 KB over the wire, and brotli takes it lower again - turn one of them on at the host (most CDNs do by default). The `.wasm` files are immutable, so they cache hard after the first load, and the SAHPool VFS is synchronous, so the engine needs neither the larger Asyncify async build nor `SharedArrayBuffer`.
+About 3 MB raw, but that's not the number that reaches a browser. The `.wasm` and the Worker JS all compress well, so served with gzip it's around 1.2 MB over the wire, and brotli takes it lower again - turn one of them on at the host (most CDNs do by default). The `.wasm` files are immutable, so they cache hard after the first load, and the SAHPool VFS is synchronous, so the engine needs neither the larger Asyncify async build nor `SharedArrayBuffer`.
 
 Drop `dist/` on any origin that's a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) - HTTPS in production, or `localhost` for development. OPFS needs a secure context, but **no COOP/COEP headers and no cross-origin isolation**, so plain static hosting works. (SQLite in the browser usually needs cross-origin isolation, because the common technique makes an async storage API look synchronous via `SharedArrayBuffer`. Dynoxide avoids that by running the official synchronous OPFS SAHPool VFS inside a Worker, where synchronous file handles are available directly.) One header does matter: if you set a Content-Security-Policy it must allow `'wasm-unsafe-eval'`, or the engine won't instantiate. Serve the `.wasm` as `application/wasm` while you're at it.
 
