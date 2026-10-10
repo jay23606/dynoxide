@@ -320,6 +320,14 @@ pub async fn execute<S: StorageBackend>(
         );
 
         let item = if let Some(proj_expr) = &get.projection_expression {
+            // An empty expression is refused as GetItem refuses one (inferred:
+            // GetItem's answer, not captured here). Parsed, it would be a
+            // syntax error at its end.
+            if proj_expr.is_empty() {
+                return Err(DynoxideError::ValidationException(
+                    "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
+                ));
+            }
             let projection = expressions::projection::parse(proj_expr)
                 .map_err(DynoxideError::ValidationException)?;
             tracker.track_projection_expr(&projection);

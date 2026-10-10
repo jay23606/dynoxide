@@ -374,12 +374,15 @@ impl TokenStream {
 /// `near` is the last token read. Captured in us-east-1 and eu-west-2,
 /// 2026-10-09, across ConditionExpression, FilterExpression,
 /// KeyConditionExpression and UpdateExpression.
+///
+/// An expression with no tokens at all, only whitespace, is the same error at
+/// its end with the whitespace as sent for `near`: `near: "   "`, or a tab and
+/// a newline as they were (captured eu-west-2 and us-east-1, 2026-10-10).
 pub fn syntax_error_at(source: &str, spans: &[TokenSpan], index: usize) -> String {
     let Some(offending) = spans.get(index) else {
         let near = spans
             .last()
-            .map(|last| &source[last.start..last.end()])
-            .unwrap_or("");
+            .map_or(source, |last| &source[last.start..last.end()]);
         return format!(r#"Syntax error; token: "<EOF>", near: "{near}""#);
     };
     let start = if index > 0 {

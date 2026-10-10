@@ -214,6 +214,15 @@ pub fn parse(expr: &str) -> Result<UpdateExpr, String> {
         )
     })?;
     let mut stream = TokenStream::new(tokens);
+    // Whitespace alone has no clause, and is refused at its end rather than
+    // read as an update that changes nothing (captured eu-west-2 and
+    // us-east-1, 2026-10-10). The caller refuses an empty string before this.
+    if stream.at_end() {
+        return Err(format!(
+            "Invalid UpdateExpression: {}",
+            stream.syntax_error(expr)
+        ));
+    }
 
     let mut set_actions = Vec::new();
     let mut remove_actions = Vec::new();

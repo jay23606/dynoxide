@@ -125,6 +125,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An `UpdateItem` whose `UpdateExpression` was only whitespace, such as
+  `"   "`, answered 200 and wrote the item: the key alone for a new item, or
+  the item as it was for an existing one. 1.2.1 did this too. An expression made
+  only of whitespace is now refused as DynamoDB refuses it, as a syntax error
+  at its end with the whitespace as sent: `Invalid UpdateExpression: Syntax
+  error; token: "<EOF>", near: "   "`, and nothing is written. A
+  `ProjectionExpression` of whitespace is refused the same way on every read
+  that takes one, where it returned items with no attributes. A
+  `ConditionExpression`, `KeyConditionExpression` or `FilterExpression` of
+  whitespace was already refused, but with an empty `near`; it now gives the
+  whitespace too, in the envelope on `PutItem`, `UpdateItem` and `DeleteItem`
+  and bare elsewhere. A transaction's `Update` with an empty
+  `UpdateExpression` is refused up front with `Invalid UpdateExpression: The
+  expression can not be empty;`, where it wrote an item holding only its key,
+  and `TransactGetItems` refuses an empty `ProjectionExpression` as `GetItem`
+  does. Captured against eu-west-2 and us-east-1, the transactions also
+  against ap-southeast-2 and eu-central-1.
 - A legacy `QueryFilter` or `ScanFilter` condition whose value didn't read,
   such as `{"NULL": false}` or `{"BOOL": "maybe"}`, was dropped, so the Query
   or Scan ran without that condition and returned items it should have

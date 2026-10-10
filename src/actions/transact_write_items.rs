@@ -758,6 +758,14 @@ fn validate_action_request(item: &TransactWriteItem) -> Result<()> {
                     .to_string(),
             ));
         }
+        // An empty expression is refused here, ahead of the table lookup,
+        // where it used to parse as an update that changes nothing and write
+        // the key alone (captured eu-west-2 and us-east-1, 2026-10-09).
+        if update.update_expression.is_empty() {
+            return Err(DynoxideError::ValidationException(
+                "Invalid UpdateExpression: The expression can not be empty;".to_string(),
+            ));
+        }
         let update_expression = crate::expressions::update::parse(&update.update_expression)
             .map_err(DynoxideError::ValidationException)?;
         validate_condition_size(update.condition_expression.as_deref())?;

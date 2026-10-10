@@ -33,11 +33,17 @@ pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
     })?;
     let mut stream = TokenStream::new(tokens);
 
-    let mut paths = Vec::new();
-
+    // Whitespace alone names no attribute, and is refused at its end (GetItem
+    // captured eu-west-2 and us-east-1, 2026-10-10). The caller refuses an
+    // empty string before this.
     if stream.at_end() {
-        return Ok(ProjectionExpr { paths });
+        return Err(format!(
+            "Invalid ProjectionExpression: {}",
+            stream.syntax_error(expr)
+        ));
     }
+
+    let mut paths = Vec::new();
 
     paths.push(parse_path(&mut stream).map_err(|e| projection_parser_error(expr, &mut stream, e))?);
 
