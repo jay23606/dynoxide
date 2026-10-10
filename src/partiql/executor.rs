@@ -2165,7 +2165,10 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
 }
 
 /// A digest of the parts of a SELECT that determine its row walk: the WHERE
-/// clause's groups and the parameters. Projections are left out deliberately,
+/// clause as parsed (see `write_clause_shape`), the parameters, the index and
+/// any ORDER BY. Equal statements must digest alike from one request to the
+/// next, so maps, whose key order is drawn afresh for every request, are
+/// written in key order. Projections are left out deliberately,
 /// because they run after the read and do not move the cursor. Tokens are
 /// ephemeral and in-process, so the hash does not need to be stable across
 /// builds.
@@ -2181,24 +2184,41 @@ fn statement_fingerprint(
     index_name: Option<&str>,
     order_by: &[OrderByTerm],
 ) -> u64 {
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    fingerprint_into(&mut hasher, where_clause, parameters, index_name, order_by);
+    hasher.finish()
+}
+
+/// Feed a statement's fingerprint into any hasher, so a test can measure what
+/// a fingerprint costs by counting the bytes it writes.
+fn fingerprint_into<H: std::hash::Hasher>(
+    hasher: &mut H,
+    where_clause: Option<&WhereClause>,
+    parameters: &[AttributeValue],
+    index_name: Option<&str>,
+    order_by: &[OrderByTerm],
+) {
+    use std::hash::Hash;
     // Writing into a hasher can't fail.
-    let _ = write_clause_shape(&mut HashWriter(&mut hasher), where_clause);
+    let _ = write_clause_shape(&mut HashWriter(&mut *hasher), where_clause);
     // The index is part of the walk, not just of the filter: a token minted
     // against one index would otherwise resume against another at a position
     // that means nothing there.
-    index_name.hash(&mut hasher);
-    serde_json::to_string(parameters)
+    index_name.hash(hasher);
+    // Through a `serde_json::Value`, whose maps keep their keys in order: a map
+    // parameter is a `HashMap`, decoded afresh for every page, so writing it
+    // straight out would order its keys differently on each page.
+    serde_json::to_value(parameters)
+        .and_then(|v| serde_json::to_vec(&v))
         .unwrap_or_default()
-        .hash(&mut hasher);
+        .hash(hasher);
     // So is the order: a position in an ascending read resumed in a
     // descending one would start from the wrong end. Mixed in only when there
     // is an ORDER BY, so a statement without one hashes as it always did.
     if !order_by.is_empty() {
-        format!("{order_by:?}").hash(&mut hasher);
+        format!("{order_by:?}").hash(hasher);
     }
-    hasher.finish()
 }
 
 /// A `fmt::Write` that feeds a hasher, so a clause is hashed as it is written
@@ -3967,11 +3987,14 @@ mod tests {
     /// once (about 770 KB), the 32 groups hold them 32 times (about 25 MB).
     #[test]
     fn a_clause_is_fingerprinted_once_per_condition() {
+        /// A hasher that only counts the bytes written into it.
         struct Count(usize);
-        impl std::fmt::Write for Count {
-            fn write_str(&mut self, s: &str) -> std::fmt::Result {
-                self.0 += s.len();
-                Ok(())
+        impl std::hash::Hasher for Count {
+            fn write(&mut self, bytes: &[u8]) {
+                self.0 += bytes.len();
+            }
+            fn finish(&self) -> u64 {
+                self.0 as u64
             }
         }
         let operands = (0..100)
@@ -3986,8 +4009,10 @@ mod tests {
         assert!(statement.chars().count() <= 8_192);
         let wc = where_of(&statement);
         assert_eq!(wc.groups.len(), 32);
+        // Through the fingerprint itself, so a fingerprint that went back to
+        // the groups would be caught here, not only a clause writer that did.
         let mut written = Count(0);
-        write_clause_shape(&mut written, Some(&wc)).unwrap();
+        fingerprint_into(&mut written, Some(&wc), &[], None, &[]);
         assert!(
             written.0 < 2_000_000,
             "fingerprinting wrote {} bytes",
@@ -4009,6 +4034,49 @@ mod tests {
         assert_ne!(fingerprint(a), fingerprint(b));
         assert_ne!(fingerprint(a), fingerprint(c));
         assert_ne!(fingerprint(a), statement_fingerprint(None, &[], None, &[]));
+
+        // Parameters, the index and the order each still count.
+        let wc = where_of(r#"SELECT * FROM "t" WHERE pk = ?"#);
+        let with = |p: &[AttributeValue], index: Option<&str>, order: &[OrderByTerm]| {
+            statement_fingerprint(Some(&wc), p, index, order)
+        };
+        let one = [AttributeValue::S("1".to_string())];
+        let two = [AttributeValue::S("2".to_string())];
+        assert_ne!(with(&one, None, &[]), with(&two, None, &[]));
+        assert_ne!(with(&one, None, &[]), with(&one, Some("byName"), &[]));
+        let ordered = match parse(r#"SELECT * FROM "t" WHERE pk = ? ORDER BY sk DESC"#).unwrap() {
+            Statement::Select { order_by, .. } => order_by,
+            other => panic!("expected a SELECT: {other:?}"),
+        };
+        assert!(!ordered.is_empty());
+        assert_ne!(with(&one, None, &[]), with(&one, None, &ordered));
+    }
+
+    /// A clause built from groups alone carries no tree, and is read off its
+    /// groups: it still digests alike for an equal clause and apart for a
+    /// different one, and apart from no clause at all.
+    #[test]
+    fn a_clause_without_a_tree_is_fingerprinted_from_its_groups() {
+        let groups_only = |statement: &str| {
+            let mut wc = where_of(statement);
+            wc.tree = None;
+            wc
+        };
+        let a = groups_only(r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#);
+        let b = groups_only(r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 3)"#);
+        let a_again = groups_only(r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#);
+        let digest = |wc: &WhereClause| statement_fingerprint(Some(wc), &[], None, &[]);
+        assert_eq!(digest(&a), digest(&a_again));
+        assert_ne!(digest(&a), digest(&b));
+        assert_ne!(digest(&a), statement_fingerprint(None, &[], None, &[]));
+        // A map in a groups-only clause is written in key order too.
+        let m1 = groups_only(
+            r#"SELECT * FROM "t" WHERE m = {'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5, 'f': 6}"#,
+        );
+        let m2 = groups_only(
+            r#"SELECT * FROM "t" WHERE m = {'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5, 'f': 6}"#,
+        );
+        assert_eq!(digest(&m1), digest(&m2));
     }
 
     /// A placeholder with no parameter to fill it decides nothing, whatever

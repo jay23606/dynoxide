@@ -3065,6 +3065,82 @@ fn test_select_pagination_walks_every_row_once() {
     assert_eq!(keys.len(), 7, "every row exactly once, no gaps or repeats");
 }
 
+/// Walk a SELECT one row at a time, building the parameters afresh for every
+/// page the way a client's second request decodes them afresh, and return the
+/// primary keys seen.
+fn paginate_with(
+    db: &Database,
+    statement: &str,
+    parameters: impl Fn() -> Option<Vec<AttributeValue>>,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut next_token = None;
+    let mut pages = 0;
+    loop {
+        let response = db
+            .execute_statement(ExecuteStatementRequest {
+                statement: statement.to_string(),
+                parameters: parameters(),
+                limit: Some(1),
+                next_token,
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("page {} was refused: {e}", pages + 1));
+        pages += 1;
+        for item in response.items.unwrap_or_default() {
+            if let Some(AttributeValue::S(pk)) = item.get("pk") {
+                keys.push(pk.clone());
+            }
+        }
+        next_token = response.next_token;
+        if next_token.is_none() {
+            break;
+        }
+        assert!(pages < 20, "pagination did not terminate");
+    }
+    keys.sort();
+    keys
+}
+
+/// A map literal is read into a hash map whose key order is drawn afresh on
+/// every request, so a NextToken bound to the clause's printed form stopped
+/// matching its own statement on the next page. Every page here repeats the
+/// same statement, and every one must resume.
+#[test]
+fn test_select_pages_through_a_map_literal_in_the_where_clause() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..5 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+    let keys = paginate_with(
+        &db,
+        "SELECT * FROM \"Paged\" WHERE name <> {'a': 1, 'b': 2, 'c': 3, 'd': 4, \
+         'e': 5, 'f': 6, 'g': 7, 'h': 8}",
+        || None,
+    );
+    assert_eq!(keys, ["k0", "k1", "k2", "k3", "k4"]);
+}
+
+/// The same for a map parameter: each page's request carries the map freshly
+/// decoded, so its key order is its own.
+#[test]
+fn test_select_pages_through_a_map_parameter() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Paged");
+    for i in 0..5 {
+        put_test_item(&db, "Paged", &format!("k{i}"), "n");
+    }
+    let keys = paginate_with(&db, "SELECT * FROM \"Paged\" WHERE name <> ?", || {
+        let map: HashMap<String, AttributeValue> = ('a'..='h')
+            .enumerate()
+            .map(|(i, k)| (k.to_string(), AttributeValue::N(i.to_string())))
+            .collect();
+        Some(vec![AttributeValue::M(map)])
+    });
+    assert_eq!(keys, ["k0", "k1", "k2", "k3", "k4"]);
+}
+
 #[test]
 fn test_select_without_limit_returns_everything_and_no_token() {
     let db = Database::memory().unwrap();

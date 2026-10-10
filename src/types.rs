@@ -11,7 +11,7 @@ use std::fmt;
 /// S (String), N (Number as string), B (Binary), BOOL, NULL,
 /// SS (String Set), NS (Number Set), BS (Binary Set),
 /// L (List), M (Map).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum AttributeValue {
     /// String type
     S(String),
@@ -33,6 +33,38 @@ pub enum AttributeValue {
     L(Vec<AttributeValue>),
     /// Map - key-value pairs
     M(HashMap<String, AttributeValue>),
+}
+
+/// The derived form, except that a map's entries are written in key order.
+/// A map is a `HashMap`, so its own order is drawn afresh for every map, and
+/// two equal maps decoded by two requests would otherwise print differently.
+/// A PartiQL NextToken is bound to its statement's printed form, so it relies
+/// on equal values printing alike.
+impl fmt::Debug for AttributeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AttributeValue::S(v) => f.debug_tuple("S").field(v).finish(),
+            AttributeValue::N(v) => f.debug_tuple("N").field(v).finish(),
+            AttributeValue::B(v) => f.debug_tuple("B").field(v).finish(),
+            AttributeValue::BOOL(v) => f.debug_tuple("BOOL").field(v).finish(),
+            AttributeValue::NULL(v) => f.debug_tuple("NULL").field(v).finish(),
+            AttributeValue::SS(v) => f.debug_tuple("SS").field(v).finish(),
+            AttributeValue::NS(v) => f.debug_tuple("NS").field(v).finish(),
+            AttributeValue::BS(v) => f.debug_tuple("BS").field(v).finish(),
+            AttributeValue::L(v) => f.debug_tuple("L").field(v).finish(),
+            AttributeValue::M(map) => {
+                struct Sorted<'a>(&'a HashMap<String, AttributeValue>);
+                impl fmt::Debug for Sorted<'_> {
+                    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        let mut entries: Vec<_> = self.0.iter().collect();
+                        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                        f.debug_map().entries(entries).finish()
+                    }
+                }
+                f.debug_tuple("M").field(&Sorted(map)).finish()
+            }
+        }
+    }
 }
 
 impl AttributeValue {

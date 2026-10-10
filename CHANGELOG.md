@@ -617,6 +617,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AttributeValueList` its "Invalid number of argument(s)" message. Captured
   against eu-west-2 and us-east-1.
 
+- A PartiQL `SELECT` whose WHERE clause or parameters hold a map with more
+  than one key can be paged with `NextToken`. A map's key order was drawn
+  afresh for every request, so the token stopped matching its own statement on
+  the next page and was refused with `NextToken does not match request`. The
+  `Debug` form of a map `AttributeValue` now writes its entries in key order.
+
 ## [1.2.1] - 2026-09-20
 
 ### Security
