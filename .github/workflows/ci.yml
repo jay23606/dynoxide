@@ -51,9 +51,8 @@ jobs:
   # serde_json keeps an object's keys in insertion order when any crate in a
   # build turns on its preserve_order feature, and a HashMap's insertion order
   # differs between two maps holding the same entries. The idempotency hash
-  # and the PartiQL NextToken fingerprint sort keys themselves so they don't
-  # depend on that. Their tests can only fail with the feature on, so they run
-  # here with it.
+  # sorts keys itself so it doesn't depend on that. Its test can only fail with
+  # the feature on, so it runs here with it.
   map-key-order:
     name: Map key order (serde_json preserve_order)
     runs-on: ubuntu-latest
@@ -64,15 +63,14 @@ jobs:
 
       # libtest exits 0 when its filters match nothing, so a renamed test would
       # turn this job into a silent no-op; the count check catches that.
-      - name: Hashes ignore map key order
+      - name: The idempotency hash ignores map key order
         shell: bash
         run: |
           set -o pipefail
           cargo test --lib --features serde_json/preserve_order -- \
             a_request_hash_ignores_map_key_order \
-            a_map_parameter_fingerprints_alike_whatever_its_key_order \
             | tee map-key-order.log
-          grep -q 'test result: ok. 2 passed' map-key-order.log
+          grep -q 'test result: ok. 1 passed' map-key-order.log
 
   # The listener bind path is platform-specific (SO_REUSEADDR on Unix,
   # SO_EXCLUSIVEADDRUSE on Windows), so the unit tests need a Windows run;

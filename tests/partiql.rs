@@ -3182,23 +3182,40 @@ fn test_select_pages_through_a_map_literal_in_the_where_clause() {
     assert_eq!(keys, ["k0", "k1", "k2", "k3", "k4"]);
 }
 
-/// The same for a map parameter: each page's request carries the map freshly
-/// decoded, so its key order is its own.
+/// A map parameter never resumes a read, even sent again unchanged: the first
+/// page hands out a token and the second is refused with it (captured
+/// eu-west-2 and us-east-1, 2026-10-10; `tests/partiql_next_token.rs` has
+/// the other parameter types).
 #[test]
-fn test_select_pages_through_a_map_parameter() {
+fn test_select_with_a_map_parameter_does_not_resume() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Paged");
     for i in 0..5 {
         put_test_item(&db, "Paged", &format!("k{i}"), "n");
     }
-    let keys = paginate_with(&db, "SELECT * FROM \"Paged\" WHERE name <> ?", || {
+    let page = |next_token: Option<String>| {
         let map: HashMap<String, AttributeValue> = ('a'..='h')
             .enumerate()
             .map(|(i, k)| (k.to_string(), AttributeValue::N(i.to_string())))
             .collect();
-        Some(vec![AttributeValue::M(map)])
-    });
-    assert_eq!(keys, ["k0", "k1", "k2", "k3", "k4"]);
+        db.execute_statement(ExecuteStatementRequest {
+            statement: "SELECT * FROM \"Paged\" WHERE name <> ?".to_string(),
+            parameters: Some(vec![AttributeValue::M(map)]),
+            limit: Some(1),
+            next_token,
+            ..Default::default()
+        })
+    };
+    let first = page(None).unwrap();
+    let token = first
+        .next_token
+        .expect("the first page still hands out a token");
+    let err = page(Some(token)).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "NextToken does not match request",
+        "got {err}"
+    );
 }
 
 #[test]

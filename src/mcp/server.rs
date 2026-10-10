@@ -608,7 +608,7 @@ pub struct ExecutePartiqlParams {
     pub limit: Option<usize>,
 
     #[schemars(
-        description = "Continuation token from a previous SELECT response, to fetch the next page. Pass back the NextToken the last call returned; its absence means there are no more pages. The statement and parameters must stay identical across pages; a token replayed with a different statement or parameters is rejected with a ValidationException."
+        description = "Continuation token from a previous SELECT response, to fetch the next page. Pass back the NextToken the last call returned; its absence means there are no more pages. The statement must stay identical character for character across pages, and so must the parameters; a token replayed with any difference is rejected with a ValidationException. A statement with a list or map parameter cannot be paged past its first page, as on DynamoDB."
     )]
     pub next_token: Option<String>,
 

@@ -125,8 +125,11 @@ pub async fn execute<S: StorageBackend>(
     )?;
 
     let params = request.parameters.unwrap_or_default();
-    let run = partiql::executor::execute_page(
+    // The statement's text goes with it, so a continuation token is bound to
+    // the statement as written, as DynamoDB binds it.
+    let run = partiql::executor::execute_written_page(
         storage,
+        Some(&request.statement),
         &stmt,
         &params,
         request.limit,

@@ -1276,9 +1276,40 @@ fn validate_operand_types(
     Ok(())
 }
 
+/// Run one page of a parsed statement. A continuation token is bound to the
+/// statement as parsed, since its text isn't at hand here; `ExecuteStatement`
+/// binds it to the text as written instead, as DynamoDB does.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_page<S: StorageBackend>(
     storage: &S,
+    stmt: &Statement,
+    parameters: &[AttributeValue],
+    limit: Option<usize>,
+    next_token: Option<&str>,
+    consistent_read: bool,
+    capacity_mode: Option<&str>,
+    resolved: Option<&ResolvedTable>,
+) -> Result<StatementPage> {
+    execute_written_page(
+        storage,
+        None,
+        stmt,
+        parameters,
+        limit,
+        next_token,
+        consistent_read,
+        capacity_mode,
+        resolved,
+    )
+    .await
+}
+
+/// [`execute_page`] for a statement whose text, `written`, is at hand: a
+/// continuation token is then bound to that text exactly as written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_written_page<S: StorageBackend>(
+    storage: &S,
+    written: Option<&str>,
     stmt: &Statement,
     parameters: &[AttributeValue],
     limit: Option<usize>,
@@ -1361,6 +1392,7 @@ pub async fn execute_page<S: StorageBackend>(
         } => {
             let outcome = execute_select(
                 storage,
+                written,
                 table_name,
                 index_name.as_deref(),
                 projections,
@@ -1510,6 +1542,7 @@ fn insert_nested_projection(result: &mut Item, path: &str, val: AttributeValue) 
 #[allow(clippy::too_many_arguments)]
 async fn execute_select<S: StorageBackend>(
     storage: &S,
+    written: Option<&str>,
     table_name: &str,
     index_name: Option<&str>,
     projections: &[String],
@@ -1642,10 +1675,21 @@ async fn execute_select<S: StorageBackend>(
         }
     }
 
-    let fingerprint = statement_fingerprint(where_clause, parameters, index_name, order_by);
+    let fingerprint =
+        statement_fingerprint(written, where_clause, parameters, index_name, order_by);
     let cursor = next_token
         .map(|token| decode_next_token(token, table_name, fingerprint))
         .transpose()?;
+    // A statement with a list or map parameter is never resumed, even with
+    // the same parameters sent again unchanged; the first page still hands
+    // out a token (captured eu-west-2 and us-east-1, 2026-10-10).
+    if cursor.is_some()
+        && parameters
+            .iter()
+            .any(|p| matches!(p, AttributeValue::L(_) | AttributeValue::M(_)))
+    {
+        return Err(token_mismatch());
+    }
 
     // An index read's cursor is meaningless without the base table key: the
     // backend falls back to a two-column comparison that cannot advance past
@@ -2232,11 +2276,16 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
     ))
 }
 
-/// A digest of the parts of a SELECT that determine its row walk: the WHERE
-/// clause as parsed (see `write_clause_shape`), the parameters, the index and
-/// any ORDER BY. Equal statements must digest alike from one request to the
-/// next, so maps, whose key order is drawn afresh for every request, are
-/// written in key order. Projections are left out deliberately,
+/// A digest binding a continuation token to its statement and parameters.
+/// DynamoDB binds it to the statement exactly as written, so with the text at
+/// hand (`written`) that is what is hashed, beside the parameters by value: a
+/// space, a keyword's case, the projection or a map literal's key order
+/// changed between pages is a different statement, and `0` and `0.0` are
+/// different parameters (captured eu-west-2 and us-east-1, 2026-10-10).
+///
+/// Without the text, the digest is of the parts of the SELECT that determine
+/// its row walk: the WHERE clause as parsed (see `write_clause_shape`), the
+/// parameters, the index and any ORDER BY. Projections are left out there,
 /// because they run after the read and do not move the cursor. Tokens are
 /// ephemeral and in-process, so the hash does not need to be stable across
 /// builds.
@@ -2247,14 +2296,21 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
 /// that contract, and adding one that has no bearing on the walk then
 /// invalidated every token already in flight with nothing to say it had.
 fn statement_fingerprint(
+    written: Option<&str>,
     where_clause: Option<&WhereClause>,
     parameters: &[AttributeValue],
     index_name: Option<&str>,
     order_by: &[OrderByTerm],
 ) -> u64 {
-    use std::hash::Hasher;
+    use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    fingerprint_into(&mut hasher, where_clause, parameters, index_name, order_by);
+    match written {
+        Some(text) => {
+            text.hash(&mut hasher);
+            crate::canonical_json(parameters).hash(&mut hasher);
+        }
+        None => fingerprint_into(&mut hasher, where_clause, parameters, index_name, order_by),
+    }
     hasher.finish()
 }
 
@@ -2274,9 +2330,9 @@ fn fingerprint_into<H: std::hash::Hasher>(
     // against one index would otherwise resume against another at a position
     // that means nothing there.
     index_name.hash(hasher);
-    // With every map's keys sorted: a map parameter is a `HashMap`, decoded
-    // afresh for every page, so writing it straight out would order its keys
-    // differently on each page.
+    // With every map's keys sorted, so a map's digest doesn't hang on the
+    // order its `HashMap` iterates in. A list or map parameter never resumes
+    // a read anyway (see `execute_select`).
     crate::canonical_json(parameters).hash(hasher);
     // So is the order: a position in an ascending read resumed in a
     // descending one would start from the wrong end. Mixed in only when there
@@ -4214,20 +4270,24 @@ mod tests {
     /// it was minted for.
     #[test]
     fn a_fingerprint_follows_the_clause() {
-        let fingerprint =
-            |statement: &str| statement_fingerprint(Some(&where_of(statement)), &[], None, &[]);
+        let fingerprint = |statement: &str| {
+            statement_fingerprint(None, Some(&where_of(statement)), &[], None, &[])
+        };
         let a = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#;
         let b = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 3)"#;
         let c = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 AND b = 2)"#;
         assert_eq!(fingerprint(a), fingerprint(a));
         assert_ne!(fingerprint(a), fingerprint(b));
         assert_ne!(fingerprint(a), fingerprint(c));
-        assert_ne!(fingerprint(a), statement_fingerprint(None, &[], None, &[]));
+        assert_ne!(
+            fingerprint(a),
+            statement_fingerprint(None, None, &[], None, &[])
+        );
 
         // Parameters, the index and the order each still count.
         let wc = where_of(r#"SELECT * FROM "t" WHERE pk = ?"#);
         let with = |p: &[AttributeValue], index: Option<&str>, order: &[OrderByTerm]| {
-            statement_fingerprint(Some(&wc), p, index, order)
+            statement_fingerprint(None, Some(&wc), p, index, order)
         };
         let one = [AttributeValue::S("1".to_string())];
         let two = [AttributeValue::S("2".to_string())];
@@ -4239,30 +4299,6 @@ mod tests {
         };
         assert!(!ordered.is_empty());
         assert_ne!(with(&one, None, &[]), with(&one, None, &ordered));
-    }
-
-    /// A map parameter fingerprints by its contents, not by the order its keys
-    /// come out in. Two `HashMap`s holding the same entries iterate in
-    /// different orders, and serde_json keeps that order when a crate in the
-    /// build turns on its `preserve_order` feature, so the fingerprint sorts
-    /// keys itself, at every depth.
-    #[test]
-    fn a_map_parameter_fingerprints_alike_whatever_its_key_order() {
-        let map = |n: &str| -> AttributeValue {
-            let inner: HashMap<String, AttributeValue> = (0..16)
-                .map(|i| (format!("i{i}"), AttributeValue::N(n.to_string())))
-                .collect();
-            AttributeValue::M(
-                (0..16)
-                    .map(|i| (format!("k{i}"), AttributeValue::M(inner.clone())))
-                    .collect(),
-            )
-        };
-        let fingerprint = |p: &[AttributeValue]| statement_fingerprint(None, p, None, &[]);
-        for _ in 0..8 {
-            assert_eq!(fingerprint(&[map("1")]), fingerprint(&[map("1")]));
-        }
-        assert_ne!(fingerprint(&[map("1")]), fingerprint(&[map("2")]));
     }
 
     /// A clause built from groups alone carries no tree, and is read off its
@@ -4278,10 +4314,13 @@ mod tests {
         let a = groups_only(r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#);
         let b = groups_only(r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 3)"#);
         let a_again = groups_only(r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#);
-        let digest = |wc: &WhereClause| statement_fingerprint(Some(wc), &[], None, &[]);
+        let digest = |wc: &WhereClause| statement_fingerprint(None, Some(wc), &[], None, &[]);
         assert_eq!(digest(&a), digest(&a_again));
         assert_ne!(digest(&a), digest(&b));
-        assert_ne!(digest(&a), statement_fingerprint(None, &[], None, &[]));
+        assert_ne!(
+            digest(&a),
+            statement_fingerprint(None, None, &[], None, &[])
+        );
         // A map in a groups-only clause is written in key order too.
         let m1 = groups_only(
             r#"SELECT * FROM "t" WHERE m = {'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5, 'f': 6}"#,
