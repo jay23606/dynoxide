@@ -30,6 +30,12 @@ jobs:
           # performance changes could stop compiling and no job would notice.
           - name: bench-counters
             flags: "--features bench-counters --test repeated_work_counts"
+          # Unit tests compile every test-only path into the library, so the
+          # library-only build is checked here with an integration test: an
+          # unreadable legacy Expected must be refused in DynamoDB's words
+          # there too.
+          - name: library-expected
+            flags: "--no-default-features --features native-sqlite --test expected_library_build"
 
     steps:
       - uses: actions/checkout@v5

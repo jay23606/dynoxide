@@ -661,12 +661,6 @@ pub struct ExpressionParamContext<'a> {
     pub layer: crate::validation::ValueLayer,
 }
 
-/// Validate expression vs non-expression parameter conflicts and basic
-/// ExpressionAttributeNames/Values key format.
-///
-/// This performs the pre-checks that DynamoDB runs before table existence and
-/// key schema validation.
-///
 /// Refuse a placeholder whose name holds a character outside ASCII before the
 /// expression is read: DynamoDB reports the map's key, not the expression
 /// (`:vé`, `#n€`, an emoji or a no-break space; captured on UpdateItem in
@@ -685,6 +679,12 @@ fn reject_non_ascii_placeholder(
     )))
 }
 
+/// Validate expression vs non-expression parameter conflicts and basic
+/// ExpressionAttributeNames/Values key format.
+///
+/// This performs the pre-checks that DynamoDB runs before table existence and
+/// key schema validation.
+///
 /// Returns the parsed `ExpressionAttributeValues` if raw JSON was provided
 /// and successfully parsed, so the caller can store it on the request.
 ///
