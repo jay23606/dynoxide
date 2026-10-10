@@ -227,10 +227,12 @@ const BAD_CAPACITY_MODE: &str = "Value 'BOGUS' at 'returnConsumedCapacity' faile
      constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
 
 /// More than 25 statements is a violation on the `statements` member, listed
-/// with the request's others and after ReturnConsumedCapacity (captured
-/// eu-west-2 and us-east-1, 2026-10-10). The value echoes every statement as
-/// us-east-1 prints it, the request object's Java `toString`; eu-west-2
-/// printed an object identity per statement, which can't be reproduced.
+/// with the request's others and after ReturnConsumedCapacity (the order
+/// captured eu-west-2 and us-east-1, 2026-10-10). The value echoes every
+/// statement as us-east-1 printed it, the request object's Java `toString`.
+/// eu-west-2 printed `BatchStatementRequest@` and a hash instead, the same for
+/// each identical statement, so derived from the value, and no obvious Java
+/// formula reproduces it: the echo text is us-east-1's alone.
 #[test]
 fn a_batch_over_25_statements_is_listed_with_its_other_members() {
     let db = setup();
@@ -294,6 +296,60 @@ fn a_transaction_lists_its_token_and_capacity_mode_with_its_statements() {
              satisfy constraint: Member must have length less than or equal to 36; {}; \
              {BAD_CAPACITY_MODE}",
             too_long(&long, "transactStatements.1.member.statement")
+        ))
+    );
+}
+
+/// Exactly 25 statements is within the limit and runs (each names its own
+/// item, as a batch refuses two reads of one).
+#[test]
+fn a_batch_of_exactly_25_statements_runs() {
+    let db = setup();
+    let statements: Vec<Value> = (0..25)
+        .map(|i| json!({"Statement": format!(r#"SELECT * FROM "Members" WHERE pk = 'k{i}'"#)}))
+        .collect();
+    assert_eq!(batch(&db, json!(statements)), Ok(()));
+}
+
+/// The transaction's statement list is a member too: an empty list, or one of
+/// more than 100, is listed with the token, the statements and the mode,
+/// after the token, where it used to answer on its own after them. Inferred,
+/// not captured: the batch lists its own list-length error with its other
+/// members (captured eu-west-2 and us-east-1, 2026-10-10), and the
+/// transaction's members are listed token first, statements, then mode.
+#[test]
+fn a_transactions_statement_count_is_listed_with_its_other_members() {
+    let db = setup();
+    let token = "t".repeat(40);
+    let token_error = format!(
+        "Value '{token}' at 'clientRequestToken' failed to satisfy constraint: Member must \
+         have length less than or equal to 36"
+    );
+    let outcome = |request: Value| {
+        db.execute_transaction(
+            serde_json::from_value::<ExecuteTransactionRequest>(request).unwrap(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    };
+    assert_eq!(
+        outcome(json!({"TransactStatements": [], "ClientRequestToken": token})),
+        Err(format!(
+            "2 validation errors detected: {token_error}; Value at 'transactStatements' \
+             failed to satisfy constraint: Member must have length greater than or equal to 1"
+        ))
+    );
+
+    let long = select_of_length(9_000);
+    let mut statements =
+        vec![json!({"Statement": r#"SELECT * FROM "Members" WHERE pk = 'a'"#}); 100];
+    statements.push(json!({"Statement": long}));
+    assert_eq!(
+        outcome(json!({"TransactStatements": statements})),
+        Err(format!(
+            "2 validation errors detected: Value at 'transactStatements' failed to satisfy \
+             constraint: Member must have length less than or equal to 100; {}",
+            too_long(&long, "transactStatements.101.member.statement")
         ))
     );
 }

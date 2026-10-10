@@ -84,11 +84,31 @@ pub async fn execute<S: StorageBackend>(
 /// ReturnConsumedCapacity (captured eu-west-2 and us-east-1, 2026-10-10, the
 /// regions identical). Any of them refuses the whole request before a
 /// statement is parsed or the idempotency cache is consulted.
+///
+/// The statement list's own length (empty, or more than 100) is listed with
+/// them, after the token and ahead of the statements. That is inferred, not
+/// captured: the batch lists its list-length error with its other members
+/// (captured), and the transaction's statements member sits between the token
+/// and the mode. The wording is the one this action used before, uncaptured.
 fn member_violations(request: &ExecuteTransactionRequest) -> Vec<String> {
     let mut violations = Vec::new();
     violations.extend(crate::token_constraint_error(
         request.client_request_token.as_deref(),
     ));
+    if request.transact_statements.is_empty() {
+        violations.push(
+            "Value at 'transactStatements' failed to satisfy constraint: Member must have \
+             length greater than or equal to 1"
+                .to_string(),
+        );
+    }
+    if request.transact_statements.len() > 100 {
+        violations.push(
+            "Value at 'transactStatements' failed to satisfy constraint: Member must have \
+             length less than or equal to 100"
+                .to_string(),
+        );
+    }
     for (i, statement) in request.transact_statements.iter().enumerate() {
         let member = format!("transactStatements.{}.member", i + 1);
         violations.extend(crate::partiql::statement_length_violation(
@@ -126,19 +146,9 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
     // this stays for callers that come here directly.
     check_members(&request)?;
 
+    // The statement list's length is checked with the other members, so a
+    // list that reaches here holds 1 to 100 statements.
     let statements = &request.transact_statements;
-
-    // Validate: must have between 1 and 100 statements
-    if statements.is_empty() {
-        return Err(DynoxideError::ValidationException(
-            "1 validation error detected: Value at 'transactStatements' failed to satisfy constraint: Member must have length greater than or equal to 1".to_string(),
-        ));
-    }
-    if statements.len() > 100 {
-        return Err(DynoxideError::ValidationException(
-            "Member must have length less than or equal to 100".to_string(),
-        ));
-    }
 
     // A parameter holding an empty attribute name is a top-level rejection,
     // before any statement is parsed (captured in ten regions).

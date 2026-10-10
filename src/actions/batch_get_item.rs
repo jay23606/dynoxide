@@ -380,7 +380,9 @@ pub async fn execute<S: StorageBackend>(
 /// with the tables, each table's members and every attribute map in order of
 /// name. Two tables came back in name order in half the regions captured and
 /// in the other order in the rest, so the order is DynamoDB's own map order;
-/// name order is the deterministic choice.
+/// name order is the deterministic choice. Cut at
+/// [`crate::actions::batch_write_item::ECHO_LIMIT`] like the other echoes; this
+/// one is JSON, no larger than the request, so it is cut once built.
 fn request_items_echo(request_items: &HashMap<String, KeysAndAttributes>) -> String {
     let mut tables: Vec<(&String, &KeysAndAttributes)> = request_items.iter().collect();
     tables.sort_by(|a, b| a.0.cmp(b.0));
@@ -416,7 +418,7 @@ fn request_items_echo(request_items: &HashMap<String, KeysAndAttributes>) -> Str
         }
         echo.insert(table_name.clone(), serde_json::Value::Object(members));
     }
-    serde_json::Value::Object(echo).to_string()
+    crate::actions::batch_write_item::bound_echo(serde_json::Value::Object(echo).to_string())
 }
 
 /// Rebuild every JSON object with its keys in order of name, so the echo does

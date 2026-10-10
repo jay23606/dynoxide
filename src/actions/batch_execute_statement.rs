@@ -148,32 +148,60 @@ pub struct BatchStatementError {
 }
 
 /// The statement list as DynamoDB echoes it in a constraint message: each
-/// request's Java `toString`, as us-east-1 printed it on 2026-10-10.
-/// eu-west-2 printed an object identity per statement instead, which can't be
-/// reproduced. A member's parameters follow the same Java model, uncaptured.
+/// request's Java `toString`, in us-east-1's form, captured 2026-10-10.
+/// eu-west-2 printed `BatchStatementRequest@` and a hash in its place, the same
+/// hash for each of the 26 identical statements captured, so it is derived from
+/// the value; no obvious Java formula reproduces it, so us-east-1's form is the
+/// one followed. A member's parameters follow the same Java model, uncaptured
+/// (the capture's statements had none). Bounded by
+/// [`crate::actions::batch_write_item::ECHO_LIMIT`].
 fn statements_echo(statements: &[BatchStatementRequest]) -> String {
-    let java = |shown: Option<String>| shown.unwrap_or_else(|| "null".to_string());
-    let statements: Vec<String> = statements
-        .iter()
-        .map(|s| {
-            let parameters = s.parameters.as_ref().map(|parameters| {
-                let parameters: Vec<String> = parameters
-                    .iter()
-                    .map(crate::actions::batch_write_item::java_attribute_value)
-                    .collect();
-                format!("[{}]", parameters.join(", "))
-            });
-            format!(
-                "BatchStatementRequest(statement={}, parameters={}, consistentRead={}, \
-                 returnValuesOnConditionCheckFailure={})",
-                s.statement,
-                java(parameters),
-                java(s.consistent_read.map(|c| c.to_string())),
-                java(s.return_values_on_condition_check_failure.clone()),
-            )
-        })
-        .collect();
-    format!("[{}]", statements.join(", "))
+    let mut out = crate::actions::batch_write_item::BoundedEcho::new();
+    let _ = write_statements(&mut out, statements);
+    out.finish()
+}
+
+fn write_statements(
+    out: &mut dyn std::fmt::Write,
+    statements: &[BatchStatementRequest],
+) -> std::fmt::Result {
+    out.write_str("[")?;
+    for (i, s) in statements.iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        write!(
+            out,
+            "BatchStatementRequest(statement={}, parameters=",
+            s.statement
+        )?;
+        match s.parameters {
+            Some(ref parameters) => {
+                out.write_str("[")?;
+                for (j, parameter) in parameters.iter().enumerate() {
+                    if j > 0 {
+                        out.write_str(", ")?;
+                    }
+                    crate::actions::batch_write_item::write_java_attribute_value(out, parameter)?;
+                }
+                out.write_str("]")?;
+            }
+            None => out.write_str("null")?,
+        }
+        out.write_str(", consistentRead=")?;
+        match s.consistent_read {
+            Some(c) => write!(out, "{c}")?,
+            None => out.write_str("null")?,
+        }
+        out.write_str(", returnValuesOnConditionCheckFailure=")?;
+        out.write_str(
+            s.return_values_on_condition_check_failure
+                .as_deref()
+                .unwrap_or("null"),
+        )?;
+        out.write_str(")")?;
+    }
+    out.write_str("]")
 }
 
 pub async fn execute<S: StorageBackend>(
@@ -186,8 +214,8 @@ pub async fn execute<S: StorageBackend>(
     // statement is parsed or runs. Captured eu-west-2 and us-east-1,
     // 2026-10-10: statement then parameters across members, every over-long
     // statement listed, and ReturnConsumedCapacity ahead of an over-long list.
-    // That a member's own violations also come after ReturnConsumedCapacity
-    // follows from that: they are the same `statements` member.
+    // Inferred, not captured: that a member's own violations also come after
+    // ReturnConsumedCapacity, as they belong to the same `statements` member.
     let mut violations = Vec::new();
     violations.extend(crate::validation::return_consumed_capacity_rejection(
         request.return_consumed_capacity.as_deref(),

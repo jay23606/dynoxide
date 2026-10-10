@@ -554,117 +554,243 @@ fn require_key_attributes(item: &Item, schema: &helpers::KeySchema) -> Result<()
     Ok(())
 }
 
+/// The most a constraint message's echo of a member may run to, in bytes.
+///
+/// DynamoDB echoes the refused member in its Java model's `toString`, which
+/// names all sixteen of a value's fields and so runs to about twenty times the
+/// request's own size: a rejected request near the 16 MiB body limit would
+/// build an echo hundreds of megabytes long. Dynoxide stops the echo here and
+/// ends it with `...`. The limit is Dynoxide's own, well above the echo of any
+/// ordinary request (26 statements of 8,192 characters echo to about 220 KB);
+/// what DynamoDB does with an echo this size has not been captured.
+pub(crate) const ECHO_LIMIT: usize = 1024 * 1024;
+
+/// A string that takes writes up to [`ECHO_LIMIT`] bytes and then refuses
+/// them, so a formatter writing into it stops as soon as it is full rather than
+/// building the whole echo first.
+pub(crate) struct BoundedEcho {
+    text: String,
+    full: bool,
+}
+
+impl BoundedEcho {
+    pub(crate) fn new() -> Self {
+        BoundedEcho {
+            text: String::new(),
+            full: false,
+        }
+    }
+
+    /// The echo, ending `...` if it reached the limit.
+    pub(crate) fn finish(mut self) -> String {
+        if self.full {
+            self.text.push_str("...");
+        }
+        self.text
+    }
+}
+
+impl std::fmt::Write for BoundedEcho {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if self.full {
+            return Err(std::fmt::Error);
+        }
+        let room = ECHO_LIMIT - self.text.len();
+        if s.len() <= room {
+            self.text.push_str(s);
+            return Ok(());
+        }
+        let mut cut = room;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.text.push_str(&s[..cut]);
+        self.full = true;
+        Err(std::fmt::Error)
+    }
+}
+
+/// Cut an echo already built to [`ECHO_LIMIT`], for an echo that is no larger
+/// than the request it comes from.
+pub(crate) fn bound_echo(echo: String) -> String {
+    let mut out = BoundedEcho::new();
+    let _ = std::fmt::Write::write_str(&mut out, &echo);
+    out.finish()
+}
+
 /// The `RequestItems` map as DynamoDB echoes it in a constraint message: the
 /// request object's Java `toString`, which names every field of every value.
 /// Eleven of twelve regions printed it this way on 2026-10-09; the other, and
 /// eu-west-2 on other days, print each attribute value as an object hash, so no
 /// echo matches every region byte for byte. Tables and attributes are in order
-/// of name, where DynamoDB's own order is its map's.
+/// of name, where DynamoDB's own order is its map's. Bounded by
+/// [`ECHO_LIMIT`].
 fn request_items_echo(request_items: &HashMap<String, Vec<WriteRequest>>) -> String {
+    let mut out = BoundedEcho::new();
+    let _ = write_request_items(&mut out, request_items);
+    out.finish()
+}
+
+fn write_request_items(
+    out: &mut dyn std::fmt::Write,
+    request_items: &HashMap<String, Vec<WriteRequest>>,
+) -> std::fmt::Result {
     let mut tables: Vec<(&String, &Vec<WriteRequest>)> = request_items.iter().collect();
     tables.sort_by(|a, b| a.0.cmp(b.0));
-    let tables: Vec<String> = tables
-        .into_iter()
-        .map(|(table_name, requests)| {
-            let requests: Vec<String> = requests.iter().map(java_write_request).collect();
-            format!("{table_name}=[{}]", requests.join(", "))
-        })
-        .collect();
-    format!("{{{}}}", tables.join(", "))
+    out.write_str("{")?;
+    for (i, (table_name, requests)) in tables.into_iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        write!(out, "{table_name}=[")?;
+        for (j, request) in requests.iter().enumerate() {
+            if j > 0 {
+                out.write_str(", ")?;
+            }
+            write_write_request(out, request)?;
+        }
+        out.write_str("]")?;
+    }
+    out.write_str("}")
 }
 
-fn java_write_request(request: &WriteRequest) -> String {
-    let put = match request.put_request {
-        Some(ref put) => format!(
-            "PutRequest(item={}, workloadProfileName=null)",
-            java_item(&put.item)
-        ),
-        None => "null".to_string(),
-    };
-    let delete = match request.delete_request {
-        Some(ref delete) => format!(
-            "DeleteRequest(key={}, workloadProfileName=null)",
-            java_item(&delete.key)
-        ),
-        None => "null".to_string(),
-    };
-    format!("WriteRequest(putRequest={put}, deleteRequest={delete})")
+fn write_write_request(out: &mut dyn std::fmt::Write, request: &WriteRequest) -> std::fmt::Result {
+    out.write_str("WriteRequest(putRequest=")?;
+    match request.put_request {
+        Some(ref put) => {
+            out.write_str("PutRequest(item=")?;
+            write_java_item(out, &put.item)?;
+            out.write_str(", workloadProfileName=null)")?;
+        }
+        None => out.write_str("null")?,
+    }
+    out.write_str(", deleteRequest=")?;
+    match request.delete_request {
+        Some(ref delete) => {
+            out.write_str("DeleteRequest(key=")?;
+            write_java_item(out, &delete.key)?;
+            out.write_str(", workloadProfileName=null)")?;
+        }
+        None => out.write_str("null")?,
+    }
+    out.write_str(")")
 }
 
-fn java_item(item: &HashMap<String, AttributeValue>) -> String {
+fn write_java_item(
+    out: &mut dyn std::fmt::Write,
+    item: &HashMap<String, AttributeValue>,
+) -> std::fmt::Result {
     let mut attributes: Vec<(&String, &AttributeValue)> = item.iter().collect();
     attributes.sort_by(|a, b| a.0.cmp(b.0));
-    let attributes: Vec<String> = attributes
-        .into_iter()
-        .map(|(name, value)| format!("{name}={}", java_attribute_value(value)))
-        .collect();
-    format!("{{{}}}", attributes.join(", "))
+    out.write_str("{")?;
+    for (i, (name, value)) in attributes.into_iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        write!(out, "{name}=")?;
+        write_java_attribute_value(out, value)?;
+    }
+    out.write_str("}")
 }
 
 /// One attribute value with all sixteen of the Java model's fields, the one in
 /// use filled in. Only the string form has been captured; the others follow the
 /// same model, with binary shown as Java prints a `ByteBuffer`.
-pub(crate) fn java_attribute_value(value: &AttributeValue) -> String {
-    let byte_buffer = |bytes: &[u8]| {
-        format!(
+pub(crate) fn write_java_attribute_value(
+    out: &mut dyn std::fmt::Write,
+    value: &AttributeValue,
+) -> std::fmt::Result {
+    const FIELDS: [&str; 16] = [
+        "s",
+        "n",
+        "b",
+        "iNT",
+        "dECIMAL",
+        "dOUBLE",
+        "sS",
+        "nS",
+        "bS",
+        "iNTSET",
+        "dECIMALSET",
+        "dOUBLESET",
+        "m",
+        "l",
+        "nULL",
+        "bOOL",
+    ];
+    let slot = match value {
+        AttributeValue::S(_) => 0,
+        AttributeValue::N(_) => 1,
+        AttributeValue::B(_) => 2,
+        AttributeValue::SS(_) => 6,
+        AttributeValue::NS(_) => 7,
+        AttributeValue::BS(_) => 8,
+        AttributeValue::M(_) => 12,
+        AttributeValue::L(_) => 13,
+        AttributeValue::NULL(_) => 14,
+        AttributeValue::BOOL(_) => 15,
+    };
+    out.write_str("AttributeValue(")?;
+    for (i, name) in FIELDS.iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        write!(out, "{name}=")?;
+        if i == slot {
+            write_java_shown(out, value)?;
+        } else {
+            out.write_str("null")?;
+        }
+    }
+    out.write_str(")")
+}
+
+fn write_java_shown(out: &mut dyn std::fmt::Write, value: &AttributeValue) -> std::fmt::Result {
+    let byte_buffer = |out: &mut dyn std::fmt::Write, bytes: &[u8]| {
+        write!(
+            out,
             "java.nio.HeapByteBuffer[pos=0 lim={len} cap={len}]",
             len = bytes.len()
         )
     };
-    let mut fields: [(&str, Option<String>); 16] = [
-        ("s", None),
-        ("n", None),
-        ("b", None),
-        ("iNT", None),
-        ("dECIMAL", None),
-        ("dOUBLE", None),
-        ("sS", None),
-        ("nS", None),
-        ("bS", None),
-        ("iNTSET", None),
-        ("dECIMALSET", None),
-        ("dOUBLESET", None),
-        ("m", None),
-        ("l", None),
-        ("nULL", None),
-        ("bOOL", None),
-    ];
-    let (slot, shown) = match value {
-        AttributeValue::S(s) => (0, s.clone()),
-        AttributeValue::N(n) => (1, n.clone()),
-        AttributeValue::B(b) => (2, byte_buffer(b)),
-        AttributeValue::SS(set) => (6, format!("[{}]", set.join(", "))),
-        AttributeValue::NS(set) => (7, format!("[{}]", set.join(", "))),
-        AttributeValue::BS(set) => (
-            8,
-            format!(
-                "[{}]",
-                set.iter()
-                    .map(|b| byte_buffer(b))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ),
-        AttributeValue::M(map) => (12, java_item(map)),
-        AttributeValue::L(list) => (
-            13,
-            format!(
-                "[{}]",
-                list.iter()
-                    .map(java_attribute_value)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ),
-        AttributeValue::NULL(null) => (14, null.to_string()),
-        AttributeValue::BOOL(b) => (15, b.to_string()),
-    };
-    fields[slot].1 = Some(shown);
-    let fields: Vec<String> = fields
-        .iter()
-        .map(|(name, shown)| format!("{name}={}", shown.as_deref().unwrap_or("null")))
-        .collect();
-    format!("AttributeValue({})", fields.join(", "))
+    match value {
+        AttributeValue::S(s) => out.write_str(s),
+        AttributeValue::N(n) => out.write_str(n),
+        AttributeValue::B(b) => byte_buffer(out, b),
+        AttributeValue::SS(set) | AttributeValue::NS(set) => {
+            out.write_str("[")?;
+            for (i, member) in set.iter().enumerate() {
+                if i > 0 {
+                    out.write_str(", ")?;
+                }
+                out.write_str(member)?;
+            }
+            out.write_str("]")
+        }
+        AttributeValue::BS(set) => {
+            out.write_str("[")?;
+            for (i, member) in set.iter().enumerate() {
+                if i > 0 {
+                    out.write_str(", ")?;
+                }
+                byte_buffer(out, member)?;
+            }
+            out.write_str("]")
+        }
+        AttributeValue::M(map) => write_java_item(out, map),
+        AttributeValue::L(list) => {
+            out.write_str("[")?;
+            for (i, member) in list.iter().enumerate() {
+                if i > 0 {
+                    out.write_str(", ")?;
+                }
+                write_java_attribute_value(out, member)?;
+            }
+            out.write_str("]")
+        }
+        AttributeValue::NULL(null) => write!(out, "{null}"),
+        AttributeValue::BOOL(b) => write!(out, "{b}"),
+    }
 }
 
 #[cfg(test)]

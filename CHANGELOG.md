@@ -605,13 +605,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   statements in a batch, lists every one in DynamoDB's "N validation errors
   detected" form rather than the first, and an empty statement in a batch or
   transaction refuses the whole request as a member. `ReturnConsumedCapacity`
-  is listed with the rest rather than refused on its own: first on
-  `BatchExecuteStatement`, last on `ExecuteTransaction`, after an over-long
-  `ClientRequestToken` and the statements. More than 25 statements in a batch
-  is refused as a member too, echoing the statements, where it used to give
-  "Too many statements in BatchExecuteStatement". The MCP
-  `batch_execute_partiql` and `execute_transaction_partiql` tools list a bad
-  mode the same way. Captured against eu-west-2 and us-east-1.
+  is listed with the rest rather than refused on its own: on
+  `BatchExecuteStatement` ahead of the statement list's length, and on
+  `ExecuteTransaction` after an over-long `ClientRequestToken` and the
+  statements (both orders captured against eu-west-2 and us-east-1). More
+  than 25 statements in a batch is refused as a member too, where it used to
+  give "Too many statements in BatchExecuteStatement"; its echo of the
+  statements is us-east-1's, as eu-west-2 printed a hash in their place that
+  can't be reproduced. Inferred rather than captured: a batch member's own
+  errors following `ReturnConsumedCapacity`, and an empty transaction, or one
+  of more than 100 statements, listed with the token and the statements rather
+  than answering after them. The MCP `batch_execute_partiql` and
+  `execute_transaction_partiql` tools list a bad mode the same way.
+- A refused member echoed in a constraint message (`BatchWriteItem`'s and
+  `BatchGetItem`'s request items, `BatchExecuteStatement`'s statements) stops
+  at 1 MiB and ends `...`. The Java form these echoes take runs to about
+  twenty times the request, so a rejected request near the body limit built
+  an error message of hundreds of megabytes. The limit is Dynoxide's own;
+  what DynamoDB does with an echo that size has not been captured.
 - A malformed `Expected` condition on `PutItem`, `UpdateItem` or `DeleteItem`
   is refused rather than ignored. An unknown `ComparisonOperator` gets
   DynamoDB's "Invalid comparison operator" message, and `EQ` with an empty
