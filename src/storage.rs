@@ -15,14 +15,30 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 use crate::storage_backend::sql_builders::SCHEMA_VERSION;
 
-/// How long a connection to a database file waits for a lock another
-/// process holds before it reports the database locked. Another Dynoxide
-/// opening the same file holds its write lock while it brings the file up to
-/// date, which can take longer than SQLite's usual five seconds on a large
-/// file. An in-memory database has no other process to wait for and keeps the
-/// default.
+/// How long a connection to a database file waits, while it opens, for a lock
+/// another process holds before it reports the database locked. Another
+/// Dynoxide opening the same file holds its write lock while it brings the
+/// file up to date, which can take longer than five seconds on a large file.
+/// Once the file is open the connection waits [`REQUEST_BUSY_TIMEOUT`]
+/// instead. An in-memory database has no other process to wait for and keeps
+/// the default throughout.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-const FILE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long an open connection waits for a lock another process holds:
+/// rusqlite's default. Every request waits behind the one holding the
+/// connection, so a request held up by another process gives up after this
+/// rather than holding the rest up for [`OPEN_BUSY_TIMEOUT`].
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+const REQUEST_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(test)]
+thread_local! {
+    /// The busy timeout a connection on this thread had when it finished
+    /// opening: its migrations ran under it. For tests of the two phases.
+    static OPENED_WITH_BUSY_TIMEOUT_MS: std::cell::Cell<Option<i64>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Number of hash buckets used for parallel scan segment assignment.
 /// Matches dynalite's implementation.
@@ -279,7 +295,7 @@ impl Storage {
     /// Open a persistent database at the given path.
     pub fn new(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(FILE_BUSY_TIMEOUT)?;
+        conn.busy_timeout(OPEN_BUSY_TIMEOUT)?;
         let mut storage = Self {
             conn,
             metadata_cache: RefCell::new(HashMap::new()),
@@ -290,6 +306,7 @@ impl Storage {
             clock: Arc::new(SystemClock),
         };
         storage.initialize().map_err(Self::maybe_encrypted_error)?;
+        storage.conn.busy_timeout(REQUEST_BUSY_TIMEOUT)?;
         Ok(storage)
     }
 
@@ -364,7 +381,7 @@ impl Storage {
         use zeroize::Zeroize;
 
         let conn = Connection::open(path)?;
-        conn.busy_timeout(FILE_BUSY_TIMEOUT)?;
+        conn.busy_timeout(OPEN_BUSY_TIMEOUT)?;
         // Safety: key is validated to be exactly 64 hex characters [0-9a-fA-F]
         // by Database::new_encrypted(), so no injection is possible in the
         // x'...' hex literal format. Note: pragma_update does NOT use parameter
@@ -384,6 +401,7 @@ impl Storage {
             clock: Arc::new(SystemClock),
         };
         storage.initialize()?;
+        storage.conn.busy_timeout(REQUEST_BUSY_TIMEOUT)?;
         Ok(storage)
     }
 
@@ -411,7 +429,14 @@ impl Storage {
         // Enable WAL mode for better concurrency
         self.conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::register_functions(&self.conn)?;
-        self.migrate_to_current()
+        self.migrate_to_current()?;
+        #[cfg(test)]
+        OPENED_WITH_BUSY_TIMEOUT_MS.set(Some(self.conn.query_row(
+            "PRAGMA busy_timeout",
+            [],
+            |r| r.get(0),
+        )?));
+        Ok(())
     }
 
     /// Register the SQL functions every statement this layer runs may call.
@@ -2199,13 +2224,14 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
 const BACKUP_LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// How long a backup keeps retrying a busy or locked database before giving
-/// up, by the clock: the same patience as a connection's busy timeout, and
-/// shorter under test so a test of the limit runs quickly.
+/// up, by the clock: the same patience as an open connection's busy timeout,
+/// [`REQUEST_BUSY_TIMEOUT`], and shorter under test so a test of the limit
+/// runs quickly.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 const BACKUP_LOCK_PATIENCE: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_millis(200)
 } else {
-    std::time::Duration::from_secs(5)
+    REQUEST_BUSY_TIMEOUT
 };
 
 /// How many times a backup starts over, because another connection changed
@@ -3511,22 +3537,37 @@ mod tests {
             .unwrap()
     }
 
+    /// The busy timeout the last open on this thread ran its migrations
+    /// under, and the one the connection it handed out has.
+    fn open_and_after(storage: &Storage) -> (Option<i64>, i64) {
+        (
+            OPENED_WITH_BUSY_TIMEOUT_MS.take(),
+            busy_timeout_ms(storage.conn()),
+        )
+    }
+
+    /// A database file waits 30 seconds for a lock another process holds
+    /// while it opens and brings the file up to date, and five once it is
+    /// open, so a request held up by another process gives up after five
+    /// seconds rather than holding every other request up behind it.
     #[test]
-    fn a_database_file_waits_thirty_seconds_for_a_lock() {
+    fn a_database_file_waits_thirty_seconds_for_a_lock_while_opening_and_five_after() {
         let (_dir, path) = v9_snapshot_path();
-        assert_eq!(busy_timeout_ms(Storage::new(&path).unwrap().conn()), 30_000);
+        let storage = Storage::new(&path).unwrap();
+        assert_eq!(open_and_after(&storage), (Some(30_000), 5_000));
         // An in-memory database has no other process to wait for, and keeps
-        // the connection's default.
-        assert_eq!(busy_timeout_ms(Storage::memory().unwrap().conn()), 5_000);
+        // the connection's default throughout.
+        let memory = Storage::memory().unwrap();
+        assert_eq!(open_and_after(&memory), (Some(5_000), 5_000));
     }
 
     #[cfg(feature = "_has-encryption")]
     #[test]
-    fn an_encrypted_database_file_waits_thirty_seconds_for_a_lock() {
+    fn an_encrypted_database_file_waits_thirty_seconds_for_a_lock_while_opening_and_five_after() {
         const KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
         let (_dir, path) = v9_snapshot_path();
         let storage = Storage::new_encrypted(&path, KEY).unwrap();
-        assert_eq!(busy_timeout_ms(storage.conn()), 30_000);
+        assert_eq!(open_and_after(&storage), (Some(30_000), 5_000));
     }
 
     /// A second process opening a file while the first holds its write lock
