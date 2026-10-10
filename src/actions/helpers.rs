@@ -865,11 +865,9 @@ fn validate_expression_attribute_value(
         // tagged for the envelope; this arm serves the other operations'
         // pre-parsed in-process EAV paths.
         AttributeValue::NULL(b) if !b => {
-            return Err(ClassifiedValidationError::bare(format!(
-                "ExpressionAttributeValues contains invalid value: \
-                 One or more parameter values were invalid: \
-                 Null attribute value types must have the value of true for key {key}"
-            )));
+            return Err(ClassifiedValidationError::bare(
+                crate::serde_errors::named_value_refusal(crate::serde_errors::NULL_NOT_TRUE, key),
+            ));
         }
         AttributeValue::SS(set) if set.is_empty() => {
             return Err(ClassifiedValidationError::enveloped(format!(
@@ -957,9 +955,7 @@ pub fn validate_no_null_false(values: &HashMap<String, AttributeValue>) -> Resul
 pub(crate) fn validate_no_null_false_value(value: &AttributeValue) -> Result<()> {
     match value {
         AttributeValue::NULL(b) if !b => Err(DynoxideError::EnvelopedValidation(
-            "One or more parameter values were invalid: \
-             Null attribute value types must have the value of true"
-                .to_string(),
+            crate::serde_errors::NULL_NOT_TRUE.to_string(),
         )),
         AttributeValue::L(list) => {
             for v in list {
@@ -1003,73 +999,51 @@ pub fn parse_expression_attribute_values_raw(
                 result.insert(key.clone(), av);
             }
             Err(e) => {
+                use crate::serde_errors::{
+                    EMPTY_VALUE, MORE_THAN_ONE_TYPE, ValueRefusal, named_value_refusal,
+                    value_refusal,
+                };
                 let msg = e.to_string();
                 // A malformed value fails the request as it is read, before
                 // any key is named.
-                if msg.starts_with(crate::serde_errors::SERIALIZATION_MARKER) {
-                    return Err(crate::serde_errors::classify_marked_serde_error(&msg)
-                        .unwrap_or_else(|| DynoxideError::SerializationException(msg.clone())));
+                if let Some(error) = crate::serde_errors::marked_serialization_error(&msg) {
+                    return Err(error);
                 }
-                // Strip the serde position suffix and any internal marker
-                let inner = crate::serde_errors::clean_serde_message(&msg);
-
-                if inner.contains("empty AttributeValue")
-                    || (inner.contains("Supplied AttributeValue") && inner.contains("empty"))
-                {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         Supplied AttributeValue is empty, must contain exactly one of the \
-                         supported datatypes for key {key}"
-                    )));
-                } else if inner.contains("more than one datatypes") {
-                    return Err(DynoxideError::ValidationException(format!(
-                        "ExpressionAttributeValues contains invalid value: \
-                         Supplied AttributeValue has more than one datatypes set, \
-                         must contain exactly one of the supported datatypes for key {key}"
-                    )));
-                } else if inner.contains("cannot be converted to a numeric value")
-                    || inner.contains("significant digits")
-                    || inner.contains("Number overflow")
-                    || inner.contains("Number underflow")
-                {
+                return Err(match value_refusal(&msg) {
+                    ValueRefusal::Empty => {
+                        DynoxideError::ValidationException(named_value_refusal(EMPTY_VALUE, key))
+                    }
+                    ValueRefusal::MoreThanOneType => DynoxideError::ValidationException(
+                        named_value_refusal(MORE_THAN_ONE_TYPE, key),
+                    ),
                     // The current layer refuses it with no wrapper, in the
                     // envelope on DeleteItem; the older layer names the key.
-                    return Err(match layer {
+                    ValueRefusal::Number(inner) => match layer {
                         crate::validation::ValueLayer::Current => {
                             DynoxideError::EnvelopedValidation(inner.to_string())
                         }
                         crate::validation::ValueLayer::Older => {
-                            DynoxideError::ValidationException(format!(
-                                "ExpressionAttributeValues contains invalid value: \
-                                 {inner} for key {key}"
-                            ))
+                            DynoxideError::ValidationException(named_value_refusal(inner, key))
                         }
-                    });
-                } else if inner.contains("Null attribute value types must have the value of true")
-                    && !msg.starts_with(crate::serde_errors::REQUEST_VALIDATION_MARKER)
-                {
+                    },
                     // A NULL refused as it was parsed (a string that reads as
                     // false, or false beside another member) is named by key,
                     // as an empty value is (captured eu-west-2 and us-east-1,
                     // 2026-10-10, on UpdateItem, DeleteItem and Query).
-                    return Err(DynoxideError::ValidationException(format!(
-                        "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
-                    )));
-                } else if inner.contains("Null attribute value types must have the value of true") {
-                    // A rejected {"NULL": false} fails to deserialise here with a
-                    // marker-prefixed message. Real DynamoDB rejects it with the
-                    // bare validation message, without the per-key "contains invalid
-                    // value" wrapper it uses for empty or malformed values, so surface
-                    // the cleaned inner message directly rather than leaking a
-                    // SerializationException with the raw prefix. Confirmed against
-                    // real DynamoDB (eu-west-2). It is the request-validation
-                    // family DeleteItem wraps in the envelope (eu-west-2 and
-                    // us-east-1, 2026-10-09), so it is tagged; a read that
-                    // reports it bare strips the tag.
-                    return Err(DynoxideError::EnvelopedValidation(inner.to_string()));
-                } else {
-                    return Err(DynoxideError::SerializationException(msg));
-                }
+                    ValueRefusal::ParsedNull(inner) => {
+                        DynoxideError::ValidationException(named_value_refusal(inner, key))
+                    }
+                    // A rejected {"NULL": false} is refused with the bare
+                    // validation message, without the per-key wrapper DynamoDB
+                    // uses for empty or malformed values (eu-west-2). It is the
+                    // request-validation family DeleteItem wraps in the
+                    // envelope (eu-west-2 and us-east-1, 2026-10-09), so it is
+                    // tagged; a read that reports it bare strips the tag.
+                    ValueRefusal::RequestNull(inner) => {
+                        DynoxideError::EnvelopedValidation(inner.to_string())
+                    }
+                    ValueRefusal::Other => DynoxideError::SerializationException(msg),
+                });
             }
         }
     }
@@ -2014,9 +1988,8 @@ pub fn parse_exclusive_start_key(
             let msg = e.to_string();
             // A malformed value fails the request as it is read, as it does
             // in an expression value (not captured for a starting key).
-            if msg.starts_with(crate::serde_errors::SERIALIZATION_MARKER) {
-                return Err(crate::serde_errors::classify_marked_serde_error(&msg)
-                    .unwrap_or_else(|| DynoxideError::SerializationException(msg.clone())));
+            if let Some(error) = crate::serde_errors::marked_serialization_error(&msg) {
+                return Err(error);
             }
             // Strip the serde position suffix and any internal marker
             let inner = crate::serde_errors::clean_serde_message(&msg);
@@ -2056,12 +2029,10 @@ pub fn parse_exclusive_start_key(
         match av {
             // These get "The provided starting key is invalid: One or more..." prefix
             AttributeValue::NULL(b) if !b => {
-                return Err(DynoxideError::ValidationException(
-                    "The provided starting key is invalid: \
-                     One or more parameter values were invalid: \
-                     Null attribute value types must have the value of true"
-                        .to_string(),
-                ));
+                return Err(DynoxideError::ValidationException(format!(
+                    "The provided starting key is invalid: {}",
+                    crate::serde_errors::NULL_NOT_TRUE
+                )));
             }
             AttributeValue::SS(set) if set.is_empty() => {
                 return Err(DynoxideError::ValidationException(
@@ -2444,9 +2415,7 @@ fn validate_filter_attribute_value(
 ) -> Result<()> {
     match value {
         AttributeValue::NULL(b) if !b => Err(DynoxideError::ValidationException(
-            "One or more parameter values were invalid: \
-             Null attribute value types must have the value of true"
-                .to_string(),
+            crate::serde_errors::NULL_NOT_TRUE.to_string(),
         )),
         AttributeValue::SS(set) if set.is_empty() => Err(DynoxideError::ValidationException(
             "One or more parameter values were invalid: An string set  may not be empty"

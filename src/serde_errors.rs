@@ -86,6 +86,77 @@ pub(crate) fn classify_marked_serde_error(msg: &str) -> Option<crate::DynoxideEr
     None
 }
 
+/// The `SerializationException` a value the decoder has already classified as
+/// malformed fails its request with, as it is read and before any key is
+/// named; `None` for any other message.
+pub(crate) fn marked_serialization_error(msg: &str) -> Option<crate::DynoxideError> {
+    msg.strip_prefix(SERIALIZATION_MARKER).map(|stripped| {
+        crate::DynoxideError::SerializationException(strip_position(stripped).to_string())
+    })
+}
+
+/// DynamoDB's refusal of a NULL that isn't true.
+pub(crate) const NULL_NOT_TRUE: &str = "One or more parameter values were invalid: Null attribute value types must have the value \
+     of true";
+
+/// DynamoDB's refusal of a value with no type set.
+pub(crate) const EMPTY_VALUE: &str =
+    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
+
+/// DynamoDB's refusal of a value with more than one type set.
+pub(crate) const MORE_THAN_ONE_TYPE: &str = "Supplied AttributeValue has more than one datatypes \
+                                             set, must contain exactly one of the supported \
+                                             datatypes";
+
+/// What a value refused as it was read was refused for, as the readers of
+/// `ExpressionAttributeValues` tell the cases apart to decide which name the
+/// value's key.
+pub(crate) enum ValueRefusal<'a> {
+    /// No type set, or not an object.
+    Empty,
+    /// More than one type set.
+    MoreThanOneType,
+    /// A number the value layer can't store, in the layer's words.
+    Number(&'a str),
+    /// A NULL refused as it was parsed: a string that reads as false, or false
+    /// beside another member.
+    ParsedNull(&'a str),
+    /// `{"NULL": false}` on its own, refused by the request's validation.
+    RequestNull(&'a str),
+    /// Anything else, passed through as it is.
+    Other,
+}
+
+/// Which refusal a raw serde message from reading one value is.
+pub(crate) fn value_refusal(msg: &str) -> ValueRefusal<'_> {
+    let inner = clean_serde_message(msg);
+    if inner.contains("empty AttributeValue") || inner.contains("Supplied AttributeValue is empty")
+    {
+        ValueRefusal::Empty
+    } else if inner.contains("more than one datatypes") {
+        ValueRefusal::MoreThanOneType
+    } else if inner.contains("cannot be converted to a numeric value")
+        || inner.contains("significant digits")
+        || inner.contains("Number overflow")
+        || inner.contains("Number underflow")
+    {
+        ValueRefusal::Number(inner)
+    } else if inner.contains(NULL_NOT_TRUE) {
+        if msg.starts_with(REQUEST_VALIDATION_MARKER) {
+            ValueRefusal::RequestNull(inner)
+        } else {
+            ValueRefusal::ParsedNull(inner)
+        }
+    } else {
+        ValueRefusal::Other
+    }
+}
+
+/// A value's refusal naming its key, as DynamoDB words it.
+pub(crate) fn named_value_refusal(refusal: &str, key: &str) -> String {
+    format!("ExpressionAttributeValues contains invalid value: {refusal} for key {key}")
+}
+
 /// Marker prefix for validation rejections raised inside serde
 /// deserialisation, mapped to a bare `ValidationException`.
 pub(crate) const VALIDATION_MARKER: &str = "VALIDATION:";

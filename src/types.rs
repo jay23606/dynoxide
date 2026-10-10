@@ -290,8 +290,8 @@ impl<'de> Deserialize<'de> for AttributeValue {
                 crate::serde_errors::REQUEST_VALIDATION_MARKER
             };
             return Err(de::Error::custom(format!(
-                "{marker}One or more parameter values were invalid: \
-                 Null attribute value types must have the value of true"
+                "{marker}{}",
+                crate::serde_errors::NULL_NOT_TRUE
             )));
         }
 
@@ -576,19 +576,15 @@ pub(crate) fn deserialize_older_expression_values<'de, D: serde::Deserializer<'d
                 values.insert(key, av);
             }
             Err(e) => {
+                use crate::serde_errors::{ValueRefusal, named_value_refusal, value_refusal};
                 let msg = e.to_string();
-                let inner = crate::serde_errors::clean_serde_message(&msg);
-                let number = inner.contains("cannot be converted to a numeric value")
-                    || inner.contains("significant digits")
-                    || inner.contains("Number overflow")
-                    || inner.contains("Number underflow");
-                return Err(de::Error::custom(if number {
-                    format!(
-                        "{}ExpressionAttributeValues contains invalid value: {inner} for key {key}",
-                        crate::serde_errors::VALIDATION_MARKER
-                    )
-                } else {
-                    msg
+                return Err(de::Error::custom(match value_refusal(&msg) {
+                    ValueRefusal::Number(inner) => format!(
+                        "{}{}",
+                        crate::serde_errors::VALIDATION_MARKER,
+                        named_value_refusal(inner, &key)
+                    ),
+                    _ => msg,
                 }));
             }
         }
@@ -632,26 +628,22 @@ fn deserialize_named_refusals<'de, D: serde::Deserializer<'de>>(
                 values.insert(key, av);
             }
             Err(e) => {
+                use crate::serde_errors::{
+                    EMPTY_VALUE, VALIDATION_MARKER, ValueRefusal, named_value_refusal,
+                    value_refusal,
+                };
                 let msg = e.to_string();
-                let inner = crate::serde_errors::clean_serde_message(&msg);
-                let parsed_null = msg.starts_with(crate::serde_errors::VALIDATION_MARKER)
-                    && inner.contains("Null attribute value types must have the value of true");
-                let empty = name_empty
-                    && (inner.contains("empty AttributeValue")
-                        || inner.starts_with("Supplied AttributeValue is empty"));
-                return Err(de::Error::custom(if parsed_null || empty {
-                    let inner = if empty {
-                        "Supplied AttributeValue is empty, must contain exactly one of the \
-                         supported datatypes"
-                    } else {
-                        inner
-                    };
-                    format!(
-                        "{}ExpressionAttributeValues contains invalid value: {inner} for key {key}",
-                        crate::serde_errors::VALIDATION_MARKER
-                    )
-                } else {
-                    msg
+                return Err(de::Error::custom(match value_refusal(&msg) {
+                    ValueRefusal::ParsedNull(inner) => {
+                        format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
+                    }
+                    ValueRefusal::Empty if name_empty => {
+                        format!(
+                            "{VALIDATION_MARKER}{}",
+                            named_value_refusal(EMPTY_VALUE, &key)
+                        )
+                    }
+                    _ => msg,
                 }));
             }
         }
