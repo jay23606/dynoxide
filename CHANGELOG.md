@@ -81,11 +81,12 @@ installs carries 1.3.0.
   Captured against eu-west-2 and us-east-1; this corrects the 1.0.0 entry
   that found the option inert on a batch.
 - Opening a database brings it up to schema version 11, and the upgrade is
-  one way: once 1.3.0 has opened a file, don't open it with an older
-  Dynoxide. Earlier versions don't check the version a file records, so one
-  would open it and could read its multi-attribute indexes and vector table
-  sizes wrongly. Keep a copy or a snapshot of a file you may need to take
-  back. From this release a file written by a newer Dynoxide is refused,
+  one way. It changes what an older Dynoxide reads only for a global secondary
+  index with a multi-attribute key, whose entries are rebuilt, and a table with
+  a vector index, whose stored item sizes are recomputed. Earlier versions
+  don't check the version a file records, so one would open such a file and
+  read those indexes or sizes wrongly: if a file has either and you may need
+  to take it back to 1.2.x, keep a copy. From this release a file written by a newer Dynoxide is refused,
   with an error naming its schema version and the newest this build reads,
   and is left unchanged, where it used to be opened as it was. That covers
   `Database::new`, an encrypted open, the snapshot a restore reads from, and

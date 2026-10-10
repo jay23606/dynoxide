@@ -58,6 +58,31 @@ dynoxide-rs = { version = "3.0", default-features = false, features = ["native-s
 # dynoxide-rs = { version = "3.0", default-features = false, features = ["encryption"] }
 ```
 
+## Upgrading to 1.3.0
+
+**Database files are upgraded when 1.3.0 first opens them**, to schema version
+11, and older versions can't undo that. It only changes what an older Dynoxide
+reads in two cases: a global secondary index with a multi-attribute key, whose
+entries are rebuilt, and a table with a vector index, whose stored item sizes
+are recomputed. If a file has either and you might go back to 1.2.x, copy it
+first: 1.2.x doesn't check a file's schema version, so it would open the file
+and read those indexes or sizes wrongly. From 1.3.0 on, a file written by a
+newer Dynoxide is refused rather than opened.
+
+**Behaviour moved towards DynamoDB's in a lot of places**: validation messages
+and the order checks run in, PartiQL limits and NextToken rules, legacy filter
+handling, and what transactions report when they're cancelled. Requests
+DynamoDB refuses that 1.2.1 accepted are now refused too, so a test that relied
+on the old leniency may need updating. The changelog's Behaviour changes and
+Fixed sections list each one.
+
+**Depending on the `dynoxide-rs` crate?** It's now 3.0.0. The `expressions` and
+`partiql` modules are no longer public. `ParameterizedStatement`,
+`ExecuteStatementRequest` and `BatchStatementError` gained fields, so struct
+literals of them need the new field or `..Default::default()`. The minimum
+supported Rust version is now 1.94.1. The changelog's Breaking (Rust API)
+section lists each change.
+
 ## Upgrading to 1.0.0
 
 The largest behaviour change the project has shipped. Unlike the 0.12.x and
