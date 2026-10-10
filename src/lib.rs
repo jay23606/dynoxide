@@ -230,8 +230,8 @@ impl TokenCaches {
     /// A restore takes these before the storage lock, keeping the
     /// cache-then-storage order [`run_idempotent`] relies on, and holds them
     /// until the restore is done so no transaction can cache a result against
-    /// the data being replaced. A poisoned cache is still taken: it is about to
-    /// be emptied.
+    /// the data being replaced. A poisoned cache is taken all the same, and
+    /// emptied if the restore succeeds; its poison is left as it was.
     #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
     pub(crate) fn lock_all(&self) -> TokenCacheGuards<'_> {
         TokenCacheGuards {
@@ -373,10 +373,12 @@ fn token_window() -> Duration {
 /// rebuilds the reply via `replay` (which re-derives read capacity).
 ///
 /// Lock ordering is cache-then-storage: `execute` takes the storage lock
-/// second, and nothing takes storage first and then a token cache, so there is
-/// no reverse path to deadlock against. A restore takes both caches
-/// (transact-write, then execute-transaction) before storage. Any future code
-/// touching both locks must keep this order.
+/// second, and no native path takes storage first and then a token cache, so
+/// there is no reverse path to deadlock against. A restore takes both caches
+/// (transact-write, then execute-transaction) before storage. The wasm
+/// dispatch takes a cache while it holds its backend, but only briefly and
+/// never across an await, and wasm has no restore. Any future code touching
+/// both locks must keep this order.
 ///
 /// A failed `execute` is propagated without caching, so a same-token retry
 /// re-executes.
@@ -1588,19 +1590,23 @@ mod tests {
     /// half of `run_idempotent`), let `restore` run on another thread, then
     /// take the storage lock (the transaction's second half). The storage step
     /// must not end up waiting on a restore that is itself waiting on the
-    /// cache this thread holds.
+    /// cache this thread holds, and the restore must still be waiting on that
+    /// cache afterwards, or the check proved nothing.
     fn assert_restore_keeps_cache_then_storage_order<T: Send + 'static>(
         db: &Database,
         cache: &Mutex<TokenCache<T>>,
         restore: impl FnOnce(Database) -> Result<()> + Send + 'static,
     ) {
         let held = cache.lock().unwrap();
+        let (ready, is_ready) = std::sync::mpsc::channel();
         let restorer = {
             let db = db.clone();
-            std::thread::spawn(move || restore(db))
+            std::thread::spawn(move || {
+                let _ = ready.send(());
+                restore(db)
+            })
         };
-        // Long enough for the restore to take whatever it takes first.
-        std::thread::sleep(Duration::from_millis(200));
+        is_ready.recv().unwrap();
         let (sent, got) = std::sync::mpsc::channel();
         {
             let db = db.clone();
@@ -1608,11 +1614,16 @@ mod tests {
                 let _ = sent.send(db.with_storage(|_| Ok(())).is_ok());
             });
         }
-        let storage_step = got.recv_timeout(Duration::from_secs(5));
+        let storage_step = got.recv_timeout(std::time::Duration::from_secs(5));
+        let restore_waited = !restorer.is_finished();
         drop(held);
         assert!(
             matches!(storage_step, Ok(true)),
             "a transaction holding its token cache must still get the storage lock while a restore waits"
+        );
+        assert!(
+            restore_waited,
+            "the restore must wait for the token cache the transaction holds"
         );
         restorer
             .join()
@@ -1620,19 +1631,76 @@ mod tests {
             .expect("the restore finishes once the cache is free");
     }
 
+    /// Hold the storage lock and let `restore` run on another thread until it
+    /// is queued for storage, then check it already holds `cache`. This pins
+    /// the order without timing: it waits on the storage lock's own count of
+    /// waiters, so it fails every time on a restore that takes storage first.
+    fn assert_restore_takes_cache_before_storage<T: Send + 'static>(
+        db: &Database,
+        cache: &Mutex<TokenCache<T>>,
+        restore: impl FnOnce(Database) -> Result<()> + Send + 'static,
+    ) {
+        let storage = db.inner.lock().unwrap();
+        let restorer = {
+            let db = db.clone();
+            std::thread::spawn(move || restore(db))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while db.inner.waiting() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the restore never asked for the storage lock"
+            );
+            std::thread::yield_now();
+        }
+        let cache_was_free = cache.try_lock().is_ok();
+        drop(storage);
+        restorer
+            .join()
+            .unwrap()
+            .expect("the restore finishes once storage is free");
+        assert!(
+            !cache_was_free,
+            "a restore must hold the token caches before it waits for storage"
+        );
+    }
+
     #[test]
     fn a_restore_cannot_deadlock_against_a_tokened_transaction() {
         let dir = tempfile::tempdir().unwrap();
         let (db, snapshot) = database_with_snapshot(&dir);
-        let path = snapshot.clone();
-        assert_restore_keeps_cache_then_storage_order(&db, &db.tokens.transact_write, move |db| {
-            db.restore_from(&path)
-        });
+        let restore = |path: &String| {
+            let path = path.clone();
+            move |db: Database| db.restore_from(&path)
+        };
+        assert_restore_keeps_cache_then_storage_order(
+            &db,
+            &db.tokens.transact_write,
+            restore(&snapshot),
+        );
         assert_restore_keeps_cache_then_storage_order(
             &db,
             &db.tokens.execute_transaction,
-            move |db| db.restore_from(&snapshot),
+            restore(&snapshot),
         );
+        assert_restore_takes_cache_before_storage(
+            &db,
+            &db.tokens.transact_write,
+            restore(&snapshot),
+        );
+        assert_restore_takes_cache_before_storage(
+            &db,
+            &db.tokens.execute_transaction,
+            restore(&snapshot),
+        );
+    }
+
+    /// A restore from an in-memory copy of `db`, made now so the restore
+    /// itself is all the returned closure does.
+    #[cfg(feature = "mcp-server")]
+    fn connection_restore(db: &Database) -> impl FnOnce(Database) -> Result<()> + Send + 'static {
+        let copy = db.backup_to_memory().unwrap();
+        move |db: Database| db.restore_from_connection(&copy)
     }
 
     #[cfg(feature = "mcp-server")]
@@ -1640,25 +1708,26 @@ mod tests {
     fn a_connection_restore_cannot_deadlock_against_a_tokened_transaction() {
         let dir = tempfile::tempdir().unwrap();
         let (db, _) = database_with_snapshot(&dir);
-        for cache in [0, 1] {
-            let restore = move |db: Database| {
-                let copy = db.backup_to_memory()?;
-                db.restore_from_connection(&copy)
-            };
-            if cache == 0 {
-                assert_restore_keeps_cache_then_storage_order(
-                    &db,
-                    &db.tokens.transact_write,
-                    restore,
-                );
-            } else {
-                assert_restore_keeps_cache_then_storage_order(
-                    &db,
-                    &db.tokens.execute_transaction,
-                    restore,
-                );
-            }
-        }
+        assert_restore_keeps_cache_then_storage_order(
+            &db,
+            &db.tokens.transact_write,
+            connection_restore(&db),
+        );
+        assert_restore_keeps_cache_then_storage_order(
+            &db,
+            &db.tokens.execute_transaction,
+            connection_restore(&db),
+        );
+        assert_restore_takes_cache_before_storage(
+            &db,
+            &db.tokens.transact_write,
+            connection_restore(&db),
+        );
+        assert_restore_takes_cache_before_storage(
+            &db,
+            &db.tokens.execute_transaction,
+            connection_restore(&db),
+        );
     }
 
     #[test]

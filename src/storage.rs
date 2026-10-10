@@ -2161,7 +2161,7 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
 }
 
 /// How long a backup waits between attempts on a database another
-/// connection has busy or locked.
+/// connection has busy or locked, and after the copy starts over.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 const BACKUP_LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -2221,8 +2221,11 @@ impl BackupWatch {
     /// A busy spell is timed from the start of the first step that found the
     /// database busy, so the time SQLite's own busy handler spends inside that
     /// step counts towards the patience. Progress ends the spell. A copy whose
-    /// remaining page count goes back up has started over, which SQLite does
-    /// when another connection changes the database being copied.
+    /// remaining page count doesn't fall has started over, which SQLite does
+    /// when another connection changes the database being copied: the pages it
+    /// copies again leave the same count remaining as the step before, or more
+    /// if the database grew. A restart pauses before the next step, so a short
+    /// burst of writes to the source doesn't use the limit up at once.
     fn observe(
         &mut self,
         step: BackupStep,
@@ -2234,14 +2237,17 @@ impl BackupWatch {
             BackupStep::Done => BackupNext::Finish,
             BackupStep::More { remaining } => {
                 self.busy_since = None;
-                if self.last_remaining.is_some_and(|last| remaining > last) {
-                    self.restarts += 1;
-                    if self.restarts > BACKUP_RESTART_LIMIT {
-                        return BackupNext::GiveUpRestarting;
-                    }
-                }
+                let restarted = self.last_remaining.is_some_and(|last| remaining >= last);
                 self.last_remaining = Some(remaining);
-                BackupNext::Step
+                if !restarted {
+                    return BackupNext::Step;
+                }
+                self.restarts += 1;
+                if self.restarts > BACKUP_RESTART_LIMIT {
+                    BackupNext::GiveUpRestarting
+                } else {
+                    BackupNext::Pause
+                }
             }
             BackupStep::Busy => {
                 let since = *self.busy_since.get_or_insert(started);
@@ -2260,23 +2266,16 @@ impl BackupWatch {
 /// Steps run back to back while they make progress. A busy or locked database
 /// is retried every [`BACKUP_LOCK_PAUSE`] until it has been busy for
 /// [`BACKUP_LOCK_PATIENCE`] by the clock, then reported as locked. A step can
-/// overrun that by up to one busy-timeout wait of its own inside SQLite. A
-/// copy that keeps starting over because the database being copied keeps
-/// changing gives up after [`BACKUP_RESTART_LIMIT`] restarts.
+/// overrun that by a busy-timeout wait of its own inside SQLite, on each
+/// database it found locked. A copy that keeps starting over because the
+/// database being copied keeps changing waits the same pause after each
+/// restart and gives up after [`BACKUP_RESTART_LIMIT`] of them.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 fn run_backup(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<()> {
-    use rusqlite::backup::StepResult;
     let mut watch = BackupWatch::default();
     loop {
         let started = std::time::Instant::now();
-        let step = match backup.step(100)? {
-            StepResult::Done => BackupStep::Done,
-            StepResult::More => BackupStep::More {
-                remaining: backup.progress().remaining,
-            },
-            // Busy, Locked and any later variant: wait and retry, within limits.
-            _ => BackupStep::Busy,
-        };
+        let step = backup_step(backup)?;
         match watch.observe(
             step,
             started,
@@ -2304,6 +2303,20 @@ fn run_backup(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<()> {
             }
         }
     }
+}
+
+/// Copy the next hundred pages through `backup` and say what happened.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+fn backup_step(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<BackupStep> {
+    use rusqlite::backup::StepResult;
+    Ok(match backup.step(100)? {
+        StepResult::Done => BackupStep::Done,
+        StepResult::More => BackupStep::More {
+            remaining: backup.progress().remaining,
+        },
+        // Busy, Locked and any later variant: wait and retry, within limits.
+        _ => BackupStep::Busy,
+    })
 }
 
 /// Refuse a restore source that holds no Dynoxide metadata.
@@ -3336,11 +3349,12 @@ mod tests {
             watch.observe(BackupStep::More { remaining: 50 }, t, t, patience),
             BackupNext::Step
         );
-        // Each jump back up is a restart; the limit's worth are tolerated.
+        // Each jump back up is a restart; the limit's worth are tolerated,
+        // each followed by a pause.
         for _ in 0..BACKUP_RESTART_LIMIT {
             assert_eq!(
                 watch.observe(BackupStep::More { remaining: 100 }, t, t, patience),
-                BackupNext::Step
+                BackupNext::Pause
             );
             assert_eq!(
                 watch.observe(BackupStep::More { remaining: 50 }, t, t, patience),
@@ -3350,6 +3364,78 @@ mod tests {
         assert_eq!(
             watch.observe(BackupStep::More { remaining: 100 }, t, t, patience),
             BackupNext::GiveUpRestarting
+        );
+    }
+
+    #[test]
+    fn a_backup_watch_counts_a_copy_that_starts_over_at_the_same_place() {
+        // A source changed between every step starts over each time, and the
+        // first hundred pages copied again leave the same count remaining as
+        // the step before: SQLite reports 302, 302, 302... for a 402-page
+        // source, so a restart is a count that doesn't fall.
+        let patience = std::time::Duration::from_secs(5);
+        let t = std::time::Instant::now();
+        let mut watch = BackupWatch::default();
+        assert_eq!(
+            watch.observe(BackupStep::More { remaining: 302 }, t, t, patience),
+            BackupNext::Step
+        );
+        // Each restart within the limit pauses before the next step, so a
+        // short burst of writes to the source doesn't use the limit up at once.
+        for restart in 1..=BACKUP_RESTART_LIMIT {
+            assert_eq!(
+                watch.observe(BackupStep::More { remaining: 302 }, t, t, patience),
+                BackupNext::Pause,
+                "restart {restart}"
+            );
+        }
+        assert_eq!(
+            watch.observe(BackupStep::More { remaining: 302 }, t, t, patience),
+            BackupNext::GiveUpRestarting
+        );
+    }
+
+    #[test]
+    fn a_backup_of_a_source_changed_between_steps_gives_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changing.db");
+        let path = path.to_str().unwrap().to_string();
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = DELETE; CREATE TABLE t (v); \
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) \
+                 INSERT INTO t SELECT zeroblob(3000) FROM n;",
+            )
+            .unwrap();
+        let source = Connection::open(&path).unwrap();
+        let mut dest = Connection::open_in_memory().unwrap();
+        let backup = rusqlite::backup::Backup::new(&source, &mut dest).unwrap();
+        let patience = std::time::Duration::from_secs(5);
+        let mut watch = BackupWatch::default();
+        let mut outcome = None;
+        // Another connection changes the source between every pair of steps,
+        // which is what makes SQLite start the copy over. The new value must
+        // differ from the old: SQLite leaves a page alone when a write would
+        // put back the bytes already there, and the copy then carries on.
+        for step in 0..(2 * BACKUP_RESTART_LIMIT + 10) {
+            let t = std::time::Instant::now();
+            match watch.observe(backup_step(&backup).unwrap(), t, t, patience) {
+                BackupNext::Step | BackupNext::Pause => {}
+                other => {
+                    outcome = Some((step, other));
+                    break;
+                }
+            }
+            writer
+                .execute("UPDATE t SET v = randomblob(3000) WHERE rowid = 1", [])
+                .unwrap();
+        }
+        let (step, next) = outcome.expect("a copy that keeps starting over must give up");
+        assert_eq!(next, BackupNext::GiveUpRestarting);
+        assert!(
+            step <= BACKUP_RESTART_LIMIT + 1,
+            "gave up after {step} steps, not at the restart limit"
         );
     }
 

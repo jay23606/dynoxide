@@ -72,7 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finds a database busy keeps trying until it has been busy for five seconds by
   the clock (plus at most one busy wait of SQLite's own) and then reports it
   locked; one that keeps starting over because another connection keeps
-  changing the database being copied gives up after 50 restarts.
+  changing the database being copied pauses briefly after each restart and
+  gives up after 50 of them.
 - A number whose exponent is too large for a 32-bit integer is range-checked
   rather than read with an exponent of 0. `1e99999999999` was stored as 1; it
   is now refused as an overflow, and `1e-99999999999` as an underflow, as
