@@ -1122,3 +1122,192 @@ fn test_duplicate_check_takes_the_key_an_update_writes() {
     });
     assert_eq!(cancellation_codes(on_b), ["ConditionalCheckFailed", "None"]);
 }
+
+// -----------------------------------------------------------------------
+// A cancelled transaction leaves indexes, streams and sizes as they were
+// -----------------------------------------------------------------------
+
+fn from_json<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+    serde_json::from_value(value).unwrap()
+}
+
+/// Everything a write to `Indexed` could reach, read back: the items, each
+/// index's rows, the stream's records, the table's counts and sizes, and the
+/// capacity a read of each is charged.
+fn indexed_state(db: &Database) -> serde_json::Value {
+    use serde_json::json;
+    let scan = db
+        .scan(from_json(json!({
+            "TableName": "Indexed",
+            "ConsistentRead": true,
+            "ReturnConsumedCapacity": "TOTAL"
+        })))
+        .unwrap();
+    let mut items: Vec<serde_json::Value> = scan
+        .items
+        .unwrap_or_default()
+        .iter()
+        .map(|item| serde_json::to_value(item).unwrap())
+        .collect();
+    items.sort_by_key(|item| item.to_string());
+    let by_g: Vec<serde_json::Value> = ["g1", "g2", "g3"]
+        .into_iter()
+        .map(|g| {
+            let page = db
+                .query(from_json(json!({
+                    "TableName": "Indexed",
+                    "IndexName": "byG",
+                    "KeyConditionExpression": "g = :g",
+                    "ExpressionAttributeValues": {":g": {"S": g}},
+                    "ReturnConsumedCapacity": "INDEXES"
+                })))
+                .unwrap();
+            json!([page.items, page.consumed_capacity])
+        })
+        .collect();
+    let by_l: Vec<serde_json::Value> = ["p", "q"]
+        .into_iter()
+        .map(|pk| {
+            let page = db
+                .query(from_json(json!({
+                    "TableName": "Indexed",
+                    "IndexName": "byL",
+                    "KeyConditionExpression": "pk = :pk",
+                    "ExpressionAttributeValues": {":pk": {"S": pk}},
+                    "ConsistentRead": true,
+                    "ReturnConsumedCapacity": "INDEXES"
+                })))
+                .unwrap();
+            json!([page.items, page.consumed_capacity])
+        })
+        .collect();
+    let stream_arn = db
+        .list_streams(from_json(json!({"TableName": "Indexed"})))
+        .unwrap()
+        .streams[0]
+        .stream_arn
+        .clone();
+    let shard_id = db
+        .describe_stream(from_json(json!({"StreamArn": stream_arn})))
+        .unwrap()
+        .stream_description
+        .shards[0]
+        .shard_id
+        .clone();
+    let iterator = db
+        .get_shard_iterator(from_json(json!({
+            "StreamArn": stream_arn,
+            "ShardId": shard_id,
+            "ShardIteratorType": "TRIM_HORIZON"
+        })))
+        .unwrap()
+        .shard_iterator
+        .unwrap();
+    let records = db
+        .get_records(from_json(json!({"ShardIterator": iterator})))
+        .unwrap()
+        .records;
+    let table = serde_json::to_value(
+        db.describe_table(from_json(json!({"TableName": "Indexed"})))
+            .unwrap()
+            .table,
+    )
+    .unwrap();
+    json!({
+        "items": items,
+        "scan_capacity": scan.consumed_capacity,
+        "by_g": by_g,
+        "by_l": by_l,
+        "records": serde_json::to_value(records).unwrap(),
+        "item_count": table["ItemCount"],
+        "table_size": table["TableSizeBytes"],
+        "gsi": table["GlobalSecondaryIndexes"],
+        "lsi": table["LocalSecondaryIndexes"],
+    })
+}
+
+/// A transaction cancelled by its third statement keeps nothing the other
+/// three wrote: not an item, an index row, a stream record, a count or a size.
+/// A retry under the same token runs again, as a cancelled call is not kept
+/// for replay, and is cancelled the same way.
+#[test]
+fn a_cancelled_transaction_leaves_indexes_streams_and_sizes_as_they_were() {
+    use serde_json::json;
+    let db = Database::memory().unwrap();
+    db.create_table(from_json(json!({
+        "TableName": "Indexed",
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
+            {"AttributeName": "l", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "byG",
+            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}
+        }],
+        "LocalSecondaryIndexes": [{
+            "IndexName": "byL",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "l", "KeyType": "RANGE"}
+            ],
+            "Projection": {"ProjectionType": "ALL"}
+        }],
+        "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+        "BillingMode": "PAY_PER_REQUEST"
+    })))
+    .unwrap();
+    for (sk, l, n) in [("a", "l1", "1"), ("b", "l2", "2")] {
+        db.put_item(from_json(json!({
+            "TableName": "Indexed",
+            "Item": {
+                "pk": {"S": "p"}, "sk": {"S": sk}, "g": {"S": "g1"},
+                "l": {"S": l}, "n": {"N": n}
+            }
+        })))
+        .unwrap();
+    }
+    let before = indexed_state(&db);
+    assert_eq!(before["item_count"], 2, "{before}");
+    assert_eq!(before["records"].as_array().unwrap().len(), 2, "{before}");
+
+    let request = || ExecuteTransactionRequest {
+        transact_statements: vec![
+            stmt(
+                "INSERT INTO \"Indexed\" VALUE \
+                 {'pk': 'p', 'sk': 'c', 'g': 'g2', 'l': 'l3', 'n': 3}",
+            ),
+            stmt(
+                "UPDATE \"Indexed\" SET g = 'g2', l = 'l9', n = 10 \
+                 WHERE pk = 'p' AND sk = 'a'",
+            ),
+            stmt("UPDATE \"Indexed\" SET n = 20 WHERE pk = 'p' AND sk = 'b' AND n = 999"),
+            stmt(
+                "INSERT INTO \"Indexed\" VALUE \
+                 {'pk': 'q', 'sk': 'a', 'g': 'g3', 'l': 'l1', 'n': 4}",
+            ),
+        ],
+        client_request_token: Some("cancelled-token".to_string()),
+        return_consumed_capacity: Some("INDEXES".to_string()),
+    };
+    let reasons = |result: Result<_, DynoxideError>| match result {
+        Err(DynoxideError::TransactionCanceledException(_, reasons)) => reasons
+            .iter()
+            .map(|r: &dynoxide::errors::CancellationReason| r.code.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("expected TransactionCanceledException, got {other:?}"),
+    };
+    let expected = ["None", "None", "ConditionalCheckFailed", "None"];
+
+    assert_eq!(reasons(db.execute_transaction(request())), expected);
+    assert_eq!(indexed_state(&db), before);
+
+    assert_eq!(reasons(db.execute_transaction(request())), expected);
+    assert_eq!(indexed_state(&db), before);
+}
