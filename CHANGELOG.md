@@ -596,8 +596,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that statement alone in `BatchExecuteStatement` (where it no longer counts
   towards the mixed read and write check), and with the statement's index on
   `ExecuteTransaction`. More parameters than placeholders are still accepted.
-  An empty `Parameters` list on `ExecuteStatement` is refused as a request
-  member. Captured against eu-west-2 and us-east-1.
+  An empty `Parameters` list is refused as a request member, on a batch or
+  transaction member too, where it refuses the whole request.
+  Captured against eu-west-2 and us-east-1.
+- A PartiQL request that breaks several member constraints at once, such as
+  an over-long statement with an empty `Parameters` list or several over-long
+  statements in a batch, lists every one in DynamoDB's "N validation errors
+  detected" form rather than the first, and an empty statement in a batch or
+  transaction refuses the whole request as a member. Captured against
+  eu-west-2 and us-east-1.
 - A malformed `Expected` condition on `PutItem`, `UpdateItem` or `DeleteItem`
   is refused rather than ignored. An unknown `ComparisonOperator` gets
   DynamoDB's "Invalid comparison operator" message, and `EQ` with an empty

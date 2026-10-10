@@ -102,11 +102,24 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
             "Member must have length less than or equal to 100".to_string(),
         ));
     }
+    // Every member violation across the statements is listed in one error, in
+    // member order: each statement's text and parameters by index. Any of
+    // them refuses the whole request (captured eu-west-2 and us-east-1,
+    // 2026-10-10).
+    let mut violations = Vec::new();
     for (i, statement) in statements.iter().enumerate() {
-        let path = format!("transactStatements.{}.member.statement", i + 1);
-        if let Some(e) = crate::partiql::statement_length_rejection(&statement.statement, &path) {
-            return Err(e);
-        }
+        let member = format!("transactStatements.{}.member", i + 1);
+        violations.extend(crate::partiql::statement_length_violation(
+            &statement.statement,
+            &format!("{member}.statement"),
+        ));
+        violations.extend(crate::partiql::parameters_violation(
+            statement.parameters.as_deref(),
+            &format!("{member}.parameters"),
+        ));
+    }
+    if let Some(e) = crate::partiql::member_rejection(&violations) {
+        return Err(e);
     }
 
     // A parameter holding an empty attribute name is a top-level rejection,

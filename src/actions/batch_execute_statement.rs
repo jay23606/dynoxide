@@ -151,32 +151,50 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: BatchExecuteStatementRequest,
 ) -> Result<BatchExecuteStatementResponse> {
-    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-        request.return_consumed_capacity.as_deref(),
-    ) {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&msg),
-        ));
-    }
-
-    if request.statements.is_empty() {
-        return Err(DynoxideError::ValidationException(
-            "1 validation error detected: Value '[]' at 'statements' failed to satisfy constraint: Member must have length greater than or equal to 1".to_string(),
-        ));
-    }
-
     if request.statements.len() > 25 {
         return Err(DynoxideError::ValidationException(
             "Too many statements in BatchExecuteStatement; limit is 25".to_string(),
         ));
     }
 
-    // A statement of the wrong length refuses the whole request, as a member.
+    // Every member DynamoDB refuses is listed in one error, in member order:
+    // the statement list, each statement's text and parameters by index, then
+    // ReturnConsumedCapacity. Any of them refuses the whole request, before a
+    // statement is parsed or runs (captured eu-west-2 and us-east-1,
+    // 2026-10-10: statement then parameters across members, and every
+    // over-long statement listed; ReturnConsumedCapacity after the statements
+    // follows the operation's member order).
+    let mut violations = Vec::new();
+    if request.statements.is_empty() {
+        violations.push(
+            "Value '[]' at 'statements' failed to satisfy constraint: Member must have length \
+             greater than or equal to 1"
+                .to_string(),
+        );
+    }
     for (i, statement) in request.statements.iter().enumerate() {
-        let path = format!("statements.{}.member.statement", i + 1);
-        if let Some(e) = crate::partiql::statement_length_rejection(&statement.statement, &path) {
-            return Err(e);
-        }
+        let member = format!("statements.{}.member", i + 1);
+        violations.extend(crate::partiql::statement_length_violation(
+            &statement.statement,
+            &format!("{member}.statement"),
+        ));
+        // A member whose every parameter was refused as it was decoded holds
+        // an empty list too, but that is its own statement's refusal, not an
+        // empty list sent.
+        let sent = statement
+            .parameters
+            .as_deref()
+            .filter(|_| statement.parameter_rejection.is_none());
+        violations.extend(crate::partiql::parameters_violation(
+            sent,
+            &format!("{member}.parameters"),
+        ));
+    }
+    violations.extend(crate::validation::return_consumed_capacity_rejection(
+        request.return_consumed_capacity.as_deref(),
+    ));
+    if let Some(e) = crate::partiql::member_rejection(&violations) {
+        return Err(e);
     }
 
     // Parse once, and carry the resolved target alongside. Statements that fail

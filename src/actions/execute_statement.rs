@@ -46,41 +46,32 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: ExecuteStatementRequest,
 ) -> Result<ExecuteStatementResponse> {
-    // Limit is checked before the statement is parsed. A zero limit would
-    // otherwise read nothing and mint no token, silently ending a paginated
-    // walk. The wording follows Scan's shape (value kept, lowercase 'limit'),
-    // not Query's, matching what ExecuteStatement itself returns (captured
-    // eu-west-2, 2026-07-29).
-    if request.limit == Some(0) {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(
-                "Value '0' at 'limit' failed to satisfy constraint: \
-                 Member must have value greater than or equal to 1",
-            ),
-        ));
-    }
-
-    if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-        request.return_consumed_capacity.as_deref(),
-    ) {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&msg),
-        ));
-    }
-
-    if let Some(e) = crate::partiql::statement_length_rejection(&request.statement, "statement") {
+    // Every member DynamoDB refuses is listed in one error, in member order:
+    // the statement, its parameters, ReturnConsumedCapacity, Limit. The
+    // statement comes before the parameters and before ReturnConsumedCapacity
+    // (captured eu-west-2 and us-east-1, 2026-10-10); the rest follow the
+    // operation's member order. All of them are checked before the statement
+    // is parsed. A zero limit would otherwise read nothing and mint no token,
+    // silently ending a paginated walk; its wording follows Scan's shape
+    // (value kept, lowercase 'limit'), not Query's, matching what
+    // ExecuteStatement itself returns (captured eu-west-2, 2026-07-29).
+    let violations: Vec<String> = [
+        crate::partiql::statement_length_violation(&request.statement, "statement"),
+        crate::partiql::parameters_violation(request.parameters.as_deref(), "parameters"),
+        crate::validation::return_consumed_capacity_rejection(
+            request.return_consumed_capacity.as_deref(),
+        ),
+        (request.limit == Some(0)).then(|| {
+            "Value '0' at 'limit' failed to satisfy constraint: Member must have value \
+             greater than or equal to 1"
+                .to_string()
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(e) = crate::partiql::member_rejection(&violations) {
         return Err(e);
-    }
-
-    // An empty Parameters list is a request member error (captured eu-west-2
-    // and us-east-1, 2026-10-10).
-    if request.parameters.as_ref().is_some_and(Vec::is_empty) {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(
-                "Value '[]' at 'parameters' failed to satisfy constraint: Member must have \
-                 length greater than or equal to 1",
-            ),
-        ));
     }
 
     // A parameter holding an empty attribute name is refused bare, before the
