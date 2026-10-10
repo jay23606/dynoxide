@@ -1087,23 +1087,18 @@ pub(crate) fn read_expected(
                     crate::serde_errors::clean_serde_message(&msg).to_string(),
                 ))
             } else {
-                // Classified as the request body's own errors are, where that
-                // mapping is built; a plain library build, whose requests are
-                // typed values, refuses with the reader's message.
-                let fallback = || {
-                    DynoxideError::ValidationException(
-                        crate::serde_errors::clean_serde_message(&msg).to_string(),
-                    )
-                };
-                #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+                // Classified as the request body's own errors are, in every
+                // build, so a library caller gets the same words as the wire.
                 let refused =
                     crate::serde_errors::deserialize::<HashMap<String, ExpectedCondition>>(
                         &expected.to_string(),
                     )
                     .err()
-                    .unwrap_or_else(fallback);
-                #[cfg(not(any(feature = "http-server", feature = "wasm-sqlite", test)))]
-                let refused = fallback();
+                    .unwrap_or_else(|| {
+                        DynoxideError::ValidationException(
+                            crate::serde_errors::clean_serde_message(&msg).to_string(),
+                        )
+                    });
                 Err(refused)
             }
         }
@@ -2457,5 +2452,20 @@ mod tests {
         assert_eq!(super::size_estimate_range_gb(GB), vec![1.0, 2.0]);
         assert_eq!(super::size_estimate_range_gb(GB * 3 / 2), vec![1.0, 2.0]);
         assert_eq!(super::size_estimate_range_gb(10 * GB), vec![10.0, 11.0]);
+    }
+
+    /// A legacy `Expected` that doesn't read as conditions is refused in
+    /// DynamoDB's words in every build, a library-only one included: the
+    /// classification no longer depends on the server features.
+    #[test]
+    fn an_unreadable_expected_is_refused_in_dynamodbs_words() {
+        let err = super::read_expected(&serde_json::json!({"guard": {"Value": {}}})).unwrap_err();
+        match err {
+            crate::DynoxideError::ValidationException(message) => assert_eq!(
+                message,
+                "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
+            ),
+            other => panic!("expected a ValidationException, got {other:?}"),
+        }
     }
 }
