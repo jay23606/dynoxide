@@ -951,10 +951,7 @@ fn apply_attribute_updates(
                 .as_ref()
                 .is_some_and(|sk| sk == attr_name)
         {
-            return Err(DynoxideError::ValidationException(format!(
-                "One or more parameter values were invalid: \
-                 Cannot update attribute {attr_name}. This attribute is part of the key"
-            )));
+            return Err(helpers::key_attribute_update_refusal(attr_name));
         }
 
         let action = update.action.to_uppercase();
@@ -1095,9 +1092,7 @@ fn validate_not_key_attr(
                 .as_ref()
                 .is_some_and(|sk| sk == &resolved_name)
         {
-            return Err(DynoxideError::ValidationException(format!(
-                "One or more parameter values were invalid: Cannot update attribute {resolved_name}. This attribute is part of the key"
-            )));
+            return Err(helpers::key_attribute_update_refusal(&resolved_name));
         }
     }
     Ok(())

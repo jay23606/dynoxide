@@ -486,10 +486,15 @@ pub async fn execute<S: StorageBackend>(
                         };
                         // A key too large to be one is refused before anything
                         // is read or written, and is charged nothing (captured
-                        // eu-west-2 and us-east-1, 2026-10-10).
-                        let key_too_large = code == "ValidationError"
+                        // eu-west-2 and us-east-1, 2026-10-10). So is an UPDATE
+                        // of a key attribute (refused before the item is read,
+                        // captured eu-west-2 and us-east-1, 10 October 2026;
+                        // that it is charged nothing is inferred).
+                        let refused_before_reading = code == "ValidationError"
                             && (message == crate::actions::helpers::HASH_KEY_TOO_LARGE
-                                || message == crate::actions::helpers::RANGE_KEY_TOO_LARGE);
+                                || message == crate::actions::helpers::RANGE_KEY_TOO_LARGE
+                                || message
+                                    .starts_with(crate::actions::helpers::KEY_ATTRIBUTE_UPDATE));
                         // A failed statement is charged the write it attempted,
                         // added to its table's total while appearing in no arm.
                         // Captured: a failing 3KB insert beside a small success
@@ -501,7 +506,7 @@ pub async fn execute<S: StorageBackend>(
                         // without reading anything. Everything else falls back
                         // to the one-unit minimum.
                         if let Some(ref name) = table
-                            && !key_too_large
+                            && !refused_before_reading
                         {
                             let units =
                                 attempted_units(storage, &stmt, params, prepared.target.as_ref())
@@ -517,8 +522,10 @@ pub async fn execute<S: StorageBackend>(
                         // 2026-07 for the second. A key too large to be one is
                         // the exception: DynamoDB echoes the table with that
                         // ValidationError, for a partition key and a sort key
-                        // alike (captured eu-west-2 and us-east-1, 2026-10-10).
-                        let echoes_table = code != "ValidationError" || key_too_large;
+                        // alike (captured eu-west-2 and us-east-1, 2026-10-10),
+                        // and with the refusal of an UPDATE of a key attribute
+                        // (captured eu-west-2 and us-east-1, 10 October 2026).
+                        let echoes_table = code != "ValidationError" || refused_before_reading;
                         BatchStatementResponse {
                             error: Some(BatchStatementError {
                                 code,

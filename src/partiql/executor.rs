@@ -3140,9 +3140,9 @@ async fn execute_update<S: StorageBackend>(
     let (pk_str, sk_str) = single_item_key(wc, key_schema, parameters)?;
 
     // A key attribute can't be set or removed: the item would be stored under
-    // its old key with another key value in it. UpdateItem's words (captured
-    // eu-west-2, us-east-1 and ap-southeast-2); PartiQL's are inferred to be
-    // the same, and so is where the refusal falls among the others.
+    // its old key with another key value in it. Refused in UpdateItem's words
+    // before the item is read, so a missing item or a false condition makes no
+    // difference (captured eu-west-2 and us-east-1, 10 October 2026).
     let paths = set_clauses
         .iter()
         .map(|clause| clause.path.as_str())
@@ -3152,10 +3152,7 @@ async fn execute_update<S: StorageBackend>(
             .chain(key_schema.sort_key.as_deref())
             .find(|key| names_attribute(path, key));
         if let Some(key) = key {
-            return Err(DynoxideError::ValidationException(format!(
-                "One or more parameter values were invalid: Cannot update attribute {key}. \
-                 This attribute is part of the key"
-            )));
+            return Err(crate::actions::helpers::key_attribute_update_refusal(key));
         }
     }
 

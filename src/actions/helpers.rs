@@ -633,6 +633,20 @@ pub(crate) const HASH_KEY_TOO_LARGE: &str = "One or more parameter values were i
 pub(crate) const RANGE_KEY_TOO_LARGE: &str = "One or more parameter values were invalid: \
      Aggregated size of all range keys has exceeded the size limit of 1024 bytes";
 
+/// The start of DynamoDB's refusal of an update that sets or removes a key
+/// attribute, which goes on to name the attribute: see
+/// [`key_attribute_update_refusal`].
+pub(crate) const KEY_ATTRIBUTE_UPDATE: &str =
+    "One or more parameter values were invalid: Cannot update attribute ";
+
+/// DynamoDB's refusal of an update that sets or removes the key attribute
+/// `attribute`, on UpdateItem and a PartiQL UPDATE alike.
+pub(crate) fn key_attribute_update_refusal(attribute: &str) -> DynoxideError {
+    DynoxideError::ValidationException(format!(
+        "{KEY_ATTRIBUTE_UPDATE}{attribute}. This attribute is part of the key"
+    ))
+}
+
 /// The refusal for a key value larger than a key can be, if it is: over
 /// 2,048 bytes for a partition key, over 1,024 for a sort key.
 pub(crate) fn key_size_refusal(value: &AttributeValue, sort_key: bool) -> Option<DynoxideError> {
