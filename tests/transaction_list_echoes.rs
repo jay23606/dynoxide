@@ -48,15 +48,16 @@ fn an_empty_statement_list_is_echoed_as_brackets() {
     );
 }
 
-/// The capture's first statement also carried `ReturnValuesOnConditionCheckFailure:
-/// ALL_OLD`, which DynamoDB echoes; Dynoxide doesn't read that member of a
-/// transaction's statement, so this request leaves it out and expects `null`.
+/// The capture's own request: its first statement carries
+/// `ReturnValuesOnConditionCheckFailure: ALL_OLD`, echoed as sent, and the
+/// rest leave it out and are echoed `null`.
 #[test]
 fn a_statement_list_over_100_is_echoed_in_the_java_form() {
     let db = Database::memory().unwrap();
     let mut statements = vec![json!({
         "Statement": format!("UPDATE \"{TABLE}\" SET a = ? WHERE pk = ?"),
-        "Parameters": [{"N": "1"}, {"S": "k"}]
+        "Parameters": [{"N": "1"}, {"S": "k"}],
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
     })];
     statements.extend(
         (0..100).map(|_| json!({"Statement": format!("SELECT * FROM \"{TABLE}\" WHERE pk = 'a'")})),
@@ -78,7 +79,7 @@ fn a_statement_list_over_100_is_echoed_in_the_java_form() {
             ", dOUBLESET=null, m=null, l=null, nULL=null, bOOL=null), AttributeValue(s=k",
             ", n=null, b=null, iNT=null, dECIMAL=null, dOUBLE=null, sS=null, nS=null",
             ", bS=null, iNTSET=null, dECIMALSET=null, dOUBLESET=null, m=null, l=null",
-            ", nULL=null, bOOL=null)], returnValuesOnConditionCheckFailure=null)",
+            ", nULL=null, bOOL=null)], returnValuesOnConditionCheckFailure=ALL_OLD)",
             ", ParameterizedStatement(statement=SELECT * FROM \"_capture_20261010_mcii_none\" WHERE pk = 'a'",
             ", parameters=null, returnValuesOnConditionCheckFailure=null), ",
         ),
@@ -88,7 +89,7 @@ fn a_statement_list_over_100_is_echoed_in_the_java_form() {
             ", parameters=null",
             ", returnValuesOnConditionCheckFailure=null)]' at 'transactStatements' failed to satisfy constraint: Member must have length less than or equal to 100",
         ),
-        15961,
+        15964,
     );
 }
 

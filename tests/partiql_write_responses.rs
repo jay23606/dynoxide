@@ -55,6 +55,7 @@ fn transact(db: &Database, statements: &[&str], capacity: Option<&str>) -> serde
                 .map(|s| ParameterizedStatement {
                     statement: s.to_string(),
                     parameters: None,
+                    ..Default::default()
                 })
                 .collect(),
             return_consumed_capacity: capacity.map(str::to_string),

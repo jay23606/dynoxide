@@ -12,6 +12,7 @@ use dynoxide::actions::batch_execute_statement::{
 };
 use dynoxide::actions::batch_get_item::{BatchGetItemRequest, KeysAndAttributes};
 use dynoxide::actions::batch_write_item::{BatchWriteItemRequest, PutRequest, WriteRequest};
+use dynoxide::actions::execute_transaction::{ExecuteTransactionRequest, ParameterizedStatement};
 use dynoxide::actions::transact_get_items::{
     TransactGet, TransactGetItem, TransactGetItemsRequest,
 };
@@ -117,6 +118,38 @@ fn a_batch_statement_echo_is_bounded() {
     let message = message(err);
     assert!(
         message.starts_with("1 validation error detected: Value '[BatchStatementRequest("),
+        "unexpected message start: {}",
+        &message[..message.len().min(200)]
+    );
+    assert_cut(&message);
+}
+
+/// ExecuteTransaction echoes its statements when there are more than 100.
+/// 101 statements of 2,000 number parameters each are about 1.5 MB of request
+/// and about 34 MB of echo.
+#[test]
+fn a_transaction_statement_echo_is_bounded() {
+    let db = Database::memory().unwrap();
+    let statements: Vec<ParameterizedStatement> = (0..101)
+        .map(|_| ParameterizedStatement {
+            statement: "SELECT * FROM \"T\" WHERE pk = ?".to_string(),
+            parameters: Some(
+                (0..2_000)
+                    .map(|_| AttributeValue::N("1".to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        })
+        .collect();
+    let err = db
+        .execute_transaction(ExecuteTransactionRequest {
+            transact_statements: statements,
+            ..Default::default()
+        })
+        .unwrap_err();
+    let message = message(err);
+    assert!(
+        message.starts_with("1 validation error detected: Value '[ParameterizedStatement("),
         "unexpected message start: {}",
         &message[..message.len().min(200)]
     );

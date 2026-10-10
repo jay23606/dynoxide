@@ -26,6 +26,11 @@ pub struct ExecuteStatementRequest {
     pub consistent_read: Option<bool>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     pub return_consumed_capacity: Option<String>,
+    /// `ALL_OLD` hands back the item an UPDATE or DELETE failed its condition
+    /// on, on the `ConditionalCheckFailedException`; `NONE`, or leaving it out,
+    /// does not.
+    #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
+    pub return_values_on_condition_check_failure: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -48,26 +53,29 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     request: ExecuteStatementRequest,
 ) -> Result<ExecuteStatementResponse> {
-    // Every member DynamoDB refuses is listed in one error, in member order:
-    // the statement, its parameters, ReturnConsumedCapacity, Limit. The
-    // statement comes before the parameters and before ReturnConsumedCapacity
-    // (captured eu-west-2 and us-east-1, 2026-10-10); the rest follow the
-    // operation's member order. All of them are checked before the statement
+    // Every member DynamoDB refuses is listed in one error, in DynamoDB's
+    // order: ReturnValuesOnConditionCheckFailure, Limit, the statement,
+    // ReturnConsumedCapacity, the parameters (captured eu-west-2 and
+    // us-east-1, 2026-10-10). All of them are checked before the statement
     // is parsed. A zero limit would otherwise read nothing and mint no token,
     // silently ending a paginated walk; its wording follows Scan's shape
     // (value kept, lowercase 'limit'), not Query's, matching what
     // ExecuteStatement itself returns (captured eu-west-2, 2026-07-29).
     let violations: Vec<String> = [
-        crate::partiql::statement_length_violation(&request.statement, "statement"),
-        crate::partiql::parameters_violation(request.parameters.as_deref(), "parameters"),
-        crate::validation::return_consumed_capacity_rejection(
-            request.return_consumed_capacity.as_deref(),
+        crate::validation::return_values_on_condition_check_failure_rejection(
+            request.return_values_on_condition_check_failure.as_deref(),
+            "returnValuesOnConditionCheckFailure",
         ),
         (request.limit == Some(0)).then(|| {
             "Value '0' at 'limit' failed to satisfy constraint: Member must have value \
              greater than or equal to 1"
                 .to_string()
         }),
+        crate::partiql::statement_length_violation(&request.statement, "statement"),
+        crate::validation::return_consumed_capacity_rejection(
+            request.return_consumed_capacity.as_deref(),
+        ),
+        crate::partiql::parameters_violation(request.parameters.as_deref(), "parameters"),
     ]
     .into_iter()
     .flatten()
@@ -139,6 +147,7 @@ pub async fn execute<S: StorageBackend>(
         // A single statement has no preparation pass to share a resolution
         // with, so the executor resolves the table itself, once.
         None,
+        request.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD"),
     );
     // Base write, index fan-out and stream record are one atomic unit, as they
     // are on every other write path. Without it a fan-out that failed part way

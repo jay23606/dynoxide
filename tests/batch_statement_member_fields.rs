@@ -5,11 +5,11 @@
 //! Measured against real DynamoDB in eu-west-2 on 15 August 2026; case labels
 //! (B1, B7) refer to that capture.
 //!
-//! They resolve differently. `ConsistentRead` is honoured per member and changes
-//! the rate a read is charged at. `ReturnValuesOnConditionCheckFailure` is inert
-//! on this surface: DynamoDB returns the same response whatever it says, so
-//! dynoxide accepting and ignoring it is the matching behaviour, and the tests
-//! below pin that rather than assuming it.
+//! `ConsistentRead` is honoured per member and changes the rate a read is
+//! charged at. `ReturnValuesOnConditionCheckFailure` set to `ALL_OLD` puts the
+//! item a member's condition failed on on that member's `Error`, as DynamoDB
+//! does (captured eu-west-2 and us-east-1, 2026-10-10, which corrects the
+//! August capture's finding that it never returned the item).
 
 use dynoxide::Database;
 use dynoxide::types::ConsumedCapacity;
@@ -150,11 +150,9 @@ fn the_flag_does_not_change_which_rows_come_back() {
 // --- ReturnValuesOnConditionCheckFailure -----------------------------------
 
 #[test]
-fn a_failed_condition_returns_no_item_whatever_the_option_says() {
-    // B7, B8, B9. DynamoDB returns the same response for all three, and never
-    // the item. The option works on TransactWriteItems, which is what rules out
-    // a bad probe, so this is DynamoDB declining rather than dynoxide dropping
-    // the field.
+fn a_failed_condition_returns_the_item_on_the_error_only_for_all_old() {
+    // B7, B8, B9, recaptured 2026-10-10 (B1 there): `ALL_OLD` carries the
+    // item on the member's error, and `NONE` or leaving it out does not.
     let db = seeded();
     for option in [Some("ALL_OLD"), Some("NONE"), None] {
         let mut member = serde_json::json!({
@@ -171,10 +169,15 @@ fn a_failed_condition_returns_no_item_whatever_the_option_says() {
             .unwrap_or_else(|| panic!("option {option:?} should fail the condition"));
         assert_eq!(error.code, "ConditionalCheckFailed", "option {option:?}");
         assert_eq!(error.message, "The conditional request failed");
-        assert!(
-            response.item.is_none(),
-            "option {option:?} must not return the item"
-        );
+        let expected = (option == Some("ALL_OLD")).then(|| {
+            serde_json::from_value(serde_json::json!({
+                "pk": {"S": "k1"}, "gsiPk": {"S": "g1"}, "val": {"S": "v1"}
+            }))
+            .unwrap()
+        });
+        assert_eq!(error.item, expected, "option {option:?}");
+        // The item rides on the error, never on the response itself.
+        assert!(response.item.is_none(), "option {option:?}");
         // A member that ran and failed still echoes its table.
         assert_eq!(response.table_name.as_deref(), Some(TABLE));
     }
@@ -194,12 +197,13 @@ fn a_duplicate_insert_returns_no_item_with_the_option_set() {
     let response = &resp.responses[0];
     let error = response.error.as_ref().expect("a duplicate insert fails");
     assert_eq!(error.code, "DuplicateItem");
+    assert!(error.item.is_none());
     assert!(response.item.is_none());
 }
 
 #[test]
 fn a_failing_member_still_carries_the_capacity_surcharge() {
-    // B10. The option changes the response and not the billing: one failing
+    // B10. The option doesn't change the billing: one failing
     // member alongside one that succeeds reports a total above the arms, the
     // failure being charged the write it attempted.
     let db = seeded();

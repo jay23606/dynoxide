@@ -375,8 +375,11 @@ async fn route<S: StorageBackend>(
         };
 
     // Same seam as the HTTP dispatch: resolve the wire-invisible
-    // EnvelopedValidation tag for the operation before serialising.
-    result.map_err(|e| crate::validation::resolve_request_validation_tag(op, e))
+    // EnvelopedValidation tag for the operation before serialising, and give
+    // ExecuteStatement's condition failure carrying an item its own shape.
+    result.map_err(|e| {
+        crate::errors::for_operation(op, crate::validation::resolve_request_validation_tag(op, e))
+    })
 }
 
 /// `ExecuteTransaction`, which cannot use the `run!` macro because it needs the

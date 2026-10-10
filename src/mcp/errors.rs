@@ -15,7 +15,8 @@ fn short_error_type(err: &DynoxideError) -> &'static str {
         DynoxideError::ValidationException(_)
         | DynoxideError::KeyEmptyValueValidation(_)
         | DynoxideError::EnvelopedValidation(_) => "ValidationException",
-        DynoxideError::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
+        DynoxideError::ConditionalCheckFailedException(..)
+        | DynoxideError::StatementConditionalCheckFailed(..) => "ConditionalCheckFailedException",
         DynoxideError::TransactionCanceledException(..) => "TransactionCanceledException",
         DynoxideError::ItemCollectionSizeLimitExceededException(_) => {
             "ItemCollectionSizeLimitExceededException"

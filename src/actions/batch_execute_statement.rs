@@ -35,12 +35,10 @@ pub struct BatchStatementRequest {
     /// without it and 1 with it, and a batch mixing the two sums both rates.
     /// Captured eu-west-2 2026-08-15.
     pub consistent_read: Option<bool>,
-    /// Accepted and inert, which is what DynamoDB does with it. A batch member
-    /// whose condition fails returns the same response whether this is
-    /// `ALL_OLD`, `NONE`, or absent, and never carries the item: measured
-    /// against a `TransactWriteItems` `ConditionCheck` in the same round, which
-    /// does return it. The field is deserialised so a client setting it meets a
-    /// field dynoxide knows rather than one it drops.
+    /// `ALL_OLD` hands back the item this member's UPDATE or DELETE failed its
+    /// condition on, on the member's `Error`; `NONE`, or leaving it out, does
+    /// not (captured eu-west-2 and us-east-1, 2026-10-10, which corrects a
+    /// 2026-08-15 measurement that found no item either way).
     pub return_values_on_condition_check_failure: Option<String>,
     /// A parameter DynamoDB refused as the request was decoded, such as a
     /// number it can't store. DynamoDB reports it against this statement and
@@ -154,6 +152,16 @@ pub struct BatchStatementError {
     pub code: String,
     #[serde(rename = "Message")]
     pub message: String,
+    /// The item a failed condition was evaluated against, when the member set
+    /// `ReturnValuesOnConditionCheckFailure` to `ALL_OLD`.
+    #[serde(
+        rename = "Item",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::set_order::item_in_hash_order"
+    )]
+    // Number sets in Java hash-set order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
+    pub item: Option<Item>,
 }
 
 /// The statement list as DynamoDB echoes it in a constraint message: each
@@ -218,13 +226,13 @@ pub async fn execute<S: StorageBackend>(
     request: BatchExecuteStatementRequest,
 ) -> Result<BatchExecuteStatementResponse> {
     // Every member DynamoDB refuses is listed in one error: ReturnConsumedCapacity,
-    // then the statements (the list's length, then each statement's text and
-    // parameters by index). Any of them refuses the whole request, before a
-    // statement is parsed or runs. Captured eu-west-2 and us-east-1,
-    // 2026-10-10: statement then parameters across members, every over-long
-    // statement listed, and ReturnConsumedCapacity ahead of an over-long list.
-    // Inferred, not captured: that a member's own violations also come after
-    // ReturnConsumedCapacity, as they belong to the same `statements` member.
+    // then the statements (the list's length, then each statement's
+    // ReturnValuesOnConditionCheckFailure, text and parameters by index). Any
+    // of them refuses the whole request, before a statement is parsed or
+    // runs. Captured eu-west-2 and us-east-1, 2026-10-10: statement then
+    // parameters across members, every over-long statement listed,
+    // ReturnConsumedCapacity ahead of an over-long list and of a member's own
+    // violations, and a member's mode ahead of its statement.
     let mut violations = Vec::new();
     violations.extend(crate::validation::return_consumed_capacity_rejection(
         request.return_consumed_capacity.as_deref(),
@@ -245,6 +253,14 @@ pub async fn execute<S: StorageBackend>(
     }
     for (i, statement) in request.statements.iter().enumerate() {
         let member = format!("statements.{}.member", i + 1);
+        violations.extend(
+            crate::validation::return_values_on_condition_check_failure_rejection(
+                statement
+                    .return_values_on_condition_check_failure
+                    .as_deref(),
+                &format!("{member}.returnValuesOnConditionCheckFailure"),
+            ),
+        );
         violations.extend(crate::partiql::statement_length_violation(
             &statement.statement,
             &format!("{member}.statement"),
@@ -326,6 +342,7 @@ pub async fn execute<S: StorageBackend>(
                 error: Some(BatchStatementError {
                     code: "ValidationError".to_string(),
                     message,
+                    item: None,
                 }),
                 item: None,
                 table_name: None,
@@ -341,6 +358,7 @@ pub async fn execute<S: StorageBackend>(
                     // matching DynamoDB.
                     code: "ValidationError".to_string(),
                     message: e.into_message(),
+                    item: None,
                 }),
                 item: None,
                 table_name: None,
@@ -406,14 +424,16 @@ pub async fn execute<S: StorageBackend>(
                         error: Some(BatchStatementError {
                             code: "ValidationError".to_string(),
                             message,
+                            item: None,
                         }),
                         item: None,
                         table_name: None,
                     });
                     continue;
                 }
-                let run = partiql::executor::execute_page(
+                let run = partiql::executor::execute_written_page(
                     storage,
+                    None,
                     &stmt,
                     params,
                     None,
@@ -421,6 +441,7 @@ pub async fn execute<S: StorageBackend>(
                     stmt_req.consistent_read.unwrap_or(false),
                     request.return_consumed_capacity.as_deref(),
                     table.as_deref().and_then(|t| tables.get(t)),
+                    stmt_req.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD"),
                 );
                 // One transaction per statement, not per batch: a batch is not
                 // atomic across its statements, so each one commits or rolls
@@ -458,6 +479,11 @@ pub async fn execute<S: StorageBackend>(
                     Err(e) => {
                         let code = e.short_error_code().to_string();
                         let message = e.to_string();
+                        // Present only when the member asked for it.
+                        let item = match e {
+                            DynoxideError::ConditionalCheckFailedException(_, item) => item,
+                            _ => None,
+                        };
                         // A key too large to be one is refused before anything
                         // is read or written, and is charged nothing (captured
                         // eu-west-2 and us-east-1, 2026-10-10).
@@ -494,7 +520,11 @@ pub async fn execute<S: StorageBackend>(
                         // alike (captured eu-west-2 and us-east-1, 2026-10-10).
                         let echoes_table = code != "ValidationError" || key_too_large;
                         BatchStatementResponse {
-                            error: Some(BatchStatementError { code, message }),
+                            error: Some(BatchStatementError {
+                                code,
+                                message,
+                                item,
+                            }),
                             item: None,
                             table_name: if echoes_table { table } else { None },
                         }

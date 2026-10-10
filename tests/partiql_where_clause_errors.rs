@@ -114,6 +114,7 @@ fn transactions_and_batches_report_it_the_same_way() {
             transact_statements: vec![ParameterizedStatement {
                 statement: r#"SELECT * FROM "Things" WHERE"#.to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             ..Default::default()
         })

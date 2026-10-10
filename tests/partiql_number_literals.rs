@@ -432,10 +432,12 @@ fn a_leftover_token_is_refused_in_a_batch_and_a_transaction() {
                 ParameterizedStatement {
                     statement: "UPDATE \"Nums\" SET a = 'x' WHERE pk = 15".to_string(),
                     parameters: None,
+                    ..Default::default()
                 },
                 ParameterizedStatement {
                     statement: "UPDATE \"Nums\" SET a = 'y' WHERE pk = 1 foo".to_string(),
                     parameters: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1467,6 +1469,7 @@ fn transaction(
             .map(|(statement, parameters)| ParameterizedStatement {
                 statement: statement.to_string(),
                 parameters: parameters.clone(),
+                ..Default::default()
             })
             .collect(),
         ..Default::default()

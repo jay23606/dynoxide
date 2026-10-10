@@ -289,6 +289,7 @@ fn transactions_and_batches_run_a_from_first_statement() {
             transact_statements: vec![ParameterizedStatement {
                 statement: r#"FROM "Things" WHERE pk = 'p1' SET c = 1"#.to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             ..Default::default()
         })

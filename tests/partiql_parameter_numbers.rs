@@ -152,6 +152,7 @@ fn transactions_and_batches_read_a_parameter_number_the_same_way() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "UPDATE \"Things\" SET n = ? WHERE pk = 'a'".to_string(),
                 parameters: Some(vec![n("1e99999999999")]),
+                ..Default::default()
             }],
             ..Default::default()
         })

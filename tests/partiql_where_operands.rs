@@ -362,6 +362,7 @@ fn size_conditions_a_write() {
         transact_statements: vec![ParameterizedStatement {
             statement: r#"SELECT pk FROM "Things" WHERE pk = 'it1' AND size(s) = 3"#.to_string(),
             parameters: None,
+            ..Default::default()
         }],
         ..Default::default()
     });
@@ -553,6 +554,7 @@ fn a_literal_on_the_left_names_the_item_a_write_changes() {
             transact_statements: vec![ParameterizedStatement {
                 statement: r#"SELECT pk FROM "Things" WHERE 'it1' = pk"#.to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             ..Default::default()
         })

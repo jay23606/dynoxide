@@ -328,7 +328,7 @@ impl serde::Serialize for HashOrderedList<'_> {
     }
 }
 
-struct HashOrderedItem<'a>(&'a HashMap<String, AttributeValue>);
+pub(crate) struct HashOrderedItem<'a>(pub(crate) &'a HashMap<String, AttributeValue>);
 
 impl serde::Serialize for HashOrderedItem<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -755,10 +755,11 @@ mod tests {
                 "/Responses/tbl/0/ns/NS",
                 &numeric,
             ),
-            // Not captured: the item on a ConditionalCheckFailed error and a
-            // vector search hit follow AttributeValue's own (numeric) order.
+            // PutItem's, UpdateItem's and DeleteItem's ConditionalCheckFailed
+            // item comes back numerically, ExecuteStatement's in hash order
+            // (captured eu-west-2 and us-east-1, 2026-10-10).
             (
-                "ConditionalCheckFailed item (inferred)",
+                "ConditionalCheckFailed item",
                 to_value(crate::errors::ErrorResponse {
                     error_type: String::new(),
                     message: String::new(),
@@ -768,6 +769,31 @@ mod tests {
                 "/Item/ns/NS",
                 &numeric,
             ),
+            (
+                "ExecuteStatement ConditionalCheckFailed item",
+                serde_json::from_str(
+                    &crate::errors::DynoxideError::StatementConditionalCheckFailed(
+                        String::new(),
+                        item(),
+                    )
+                    .to_json(),
+                )
+                .unwrap(),
+                "/Item/ns/NS",
+                &hash,
+            ),
+            (
+                "BatchExecuteStatement error item",
+                to_value(batch_execute_statement::BatchStatementError {
+                    item: Some(item()),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Item/ns/NS",
+                &hash,
+            ),
+            // Not captured: a vector search hit follows AttributeValue's own
+            // (numeric) order.
             (
                 "SearchVectors hit (inferred)",
                 to_value(search_vectors::SearchResult {

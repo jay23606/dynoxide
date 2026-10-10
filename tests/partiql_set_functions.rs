@@ -479,6 +479,7 @@ fn transactions_and_batches_run_a_call() {
             statement: "UPDATE \"Things\" SET ss = set_add(ss, <<'t'>>) WHERE pk = 's0'"
                 .to_string(),
             parameters: None,
+            ..Default::default()
         }],
         ..Default::default()
     })

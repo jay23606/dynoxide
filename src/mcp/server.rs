@@ -727,7 +727,7 @@ pub struct TransactGetItemsParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BatchExecutePartiqlParams {
     #[schemars(
-        description = "Array of PartiQL statements. Each is {Statement: \"...\", Parameters?: [...], ConsistentRead?: true|false, ReturnValuesOnConditionCheckFailure?: \"ALL_OLD\"|\"NONE\"}. ConsistentRead is per member and sets the rate that member's read is charged at rather than which rows come back. ReturnValuesOnConditionCheckFailure is accepted and inert, as it is on DynamoDB. A batch is all-read or all-write, and a SELECT member must name the table's primary key and may not name an index."
+        description = "Array of PartiQL statements. Each is {Statement: \"...\", Parameters?: [...], ConsistentRead?: true|false, ReturnValuesOnConditionCheckFailure?: \"ALL_OLD\"|\"NONE\"}. ConsistentRead is per member and sets the rate that member's read is charged at rather than which rows come back. ReturnValuesOnConditionCheckFailure ALL_OLD returns the item a failed UPDATE or DELETE condition was evaluated against on that member's Error. A batch is all-read or all-write, and a SELECT member must name the table's primary key and may not name an index."
     )]
     pub statements: serde_json::Value,
 
@@ -742,7 +742,7 @@ pub struct BatchExecutePartiqlParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExecuteTransactionPartiqlParams {
     #[schemars(
-        description = "Array of PartiQL statements (max 100). Each is {Statement: \"...\", Parameters?: [...]}. All succeed or all fail atomically."
+        description = "Array of PartiQL statements (max 100). Each is {Statement: \"...\", Parameters?: [...], ReturnValuesOnConditionCheckFailure?: \"ALL_OLD\"|\"NONE\"}. All succeed or all fail atomically. ALL_OLD returns the item a failed UPDATE or DELETE condition was evaluated against on that statement's cancellation reason."
     )]
     pub transact_statements: serde_json::Value,
     #[schemars(description = "Optional idempotency token for the transaction")]
@@ -1856,6 +1856,7 @@ impl McpServer {
             next_token: params.next_token,
             consistent_read: params.consistent_read,
             return_consumed_capacity: params.return_consumed_capacity,
+            ..Default::default()
         };
         match self.db.execute_statement(request) {
             Ok(resp) => json_result(&resp),

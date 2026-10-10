@@ -242,8 +242,11 @@ pub(crate) fn validate_scan_table_name(name: &str) -> Result<()> {
 
 /// The rejection for a `ReturnValuesOnConditionCheckFailure` outside
 /// `[ALL_OLD, NONE]`, at `path`: `returnValuesOnConditionCheckFailure` on the
-/// single-item operations, `transactItems.N.member.<action>.` before it in a
-/// transaction. Captured in all seven regions tried, 2026-10-09.
+/// single-item operations and `ExecuteStatement`, `transactItems.N.member.<action>.`
+/// before it in a transaction, and `statements.N.member.` or
+/// `transactStatements.N.member.` on a PartiQL batch or transaction. An empty
+/// string is refused too. Captured in all seven regions tried, 2026-10-09, and
+/// for the PartiQL operations in eu-west-2 and us-east-1, 2026-10-10.
 pub(crate) fn return_values_on_condition_check_failure_rejection(
     value: Option<&str>,
     path: &str,

@@ -492,6 +492,7 @@ fn transactions_and_batches_read_a_condition_function() {
                 statement: "SELECT * FROM \"Things\" WHERE pk = 'a1' AND attribute_exists(ss)"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             ..Default::default()
         })
@@ -510,6 +511,7 @@ fn transactions_and_batches_read_a_condition_function() {
             statement: "UPDATE \"Things\" SET t = 1 WHERE pk = 'a2' AND attribute_exists(q)"
                 .to_string(),
             parameters: None,
+            ..Default::default()
         }],
         ..Default::default()
     })

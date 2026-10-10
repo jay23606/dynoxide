@@ -1736,6 +1736,7 @@ fn test_transaction_delete_returning_is_rejected() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "DELETE FROM \"Users\" WHERE pk = 't1' RETURNING ALL OLD *".to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             ..Default::default()
         })
@@ -1766,6 +1767,7 @@ fn test_transaction_update_returning_is_rejected() {
                 statement: "UPDATE \"Users\" SET data = 'new' WHERE pk = 't1' RETURNING ALL NEW *"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             ..Default::default()
         })
@@ -1802,11 +1804,13 @@ fn test_transaction_returning_reports_offending_index_and_rolls_back() {
                 ParameterizedStatement {
                     statement: "DELETE FROM \"Users\" WHERE pk = 'keep-a'".to_string(),
                     parameters: None,
+                    ..Default::default()
                 },
                 ParameterizedStatement {
                     statement: "DELETE FROM \"Users\" WHERE pk = 'keep-b' RETURNING ALL OLD *"
                         .to_string(),
                     parameters: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -3884,10 +3888,12 @@ fn test_count_is_rejected_at_the_top_level_on_execute_transaction() {
                 ParameterizedStatement {
                     statement: "SELECT * FROM \"Users\" WHERE pk = 'a'".to_string(),
                     parameters: None,
+                    ..Default::default()
                 },
                 ParameterizedStatement {
                     statement: "SELECT count(pk) FROM \"Users\"".to_string(),
                     parameters: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -3909,10 +3915,12 @@ fn test_count_star_is_rejected_with_the_statement_index_in_a_transaction() {
     let select = || ParameterizedStatement {
         statement: "SELECT * FROM \"Users\" WHERE pk = 'a'".to_string(),
         parameters: None,
+        ..Default::default()
     };
     let count = || ParameterizedStatement {
         statement: "SELECT COUNT(*) FROM \"Users\"".to_string(),
         parameters: None,
+        ..Default::default()
     };
     for (statements, index) in [(vec![count(), select()], 0), (vec![select(), count()], 1)] {
         let err = db
@@ -4172,6 +4180,7 @@ fn partiql_surfaces_reject_an_unknown_return_consumed_capacity() {
         transact_statements: vec![ParameterizedStatement {
             statement: sql.to_string(),
             parameters: None,
+            ..Default::default()
         }],
         return_consumed_capacity: Some("TOTALS".to_string()),
         ..Default::default()
@@ -4212,6 +4221,7 @@ fn a_replayed_transaction_still_rejects_an_unknown_return_consumed_capacity() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "SELECT * FROM \"rcc_replay\" WHERE pk='a'".to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             client_request_token: Some("rcc-replay-token".to_string()),
             return_consumed_capacity: Some(mode.to_string()),

@@ -20,9 +20,10 @@ pub struct ExecuteTransactionRequest {
     pub return_consumed_capacity: Option<String>,
 }
 
-// `Serialize` backs the idempotency request hash (the statements and their
-// parameters are serialised via `serde_json`), so a same-token call differing
-// only in `ReturnConsumedCapacity` replays rather than mismatches.
+// `Serialize` backs the idempotency request hash (the statements, their
+// parameters and their modes are serialised via `serde_json`), so a same-token
+// call differing only in `ReturnConsumedCapacity` replays rather than
+// mismatches.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ParameterizedStatement {
     #[serde(rename = "Statement")]
@@ -33,6 +34,26 @@ pub struct ParameterizedStatement {
         deserialize_with = "crate::types::deserialize_parameters"
     )]
     pub parameters: Option<Vec<AttributeValue>>,
+    /// `ALL_OLD` hands back the item this statement's UPDATE or DELETE failed
+    /// its condition on, on the statement's cancellation reason; `NONE`, or
+    /// leaving it out, does not.
+    #[serde(
+        rename = "ReturnValuesOnConditionCheckFailure",
+        default,
+        serialize_with = "mode_or_none"
+    )]
+    pub return_values_on_condition_check_failure: Option<String>,
+}
+
+/// A statement's mode as the idempotency hash sees it: leaving it out is
+/// `NONE`, so a same-token retry that leaves it out replays a call that sent
+/// `NONE`, and one sending `ALL_OLD` mismatches (captured eu-west-2 and
+/// us-east-1, 2026-10-10).
+fn mode_or_none<S: serde::Serializer>(
+    mode: &Option<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(mode.as_deref().unwrap_or("NONE"))
 }
 
 // `Clone` so the idempotency cache can store the first-call response and clone
@@ -85,9 +106,8 @@ pub async fn execute<S: StorageBackend>(
 /// statement's Java `toString` (captured eu-west-2 and us-east-1, 2026-10-10;
 /// some hosts print an object hash per statement instead, and the form most
 /// give is the one followed). A statement's
-/// `ReturnValuesOnConditionCheckFailure` is echoed as `null`, as Dynoxide
-/// doesn't read that member of a transaction's statement. Bounded by
-/// [`crate::actions::batch_write_item::ECHO_LIMIT`].
+/// `ReturnValuesOnConditionCheckFailure` is echoed as sent, `null` when left
+/// out. Bounded by [`crate::actions::batch_write_item::ECHO_LIMIT`].
 fn statements_echo(statements: &[ParameterizedStatement]) -> String {
     let mut out = crate::actions::batch_write_item::BoundedEcho::new();
     let _ = write_statements(&mut out, statements);
@@ -121,16 +141,24 @@ fn write_statements(
             }
             None => out.write_str("null")?,
         }
-        out.write_str(", returnValuesOnConditionCheckFailure=null)")?;
+        out.write_str(", returnValuesOnConditionCheckFailure=")?;
+        out.write_str(
+            statement
+                .return_values_on_condition_check_failure
+                .as_deref()
+                .unwrap_or("null"),
+        )?;
+        out.write_str(")")?;
     }
     out.write_str("]")
 }
 
 /// The request's member violations, listed as DynamoDB lists them: the
-/// token, then each statement's text and parameters by index, then
-/// ReturnConsumedCapacity (captured eu-west-2 and us-east-1, 2026-10-10, the
-/// regions identical). Any of them refuses the whole request before a
-/// statement is parsed or the idempotency cache is consulted.
+/// token, then each statement's ReturnValuesOnConditionCheckFailure, text and
+/// parameters by index, then ReturnConsumedCapacity (captured eu-west-2 and
+/// us-east-1, 2026-10-10, the regions identical). Any of them refuses the
+/// whole request before a statement is parsed or the idempotency cache is
+/// consulted.
 ///
 /// The statement list's own length (empty, or more than 100) is listed with
 /// them, after the token and ahead of the statements, echoing the list: `[]`
@@ -157,6 +185,14 @@ fn member_violations(request: &ExecuteTransactionRequest) -> Vec<String> {
     }
     for (i, statement) in request.transact_statements.iter().enumerate() {
         let member = format!("transactStatements.{}.member", i + 1);
+        violations.extend(
+            crate::validation::return_values_on_condition_check_failure_rejection(
+                statement
+                    .return_values_on_condition_check_failure
+                    .as_deref(),
+                &format!("{member}.returnValuesOnConditionCheckFailure"),
+            ),
+        );
         violations.extend(crate::partiql::statement_length_violation(
             &statement.statement,
             &format!("{member}.statement"),
@@ -347,6 +383,13 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         }
     }
 
+    // Which statements asked for the item a failed condition was evaluated
+    // against.
+    let old_on_failure: Vec<bool> = statements
+        .iter()
+        .map(|s| s.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD"))
+        .collect();
+
     // All statements run inside one SQLite transaction (all-or-nothing).
     let (responses, charges) = helpers::with_write_transaction(
         storage,
@@ -355,6 +398,7 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
             &parsed,
             &tables,
             request.return_consumed_capacity.as_deref(),
+            &old_on_failure,
         ),
     )
     .await?;
@@ -508,56 +552,110 @@ pub(crate) fn replay_response(
 /// Run every statement, returning the responses and what each contributed to
 /// `ConsumedCapacity`. The charges are only meaningful when the whole
 /// transaction commits; a cancellation returns an error and reports nothing.
+///
+/// A cancellation lists every statement that failed, as DynamoDB's does
+/// (captured eu-west-2 and us-east-1, 2026-10-10: `[ConditionalCheckFailed,
+/// None, ConditionalCheckFailed]`, `[ConditionalCheckFailed, DuplicateItem]`),
+/// so every statement runs even after one has failed. The SQLite transaction
+/// is rolled back on the error, so nothing any of them wrote is kept.
 async fn execute_within_transaction<S: StorageBackend>(
     storage: &S,
     parsed: &[(partiql::parser::Statement, Vec<AttributeValue>)],
     tables: &HashMap<String, ResolvedTable>,
     capacity_mode: Option<&str>,
+    old_on_failure: &[bool],
 ) -> Result<(Vec<ItemResponse>, Vec<StatementCharge>)> {
+    let resolved_for = |stmt: &partiql::parser::Statement| {
+        partiql::parser::table_name(stmt).and_then(|t| tables.get(t))
+    };
+
+    // A SELECT key of the wrong type, or of a type no key can have, and an
+    // UPDATE or DELETE key of the wrong type, cancel the transaction with
+    // GetItem's reason (captured eu-west-2 and us-east-1, 2026-10-09). They
+    // are checked of every statement before any runs: when one has such a
+    // key, every other statement is reported `None`, a statement whose
+    // condition is false included (captured eu-west-2 and us-east-1,
+    // 2026-10-10; inferred for the other failure kinds).
+    let wrong_key_type: Vec<bool> = parsed
+        .iter()
+        .map(|(stmt, params)| {
+            resolved_for(stmt).is_some_and(|resolved| match stmt {
+                partiql::parser::Statement::Select { .. } => matches!(
+                    partiql::executor::keyed_select(stmt, params, resolved),
+                    partiql::executor::KeyedSelect::KeyType(_)
+                ),
+                _ => partiql::executor::write_key_fault(stmt, params, resolved).is_some(),
+            })
+        })
+        .collect();
+    if wrong_key_type.contains(&true) {
+        return Err(cancelled(
+            wrong_key_type
+                .iter()
+                .map(|&wrong| {
+                    if wrong {
+                        CancellationReason {
+                            code: "ValidationError".to_string(),
+                            message: Some(
+                                "The provided key element does not match the schema".to_string(),
+                            ),
+                            item: None,
+                        }
+                    } else {
+                        no_reason()
+                    }
+                })
+                .collect(),
+        ));
+    }
+
     let mut responses = Vec::with_capacity(parsed.len());
     let mut charges: Vec<StatementCharge> = Vec::with_capacity(parsed.len());
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
+    let mut failed = false;
 
-    for (stmt, params) in parsed {
-        let resolved = partiql::parser::table_name(stmt).and_then(|t| tables.get(t));
-        // A SELECT key of the wrong type, or of a type no key can have, and an
-        // UPDATE or DELETE key of the wrong type, cancel the transaction with
-        // GetItem's reason; an INSERT key of the wrong type cancels it with
-        // PutItem's (captured eu-west-2 and us-east-1, 2026-10-09).
-        let wrong_key_type = resolved.is_some_and(|resolved| match stmt {
-            partiql::parser::Statement::Select { .. } => matches!(
-                partiql::executor::keyed_select(stmt, params, resolved),
-                partiql::executor::KeyedSelect::KeyType(_)
-            ),
-            _ => partiql::executor::write_key_fault(stmt, params, resolved).is_some(),
-        });
+    for ((stmt, params), &old_on_failure) in parsed.iter().zip(old_on_failure) {
+        let resolved = resolved_for(stmt);
+        // An INSERT key of the wrong type cancels the transaction with
+        // PutItem's reason (captured eu-west-2 and us-east-1, 2026-10-09).
         let insert_keys = match resolved {
             Some(resolved) => {
                 partiql::executor::check_transaction_insert_keys(stmt, params, resolved)
             }
             None => Ok(()),
         };
-        let outcome = if wrong_key_type {
-            Err(DynoxideError::ValidationException(
-                "The provided key element does not match the schema".to_string(),
-            ))
-        } else if let Err(e) = insert_keys {
-            Err(e)
-        } else {
-            partiql::executor::execute_page(
-                storage,
-                stmt,
-                params,
-                None,
-                None,
-                false,
-                capacity_mode,
-                resolved,
-            )
-            .await
+        let outcome = match insert_keys {
+            Err(e) => Err(e),
+            Ok(()) => {
+                partiql::executor::execute_written_page(
+                    storage,
+                    None,
+                    stmt,
+                    params,
+                    None,
+                    None,
+                    false,
+                    capacity_mode,
+                    resolved,
+                    old_on_failure,
+                )
+                .await
+            }
         };
         match outcome {
             Ok(page) => {
+                // A DELETE with a condition, of an item that isn't there, does
+                // nothing when the transaction commits, and is reported as a
+                // failed condition, with no item, when it is cancelled
+                // (captured eu-west-2 and us-east-1, 2026-10-10).
+                let missed_condition = matches!(stmt, partiql::parser::Statement::Delete { .. })
+                    && page
+                        .capacity
+                        .as_ref()
+                        .is_some_and(|capacity| capacity.old_size.is_none())
+                    && resolved.is_some_and(|resolved| {
+                        partiql::executor::delete_has_condition(stmt, resolved)
+                    });
                 let table_name = partiql::parser::table_name(stmt).unwrap_or_default();
                 charges.push(match page.capacity {
                     Some(capacity) => StatementCharge::Write(capacity),
@@ -568,68 +666,73 @@ async fn execute_within_transaction<S: StorageBackend>(
                 });
                 let item = page.items.and_then(|items| items.into_iter().next());
                 responses.push(ItemResponse { item });
-                cancellation_reasons.push(CancellationReason {
-                    code: "None".to_string(),
-                    message: None,
-                    item: None,
+                cancellation_reasons.push(if missed_condition {
+                    CancellationReason {
+                        code: "ConditionalCheckFailed".to_string(),
+                        message: Some("The conditional request failed".to_string()),
+                        item: None,
+                    }
+                } else {
+                    no_reason()
                 });
             }
             Err(e) => {
-                // Record the failure reason
-                let message = Some(e.to_string());
-                let (code, item) = match e {
-                    DynoxideError::ConditionalCheckFailedException(_, item) => {
-                        ("ConditionalCheckFailed".to_string(), item)
-                    }
-                    DynoxideError::DuplicateItemException(_) => ("DuplicateItem".to_string(), None),
-                    // A statement against a table that does not exist cancels
-                    // the transaction with this reason (captured eu-west-2 and
-                    // us-east-1, 2026-10-09).
-                    DynoxideError::ResourceNotFoundException(_) => {
-                        ("ResourceNotFound".to_string(), None)
-                    }
-                    // Group KeyEmptyValueValidation with ValidationException so an empty-value
-                    // key keeps the "ValidationError" reason instead of falling through to
-                    // InternalError (#95).
-                    DynoxideError::ValidationException(_)
-                    | DynoxideError::KeyEmptyValueValidation(_) => {
-                        ("ValidationError".to_string(), None)
-                    }
-                    _ => ("InternalError".to_string(), None),
-                };
+                failed = true;
                 responses.push(ItemResponse { item: None });
-                cancellation_reasons.push(CancellationReason {
-                    code,
-                    message,
-                    item,
-                });
-
-                // Fill remaining slots with None and stop: don't execute
-                // statements that will be rolled back.
-                for _ in responses.len()..parsed.len() {
-                    responses.push(ItemResponse { item: None });
-                    cancellation_reasons.push(CancellationReason {
-                        code: "None".to_string(),
-                        message: None,
-                        item: None,
-                    });
-                }
-
-                let codes: Vec<&str> = cancellation_reasons
-                    .iter()
-                    .map(|r| r.code.as_str())
-                    .collect();
-                let message = format!(
-                    "Transaction cancelled, please refer cancellation reasons for specific reasons [{}]",
-                    codes.join(", ")
-                );
-                return Err(DynoxideError::TransactionCanceledException(
-                    message,
-                    cancellation_reasons,
-                ));
+                cancellation_reasons.push(failure_reason(e));
             }
         }
     }
 
+    if failed {
+        return Err(cancelled(cancellation_reasons));
+    }
     Ok((responses, charges))
+}
+
+/// The reason a statement that ran without failing is given.
+fn no_reason() -> CancellationReason {
+    CancellationReason {
+        code: "None".to_string(),
+        message: None,
+        item: None,
+    }
+}
+
+/// The reason a failed statement is given, with the item its condition was
+/// evaluated against when it asked for it.
+fn failure_reason(e: DynoxideError) -> CancellationReason {
+    let message = Some(e.to_string());
+    let (code, item) = match e {
+        DynoxideError::ConditionalCheckFailedException(_, item) => {
+            ("ConditionalCheckFailed".to_string(), item)
+        }
+        DynoxideError::DuplicateItemException(_) => ("DuplicateItem".to_string(), None),
+        // A statement against a table that does not exist cancels the
+        // transaction with this reason (captured eu-west-2 and us-east-1,
+        // 2026-10-09).
+        DynoxideError::ResourceNotFoundException(_) => ("ResourceNotFound".to_string(), None),
+        // Group KeyEmptyValueValidation with ValidationException so an
+        // empty-value key keeps the "ValidationError" reason instead of
+        // falling through to InternalError (#95).
+        DynoxideError::ValidationException(_) | DynoxideError::KeyEmptyValueValidation(_) => {
+            ("ValidationError".to_string(), None)
+        }
+        _ => ("InternalError".to_string(), None),
+    };
+    CancellationReason {
+        code,
+        message,
+        item,
+    }
+}
+
+/// The cancellation for these reasons, its message listing their codes.
+fn cancelled(reasons: Vec<CancellationReason>) -> DynoxideError {
+    let codes: Vec<&str> = reasons.iter().map(|r| r.code.as_str()).collect();
+    let message = format!(
+        "Transaction cancelled, please refer cancellation reasons for specific reasons [{}]",
+        codes.join(", ")
+    );
+    DynoxideError::TransactionCanceledException(message, reasons)
 }

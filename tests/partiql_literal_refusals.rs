@@ -501,6 +501,7 @@ fn a_call_in_a_select_list_is_an_unexpected_path_component() {
         transact_statements: vec![ParameterizedStatement {
             statement: r#"SELECT size(s) FROM "Things" WHERE pk = 'it1'"#.to_string(),
             parameters: None,
+            ..Default::default()
         }],
         ..Default::default()
     });

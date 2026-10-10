@@ -51,15 +51,18 @@ fn test_multiple_inserts_all_succeed() {
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u2', 'name': 'Bob'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u3', 'name': 'Charlie'}"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         client_request_token: None,
@@ -91,17 +94,20 @@ fn test_insert_failure_rolls_back_entire_transaction() {
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 // This fails because the table does not exist
                 statement: "INSERT INTO \"NonExistent\" VALUE {'pk': 'u2', 'name': 'Bob'}"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u3', 'name': 'Charlie'}"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         client_request_token: None,
@@ -152,10 +158,12 @@ fn test_mixed_select_and_insert() {
             ParameterizedStatement {
                 statement: "SELECT * FROM \"Users\" WHERE pk = 'u1'".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u2', 'name': 'Bob'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         client_request_token: None,
@@ -196,10 +204,12 @@ fn test_duplicate_target_rejected() {
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'dup', 'name': 'One'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "UPDATE \"Users\" SET name = 'Two' WHERE pk = 'dup'".to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -231,6 +241,7 @@ fn test_over_100_statements_rejected() {
                 i, i
             ),
             parameters: None,
+            ..Default::default()
         })
         .collect();
 
@@ -289,10 +300,12 @@ fn test_syntax_error_rejected_before_execution() {
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1', 'name': 'Alice'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INVALID STATEMENT HERE".to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         client_request_token: None,
@@ -335,10 +348,12 @@ fn test_update_within_transaction() {
                 statement: "UPDATE \"Users\" SET name = 'Alice Updated' WHERE pk = 'u1'"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u2', 'name': 'Bob'}".to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -389,11 +404,13 @@ fn test_delete_within_transaction() {
             ParameterizedStatement {
                 statement: "DELETE FROM \"Users\" WHERE pk = 'u1'".to_string(),
                 parameters: None,
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u3', 'name': 'Charlie'}"
                     .to_string(),
                 parameters: None,
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -446,10 +463,12 @@ fn test_parameterised_statements() {
             ParameterizedStatement {
                 statement: "UPDATE \"Users\" SET name = 'Alice V2' WHERE pk = ?".to_string(),
                 parameters: Some(vec![AttributeValue::S("u1".to_string())]),
+                ..Default::default()
             },
             ParameterizedStatement {
                 statement: "UPDATE \"Users\" SET name = 'Bob V2' WHERE pk = ?".to_string(),
                 parameters: Some(vec![AttributeValue::S("u2".to_string())]),
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -490,6 +509,7 @@ fn test_empty_string_key_insert_keeps_validation_error_reason() {
         transact_statements: vec![ParameterizedStatement {
             statement: "INSERT INTO \"Users\" VALUE {'pk': ''}".to_string(),
             parameters: None,
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -540,6 +560,7 @@ fn increment_counter(pk: &str) -> Vec<ParameterizedStatement> {
     vec![ParameterizedStatement {
         statement: format!("UPDATE \"Counters\" SET n = n + 1 WHERE pk = '{pk}'"),
         parameters: None,
+        ..Default::default()
     }]
 }
 
@@ -547,6 +568,7 @@ fn stmt(statement: &str) -> ParameterizedStatement {
     ParameterizedStatement {
         statement: statement.to_string(),
         parameters: None,
+        ..Default::default()
     }
 }
 
@@ -650,6 +672,7 @@ fn test_execute_transaction_read_set_reports_read_capacity() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "SELECT * FROM \"Users\" WHERE pk = 'u1'".to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             client_request_token: None,
             return_consumed_capacity: Some("INDEXES".to_string()),
@@ -677,6 +700,7 @@ fn test_execute_transaction_write_set_total_mode() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1'}".to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             client_request_token: None,
             return_consumed_capacity: Some("TOTAL".to_string()),
@@ -702,6 +726,7 @@ fn test_execute_transaction_same_token_different_statements_mismatch() {
         transact_statements: vec![ParameterizedStatement {
             statement: "INSERT INTO \"Users\" VALUE {'pk': 'u1'}".to_string(),
             parameters: None,
+            ..Default::default()
         }],
         client_request_token: Some("mismatch-token".to_string()),
         return_consumed_capacity: None,
@@ -713,6 +738,7 @@ fn test_execute_transaction_same_token_different_statements_mismatch() {
             transact_statements: vec![ParameterizedStatement {
                 statement: "INSERT INTO \"Users\" VALUE {'pk': 'u2'}".to_string(),
                 parameters: None,
+                ..Default::default()
             }],
             client_request_token: Some("mismatch-token".to_string()),
             return_consumed_capacity: None,

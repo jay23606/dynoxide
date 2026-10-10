@@ -44,6 +44,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   members in DynamoDB's order (string and binary sets by their bytes, number
   sets by value), so a set no longer keeps the order it was built in through
   serde. Normalising an item for a write sorts its sets in place.
+- `ReturnValuesOnConditionCheckFailure` works on the three PartiQL
+  operations. Set to `ALL_OLD`, an `UPDATE` or `DELETE` whose WHERE clause is
+  false on an item that exists hands back the whole item: on that statement's
+  cancellation reason in `ExecuteTransaction`, on the member's `Error` in
+  `BatchExecuteStatement`, and on `ExecuteStatement`'s
+  `ConditionalCheckFailedException`, which then writes its message as
+  `Message` and its number sets in hash order. `NONE`, leaving it out, a
+  missing item, a duplicate `INSERT` and a statement without a condition give
+  no item. A value other than `ALL_OLD` or `NONE`, an empty string included,
+  is refused as a member, ahead of the statement and its parameters, where
+  `ExecuteStatement` and `ExecuteTransaction` used to accept anything. A
+  transaction's mode takes part in its `ClientRequestToken` match, leaving it
+  out counting as `NONE`, and its over-long echo prints the value sent.
+  `ExecuteStatement` lists its member errors in DynamoDB's order: the mode,
+  `Limit`, the statement, `ReturnConsumedCapacity`, then the parameters.
+  Captured against eu-west-2 and us-east-1; this corrects the 1.0.0 entry
+  that found the option inert on a batch.
 
 ### Added
 
@@ -66,7 +83,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `lsi_item_count_and_size` and `vector_item_count_and_size` return a table's
   or an index's item count and total size, the figures DescribeTable reports.
 
+### Changed
+
+#### Breaking (Rust API)
+
+- `ParameterizedStatement` and `ExecuteStatementRequest` gain
+  `return_values_on_condition_check_failure`, and `BatchStatementError` gains
+  `item`, so struct literals of them need the field adding, or
+  `..Default::default()`.
+
 ### Fixed
+
+- `ExecuteTransaction` lists a reason for every statement that failed, as
+  DynamoDB does, where it stopped at the first and reported `None` for the
+  rest. A key of the wrong type on any statement is reported alone, with
+  `None` for every other statement, a statement whose condition is false
+  included. A `DELETE` with a condition, of an item that isn't there, does
+  nothing when the transaction commits, as before, and is reported as a failed
+  condition, with no item, when the transaction is cancelled. Captured against
+  eu-west-2 and us-east-1.
 
 - Restoring a snapshot taken by an earlier version brings it up to date as
   opening the file would, running the schema migrations its recorded version
@@ -723,10 +758,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than 25 statements in a batch is refused as a member too, where it used to
   give "Too many statements in BatchExecuteStatement"; its echo of the
   statements is us-east-1's, as eu-west-2 printed a hash in their place that
-  can't be reproduced. Inferred rather than captured: a batch member's own
-  errors following `ReturnConsumedCapacity`, and an empty transaction, or one
-  of more than 100 statements, listed with the token and the statements rather
-  than answering after them. The MCP `execute_partiql`, `batch_execute_partiql`
+  can't be reproduced. A batch member's own errors follow
+  `ReturnConsumedCapacity` (captured). Inferred rather than captured: an empty
+  transaction, or one of more than 100 statements, listed with the token and
+  the statements rather than answering after them. The MCP `execute_partiql`, `batch_execute_partiql`
   and `execute_transaction_partiql` tools list a bad mode the same way.
 - A transaction's list longer than DynamoDB allows is echoed as DynamoDB
   echoes it: `ExecuteTransaction`'s statements as `ParameterizedStatement(...)`
@@ -735,9 +770,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every field named, where they echoed nothing or Dynoxide's own debugging
   form. An attribute map in any of these echoes, and in `BatchWriteItem`'s,
   lists its entries in the order of a Java hash map, as DynamoDB's do, rather
-  than by name. A statement's `ReturnValuesOnConditionCheckFailure` is echoed
-  as `null`, as Dynoxide doesn't read that member of a transaction's
-  statement. Captured against us-east-1, eu-west-1 and us-west-2 (eu-west-2
+  than by name. Captured against us-east-1, eu-west-1 and us-west-2 (eu-west-2
   echoes no action list).
 - A PartiQL WHERE clause's alternatives are held to 16,384 condition slots
   between them, where each alternative was already held to 4,096. Every slot is

@@ -521,6 +521,30 @@ pub(crate) fn check_transaction_insert_keys(
     crate::actions::helpers::validate_item_keys(&item, &resolved.key_schema, &resolved.meta)
 }
 
+/// Whether a DELETE's WHERE clause asks anything of the item beyond naming its
+/// key. A transaction that is cancelled reports such a DELETE of a missing
+/// item as a failed condition, where one naming only the key reports `None`
+/// (captured eu-west-2 and us-east-1, 2026-10-10, for `v = 1` beside the key;
+/// any other condition is inferred to count the same).
+pub(crate) fn delete_has_condition(stmt: &Statement, resolved: &ResolvedTable) -> bool {
+    let Statement::Delete {
+        where_clause: Some(wc),
+        ..
+    } = stmt
+    else {
+        return false;
+    };
+    let schema = &resolved.key_schema;
+    let is_key =
+        |path: &str| path == schema.partition_key || schema.sort_key.as_deref() == Some(path);
+    let names_key = |condition: &WhereCondition| match condition {
+        WhereCondition::Comparison(c) => c.op == CompOp::Eq && is_key(&c.path),
+        WhereCondition::In(path, values) => values.len() == 1 && is_key(path),
+        _ => false,
+    };
+    !matches!(wc.groups.as_slice(), [group] if group.iter().all(|c| names_key(c)))
+}
+
 /// Check one statement parameter as any attribute value is checked, with no
 /// path in the message: its numbers, and empty or duplicated sets. DynamoDB
 /// checks a statement's parameters before it reads the statement, whether it
@@ -1300,12 +1324,19 @@ pub async fn execute_page<S: StorageBackend>(
         consistent_read,
         capacity_mode,
         resolved,
+        false,
     )
     .await
 }
 
 /// [`execute_page`] for a statement whose text, `written`, is at hand: a
 /// continuation token is then bound to that text exactly as written.
+///
+/// `old_on_condition_failure` is `ReturnValuesOnConditionCheckFailure` set to
+/// `ALL_OLD`: an UPDATE or DELETE whose WHERE clause is false on an item that
+/// exists then fails carrying that item, as DynamoDB's does on all three
+/// PartiQL operations. A missing item never carries one (captured eu-west-2
+/// and us-east-1, 2026-10-10).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_written_page<S: StorageBackend>(
     storage: &S,
@@ -1317,6 +1348,7 @@ pub(crate) async fn execute_written_page<S: StorageBackend>(
     consistent_read: bool,
     capacity_mode: Option<&str>,
     resolved: Option<&ResolvedTable>,
+    old_on_condition_failure: bool,
 ) -> Result<StatementPage> {
     if next_token.is_some() && !matches!(stmt, Statement::Select { .. }) {
         return Err(DynoxideError::ValidationException(
@@ -1459,6 +1491,7 @@ pub(crate) async fn execute_written_page<S: StorageBackend>(
                 *returning,
                 capacity_mode,
                 resolved,
+                old_on_condition_failure,
             )
             .await?;
             // RETURNING surfaces the requested projection of the updated item;
@@ -1504,6 +1537,7 @@ pub(crate) async fn execute_written_page<S: StorageBackend>(
                 parameters,
                 capacity_mode,
                 resolved,
+                old_on_condition_failure,
             )
             .await?;
             // RETURNING ALL OLD * always surfaces an Items array: the deleted
@@ -2889,6 +2923,7 @@ async fn execute_update<S: StorageBackend>(
     returning: Option<ReturningVariant>,
     capacity_mode: Option<&str>,
     resolved: Option<&ResolvedTable>,
+    old_on_condition_failure: bool,
 ) -> Result<(Option<Item>, WriteCapacity)> {
     // Resolved by the caller when a preparation pass already did it, which is
     // what stops a batch reading the same table's metadata and parsing the same
@@ -2923,11 +2958,18 @@ async fn execute_update<S: StorageBackend>(
     // PartiQL UPDATE is not an upsert: the target item must already exist, so a
     // missing item fails ConditionalCheckFailedException and creates nothing.
     // Non-key WHERE predicates act as a further condition on the existing item;
-    // if that predicate is false the update fails the same way. Neither writes.
-    if existing_json.is_none() || !matches_where(&old_item, where_clause, parameters) {
+    // if that predicate is false the update fails the same way, carrying the
+    // item when it was asked for. Neither writes.
+    if existing_json.is_none() {
         return Err(DynoxideError::ConditionalCheckFailedException(
             "The conditional request failed".to_string(),
             None,
+        ));
+    }
+    if !matches_where(&old_item, where_clause, parameters) {
+        return Err(DynoxideError::ConditionalCheckFailedException(
+            "The conditional request failed".to_string(),
+            old_on_condition_failure.then_some(old_item),
         ));
     }
 
@@ -3169,6 +3211,7 @@ async fn execute_delete<S: StorageBackend>(
     parameters: &[AttributeValue],
     capacity_mode: Option<&str>,
     resolved: Option<&ResolvedTable>,
+    old_on_condition_failure: bool,
 ) -> Result<(Option<Item>, WriteCapacity)> {
     // Resolved by the caller when a preparation pass already did it, which is
     // what stops a batch reading the same table's metadata and parsing the same
@@ -3203,7 +3246,7 @@ async fn execute_delete<S: StorageBackend>(
         if !matches_where(&existing, where_clause, parameters) {
             return Err(DynoxideError::ConditionalCheckFailedException(
                 "The conditional request failed".to_string(),
-                None,
+                old_on_condition_failure.then_some(existing),
             ));
         }
     }
