@@ -453,7 +453,7 @@ impl WhereClause {
 /// Non-exhaustive, like `WhereClause` and `Statement`. The parser gains variants
 /// as it learns predicates, and each one it gained used to break every
 /// downstream `match` on it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum WhereCondition {
     Comparison(Condition),
@@ -510,6 +510,9 @@ pub enum Operand {
     /// bytes, and a set's, list's or map's member count; nothing for any other
     /// value, which then compares as a missing one does.
     Size(Box<Operand>),
+    /// A condition function's call, `attribute_exists(a)` and the like, as
+    /// the boolean it returns for an item.
+    Condition(Box<WhereCondition>),
 }
 
 /// What `IS <type>` tests in a WHERE clause: the types DynamoDB supports there
@@ -545,7 +548,7 @@ impl TypeTest {
 }
 
 /// A comparison condition (path op value).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Condition {
     pub path: String,
     pub op: CompOp,
@@ -2636,89 +2639,43 @@ impl ConditionFunction {
         }
     }
 
+    /// The call as an operand: the boolean it returns for an item.
+    fn operand(&self) -> Operand {
+        Operand::Condition(Box::new(self.holds.clone()))
+    }
+
     /// The call compared with an operand. It is a boolean: equal only to the
-    /// same boolean, so unequal to a missing value or one of another type, and
-    /// the ordering operators refuse it (captured eu-west-2 and us-east-1,
-    /// 2026-10-09 for a literal, 2026-10-10 for a path, a size or a parameter).
+    /// same boolean, so unequal to a missing value, a size or a value of
+    /// another type, and the ordering operators refuse it (captured eu-west-2
+    /// and us-east-1, 2026-10-09 for a literal, 2026-10-10 for a path, a size
+    /// or a parameter). A boolean literal settles it as the call or its
+    /// negation. Anything else is one condition, read item by item rather
+    /// than spelled out as alternatives, so ten `<>` comparisons ANDed stay
+    /// one group and a key condition beside one keeps the read a key read, as
+    /// DynamoDB runs both (captured eu-west-2 and us-east-1, 2026-10-10).
     fn compared(&self, t: &mut Tokenizer, op: &str, value: Operand) -> Result<BoolExpr, String> {
-        let equal = match op {
-            "=" => true,
-            "<>" | "!=" => false,
+        let op = match op {
+            "=" => CompOp::Eq,
+            "<>" | "!=" => CompOp::Ne,
             other => {
                 t.note_operand_refusal(bool_operand_refusal(other));
                 return self.condition(true);
             }
         };
-        let equals = self.equals(value)?;
-        Ok(if equal {
-            equals
-        } else {
-            BoolExpr::Not(Box::new(equals))
-        })
-    }
-
-    /// The condition that the call equals `operand`. A literal is settled
-    /// here; a path or a parameter is compared item by item, as `true` where
-    /// the call holds and as `false` where it doesn't. A size is a number, so
-    /// never equal to it.
-    fn equals(&self, operand: Operand) -> Result<BoolExpr, String> {
-        let is = |operand: &Operand, b: bool| -> BoolExpr {
-            BoolExpr::Leaf(WhereCondition::Compare(
-                operand.clone(),
-                CompOp::Eq,
-                Operand::Value(PartiqlValue::Literal(AttributeValue::BOOL(b))),
-            ))
-        };
-        match operand {
-            Operand::Value(PartiqlValue::Literal(AttributeValue::BOOL(b))) => self.condition(b),
-            Operand::Value(PartiqlValue::Literal(_)) | Operand::Size(_) => self.never(),
-            other => Ok(BoolExpr::Or(vec![
-                BoolExpr::And(vec![self.condition(true)?, is(&other, true)]),
-                BoolExpr::And(vec![self.condition(false)?, is(&other, false)]),
-            ])),
+        if let Operand::Value(PartiqlValue::Literal(AttributeValue::BOOL(b))) = value {
+            return self.condition(b == (op == CompOp::Eq));
         }
-    }
-
-    /// A condition that holds for no item.
-    fn never(&self) -> Result<BoolExpr, String> {
-        Ok(BoolExpr::And(vec![
-            self.condition(true)?,
-            self.condition(false)?,
-        ]))
+        Ok(BoolExpr::Leaf(WhereCondition::Compare(
+            self.operand(),
+            op,
+            value,
+        )))
     }
 
     /// The call in a list: true when any member equals it (captured eu-west-2
-    /// and us-east-1, 2026-10-10). The literal members are settled together
-    /// and a member repeated is compared once, so a long list doesn't grow
-    /// the clause by one alternative per member.
-    fn listed(&self, members: &[Operand]) -> Result<BoolExpr, String> {
-        let has = |b: bool| {
-            members.contains(&Operand::Value(PartiqlValue::Literal(
-                AttributeValue::BOOL(b),
-            )))
-        };
-        let mut alternatives = match (has(true), has(false)) {
-            (true, true) => vec![self.condition(true)?, self.condition(false)?],
-            (true, false) => vec![self.condition(true)?],
-            (false, true) => vec![self.condition(false)?],
-            (false, false) => Vec::new(),
-        };
-        let mut compared: Vec<&Operand> = Vec::new();
-        for member in members {
-            if matches!(
-                member,
-                Operand::Path(_) | Operand::Value(PartiqlValue::Parameter(_))
-            ) && !compared.contains(&member)
-            {
-                compared.push(member);
-                alternatives.push(self.equals(member.clone())?);
-            }
-        }
-        Ok(match alternatives.len() {
-            0 => self.never()?,
-            1 => alternatives.pop().unwrap_or(BoolExpr::Or(Vec::new())),
-            _ => BoolExpr::Or(alternatives),
-        })
+    /// and us-east-1, 2026-10-10), as one condition.
+    fn listed(&self, members: Vec<Operand>) -> BoolExpr {
+        BoolExpr::Leaf(WhereCondition::CompareIn(self.operand(), members))
     }
 }
 
@@ -2895,7 +2852,7 @@ fn condition_function_tail(
         t.next_token()?;
         let members = parse_in_list(t, depth, parse_bound_operand)?;
         note_in_operand_count(t, members.len());
-        let listed = function.listed(&members)?;
+        let listed = function.listed(members);
         return Ok(if negated {
             BoolExpr::Not(Box::new(listed))
         } else {
@@ -3033,6 +2990,9 @@ fn parse_attribute_type(
         }
         Operand::Path(_) => Some(operand_type(ATTRIBUTE_TYPE_OPERAND_TYPES)),
         Operand::Size(_) => Some(operand_type("N")),
+        // Not reached: a call is read as an operand only beside a comparison
+        // operator or in an IN list. It would be a boolean (inferred).
+        Operand::Condition(_) => Some(operand_type("BOOL")),
     };
     if let Some(message) = refusal {
         t.note_operand_refusal(message);
@@ -3500,6 +3460,7 @@ fn condition_bytes(condition: &WhereCondition) -> usize {
             Operand::Path(p) => p.len(),
             Operand::Value(v) => value(v),
             Operand::Size(inner) => operand(inner),
+            Operand::Condition(inner) => condition_bytes(inner),
         }
     }
     use WhereCondition as W;

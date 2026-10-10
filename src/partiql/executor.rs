@@ -1234,6 +1234,13 @@ fn validate_operand_types(
             // number, so a string or boolean against it under `=` or `<>` is
             // simply unequal rather than refused.
             WhereCondition::Compare(left, op, right) => {
+                // A condition function compared is checked as it would be on
+                // its own: `attribute_type(a, ?) = b` checks the type.
+                for side in [left, right] {
+                    if let Operand::Condition(inner) = side {
+                        check(inner, parameters)?;
+                    }
+                }
                 let Some(op) = ordering_op(op) else {
                     return Ok(());
                 };
@@ -1267,6 +1274,13 @@ fn validate_operand_types(
                     }
                 }
             },
+            WhereCondition::CompareIn(operand, members) => {
+                for side in std::iter::once(operand).chain(members) {
+                    if let Operand::Condition(inner) = side {
+                        check(inner, parameters)?;
+                    }
+                }
+            }
             // A type given to `attribute_type` as a parameter is checked
             // once it is bound, negated or not (captured eu-west-2 and
             // us-east-1, 2026-10-09).
@@ -2243,6 +2257,7 @@ fn condition_paths(condition: &WhereCondition) -> Vec<&str> {
         match operand {
             Operand::Path(path) => vec![path.as_str()],
             Operand::Size(inner) => operand_paths(inner),
+            Operand::Condition(inner) => condition_paths(inner),
             _ => Vec::new(),
         }
     }
@@ -3927,6 +3942,7 @@ fn has_unbound_parameter(condition: &WhereCondition, bound: usize) -> bool {
             Operand::Path(_) => false,
             Operand::Value(v) => value(v, bound),
             Operand::Size(inner) => operand(inner, bound),
+            Operand::Condition(inner) => has_unbound_parameter(inner, bound),
         }
     }
     match condition {
@@ -4171,6 +4187,11 @@ fn operand_value(
     match operand {
         Operand::Path(path) => resolve_nested_path(item, path).cloned(),
         Operand::Value(value) => resolve_value(value, parameters).ok(),
+        Operand::Condition(condition) => Some(AttributeValue::BOOL(matches_conditions(
+            item,
+            std::slice::from_ref(condition.as_ref()),
+            parameters,
+        ))),
         Operand::Size(inner) => {
             let size = match operand_value(item, inner, parameters)? {
                 AttributeValue::S(s) => s.encode_utf16().count(),

@@ -544,3 +544,300 @@ fn transactions_and_batches_read_a_condition_function() {
         "The conditional request failed"
     );
 }
+
+/// The tables the comparisons below were captured against, item for item:
+/// `Hashed` (hash key) holds r1 to r5, q1 to q5 and d1, and `Sorted` (hash and
+/// numeric sort key) holds partition `p` with sort keys 1 to 5. `Hashed` also
+/// holds a large item of its own, `big`, so a scan of it costs more than a
+/// read of one small partition.
+fn captured_db() -> Database {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+            "TableName": "Hashed",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    db.create_table(
+        serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+            "TableName": "Sorted",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "N"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let h_items = serde_json::json!({
+        "r1": {"a": {"N": "1"}, "b": {"BOOL": true}, "bb": {"M": {"c": {"BOOL": true}}},
+               "l": {"L": [{"BOOL": true}]}, "s": {"S": "ab"}, "x": {"N": "1"}, "y": {"N": "1"}},
+        "r2": {"b": {"BOOL": false}, "bb": {"M": {"c": {"BOOL": false}}},
+               "l": {"L": [{"BOOL": false}]}, "s": {"S": "abc"}, "x": {"N": "1"}, "y": {"N": "2"}},
+        "r3": {"a": {"N": "1"}, "b": {"BOOL": false}, "bb": {"M": {"c": {"BOOL": false}}},
+               "l": {"L": [{"BOOL": false}]}},
+        "r4": {"b": {"BOOL": true}, "bb": {"M": {"c": {"BOOL": true}}}, "l": {"L": [{"BOOL": true}]}},
+        "r5": {"a": {"N": "1"}, "b": {"S": "x"}},
+        "q1": {"a.b": {"N": "1"}},
+        "q2": {"a": {"M": {"b": {"N": "1"}}}},
+        "q3": {"a[0]": {"N": "1"}},
+        "q4": {"a": {"L": [{"N": "1"}]}},
+        "q5": {},
+        "big": {"filler": {"S": "z".repeat(20_000)}}
+    });
+    for (pk, rest) in h_items.as_object().unwrap() {
+        let mut item = rest.clone();
+        item["pk"] = serde_json::json!({"S": pk});
+        put_json(&db, "Hashed", item);
+    }
+    put_json(&db, "Hashed", captured_d1());
+    let f_items = serde_json::json!({
+        "1": {"b": {"BOOL": true}, "nl": {"NULL": true}, "s": {"S": "x"},
+              "l": {"L": [{"BOOL": false}, {"NULL": true}]}},
+        "2": {"b": {"BOOL": false}, "s": {"S": "no"}, "l": {"L": [{"BOOL": true}]}},
+        "3": {},
+        "4": {"b": {"S": "false"}, "nl": {"S": "no"}},
+        "5": {"b": {"N": "0"}, "nl": {"BOOL": false}}
+    });
+    for (sk, rest) in f_items.as_object().unwrap() {
+        let mut item = rest.clone();
+        item["pk"] = serde_json::json!({"S": "p"});
+        item["sk"] = serde_json::json!({"N": sk});
+        put_json(&db, "Sorted", item);
+    }
+    db
+}
+
+/// The item DELETE was tried on, put back after each attempt.
+fn captured_d1() -> serde_json::Value {
+    serde_json::json!({
+        "pk": {"S": "d1"}, "a": {"N": "1"}, "b": {"BOOL": true},
+        "bb": {"M": {"c": {"BOOL": true}}}, "l": {"L": [{"BOOL": true}]}
+    })
+}
+
+fn put_json(db: &Database, table: &str, item: serde_json::Value) {
+    db.put_item(
+        serde_json::from_value::<PutItemRequest>(serde_json::json!({
+            "TableName": table, "Item": item
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// What a statement answers, as sorted keys (`pk` or `pk/sk`) in the order
+/// returned when `ordered`, or as the error's message, and the capacity it
+/// was charged.
+fn answer(
+    db: &Database,
+    statement: &str,
+    parameters: Option<serde_json::Value>,
+) -> (Result<Vec<String>, String>, Option<f64>) {
+    let mut request = serde_json::json!({
+        "Statement": statement, "ReturnConsumedCapacity": "TOTAL"
+    });
+    if let Some(parameters) = parameters {
+        request["Parameters"] = parameters;
+    }
+    let request: ExecuteStatementRequest = serde_json::from_value(request).unwrap();
+    match db.execute_statement(request) {
+        Ok(response) => {
+            let keys = response
+                .items
+                .unwrap_or_default()
+                .iter()
+                .map(|item| {
+                    let pk = match item.get("pk") {
+                        Some(AttributeValue::S(pk)) => pk.clone(),
+                        _ => String::new(),
+                    };
+                    match item.get("sk") {
+                        Some(AttributeValue::N(sk)) => format!("{pk}/{sk}"),
+                        _ => pk,
+                    }
+                })
+                .collect();
+            (
+                Ok(keys),
+                response.consumed_capacity.map(|c| c.capacity_units),
+            )
+        }
+        Err(e) => (Err(e.to_string()), None),
+    }
+}
+
+fn sorted(keys: Result<Vec<String>, String>) -> Result<Vec<String>, String> {
+    keys.map(|mut keys| {
+        keys.sort();
+        keys
+    })
+}
+
+/// A key condition beside a condition function compared with a path is a key
+/// read: charged what the key condition alone is, and ORDER BY runs on it,
+/// with the call written either side and with `<>` (captured eu-west-2 and
+/// us-east-1, 2026-10-10, cases 2K).
+#[test]
+fn a_key_condition_beside_a_condition_function_comparison_is_a_key_read() {
+    let db = captured_db();
+    let (alone, alone_cost) = answer(&db, r#"SELECT pk FROM "Hashed" WHERE pk = 'r1'"#, None);
+    assert_eq!(alone, Ok(vec!["r1".to_string()]));
+    let (scan, scan_cost) = answer(&db, r#"SELECT pk FROM "Hashed" WHERE pk <> 'zz'"#, None);
+    assert!(scan.is_ok());
+    assert!(
+        scan_cost > alone_cost,
+        "a scan of the table costs more than a key read: {scan_cost:?} against {alone_cost:?}"
+    );
+    let (rows, cost) = answer(
+        &db,
+        r#"SELECT pk FROM "Hashed" WHERE pk = 'r1' AND attribute_exists(a) = b"#,
+        None,
+    );
+    assert_eq!(rows, Ok(vec!["r1".to_string()]));
+    assert_eq!(cost, alone_cost);
+    for (statement, expected) in [
+        (
+            r#"SELECT pk FROM "Hashed" WHERE pk = 'r1' AND attribute_exists(a) = b ORDER BY pk"#,
+            vec!["r1"],
+        ),
+        (
+            r#"SELECT pk, sk FROM "Sorted" WHERE pk = 'p' AND attribute_exists(s) = b"#,
+            vec!["p/1"],
+        ),
+        (
+            r#"SELECT pk, sk FROM "Sorted" WHERE pk = 'p' AND attribute_exists(s) = b ORDER BY sk DESC"#,
+            vec!["p/1"],
+        ),
+        (
+            r#"SELECT pk, sk FROM "Sorted" WHERE pk = 'p' AND b = attribute_exists(s) ORDER BY sk DESC"#,
+            vec!["p/1"],
+        ),
+        (
+            r#"SELECT pk, sk FROM "Sorted" WHERE pk = 'p' AND attribute_exists(s) <> b ORDER BY sk"#,
+            vec!["p/2", "p/3", "p/4", "p/5"],
+        ),
+    ] {
+        let expected: Vec<String> = expected.into_iter().map(String::from).collect();
+        assert_eq!(answer(&db, statement, None).0, Ok(expected), "{statement}");
+    }
+    let (_, cost) = answer(
+        &db,
+        r#"SELECT pk, sk FROM "Sorted" WHERE pk = 'p' AND attribute_exists(s) = b"#,
+        None,
+    );
+    assert_eq!(cost, Some(0.5));
+}
+
+/// A condition function compared with `<>` is one predicate, so ten of them
+/// ANDed run, written either way round, and an UPDATE whose ten are false
+/// fails its condition (captured eu-west-2 and us-east-1, 2026-10-10, cases
+/// C). A missing operand is unequal to the call.
+#[test]
+fn ten_condition_function_inequalities_run() {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+            "TableName": "Chain",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for item in [
+        serde_json::json!({"pk": {"S": "r1"}, "a": {"N": "1"}, "b": {"BOOL": true},
+                           "x": {"N": "1"}, "y": {"BOOL": true}, "nl": {"NULL": true}}),
+        serde_json::json!({"pk": {"S": "r2"}, "b": {"BOOL": false}, "y": {"BOOL": false}}),
+        serde_json::json!({"pk": {"S": "r3"}, "a": {"N": "1"}, "b": {"BOOL": false},
+                           "x": {"N": "1"}, "y": {"BOOL": true}}),
+        serde_json::json!({"pk": {"S": "r4"}}),
+    ] {
+        put_json(&db, "Chain", item);
+    }
+    let terms = [
+        "attribute_exists(a) <> b",
+        "attribute_exists(x) <> y",
+        "attribute_exists(nl) <> b",
+        "attribute_exists(b) <> y",
+        "attribute_exists(y) <> b",
+        "attribute_exists(a) <> y",
+        "attribute_exists(x) <> b",
+        "attribute_exists(nl) <> y",
+        "attribute_exists(pk) <> b",
+        "attribute_exists(pk) <> y",
+    ];
+    let select = |clause: String| {
+        sorted(
+            answer(
+                &db,
+                &format!(r#"SELECT pk FROM "Chain" WHERE {clause}"#),
+                None,
+            )
+            .0,
+        )
+    };
+    let rows = |keys: &[&str]| Ok(keys.iter().map(|k| k.to_string()).collect::<Vec<_>>());
+    assert_eq!(select(terms[0].to_string()), rows(&["r3", "r4"]));
+    for k in [2, 4, 5, 8, 10] {
+        assert_eq!(select(terms[..k].join(" AND ")), rows(&["r4"]), "{k} ANDed");
+    }
+    let mirrored: Vec<String> = terms[..5]
+        .iter()
+        .map(|t| {
+            let (call, path) = t.split_once(" <> ").unwrap();
+            format!("{path} <> {call}")
+        })
+        .collect();
+    assert_eq!(select(mirrored.join(" AND ")), rows(&["r4"]));
+    let ored: Vec<String> = terms[..5].iter().map(|t| t.replace("<>", "=")).collect();
+    assert_eq!(select(ored.join(" OR ")), rows(&["r1", "r2", "r3"]));
+    let update = format!(
+        r#"UPDATE "Chain" SET w = 1 WHERE pk = 'r2' AND {}"#,
+        terms.join(" AND ")
+    );
+    assert_eq!(
+        answer(&db, &update, None).0,
+        Err("The conditional request failed".to_string())
+    );
+}
+
+/// DynamoDB counts each call and each comparison operator against its 300
+/// operator limit, so a long enough chain of condition-function comparisons
+/// is refused for its operators rather than run. Inferred from the captured
+/// counting rule (each `attribute_exists(x) <> y` costs two, each AND one).
+#[test]
+fn a_chain_of_condition_function_comparisons_is_held_to_the_operator_limit() {
+    let db = captured_db();
+    let chain = |count: usize| vec!["attribute_exists(a) <> b"; count].join(" AND ");
+    // 100 comparisons: 200 operators and 99 ANDs.
+    assert!(
+        answer(
+            &db,
+            &format!(r#"SELECT pk FROM "Hashed" WHERE {}"#, chain(100)),
+            None
+        )
+        .0
+        .is_ok()
+    );
+    // 101: 202 and 100, so the 301st is refused.
+    assert_eq!(
+        answer(
+            &db,
+            &format!(r#"SELECT pk FROM "Hashed" WHERE {}"#, chain(101)),
+            None
+        )
+        .0,
+        Err("The expression contains too many operators; operator count: 301".to_string())
+    );
+}
