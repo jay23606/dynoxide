@@ -1812,7 +1812,7 @@ fn parse_projections(t: &mut Tokenizer) -> Result<Vec<String>, String> {
         let name = t
             .next_token()?
             .ok_or("Expected projection attribute name")?;
-        let mut path = unquote(&name);
+        let mut path = path_segment(&name);
 
         // Greedily consume dot-separated segments and array indexes
         loop {
@@ -1822,7 +1822,7 @@ fn parse_projections(t: &mut Tokenizer) -> Result<Vec<String>, String> {
                     let segment = t.next_token()?.ok_or("Expected attribute name after '.'")?;
                     check_dot_component(&segment)?;
                     path.push('.');
-                    path.push_str(&unquote(&segment));
+                    path.push_str(&path_segment(&segment));
                 }
                 Some(ref s) if s == "[" => {
                     t.next_token()?; // consume [
@@ -3831,7 +3831,7 @@ fn path_parts(path: &str) -> String {
         Some(segments) => segments
             .iter()
             .map(|segment| match segment {
-                super::PathSegment::Key(key) => (*key).to_string(),
+                super::PathSegment::Key(key) => key.to_string(),
                 super::PathSegment::Index(index) => format!("[{index}]"),
             })
             .collect::<Vec<_>>()
@@ -3856,14 +3856,14 @@ fn path_end(t: &Tokenizer) -> Result<usize, String> {
 /// Parse a dotted path starting from an already-consumed first token.
 /// Greedily consumes `.segment` continuations.
 fn parse_dotted_path_from_token(first_tok: &str, t: &mut Tokenizer) -> Result<String, String> {
-    let mut path = unquote(first_tok);
+    let mut path = path_segment(first_tok);
     while let Some(ref next) = t.peek_token()? {
         if next == "." {
             t.next_token()?; // consume dot
             let seg = t.next_token()?.ok_or("Expected attribute name after '.'")?;
             check_dot_component(&seg)?;
             path.push('.');
-            path.push_str(&unquote(&seg));
+            path.push_str(&path_segment(&seg));
         } else if next == "[" {
             t.next_token()?; // consume [
             let idx = t.next_token()?.ok_or("Expected index in '[]'")?;
@@ -3879,6 +3879,18 @@ fn parse_dotted_path_from_token(first_tok: &str, t: &mut Tokenizer) -> Result<St
         }
     }
     Ok(path)
+}
+
+/// One step of a path as written: a name, quoted or not, as the path text
+/// holds it. A quoted name is one attribute whatever it holds, so one with a
+/// `.` or a `[` in it stays quoted in the path (see `attribute_path`).
+fn path_segment(tok: &str) -> String {
+    let name = unquote(tok);
+    if tok.starts_with('"') {
+        super::attribute_path(&name).into_owned()
+    } else {
+        name
+    }
 }
 
 /// Parse a path inside a function call (e.g. EXISTS, BEGINS_WITH, CONTAINS).
@@ -4073,7 +4085,7 @@ fn read_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> {
                 let seg = t.next_token()?.ok_or("Expected attribute name after '.'")?;
                 check_dot_component(&seg)?;
                 path.push('.');
-                path.push_str(&unquote(&seg));
+                path.push_str(&path_segment(&seg));
             } else {
                 break;
             }

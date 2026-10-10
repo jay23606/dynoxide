@@ -10,7 +10,7 @@ use crate::partiql::parser::{
     CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause,
     WhereCondition,
 };
-use crate::partiql::{PathSegment, split_path_segments};
+use crate::partiql::{PathSegment, names_attribute, split_path_segments};
 use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item, ScalarAttributeType};
 use std::collections::HashMap;
@@ -221,7 +221,7 @@ fn key_conditions(
     let mut found: Vec<KeyCondition> = Vec::new();
     for cond in group {
         let (op, values): (&'static str, Vec<&PartiqlValue>) = match &**cond {
-            WhereCondition::Comparison(c) if c.path == key => match c.op {
+            WhereCondition::Comparison(c) if names_attribute(&c.path, key) => match c.op {
                 CompOp::Eq => ("=", vec![&c.value]),
                 CompOp::Lt if sort_key => ("<", vec![&c.value]),
                 CompOp::Le if sort_key => ("<=", vec![&c.value]),
@@ -229,11 +229,13 @@ fn key_conditions(
                 CompOp::Ge if sort_key => (">=", vec![&c.value]),
                 _ => continue,
             },
-            WhereCondition::In(path, values) if path == key => ("=", values.iter().collect()),
-            WhereCondition::Between(path, lo, hi) if sort_key && path == key => {
+            WhereCondition::In(path, values) if names_attribute(path, key) => {
+                ("=", values.iter().collect())
+            }
+            WhereCondition::Between(path, lo, hi) if sort_key && names_attribute(path, key) => {
                 ("BETWEEN", vec![lo, hi])
             }
-            WhereCondition::BeginsWith(path, prefix) if sort_key && path == key => {
+            WhereCondition::BeginsWith(path, prefix) if sort_key && names_attribute(path, key) => {
                 ("begins_with", vec![prefix])
             }
             _ => continue,
@@ -408,7 +410,7 @@ pub(crate) fn keyed_select(
     // Each condition has to be an `=`, or an `IN` with one value, on a key
     // attribute; the same one written twice is still one (captured eu-west-2
     // and us-east-1, 2026-10-09).
-    let names_a_key = |path: &str| keys.iter().any(|(name, _)| *name == path);
+    let names_a_key = |path: &str| keys.iter().any(|(name, _)| names_attribute(path, name));
     let single = group.iter().all(|cond| match &**cond {
         WhereCondition::Comparison(c) => c.op == CompOp::Eq && names_a_key(&c.path),
         WhereCondition::In(path, values) => values.len() == 1 && names_a_key(path),
@@ -536,8 +538,13 @@ pub(crate) fn delete_has_condition(stmt: &Statement, resolved: &ResolvedTable) -
         return false;
     };
     let schema = &resolved.key_schema;
-    let is_key =
-        |path: &str| path == schema.partition_key || schema.sort_key.as_deref() == Some(path);
+    let is_key = |path: &str| {
+        names_attribute(path, &schema.partition_key)
+            || schema
+                .sort_key
+                .as_deref()
+                .is_some_and(|sk| names_attribute(path, sk))
+    };
     let names_key = |condition: &WhereCondition| match condition {
         WhereCondition::Comparison(c) => c.op == CompOp::Eq && is_key(&c.path),
         WhereCondition::In(path, values) => values.len() == 1 && is_key(path),
@@ -636,11 +643,17 @@ fn reject_overlapping_key_conditions(
         };
         for cond in group {
             match &**cond {
-                WhereCondition::Comparison(c) if c.path == read_pk && c.op == CompOp::Eq => {
+                WhereCondition::Comparison(c)
+                    if names_attribute(&c.path, read_pk) && c.op == CompOp::Eq =>
+                {
                     narrow(key(&c.value).into_iter().collect());
                 }
-                WhereCondition::In(path, values) if path == read_pk => narrow(keys_of(values)?),
-                WhereCondition::Comparison(c) if Some(c.path.as_str()) == read_sk => {
+                WhereCondition::In(path, values) if names_attribute(path, read_pk) => {
+                    narrow(keys_of(values)?)
+                }
+                WhereCondition::Comparison(c)
+                    if read_sk.is_some_and(|sk| names_attribute(&c.path, sk)) =>
+                {
                     if let Some(v) = key(&c.value) {
                         match c.op {
                             CompOp::Eq => add(vec![SortKeyAtom::Points(vec![v])]),
@@ -653,7 +666,9 @@ fn reject_overlapping_key_conditions(
                         }
                     }
                 }
-                WhereCondition::Between(path, lo, hi) if Some(path.as_str()) == read_sk => {
+                WhereCondition::Between(path, lo, hi)
+                    if read_sk.is_some_and(|sk| names_attribute(path, sk)) =>
+                {
                     if let (Some(lo), Some(hi)) = (key(lo), key(hi)) {
                         add(vec![
                             SortKeyAtom::Above(lo, true),
@@ -661,17 +676,23 @@ fn reject_overlapping_key_conditions(
                         ]);
                     }
                 }
-                WhereCondition::In(path, values) if Some(path.as_str()) == read_sk => {
+                WhereCondition::In(path, values)
+                    if read_sk.is_some_and(|sk| names_attribute(path, sk)) =>
+                {
                     add(vec![SortKeyAtom::Points(keys_of(values)?)]);
                 }
-                WhereCondition::BeginsWith(path, prefix) if Some(path.as_str()) == read_sk => {
+                WhereCondition::BeginsWith(path, prefix)
+                    if read_sk.is_some_and(|sk| names_attribute(path, sk)) =>
+                {
                     if let Some(prefix) = key(prefix) {
                         add(vec![SortKeyAtom::Prefix(prefix)]);
                     }
                 }
                 // Captured eu-west-2 and us-east-1, 2026-10-09: `pk = 'a' AND
                 // NOT sk BETWEEN 1 AND 2 OR pk = 'a' AND sk = 3` runs.
-                WhereCondition::NotBetween(path, _, _) if Some(path.as_str()) == read_sk => {
+                WhereCondition::NotBetween(path, _, _)
+                    if read_sk.is_some_and(|sk| names_attribute(path, sk)) =>
+                {
                     return Ok(());
                 }
                 // Captured eu-west-2 and us-east-1, 2026-10-09: a negated or
@@ -679,10 +700,14 @@ fn reject_overlapping_key_conditions(
                 // `NOT ... BETWEEN` does: `pk = 'a' AND NOT sk = '1' OR pk =
                 // 'a' AND sk = '2'` and `pk = 'a' OR pk = 'a' AND NOT sk =
                 // '1'` both run.
-                WhereCondition::NotComparison(c) if Some(c.path.as_str()) == read_sk => {
+                WhereCondition::NotComparison(c)
+                    if read_sk.is_some_and(|sk| names_attribute(&c.path, sk)) =>
+                {
                     return Ok(());
                 }
-                WhereCondition::NotBeginsWith(path, _) if Some(path.as_str()) == read_sk => {
+                WhereCondition::NotBeginsWith(path, _)
+                    if read_sk.is_some_and(|sk| names_attribute(path, sk)) =>
+                {
                     return Ok(());
                 }
                 _ => {}
@@ -727,7 +752,7 @@ fn key_groups(
     let is_key = |cond: &WhereCondition| {
         condition_path(cond).is_some_and(|path| {
             let root = root_attribute(path);
-            root == read_pk || Some(root) == read_sk
+            root == read_pk || read_sk == Some(&*root)
         })
     };
     fn mentions_key(tree: &ConditionTree, is_key: &dyn Fn(&WhereCondition) -> bool) -> bool {
@@ -929,7 +954,9 @@ fn check_order_terms(
         if let Some(rejection) = &term.rejection {
             return Err(reject(rejection.clone()));
         }
-        if term.path != read_pk && Some(term.path.as_str()) != read_sk {
+        if !names_attribute(&term.path, read_pk)
+            && !read_sk.is_some_and(|sk| names_attribute(&term.path, sk))
+        {
             return Err(reject(format!(
                 "Attribute {} in ORDER BY clause must be part of the primary key",
                 term.path
@@ -959,10 +986,12 @@ fn plan_order(
         let pinned: Vec<Vec<&PartiqlValue>> = group
             .iter()
             .filter_map(|cond| match &**cond {
-                WhereCondition::Comparison(c) if c.path == read_pk && c.op == CompOp::Eq => {
+                WhereCondition::Comparison(c)
+                    if names_attribute(&c.path, read_pk) && c.op == CompOp::Eq =>
+                {
                     Some(vec![&c.value])
                 }
-                WhereCondition::In(path, values) if path == read_pk => {
+                WhereCondition::In(path, values) if names_attribute(path, read_pk) => {
                     Some(values.iter().collect())
                 }
                 _ => None,
@@ -977,7 +1006,9 @@ fn plan_order(
         };
         partition_values.extend(values.iter().copied());
     }
-    let pk_term = order_by.iter().find(|term| term.path == read_pk);
+    let pk_term = order_by
+        .iter()
+        .find(|term| names_attribute(&term.path, read_pk));
     if partition_values.len() > 1 && pk_term.is_none() {
         return Err(reject(
             "Must have hash key in ORDER BY clause when more than one hash key condition \
@@ -1000,7 +1031,7 @@ fn plan_order(
 
     let forward = order_by
         .iter()
-        .find(|term| Some(term.path.as_str()) == read_sk)
+        .find(|term| read_sk.is_some_and(|sk| names_attribute(&term.path, sk)))
         .is_some_and(|term| !term.descending);
     Ok(OrderPlan {
         partitions,
@@ -1582,10 +1613,31 @@ pub(crate) async fn execute_written_page<S: StorageBackend>(
 /// keyed by the leaf segment name (`c`), not the full path or reconstructed
 /// nested structure. For simple paths and array index paths, the key is used as-is.
 fn insert_nested_projection(result: &mut Item, path: &str, val: AttributeValue) {
-    let parts: Vec<&str> = path.split('.').collect();
-    // Use the leaf segment as the key
-    let key = parts.last().unwrap();
-    result.insert(key.to_string(), val);
+    result.insert(projection_key(path), val);
+}
+
+/// The key a projected path is returned under: its last name, with any list
+/// indexes after it. A quoted name is the name it quotes, so `"a.b"` comes
+/// back as `a.b` (captured eu-west-2 and us-east-1, 2026-10-10).
+fn projection_key(path: &str) -> String {
+    if !path.contains('"') {
+        // Use the leaf segment as the key
+        return path.rsplit('.').next().unwrap_or(path).to_string();
+    }
+    let Some(segments) = split_path_segments(path) else {
+        return path.to_string();
+    };
+    let last_name = segments
+        .iter()
+        .rposition(|segment| matches!(segment, PathSegment::Key(_)))
+        .unwrap_or(0);
+    segments[last_name..]
+        .iter()
+        .map(|segment| match segment {
+            PathSegment::Key(name) => name.to_string(),
+            PathSegment::Index(index) => format!("[{index}]"),
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1764,7 +1816,7 @@ async fn execute_select<S: StorageBackend>(
         idx.is_lsi
             && projections
                 .iter()
-                .any(|p| !idx.projects(root_attribute(p), table_key_schema))
+                .any(|p| !idx.projects(&root_attribute(p), table_key_schema))
     });
 
     let window = evaluate_window(
@@ -2223,10 +2275,17 @@ impl ResolvedIndex {
 }
 
 /// The attribute a path names, ignoring any document navigation after it.
-/// `address.city` and `tags[0]` are both carried by `address` and `tags`.
-fn root_attribute(path: &str) -> &str {
+/// `address.city` and `tags[0]` are both carried by `address` and `tags`, and
+/// a quoted `"a.b"` by `a.b`.
+fn root_attribute(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.starts_with('"')
+        && let Some(segments) = split_path_segments(path)
+        && let Some(PathSegment::Key(name)) = segments.into_iter().next()
+    {
+        return name;
+    }
     let end = path.find(['.', '[']).unwrap_or(path.len());
-    &path[..end]
+    std::borrow::Cow::Borrowed(&path[..end])
 }
 
 /// The path a WHERE condition on one path reads; `None` for a condition on
@@ -2585,7 +2644,7 @@ fn translate_sk_conditions(
     let mut resolved = Vec::new();
     for cond in group {
         match &**cond {
-            WhereCondition::Comparison(c) if c.path == sk_name => {
+            WhereCondition::Comparison(c) if names_attribute(&c.path, sk_name) => {
                 let value = resolve_value(&c.value, parameters).ok()?;
                 value.to_key_string()?;
                 let sk = sk_name.to_string();
@@ -2600,7 +2659,7 @@ fn translate_sk_conditions(
                     CompOp::Ne => return None,
                 });
             }
-            WhereCondition::Between(path, lo, hi) if path == sk_name => {
+            WhereCondition::Between(path, lo, hi) if names_attribute(path, sk_name) => {
                 let lo = resolve_value(lo, parameters).ok()?;
                 let hi = resolve_value(hi, parameters).ok()?;
                 lo.to_key_string()?;
@@ -2611,7 +2670,7 @@ fn translate_sk_conditions(
                     hi,
                 ));
             }
-            WhereCondition::BeginsWith(path, prefix) if path == sk_name => {
+            WhereCondition::BeginsWith(path, prefix) if names_attribute(path, sk_name) => {
                 let prefix = resolve_value(prefix, parameters).ok()?;
                 prefix.to_key_string()?;
                 resolved.push(ResolvedSortKeyCondition::BeginsWith(
@@ -2623,7 +2682,9 @@ fn translate_sk_conditions(
             // Captured eu-west-2 and us-east-1, 2026-10-10, for the sort key
             // through BatchExecuteStatement and ExecuteTransaction; the
             // ExecuteStatement charge is inferred from those.
-            WhereCondition::In(path, values) if path == sk_name && values.len() == 1 => {
+            WhereCondition::In(path, values)
+                if names_attribute(path, sk_name) && values.len() == 1 =>
+            {
                 let value = resolve_value(&values[0], parameters).ok()?;
                 value.to_key_string()?;
                 resolved.push(ResolvedSortKeyCondition::Eq(sk_name.to_string(), value));
@@ -2644,7 +2705,7 @@ fn translate_sk_conditions(
             | WhereCondition::IsNotMissing(path)
             | WhereCondition::IsType(path, _)
             | WhereCondition::IsNotType(path, _)
-                if path == sk_name =>
+                if names_attribute(path, sk_name) =>
             {
                 return None;
             }
@@ -2678,8 +2739,10 @@ fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
         return false;
     }
     wc.groups[0].iter().any(|c| match &**c {
-        WhereCondition::Comparison(cond) => cond.path == pk_name && cond.op == CompOp::Eq,
-        WhereCondition::In(path, _) => path == pk_name,
+        WhereCondition::Comparison(cond) => {
+            names_attribute(&cond.path, pk_name) && cond.op == CompOp::Eq
+        }
+        WhereCondition::In(path, _) => names_attribute(path, pk_name),
         _ => false,
     })
 }
@@ -2715,10 +2778,14 @@ fn pk_in_every_group<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a Parti
 /// reads it.
 fn group_pk_value<'a>(group: &'a [Arc<WhereCondition>], pk_name: &str) -> Option<&'a PartiqlValue> {
     let mut pinning = group.iter().filter_map(|c| match &**c {
-        WhereCondition::Comparison(cond) if cond.path == pk_name && cond.op == CompOp::Eq => {
+        WhereCondition::Comparison(cond)
+            if names_attribute(&cond.path, pk_name) && cond.op == CompOp::Eq =>
+        {
             Some(std::slice::from_ref(&cond.value))
         }
-        WhereCondition::In(path, values) if path == pk_name => Some(values.as_slice()),
+        WhereCondition::In(path, values) if names_attribute(path, pk_name) => {
+            Some(values.as_slice())
+        }
         _ => None,
     });
     let values = pinning.next()?;
@@ -2834,7 +2901,7 @@ fn statement_key(
             let mut values = wc
                 .top_level_equalities
                 .iter()
-                .filter(|cond| cond.path == name)
+                .filter(|cond| names_attribute(&cond.path, name))
                 .map(|cond| resolve_value(&cond.value, parameters).ok());
             let first = values.next()??;
             let first_key = first.to_key_string();
@@ -3453,7 +3520,11 @@ fn single_item_key(
     let pinned =
         |name: &str, declared: Option<&ScalarAttributeType>| -> Result<(String, AttributeValue)> {
             let mut key: Option<(String, AttributeValue)> = None;
-            for cond in wc.top_level_equalities.iter().filter(|c| c.path == name) {
+            for cond in wc
+                .top_level_equalities
+                .iter()
+                .filter(|c| names_attribute(&c.path, name))
+            {
                 let resolved = resolve_value(&cond.value, parameters)?;
                 let value = typed_key(&resolved, name, declared)?;
                 match key {
@@ -3510,10 +3581,14 @@ fn find_key_value_in_groups<'a>(
 ) -> Option<&'a PartiqlValue> {
     groups.iter().find_map(|group| {
         group.iter().find_map(|c| match &**c {
-            WhereCondition::Comparison(cond) if cond.path == path && cond.op == CompOp::Eq => {
+            WhereCondition::Comparison(cond)
+                if names_attribute(&cond.path, path) && cond.op == CompOp::Eq =>
+            {
                 Some(&cond.value)
             }
-            WhereCondition::In(p, values) if p == path && values.len() == 1 => Some(&values[0]),
+            WhereCondition::In(p, values) if names_attribute(p, path) && values.len() == 1 => {
+                Some(&values[0])
+            }
             _ => None,
         })
     })
@@ -3525,7 +3600,9 @@ fn find_comparison<'a>(
     path: &str,
 ) -> Option<&'a crate::partiql::parser::Condition> {
     conditions.iter().find_map(|c| match &**c {
-        WhereCondition::Comparison(cond) if cond.path == path && cond.op == CompOp::Eq => {
+        WhereCondition::Comparison(cond)
+            if names_attribute(&cond.path, path) && cond.op == CompOp::Eq =>
+        {
             Some(cond)
         }
         _ => None,
@@ -3853,10 +3930,10 @@ fn remove_nested_value(item: &mut Item, path: &str) {
         return; // the top-level item cannot be indexed
     };
     if rest.is_empty() {
-        item.remove(*key);
+        item.remove(key.as_ref());
         return;
     }
-    if let Some(current) = item.get_mut(*key) {
+    if let Some(current) = item.get_mut(key.as_ref()) {
         remove_from_value(current, rest);
     }
 }
@@ -3869,7 +3946,7 @@ fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) {
         match seg {
             PathSegment::Key(k) => {
                 if let AttributeValue::M(map) = current {
-                    map.remove(*k);
+                    map.remove(k.as_ref());
                 }
             }
             PathSegment::Index(i) => {
@@ -3885,7 +3962,7 @@ fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) {
     match seg {
         PathSegment::Key(k) => {
             if let AttributeValue::M(map) = current
-                && let Some(next) = map.get_mut(*k)
+                && let Some(next) = map.get_mut(k.as_ref())
             {
                 remove_from_value(next, rest);
             }
@@ -4239,8 +4316,9 @@ fn contains_value(
 ///
 /// Supports paths like `"a"`, `"a.b.c"`, and `"a[0].b"`.
 fn resolve_nested_path<'a>(item: &'a Item, path: &str) -> Option<&'a AttributeValue> {
-    // Fast path: no dots or brackets means a simple top-level lookup
-    if !path.contains('.') && !path.contains('[') {
+    // Fast path: no dots, brackets or quoted name means a simple top-level
+    // lookup.
+    if !path.contains(['.', '[']) && !path.starts_with('"') {
         return item.get(path);
     }
 
@@ -4251,14 +4329,14 @@ fn resolve_nested_path<'a>(item: &'a Item, path: &str) -> Option<&'a AttributeVa
 
     // First segment must be a map key on the top-level item
     let mut current = match &segments[0] {
-        PathSegment::Key(k) => item.get(*k)?,
+        PathSegment::Key(k) => item.get(k.as_ref())?,
         PathSegment::Index(_) => return None,
     };
 
     for seg in &segments[1..] {
         current = match seg {
             PathSegment::Key(k) => match current {
-                AttributeValue::M(map) => map.get(*k)?,
+                AttributeValue::M(map) => map.get(k.as_ref())?,
                 _ => return None,
             },
             PathSegment::Index(idx) => match current {

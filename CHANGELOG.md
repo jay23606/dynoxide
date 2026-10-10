@@ -748,6 +748,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that also holds its own path is refused for the path, wherever it stands
   in the list, where the operand count used to be reported. Captured against
   eu-west-2 and us-east-1.
+- A quoted name in a PartiQL statement is one attribute whatever it holds,
+  as DynamoDB reads it: `"a.b"` and `"a[0]"` name the top-level attributes
+  `a.b` and `a[0]` in a WHERE clause, a condition function, `IS NOT MISSING`
+  and a projection, which returns them under those names, and `SET "x.y" =
+  5` writes an attribute named `x.y`. They used to be read as `a.b` and
+  `a[0]` unquoted, a step into `a`, and `SET "x[0]"` was refused as an
+  invalid document path. `"a"."b"` and `"a"[0]` still step into `a`. A key
+  attribute whose name holds a `.` or a `[` is named by quoting it, so such
+  a table is read by its key and its items can be updated and deleted. For
+  Rust users of the crate, a parsed statement's path holds such a name in
+  double quotes, its own quotes doubled, so `"a.b"` is the path text for the
+  attribute `a.b`. Captured against eu-west-2 and us-east-1.
 - PartiQL `size()` calls nested inside one another, and arithmetic after a
   `size()`, are held to the same depth as nested brackets.
 - A PartiQL `IN` with more than 100 operands, negated or not, written as
