@@ -609,14 +609,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BatchExecuteStatement`, last on `ExecuteTransaction`, after an over-long
   `ClientRequestToken` and the statements. More than 25 statements in a batch
   is refused as a member too, echoing the statements, where it used to give
-  "Too many statements in BatchExecuteStatement". Captured against eu-west-2
-  and us-east-1.
+  "Too many statements in BatchExecuteStatement". The MCP
+  `batch_execute_partiql` and `execute_transaction_partiql` tools list a bad
+  mode the same way. Captured against eu-west-2 and us-east-1.
 - A malformed `Expected` condition on `PutItem`, `UpdateItem` or `DeleteItem`
   is refused rather than ignored. An unknown `ComparisonOperator` gets
   DynamoDB's "Invalid comparison operator" message, and `EQ` with an empty
   `AttributeValueList` its "Invalid number of argument(s)" message. Captured
   against eu-west-2 and us-east-1.
-
 - A PartiQL `SELECT` whose WHERE clause or parameters hold a map with more
   than one key can be paged with `NextToken`. A map's key order was drawn
   afresh for every request, so the token stopped matching its own statement on

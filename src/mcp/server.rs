@@ -2236,10 +2236,8 @@ impl McpServer {
             }
         }
 
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
-            return Ok(err);
-        }
-
+        // The mode is checked by the action with the other members, so a bad
+        // mode is listed with them rather than refused on its own first.
         let request = crate::actions::batch_execute_statement::BatchExecuteStatementRequest {
             statements,
             return_consumed_capacity: params.return_consumed_capacity,
@@ -2264,9 +2262,8 @@ impl McpServer {
         if let Some(err) = self.reject_if_read_only("execute_transaction_partiql") {
             return Ok(err);
         }
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
-            return Ok(err);
-        }
+        // The mode is checked by the action with the token and the
+        // statements, so a bad mode is listed with them.
 
         let transact_statements: Vec<crate::actions::execute_transaction::ParameterizedStatement> =
             match parse_json_param(params.transact_statements, "transact_statements") {
@@ -3528,6 +3525,50 @@ mod capacity_tests {
             request: json!({"TransactStatements": statements}),
         }
         .check();
+    }
+
+    /// The PartiQL batch and transaction tools list a bad mode with the other
+    /// member errors, as the wire and library do, rather than refusing it on
+    /// its own first (both orders captured eu-west-2 and us-east-1,
+    /// 2026-10-10).
+    #[test]
+    fn partiql_tools_list_the_mode_with_the_other_member_errors() {
+        let server = server();
+        let statements: Vec<Value> = (0..26)
+            .map(|_| json!({"Statement": "SELECT * FROM \"Cap\" WHERE pk = 'p'"}))
+            .collect();
+        let (is_error, body) = reply(server.batch_execute_partiql(Parameters(wire(json!({
+            "statements": statements,
+            "return_consumed_capacity": "BOGUS"
+        })))));
+        assert!(is_error, "the batch was accepted: {body}");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(
+                "2 validation errors detected: Value 'BOGUS' at 'returnConsumedCapacity'"
+            ),
+            "the batch listed {message}"
+        );
+        assert!(message.contains("' at 'statements' failed to satisfy constraint"));
+
+        let long = format!("SELECT * FROM \"Cap\" WHERE pk = '{}'", "x".repeat(9_000));
+        let (is_error, body) = reply(server.execute_transaction_partiql(Parameters(wire(json!({
+            "transact_statements": [{"Statement": long}],
+            "client_request_token": "t".repeat(40),
+            "return_consumed_capacity": "BOGUS"
+        })))));
+        assert!(is_error, "the transaction was accepted: {body}");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("3 validation errors detected: Value '"),
+            "the transaction listed {message}"
+        );
+        assert!(message.contains("' at 'clientRequestToken'"));
+        assert!(message.contains("' at 'transactStatements.1.member.statement'"));
+        assert!(message.ends_with(
+            "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: \
+             Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+        ));
     }
 
     #[test]
