@@ -35,6 +35,8 @@ pub struct ExecuteStatementResponse {
         skip_serializing_if = "Option::is_none",
         serialize_with = "crate::set_order::items_in_hash_order"
     )]
+    // Number sets in Java hash-set order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub items: Option<Vec<Item>>,
     #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,

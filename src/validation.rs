@@ -1847,4 +1847,56 @@ mod tests {
             DynoxideError::ResourceNotFoundException(m) if m == "msg"
         ));
     }
+
+    #[test]
+    fn normalising_an_item_sorts_its_sets_in_place_at_every_depth() {
+        // Read the stored Vecs directly: every other set-order test reads back
+        // through Serialize, which sorts on its own and would hide a write that
+        // stopped sorting.
+        let mut item: Item = [
+            (
+                "top".to_string(),
+                AttributeValue::NS(vec!["3".into(), "-1".into(), "2".into()]),
+            ),
+            (
+                "m".to_string(),
+                AttributeValue::M(
+                    [(
+                        "ss".to_string(),
+                        AttributeValue::SS(vec!["b".into(), "a".into(), "c".into()]),
+                    )]
+                    .into(),
+                ),
+            ),
+            (
+                "l".to_string(),
+                AttributeValue::L(vec![
+                    AttributeValue::NS(vec!["10".into(), "2".into(), "1e2".into()]),
+                    AttributeValue::BS(vec![vec![2], vec![0xff], vec![1]]),
+                ]),
+            ),
+        ]
+        .into();
+        normalize_item_sets(&mut item);
+
+        assert_eq!(
+            item["top"],
+            AttributeValue::NS(vec!["-1".into(), "2".into(), "3".into()])
+        );
+        let AttributeValue::M(m) = &item["m"] else {
+            panic!("m")
+        };
+        assert_eq!(
+            m["ss"],
+            AttributeValue::SS(vec!["a".into(), "b".into(), "c".into()])
+        );
+        let AttributeValue::L(l) = &item["l"] else {
+            panic!("l")
+        };
+        assert_eq!(
+            l[0],
+            AttributeValue::NS(vec!["2".into(), "10".into(), "100".into()])
+        );
+        assert_eq!(l[1], AttributeValue::BS(vec![vec![1], vec![2], vec![0xff]]));
+    }
 }

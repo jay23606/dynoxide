@@ -236,6 +236,8 @@ fn search_scanned_bytes(candidates: &[VectorCandidateRow]) -> f64 {
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
     #[serde(rename = "Item")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub item: Item,
     #[serde(rename = "Score")]
     pub score: f64,

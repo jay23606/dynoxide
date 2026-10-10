@@ -16,7 +16,8 @@
 //!
 //! Sets are stored sorted (the `sort_*_set` functions run as items are normalised
 //! for a write), and [`AttributeValue`]'s `Serialize` sorts as it writes, so a row
-//! stored before sets were sorted still reads back in order.
+//! stored before sets were sorted still reads back in order on the wire (HTTP,
+//! MCP and wasm). The typed Rust API hands back such a row's sets as stored.
 
 use crate::types::{AttributeValue, Item, normalize_number_for_sort};
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
@@ -56,15 +57,138 @@ pub(crate) fn sorted_binaries(set: &[Vec<u8>]) -> Vec<&[u8]> {
 }
 
 /// The members of a number set in ascending numeric order.
+///
+/// A set of fewer than two members, or one already in order (every set stored
+/// since sets were sorted on write), comes back without a sort key being built
+/// for each member; only an unsorted set pays for the keyed sort.
 pub(crate) fn sorted_numbers(set: &[String]) -> Vec<&str> {
-    let mut keyed: Vec<(String, &str)> = set
-        .iter()
-        .map(|n| (normalize_number_for_sort(n), n.as_str()))
-        .collect();
-    if !keyed.is_sorted_by(|a, b| a.0 <= b.0) {
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    let members: Vec<&str> = set.iter().map(String::as_str).collect();
+    if members.len() < 2 || numbers_in_order(&members) {
+        return members;
     }
+    let mut keyed: Vec<(String, &str)> = members
+        .into_iter()
+        .map(|n| (normalize_number_for_sort(n), n))
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
     keyed.into_iter().map(|(_, n)| n).collect()
+}
+
+/// Whether `members` are in ascending numeric order, compared without
+/// allocating. False if any member doesn't read as a number, which sends the
+/// set to the keyed sort.
+fn numbers_in_order(members: &[&str]) -> bool {
+    members.windows(2).all(|pair| {
+        matches!(
+            (Number::read(pair[0]), Number::read(pair[1])),
+            (Some(a), Some(b)) if a.cmp_value(&b) != std::cmp::Ordering::Greater
+        )
+    })
+}
+
+/// A DynamoDB number read in place, for comparing by value without building
+/// [`normalize_number_for_sort`]'s key.
+struct Number<'a> {
+    negative: bool,
+    /// Digits before the point, then after it, as written.
+    int: &'a [u8],
+    frac: &'a [u8],
+    /// Index into `int` then `frac` of the first non-zero digit; `None` for zero.
+    lead: Option<usize>,
+    /// The power of ten of the first non-zero digit.
+    magnitude: i64,
+}
+
+impl<'a> Number<'a> {
+    fn read(s: &'a str) -> Option<Self> {
+        let s = s.trim().as_bytes();
+        let (negative, s) = match s.split_first() {
+            Some((b'-', rest)) => (true, rest),
+            _ => (false, s),
+        };
+        let (mantissa, exponent) = match s.iter().position(|&c| c == b'e' || c == b'E') {
+            Some(i) => (
+                &s[..i],
+                std::str::from_utf8(&s[i + 1..]).ok()?.parse::<i64>().ok()?,
+            ),
+            None => (s, 0),
+        };
+        let (int, frac) = match mantissa.iter().position(|&c| c == b'.') {
+            Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
+            None => (mantissa, &mantissa[mantissa.len()..]),
+        };
+        if int.is_empty() && frac.is_empty() || !int.iter().chain(frac).all(u8::is_ascii_digit) {
+            return None;
+        }
+        let lead = int.iter().chain(frac).position(|&d| d != b'0');
+        let magnitude = match lead {
+            Some(k) => (int.len() as i64 - k as i64 - 1).checked_add(exponent)?,
+            None => 0,
+        };
+        Some(Self {
+            negative,
+            int,
+            frac,
+            lead,
+            magnitude,
+        })
+    }
+
+    /// -1, 0 or 1.
+    fn sign(&self) -> i8 {
+        match (self.lead, self.negative) {
+            (None, _) => 0,
+            (Some(_), true) => -1,
+            (Some(_), false) => 1,
+        }
+    }
+
+    /// The significant digits, from the first non-zero one.
+    fn significant(&self) -> impl Iterator<Item = u8> + '_ {
+        self.int
+            .iter()
+            .chain(self.frac)
+            .copied()
+            .skip(self.lead.unwrap_or(usize::MAX))
+    }
+
+    fn cmp_value(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let by_sign = self.sign().cmp(&other.sign());
+        if by_sign != Ordering::Equal || self.sign() == 0 {
+            return by_sign;
+        }
+        let by_size = self.magnitude.cmp(&other.magnitude).then_with(|| {
+            let (mut a, mut b) = (self.significant(), other.significant());
+            loop {
+                match (a.next(), b.next()) {
+                    (None, None) => return Ordering::Equal,
+                    (Some(x), Some(y)) if x != y => return x.cmp(&y),
+                    (Some(_), Some(_)) => {}
+                    // A longer run is larger only if a non-zero digit is left.
+                    (Some(x), None) => {
+                        return if x != b'0' || a.any(|d| d != b'0') {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Equal
+                        };
+                    }
+                    (None, Some(y)) => {
+                        return if y != b'0' || b.any(|d| d != b'0') {
+                            Ordering::Less
+                        } else {
+                            Ordering::Equal
+                        };
+                    }
+                }
+            }
+        });
+        if self.sign() < 0 {
+            by_size.reverse()
+        } else {
+            by_size
+        }
+    }
 }
 
 /// The members of a number set in the order a Java `HashSet<BigDecimal>`
@@ -347,5 +471,235 @@ mod tests {
             bs,
             vec![vec![0], vec![1], vec![1, 0], vec![0x80], vec![0xff]]
         );
+    }
+
+    proptest::proptest! {
+        // The in-place comparison agrees with the sort key it stands in for,
+        // across signs, leading and trailing zeros, points and exponents.
+        #[test]
+        fn reading_a_number_in_place_orders_it_as_its_sort_key_does(
+            a_neg in proptest::bool::ANY, a_int in "[0-9]{0,6}", a_frac in proptest::option::of("[0-9]{0,6}"),
+            a_exp in proptest::option::of(-12i64..12),
+            b_neg in proptest::bool::ANY, b_int in "[0-9]{0,6}", b_frac in proptest::option::of("[0-9]{0,6}"),
+            b_exp in proptest::option::of(-12i64..12),
+        ) {
+            let write = |neg: bool, int: &str, frac: &Option<String>, exp: Option<i64>| {
+                let mut s = String::new();
+                if neg { s.push('-'); }
+                s.push_str(if int.is_empty() && frac.as_deref().unwrap_or("").is_empty() { "0" } else { int });
+                if let Some(f) = frac { s.push('.'); s.push_str(f); }
+                if let Some(e) = exp { s.push_str(&format!("e{e}")); }
+                s
+            };
+            let a = write(a_neg, &a_int, &a_frac, a_exp);
+            let b = write(b_neg, &b_int, &b_frac, b_exp);
+            let (x, y) = (Number::read(&a).unwrap(), Number::read(&b).unwrap());
+            proptest::prop_assert_eq!(
+                x.cmp_value(&y),
+                normalize_number_for_sort(&a).cmp(&normalize_number_for_sort(&b)),
+                "{} vs {}", a, b
+            );
+        }
+    }
+
+    #[test]
+    fn a_sorted_or_tiny_number_set_comes_back_as_it_is() {
+        assert_eq!(sorted_numbers(&strings(&["7"])), vec!["7"]);
+        assert_eq!(
+            sorted_numbers(&strings(&["-1e3", "-2", "0", "0.5", "1", "1e3"])),
+            vec!["-1e3", "-2", "0", "0.5", "1", "1e3"]
+        );
+        assert_eq!(
+            sorted_numbers(&strings(&["10", "9", "1e1", "-0.5"])),
+            vec!["-0.5", "9", "10", "1e1"]
+        );
+    }
+
+    /// Every response field that carries an item, and the order its number
+    /// sets come back in. A new response type that carries an item belongs
+    /// here, with the order DynamoDB uses for it, so it can't silently get the
+    /// other one.
+    #[test]
+    fn every_response_item_field_orders_number_sets_as_dynamodb_does() {
+        use crate::actions::*;
+        use serde_json::{Value, to_value};
+
+        let members = strings(&["1", "2", "3"]);
+        let numeric: Vec<&str> = vec!["1", "2", "3"];
+        let hash: Vec<&str> = java_hash_order(&members);
+        assert_ne!(
+            numeric, hash,
+            "the two orders must differ for this to test anything"
+        );
+        let item = || -> Item { [("ns".to_string(), AttributeValue::NS(members.clone()))].into() };
+        let ns = |v: Value, pointer: &str| -> Vec<String> {
+            v.pointer(pointer)
+                .and_then(|ns| ns.as_array())
+                .unwrap_or_else(|| panic!("no number set at {pointer} in {v}"))
+                .iter()
+                .map(|n| n.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let cases: Vec<(&str, Value, &str, &Vec<&str>)> = vec![
+            (
+                "Scan",
+                to_value(scan::ScanResponse {
+                    items: Some(vec![item()]),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Items/0/ns/NS",
+                &hash,
+            ),
+            (
+                "ExecuteStatement",
+                to_value(execute_statement::ExecuteStatementResponse {
+                    items: Some(vec![item()]),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Items/0/ns/NS",
+                &hash,
+            ),
+            (
+                "BatchExecuteStatement",
+                to_value(batch_execute_statement::BatchStatementResponse {
+                    item: Some(item()),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Item/ns/NS",
+                &hash,
+            ),
+            (
+                "TransactGetItems",
+                to_value(transact_get_items::TransactGetResponse { item: Some(item()) }).unwrap(),
+                "/Item/ns/NS",
+                &hash,
+            ),
+            (
+                "ExecuteTransaction",
+                to_value(execute_transaction::ItemResponse { item: Some(item()) }).unwrap(),
+                "/Item/ns/NS",
+                &hash,
+            ),
+            (
+                "stream NewImage",
+                to_value(get_records::StreamRecord {
+                    new_image: Some(item()),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/NewImage/ns/NS",
+                &hash,
+            ),
+            (
+                "stream OldImage",
+                to_value(get_records::StreamRecord {
+                    old_image: Some(item()),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/OldImage/ns/NS",
+                &hash,
+            ),
+            (
+                "cancellation reason",
+                to_value(crate::errors::CancellationReason {
+                    item: Some(item()),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Item/ns/NS",
+                &hash,
+            ),
+            (
+                "GetItem",
+                to_value(get_item::GetItemResponse {
+                    item: Some(item()),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Item/ns/NS",
+                &numeric,
+            ),
+            (
+                "Query",
+                to_value(query::QueryResponse {
+                    items: Some(vec![item()]),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Items/0/ns/NS",
+                &numeric,
+            ),
+            (
+                "PutItem ReturnValues",
+                to_value(put_item::PutItemResponse {
+                    attributes: Some(item()),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Attributes/ns/NS",
+                &numeric,
+            ),
+            (
+                "UpdateItem ReturnValues",
+                to_value(update_item::UpdateItemResponse {
+                    attributes: Some(item()),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Attributes/ns/NS",
+                &numeric,
+            ),
+            (
+                "DeleteItem ReturnValues",
+                to_value(delete_item::DeleteItemResponse {
+                    attributes: Some(item()),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Attributes/ns/NS",
+                &numeric,
+            ),
+            (
+                "BatchGetItem",
+                to_value(batch_get_item::BatchGetItemResponse {
+                    responses: [("tbl".to_string(), vec![item()])].into(),
+                    ..Default::default()
+                })
+                .unwrap(),
+                "/Responses/tbl/0/ns/NS",
+                &numeric,
+            ),
+            // Not captured: the item on a ConditionalCheckFailed error and a
+            // vector search hit follow AttributeValue's own (numeric) order.
+            (
+                "ConditionalCheckFailed item (inferred)",
+                to_value(crate::errors::ErrorResponse {
+                    error_type: String::new(),
+                    message: String::new(),
+                    item: Some(item()),
+                })
+                .unwrap(),
+                "/Item/ns/NS",
+                &numeric,
+            ),
+            (
+                "SearchVectors hit (inferred)",
+                to_value(search_vectors::SearchResult {
+                    item: item(),
+                    score: 0.0,
+                })
+                .unwrap(),
+                "/Item/ns/NS",
+                &numeric,
+            ),
+        ];
+        for (surface, value, pointer, expected) in cases {
+            assert_eq!(&ns(value, pointer), expected, "{surface}");
+        }
     }
 }

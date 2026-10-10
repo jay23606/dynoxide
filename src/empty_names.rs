@@ -91,20 +91,26 @@ pub(crate) fn placeholder_message(placeholder: &str) -> String {
     format!("ExpressionAttributeNames contains invalid value: {MESSAGE} for key {placeholder}")
 }
 
+/// Refuse an ExpressionAttributeNames entry whose name is empty, bare, with
+/// DynamoDB's message naming the first such placeholder.
+pub(crate) fn check_names(names: Option<&HashMap<String, String>>) -> Result<()> {
+    match empty_placeholder(names) {
+        Some(placeholder) => Err(DynoxideError::ValidationException(placeholder_message(
+            placeholder,
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The first ExpressionAttributeValues key, in key order, whose value holds an
-/// empty name. Reads the parsed values when the request has them, otherwise the
-/// raw JSON some operations keep until later.
+/// empty name. Reads the raw JSON when the request carries it, as the
+/// validator does, otherwise the parsed values.
 pub(crate) fn value_placeholder<'a>(
     values: Option<&'a HashMap<String, AttributeValue>>,
     raw: Option<&'a serde_json::Value>,
 ) -> Option<&'a str> {
-    let mut found: Vec<&str> = match (values, raw) {
-        (Some(values), _) => values
-            .iter()
-            .filter(|(_, value)| value_has_empty_name(value))
-            .map(|(key, _)| key.as_str())
-            .collect(),
-        (None, Some(raw)) => raw
+    let mut found: Vec<&str> = match (raw, values) {
+        (Some(raw), _) => raw
             .as_object()
             .map(|map| {
                 map.iter()
@@ -113,6 +119,11 @@ pub(crate) fn value_placeholder<'a>(
                     .collect()
             })
             .unwrap_or_default(),
+        (None, Some(values)) => values
+            .iter()
+            .filter(|(_, value)| value_has_empty_name(value))
+            .map(|(key, _)| key.as_str())
+            .collect(),
         (None, None) => Vec::new(),
     };
     found.sort_unstable();
@@ -259,5 +270,15 @@ mod tests {
         assert!(expected_has_empty_name(Some(&expected_name)));
         let expected_value = json!({"x": {"Value": {"M": {"": {"S": "x"}}}}});
         assert!(expected_has_empty_name(Some(&expected_value)));
+    }
+
+    #[test]
+    fn the_raw_values_are_read_when_a_request_carries_both() {
+        // An in-process request can carry parsed values and the raw JSON the
+        // validator reads; the check must look where the validator looks.
+        let parsed = map(&[(":v", AttributeValue::S("clean".into()))]);
+        let raw = json!({":v": {"M": {"": {"S": "x"}}}});
+        assert_eq!(value_placeholder(Some(&parsed), Some(&raw)), Some(":v"));
+        assert_eq!(value_placeholder(Some(&parsed), None), None);
     }
 }

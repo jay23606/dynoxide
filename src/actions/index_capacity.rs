@@ -126,7 +126,7 @@ pub(crate) fn unchanged(old: &Item, new: &Item) -> bool {
             .all(|(name, a)| new.get(name).is_some_and(|b| value_unchanged(a, b)))
 }
 
-fn value_unchanged(a: &AttributeValue, b: &AttributeValue) -> bool {
+pub(crate) fn value_unchanged(a: &AttributeValue, b: &AttributeValue) -> bool {
     match (a, b) {
         (AttributeValue::SS(x), AttributeValue::SS(y)) => set_unchanged(x, y),
         (AttributeValue::NS(x), AttributeValue::NS(y)) => set_unchanged(x, y),

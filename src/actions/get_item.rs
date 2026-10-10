@@ -105,6 +105,8 @@ impl<'de> serde::Deserialize<'de> for GetItemRequest {
 #[derive(Debug, Default, Serialize)]
 pub struct GetItemResponse {
     #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub item: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
     pub consumed_capacity: Option<types::ConsumedCapacity>,
@@ -124,13 +126,7 @@ pub async fn execute<S: StorageBackend>(
     {
         return Err(crate::empty_names::bare());
     }
-    if let Some(placeholder) =
-        crate::empty_names::empty_placeholder(request.expression_attribute_names.as_ref())
-    {
-        return Err(DynoxideError::ValidationException(
-            crate::empty_names::placeholder_message(placeholder),
-        ));
-    }
+    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
 
     // Validate expression/non-expression parameter conflicts
     {

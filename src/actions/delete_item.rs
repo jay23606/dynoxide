@@ -135,6 +135,8 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
 #[derive(Debug, Default, Serialize)]
 pub struct DeleteItemResponse {
     #[serde(rename = "Attributes", skip_serializing_if = "Option::is_none")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub attributes: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
     pub consumed_capacity: Option<types::ConsumedCapacity>,

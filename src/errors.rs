@@ -17,6 +17,8 @@ pub struct CancellationReason {
         skip_serializing_if = "Option::is_none",
         serialize_with = "crate::set_order::item_in_hash_order"
     )]
+    // Number sets in Java hash-set order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub item: Option<HashMap<String, crate::types::AttributeValue>>,
 }
 
@@ -334,6 +336,8 @@ pub struct ErrorResponse {
     #[serde(rename = "message")]
     pub message: String,
     #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub item: Option<HashMap<String, crate::types::AttributeValue>>,
 }
 

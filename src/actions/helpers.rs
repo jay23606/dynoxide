@@ -391,9 +391,13 @@ fn run_index_key_validation(
             continue; // absent -> sparse, not an error
         };
         if let Some(before) = before
-            && before.get(&entry.attr) == Some(val)
+            && before
+                .get(&entry.attr)
+                .is_some_and(|old| super::index_capacity::value_unchanged(old, val))
         {
-            continue; // unchanged by this update
+            // Unchanged by this update. Sets compare as sets: a row stored
+            // before sets were sorted holds the same set in another order.
+            continue;
         }
         if let Some(violation) = check_index_key_value(val, &entry.declared) {
             violations.push((entry.index_name.clone(), entry.attr.clone(), violation));

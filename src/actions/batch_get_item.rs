@@ -31,6 +31,8 @@ pub struct KeysAndAttributes {
 #[derive(Debug, Default, Serialize)]
 pub struct BatchGetItemResponse {
     #[serde(rename = "Responses")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub responses: HashMap<String, Vec<Item>>,
     #[serde(rename = "UnprocessedKeys")]
     pub unprocessed_keys: HashMap<String, serde_json::Value>,
@@ -127,13 +129,7 @@ pub async fn execute<S: StorageBackend>(
         {
             return Err(crate::empty_names::bare());
         }
-        if let Some(placeholder) =
-            crate::empty_names::empty_placeholder(ka.expression_attribute_names.as_ref())
-        {
-            return Err(DynoxideError::ValidationException(
-                crate::empty_names::placeholder_message(placeholder),
-            ));
-        }
+        crate::empty_names::check_names(ka.expression_attribute_names.as_ref())?;
     }
 
     // Reject a request that pairs an expression projection with a non-expression

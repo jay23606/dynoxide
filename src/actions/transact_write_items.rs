@@ -186,11 +186,7 @@ fn empty_name_in_write_action(item: &TransactWriteItem) -> Result<()> {
     if crate::empty_names::map_has_empty_name(attributes) {
         return Err(crate::empty_names::bare());
     }
-    if let Some(placeholder) = crate::empty_names::empty_placeholder(names) {
-        return Err(DynoxideError::ValidationException(
-            crate::empty_names::placeholder_message(placeholder),
-        ));
-    }
+    crate::empty_names::check_names(names)?;
     if let Some(key) = crate::empty_names::value_placeholder(values, None) {
         return Err(DynoxideError::ValidationException(
             crate::empty_names::value_placeholder_message(key),

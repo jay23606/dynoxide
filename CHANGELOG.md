@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DynamoDB's document path error where it used to create a map or a list
   there. This covers `UpdateItem` and `TransactWriteItems` updates; PartiQL
   `UPDATE` already appended. Captured against eu-west-2.
+- For Rust users of the crate: `AttributeValue`'s `Serialize` writes set
+  members in DynamoDB's order (string and binary sets by their bytes, number
+  sets by value), so a set no longer keeps the order it was built in through
+  serde. Normalising an item for a write sorts its sets in place.
 
 ### Added
 
@@ -555,7 +559,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order of a Java hash set from Scan, TransactGetItems, the PartiQL
   operations, stream records and transaction cancellation reasons, as
   DynamoDB returns them. Sets are now stored sorted, and a row stored before
-  this change is sorted as it is read.
+  this change comes back sorted in responses on the wire (HTTP, MCP and wasm);
+  the Rust API returns such a row's sets as they were stored. An update that
+  leaves such a set alone no longer fails the type check for an index key the
+  set's attribute is named after.
 - An empty attribute name is refused with DynamoDB's `Empty attribute name`
   before the table is looked up: in an item or a key, as a map key at any
   depth inside a value, in AttributesToGet, in the legacy Expected,

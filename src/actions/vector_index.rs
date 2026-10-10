@@ -226,7 +226,11 @@ fn run_vector_write_validation(
 
     let changed = |attr: &str, val: &AttributeValue| -> bool {
         match before {
-            Some(b) => b.get(attr) != Some(val),
+            // Sets compare as sets, so a set stored in another order before
+            // sets were sorted doesn't count as changed.
+            Some(b) => !b
+                .get(attr)
+                .is_some_and(|old| super::index_capacity::value_unchanged(old, val)),
             None => true,
         }
     };

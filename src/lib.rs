@@ -1594,6 +1594,65 @@ mod tests {
     }
 
     #[test]
+    fn an_unrelated_update_leaves_an_unsorted_stored_set_under_an_index_key_alone() {
+        let db = Database::memory().unwrap();
+        db.create_table(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "BillingMode": "PAY_PER_REQUEST",
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        db.put_item(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "Item": {"pk": {"S": "k"}, "g": {"SS": ["a", "b"]}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // As a build before sets were sorted would have stored it.
+        let changed = db
+            .with_storage(|s| {
+                Ok(s.conn().execute(
+                    "UPDATE \"tbl\" SET item_json = replace(item_json, '\"SS\":[\"a\",\"b\"]', '\"SS\":[\"b\",\"a\"]')",
+                    [],
+                )?)
+            })
+            .unwrap();
+        assert_eq!(changed, 1, "the fixture must hold an unsorted set");
+        // `g` becomes a GSI key; the set is the wrong type for it, so the
+        // backfill leaves the item out of the index.
+        db.update_table(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
+                "GlobalSecondaryIndexUpdates": [{"Create": {
+                    "IndexName": "byG",
+                    "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"}
+                }}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        db.update_item(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "Key": {"pk": {"S": "k"}},
+                "UpdateExpression": "SET note = :v",
+                "ExpressionAttributeValues": {":v": {"S": "x"}}
+            }))
+            .unwrap(),
+        )
+        .expect("an update that doesn't touch g must not re-check g against the index");
+    }
+
+    #[test]
     fn test_database_memory() {
         let db = Database::memory().unwrap();
         // Should be able to clone (Arc)

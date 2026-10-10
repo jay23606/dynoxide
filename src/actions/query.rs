@@ -150,6 +150,8 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
 #[derive(Debug, Default, Serialize)]
 pub struct QueryResponse {
     #[serde(rename = "Items", skip_serializing_if = "Option::is_none")]
+    // Number sets in numeric order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub items: Option<Vec<Item>>,
     #[serde(rename = "Count")]
     pub count: usize,
@@ -185,13 +187,7 @@ pub async fn execute<S: StorageBackend>(
     {
         return Err(crate::empty_names::bare());
     }
-    if let Some(placeholder) =
-        crate::empty_names::empty_placeholder(request.expression_attribute_names.as_ref())
-    {
-        return Err(DynoxideError::ValidationException(
-            crate::empty_names::placeholder_message(placeholder),
-        ));
-    }
+    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
     if crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
         .is_some()
     {

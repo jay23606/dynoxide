@@ -196,6 +196,8 @@ pub struct ScanResponse {
         skip_serializing_if = "Option::is_none",
         serialize_with = "crate::set_order::items_in_hash_order"
     )]
+    // Number sets in Java hash-set order here, as DynamoDB returns them;
+    // pinned by set_order's every_response_item_field test.
     pub items: Option<Vec<Item>>,
     #[serde(rename = "Count")]
     pub count: usize,
@@ -250,13 +252,7 @@ pub async fn execute<S: StorageBackend>(
             crate::empty_names::MESSAGE
         )));
     }
-    if let Some(placeholder) =
-        crate::empty_names::empty_placeholder(request.expression_attribute_names.as_ref())
-    {
-        return Err(DynoxideError::ValidationException(
-            crate::empty_names::placeholder_message(placeholder),
-        ));
-    }
+    crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
     if let Some(key) =
         crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
     {
