@@ -505,14 +505,17 @@ pub async fn execute<S: StorageBackend>(
                         // carry it; a `ValidationError` does not, which is what
                         // an invalid RETURNING variant or a bad expression is.
                         // Captured eu-west-2 2026-08-15 for the first pair and
-                        // 2026-07 for the second.
+                        // 2026-07 for the second. A key too large to read is
+                        // the exception: the statement ran its key read and
+                        // failed there, and DynamoDB echoes the table with that
+                        // ValidationError (captured eu-west-2 and us-east-1,
+                        // 2026-10-10).
                         let code = e.short_error_code().to_string();
-                        let echoes_table = code != "ValidationError";
+                        let message = e.to_string();
+                        let echoes_table = code != "ValidationError"
+                            || message == crate::actions::helpers::HASH_KEY_TOO_LARGE;
                         BatchStatementResponse {
-                            error: Some(BatchStatementError {
-                                code,
-                                message: e.to_string(),
-                            }),
+                            error: Some(BatchStatementError { code, message }),
                             item: None,
                             table_name: if echoes_table { table } else { None },
                         }

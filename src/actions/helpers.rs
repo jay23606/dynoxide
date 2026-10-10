@@ -213,9 +213,7 @@ fn validate_item_keys_inner(
     let pk_size = key_attribute_size(pk_val);
     if pk_size > 2048 {
         return Err(DynoxideError::ValidationException(
-            "One or more parameter values were invalid: \
-             Size of hashkey has exceeded the maximum size limit of2048 bytes"
-                .to_string(),
+            HASH_KEY_TOO_LARGE.to_string(),
         ));
     }
 
@@ -482,9 +480,7 @@ pub fn validate_key_only(key: &HashMap<String, AttributeValue>, schema: &KeySche
     let pk_size = key_attribute_size(pk_val);
     if pk_size > 2048 {
         return Err(DynoxideError::ValidationException(
-            "One or more parameter values were invalid: \
-             Size of hashkey has exceeded the maximum size limit of2048 bytes"
-                .to_string(),
+            HASH_KEY_TOO_LARGE.to_string(),
         ));
     }
 
@@ -628,8 +624,13 @@ fn validate_key_type_for_key_op(
     Ok(())
 }
 
+/// DynamoDB's refusal of a partition key value over 2,048 bytes, spelled as
+/// it spells it (no space before the figure).
+pub(crate) const HASH_KEY_TOO_LARGE: &str = "One or more parameter values were invalid: \
+     Size of hashkey has exceeded the maximum size limit of2048 bytes";
+
 /// Return the byte size of a key attribute value for size limit checks.
-fn key_attribute_size(val: &AttributeValue) -> usize {
+pub(crate) fn key_attribute_size(val: &AttributeValue) -> usize {
     match val {
         AttributeValue::S(s) => s.len(),
         AttributeValue::N(n) => n.len(),

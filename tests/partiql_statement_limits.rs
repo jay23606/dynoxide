@@ -88,12 +88,63 @@ fn a_statement_over_8192_code_points_is_refused_as_a_member() {
     );
 }
 
+const HASH_KEY_TOO_LARGE: &str = "One or more parameter values were invalid: \
+                                  Size of hashkey has exceeded the maximum size limit of2048 bytes";
+
 #[test]
 fn the_limit_counts_code_points_not_bytes() {
     let db = setup();
-    // 8,192 code points, but more bytes and more UTF-16 units than that.
-    assert_eq!(single(&db, &select_of_length(8192, 'é')), Ok(()));
-    assert_eq!(single(&db, &select_of_length(8192, '\u{1F600}')), Ok(()));
+    // 8,192 code points, but more bytes and more UTF-16 units than that: the
+    // length check lets them through, and the key literal they pad is then too
+    // large for a hash key, which is DynamoDB's answer to both (captured
+    // eu-west-2 and us-east-1, 2026-10-10). An 8,193-code-point statement is
+    // refused as a member before the key is looked at.
+    assert_eq!(
+        single(&db, &select_of_length(8192, 'é')),
+        Err(HASH_KEY_TOO_LARGE.to_string())
+    );
+    assert_eq!(
+        single(&db, &select_of_length(8192, '\u{1F600}')),
+        Err(HASH_KEY_TOO_LARGE.to_string())
+    );
+}
+
+#[test]
+fn a_key_literal_over_2048_bytes_is_refused() {
+    // Captured eu-west-2 and us-east-1, 2026-10-10, with `pk = '<8,160 x>'`:
+    // ExecuteStatement refuses it, BatchExecuteStatement fails that statement
+    // and echoes its table, and ExecuteTransaction cancels with the
+    // ValidationError reason.
+    let db = setup();
+    let long = select_of_length(8192, 'x');
+    assert_eq!(single(&db, &long), Err(HASH_KEY_TOO_LARGE.to_string()));
+
+    let request: BatchExecuteStatementRequest =
+        serde_json::from_value(json!({"Statements": [{"Statement": long}]})).unwrap();
+    let response = db.batch_execute_statement(request).unwrap();
+    let member = &response.responses[0];
+    let error = member.error.as_ref().expect("the statement fails");
+    assert_eq!(
+        (error.code.as_str(), error.message.as_str()),
+        ("ValidationError", HASH_KEY_TOO_LARGE)
+    );
+    assert_eq!(member.table_name.as_deref(), Some("Limits"));
+
+    assert_eq!(
+        transaction(&db, &[&long]),
+        Err(
+            "Transaction cancelled, please refer cancellation reasons for specific reasons \
+             [ValidationError]"
+                .to_string()
+        )
+    );
+
+    // The boundary is PutItem's: 2,048 bytes run, 2,049 don't (inferred for
+    // PartiQL from the PutItem limit; only the 8,160-byte key was captured).
+    let at = format!("SELECT * FROM \"Limits\" WHERE pk = '{}'", "x".repeat(2048));
+    let over = format!("SELECT * FROM \"Limits\" WHERE pk = '{}'", "x".repeat(2049));
+    assert_eq!(single(&db, &at), Ok(()));
+    assert_eq!(single(&db, &over), Err(HASH_KEY_TOO_LARGE.to_string()));
 }
 
 #[test]

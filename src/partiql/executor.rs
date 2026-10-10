@@ -1793,7 +1793,18 @@ async fn evaluate_window<S: StorageBackend>(
     // A partition key value no key can have only gets this far when the clause
     // isn't read by key (see `check_read_key_types`), and it matches no row.
     let pk_key = match pk_condition {
-        Some(value) => Some(resolve_value(value, parameters)?.to_key_string()),
+        Some(value) => {
+            let value = resolve_value(value, parameters)?;
+            // A key read with a partition key value no key can be is refused as
+            // GetItem refuses it (captured eu-west-2 and us-east-1, 2026-10-10,
+            // on the base table; an index's key is left alone, not captured).
+            if index.is_none() && crate::actions::helpers::key_attribute_size(&value) > 2048 {
+                return Err(DynoxideError::ValidationException(
+                    crate::actions::helpers::HASH_KEY_TOO_LARGE.to_string(),
+                ));
+            }
+            Some(value.to_key_string())
+        }
         None => None,
     };
 
