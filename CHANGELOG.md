@@ -141,9 +141,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and bare elsewhere. A transaction's `Update` with an empty
   `UpdateExpression` is refused up front with `Invalid UpdateExpression: The
   expression can not be empty;`, where it wrote an item holding only its key,
-  and `TransactGetItems` refuses an empty `ProjectionExpression` as `GetItem`
-  does. Captured against eu-west-2 and us-east-1, the transactions also
-  against ap-southeast-2 and eu-central-1.
+  and `TransactGetItems` refuses an empty or whitespace `ProjectionExpression`
+  as `GetItem` does, before it looks up any table. Captured against eu-west-2
+  and us-east-1, the transactions also against ap-southeast-2 and
+  eu-central-1.
 - A legacy `QueryFilter` or `ScanFilter` condition with a `ComparisonOperator`
   DynamoDB doesn't have, such as `FOO`, or with none at all, was dropped, so
   the Query or Scan ran without it, and one whose every condition dropped
@@ -158,6 +159,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ap-southeast-2, eu-central-1 and us-east-1; us-east-1 answers an unknown
   operator with the member's enum constraint instead, and the other three
   regions are followed.
+- A legacy `AttributeUpdates` action written in another case, such as `put`
+  or `Delete`, was read as its upper-case form and applied. 1.2.1 did this
+  too. An action other than `ADD`, `DELETE` or `PUT` is now refused before the
+  table is looked up, with DynamoDB's own text: `1 validation error detected:
+  Member must satisfy enum value set: [ADD, DELETE, PUT]' for Action`.
+  Captured against eu-west-2 and us-east-1.
 - A legacy condition on an attribute whose name holds a `-`, a `.` or a
   character outside ASCII, such as `user-id` or `s.k`, was refused with a
   syntax error naming an internal placeholder, such as `near: "#kc_user-id"`.
@@ -948,7 +955,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error message of hundreds of megabytes. The limit is Dynoxide's own;
   what DynamoDB does with an echo that size has not been captured.
 - A malformed `Expected` condition on `PutItem`, `UpdateItem` or `DeleteItem`
-  is refused rather than ignored. An unknown `ComparisonOperator` gets
+  is refused rather than ignored. 1.2.1 ran the write with no condition at
+  all, so a guarded `DeleteItem` deleted the item. An unknown `ComparisonOperator` gets
   DynamoDB's "Invalid comparison operator" message, and `EQ` with an empty
   `AttributeValueList` its "Invalid number of argument(s)" message. Captured
   against eu-west-2 and us-east-1.

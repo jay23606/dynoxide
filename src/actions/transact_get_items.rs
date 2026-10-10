@@ -222,6 +222,30 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
+    // ProjectionExpressions are checked before any table is looked up: an
+    // empty or whitespace-only one on a Get against a missing table is refused
+    // as a ValidationException, not reported as the missing table (captured
+    // eu-west-2, 2026-10-10).
+    for transact_item in &request.transact_items {
+        let get = &transact_item.get;
+        if let Some(proj_expr) = &get.projection_expression {
+            if proj_expr.is_empty() {
+                return Err(DynoxideError::ValidationException(
+                    "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
+                ));
+            }
+            let projection = expressions::projection::parse(proj_expr)
+                .map_err(DynoxideError::ValidationException)?;
+            let tracker = crate::expressions::TrackedExpressionAttributes::new(
+                &get.expression_attribute_names,
+                &None,
+            );
+            tracker.track_projection_expr(&projection);
+            expressions::projection::validate(&projection, &tracker)
+                .map_err(DynoxideError::ValidationException)?;
+        }
+    }
+
     // Per-action validation pass.
     //
     // AWS surfaces per-action validation failures (empty Key, schema mismatch,
@@ -320,14 +344,7 @@ pub async fn execute<S: StorageBackend>(
         );
 
         let item = if let Some(proj_expr) = &get.projection_expression {
-            // An empty expression is refused as GetItem refuses one (inferred:
-            // GetItem's answer, not captured here). Parsed, it would be a
-            // syntax error at its end.
-            if proj_expr.is_empty() {
-                return Err(DynoxideError::ValidationException(
-                    "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
-                ));
-            }
+            // Already checked before the tables were looked up.
             let projection = expressions::projection::parse(proj_expr)
                 .map_err(DynoxideError::ValidationException)?;
             tracker.track_projection_expr(&projection);

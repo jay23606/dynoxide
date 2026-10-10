@@ -267,7 +267,7 @@ fn every_other_surface_refuses_a_whitespace_expression() {
 /// even against a table that doesn't exist (captured eu-west-2 and us-east-1,
 /// 9 October 2026), where it used to write an item holding only its key. An
 /// empty ProjectionExpression in a TransactGetItems is refused as GetItem
-/// refuses one (inferred).
+/// refuses one.
 #[test]
 fn an_empty_expression_in_a_transaction_is_refused_up_front() {
     let db = db();
@@ -295,4 +295,30 @@ fn an_empty_expression_in_a_transaction_is_refused_up_front() {
         refusal(transact_get, "TransactGetItems"),
         "Invalid ProjectionExpression: The expression can not be empty;"
     );
+}
+
+/// A TransactGetItems ProjectionExpression is checked before any table is
+/// looked up: an empty or whitespace-only one on a Get against a table that
+/// doesn't exist is refused as a ValidationException rather than reported as
+/// the missing table (captured eu-west-2, 10 October 2026).
+#[test]
+fn a_transaction_projection_is_refused_before_the_table_is_looked_up() {
+    let db = db();
+    for (projection, expected) in [
+        (
+            "",
+            "Invalid ProjectionExpression: The expression can not be empty;".to_string(),
+        ),
+        (BLANK, syntax_error("Projection", BLANK)),
+    ] {
+        let got = db.transact_get_items(request(json!({
+            "TransactItems": [{"Get": {
+                "TableName": "Absent", "Key": key(), "ProjectionExpression": projection
+            }}]
+        })));
+        assert_eq!(
+            refusal(got, "TransactGetItems on a missing table"),
+            expected
+        );
+    }
 }

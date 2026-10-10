@@ -226,6 +226,12 @@ pub struct AttributeValueUpdate {
     pub value: Option<AttributeValue>,
 }
 
+/// DynamoDB's refusal of an `AttributeUpdates` action other than `ADD`,
+/// `DELETE` or `PUT`, written exactly. Tagged for the envelope, which adds
+/// `1 validation error detected: `.
+const ATTRIBUTE_UPDATE_ACTION_REJECTION: &str =
+    "Member must satisfy enum value set: [ADD, DELETE, PUT]' for Action";
+
 fn default_put_action() -> String {
     "PUT".to_string()
 }
@@ -403,7 +409,15 @@ async fn execute_inner<S: StorageBackend>(
         && let Some(ref updates) = request.attribute_updates
     {
         for update in updates.values() {
-            let action = update.action.to_uppercase();
+            // The action is matched exactly: `put` or `Delete` is refused
+            // before the table is looked up (eu-west-2 and us-east-1,
+            // 2026-10-10). The stray quote is DynamoDB's own.
+            let action = update.action.as_str();
+            if !["ADD", "DELETE", "PUT"].contains(&action) {
+                return Err(DynoxideError::EnvelopedValidation(
+                    ATTRIBUTE_UPDATE_ACTION_REJECTION.to_string(),
+                ));
+            }
             if update.value.is_none() && action != "DELETE" {
                 return Err(DynoxideError::ValidationException(
                     "One or more parameter values were invalid: \
@@ -953,8 +967,7 @@ fn apply_attribute_updates(
             return Err(helpers::key_attribute_update_refusal(attr_name));
         }
 
-        let action = update.action.to_uppercase();
-        match action.as_str() {
+        match update.action.as_str() {
             "PUT" => {
                 if let Some(ref value) = update.value {
                     item.insert(attr_name.clone(), value.clone());
@@ -983,10 +996,9 @@ fn apply_attribute_updates(
                 }
             }
             _ => {
-                return Err(DynoxideError::ValidationException(format!(
-                    "1 validation error detected: Value '{action}' at 'attributeUpdates.{attr_name}.member.action' \
-                     failed to satisfy constraint: Member must satisfy enum value set: [ADD, PUT, DELETE]"
-                )));
+                return Err(DynoxideError::EnvelopedValidation(
+                    ATTRIBUTE_UPDATE_ACTION_REJECTION.to_string(),
+                ));
             }
         }
     }
