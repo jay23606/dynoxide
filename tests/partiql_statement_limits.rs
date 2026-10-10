@@ -133,6 +133,45 @@ fn a_where_clause_past_300_operators_is_refused() {
     );
 }
 
+/// AND, OR, NOT, comparison operators and calls to WHERE functions all count
+/// toward the 300: `pk = 'a'` is one, and each copy below adds the operators
+/// it holds. Every row is the last count DynamoDB runs and the first it
+/// refuses (captured eu-west-2 and us-east-1, 2026-10-10), except the
+/// `NOT begins_with` row, which follows from the same counts: its NOT counts
+/// as any other does.
+#[test]
+fn comparisons_and_function_calls_count_toward_the_operator_limit() {
+    let db = setup();
+    let message = "The expression contains too many operators; operator count: 301";
+    for (copy, last_run) in [
+        (" AND x = 1", 149),
+        (" AND NOT x = 1", 99),
+        (" AND begins_with(s, 'a')", 149),
+        (" AND size(s) > 0", 99),
+        (" AND x < 9", 149),
+        (" OR x = 1", 149),
+        (" AND NOT begins_with(s, 'a')", 99),
+    ] {
+        let statement = |copies: usize| {
+            format!(
+                r#"SELECT * FROM "Limits" WHERE pk = 'a'{}"#,
+                copy.repeat(copies)
+            )
+        };
+        assert_eq!(
+            single(&db, &statement(last_run)),
+            Ok(()),
+            "{copy} x {last_run}"
+        );
+        assert_eq!(
+            single(&db, &statement(last_run + 1)),
+            Err(message.to_string()),
+            "{copy} x {}",
+            last_run + 1
+        );
+    }
+}
+
 #[test]
 fn a_run_of_nots_or_signs_with_no_term_is_an_unexpected_term() {
     let db = setup();

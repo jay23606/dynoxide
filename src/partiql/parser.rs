@@ -2355,7 +2355,10 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
 /// turns a negated conjunction into a disjunction, so counting groups afterwards
 /// reports an `OR` in a clause that never had one.
 fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, String> {
-    let expr = parse_or_expr(t, 0)?;
+    t.reading_where = true;
+    let expr = parse_or_expr(t, 0);
+    t.reading_where = false;
+    let expr = expr?;
     if let Some((operator, kind)) = non_boolean(&expr, None) {
         t.note_operand_refusal(match operator {
             Some(operator) => format!(
@@ -3369,10 +3372,12 @@ fn condition_bytes(condition: &WhereCondition) -> usize {
 /// The rejection every descent shares when it runs past `MAX_EXPR_DEPTH`.
 const TOO_DEEP: &str = "Statement is nested too deeply to parse";
 
-/// How many operators a WHERE clause may hold: DynamoDB refuses the 301st
-/// (`operator count: 301` for 1,020 NOTs; captured eu-west-2 and us-east-1,
-/// 2026-10-10). NOT, AND and OR are counted; whether a comparison or a
-/// function counts as well wasn't captured.
+/// How many operators a WHERE clause may hold: DynamoDB refuses the 301st,
+/// always as `operator count: 301`. AND, OR, NOT, a comparison operator and a
+/// call to a WHERE function each count one, so `pk = 'a'` followed by 149
+/// `AND x = 1` (299 operators) runs and 150 is refused, and `AND size(s) > 0`
+/// costs three (captured eu-west-2 and us-east-1, 2026-10-10). Whether
+/// BETWEEN, IN and IS count wasn't captured, so they don't here.
 const MAX_OPERATORS: usize = 300;
 
 /// The OR-of-ANDs a clause flattens to: shared conditions, grouped.
@@ -3507,6 +3512,8 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
             Ok(WhereCondition::Contains(path, value))
         }
         "NOT" => {
+            // The NOT in front of BEGINS_WITH is an operator like any other.
+            t.count_operator();
             let func = t.next_token()?.ok_or("Expected function name after NOT")?;
             if func.eq_ignore_ascii_case("BEGINS_WITH") {
                 expect_char(t, "(")?;
@@ -4511,6 +4518,10 @@ struct Tokenizer {
     depth: usize,
     /// How many operators the WHERE clause has held so far.
     operators: usize,
+    /// Whether a WHERE clause's conditions are being read, so its comparison
+    /// operators and function calls count against `MAX_OPERATORS` as they
+    /// are consumed.
+    reading_where: bool,
 }
 
 /// One refusal DynamoDB makes as it reads a statement's terms.
@@ -4549,6 +4560,7 @@ impl Tokenizer {
             operand_refusal: None,
             depth: 0,
             operators: 0,
+            reading_where: false,
         })
     }
 
@@ -4751,6 +4763,17 @@ impl Tokenizer {
         }
         let tok = self.tokens[self.pos].clone();
         self.pos += 1;
+        // A comparison operator or a call to a WHERE function is an operator
+        // DynamoDB counts, as AND, OR and NOT are, wherever the condition
+        // parser reads it (captured eu-west-2 and us-east-1, 2026-10-10).
+        if self.reading_where {
+            let calls = self.tokens.get(self.pos).is_some_and(|next| next == "(");
+            if is_comparison_operator(&tok)
+                || (calls && WHERE_FUNCTIONS.iter().any(|f| tok.eq_ignore_ascii_case(f)))
+            {
+                self.count_operator();
+            }
+        }
         Ok(Some(tok))
     }
 
