@@ -3183,6 +3183,11 @@ fn negate_condition(cond: WhereCondition) -> Result<BoolExpr, String> {
         // Not `< low OR > high`, which would drop a row with no such attribute.
         W::Between(p, low, high) => W::NotBetween(p, low, high).into(),
         W::NotBetween(p, low, high) => W::Between(p, low, high).into(),
+        // De Morgan copies the path once per value; refuse before copying a
+        // long path thousands of times.
+        W::In(p, values) if p.len().saturating_mul(values.len()) > MAX_CLAUSE_BYTES => {
+            return Err(TOO_COMPLEX.to_string());
+        }
         W::In(p, values) => BoolExpr::And(
             values
                 .into_iter()
@@ -3239,6 +3244,66 @@ const MAX_TOTAL_CONDITIONS: usize = 4096;
 
 /// The rejection every clause-complexity budget shares.
 const TOO_COMPLEX: &str = "WHERE clause is too complex to evaluate";
+
+/// How many bytes of paths and literal values a flattened clause may hold.
+///
+/// `MAX_TOTAL_CONDITIONS` counts conditions, not their size, and a condition
+/// can carry a long path: De Morgan copies a negated `IN`'s path once per
+/// value, and every cross product copies whole groups again, so a statement
+/// within the 8,192-character limit could still hold tens of megabytes, and a
+/// transaction of a hundred such statements gigabytes, before the count cap
+/// tripped. No clause written for a real table comes near this budget.
+const MAX_CLAUSE_BYTES: usize = 1024 * 1024;
+
+/// The bytes a condition holds in paths and literal values, for
+/// `MAX_CLAUSE_BYTES`. Parameters are referred to by index, so they cost
+/// nothing here.
+fn condition_bytes(condition: &WhereCondition) -> usize {
+    fn value(v: &PartiqlValue) -> usize {
+        match v {
+            PartiqlValue::Literal(av) => av.size(),
+            PartiqlValue::Parameter(_) => 0,
+        }
+    }
+    fn operand(o: &Operand) -> usize {
+        match o {
+            Operand::Path(p) => p.len(),
+            Operand::Value(v) => value(v),
+            Operand::Size(inner) => operand(inner),
+        }
+    }
+    use WhereCondition as W;
+    match condition {
+        W::Comparison(c) | W::NotComparison(c) => c.path.len() + value(&c.value),
+        W::Exists(p) | W::NotExists(p) | W::IsMissing(p) | W::IsNotMissing(p) => p.len(),
+        W::IsType(p, _) | W::IsNotType(p, _) => p.len(),
+        W::BeginsWith(p, v) | W::NotBeginsWith(p, v) | W::Contains(p, v) | W::NotContains(p, v) => {
+            p.len() + value(v)
+        }
+        W::Between(p, low, high) | W::NotBetween(p, low, high) => {
+            p.len() + value(low) + value(high)
+        }
+        W::In(p, values) => p.len() + values.iter().map(value).sum::<usize>(),
+        W::Compare(left, _, right) => operand(left) + operand(right),
+        W::CompareBetween(o, low, high) => operand(o) + operand(low) + operand(high),
+        W::CompareIn(o, values) => operand(o) + values.iter().map(operand).sum::<usize>(),
+        W::AttributeType(o, v) => operand(o) + value(v),
+        W::Not(inner) => condition_bytes(inner),
+    }
+}
+
+/// Whether a flattened clause is past `MAX_CLAUSE_BYTES`.
+fn over_byte_budget(groups: &[Vec<WhereCondition>]) -> bool {
+    groups
+        .iter()
+        .flatten()
+        .map(condition_bytes)
+        .try_fold(0usize, |total, bytes| {
+            let total = total.saturating_add(bytes);
+            (total <= MAX_CLAUSE_BYTES).then_some(total)
+        })
+        .is_none()
+}
 
 /// The rejection every descent shares when it runs past `MAX_EXPR_DEPTH`.
 const TOO_DEEP: &str = "Statement is nested too deeply to parse";
@@ -3302,14 +3367,16 @@ fn to_dnf(expr: BoolExpr) -> Result<Vec<Vec<WhereCondition>>, String> {
                 // Group count alone does not bound the work: one group can be
                 // thousands of conditions wide, and the cross product copies
                 // every one of them per term. Budget the conditions too.
-                if out.iter().map(Vec::len).sum::<usize>() > MAX_TOTAL_CONDITIONS {
+                if out.iter().map(Vec::len).sum::<usize>() > MAX_TOTAL_CONDITIONS
+                    || over_byte_budget(&out)
+                {
                     return Err(TOO_COMPLEX.to_string());
                 }
             }
             out
         }
     };
-    if groups.len() > MAX_OR_GROUPS {
+    if groups.len() > MAX_OR_GROUPS || over_byte_budget(&groups) {
         return Err(TOO_COMPLEX.to_string());
     }
     Ok(groups)
@@ -5037,6 +5104,31 @@ mod tests {
         let err = parse(&format!(r#"SELECT * FROM "t" WHERE {clause}"#)).unwrap_err();
         assert!(err.to_string().contains("too complex"), "got {err}");
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A negated `IN` under a long path is copied once per value by De Morgan
+    /// and again by every cross product, so the number of conditions alone
+    /// doesn't bound the bytes held: this statement fits the 8,192-character
+    /// limit and holds 4,002 conditions, within that cap, while copying a
+    /// 4,000-character path for each.
+    #[test]
+    fn a_negated_in_under_a_long_path_is_too_complex() {
+        let path = "a".repeat(4_000);
+        let values = vec!["1"; 1_900].join(",");
+        let statement =
+            format!(r#"SELECT * FROM "t" WHERE NOT {path} IN [{values}] AND (x = 1 OR x = 2)"#);
+        assert!(statement.chars().count() <= 8_192, "{}", statement.len());
+        let err = parse(&statement).unwrap_err();
+        assert!(err.to_string().contains("too complex"), "got {err}");
+    }
+
+    /// The same shape under a short path is an ordinary clause.
+    #[test]
+    fn a_negated_in_under_a_short_path_is_evaluated() {
+        let values = vec!["1"; 1_900].join(",");
+        let statement =
+            format!(r#"SELECT * FROM "t" WHERE NOT a IN [{values}] AND (x = 1 OR x = 2)"#);
+        assert!(parse(&statement).is_ok());
     }
 
     /// The group cap trips while an alternation is flattened, not after every

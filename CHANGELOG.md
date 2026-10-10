@@ -575,6 +575,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deeply now runs. Captured against eu-west-2 and us-east-1.
 - PartiQL `size()` calls nested inside one another, and arithmetic after a
   `size()`, are held to the same depth as nested brackets.
+- A very large PartiQL `NOT IN` condition, such as one over a long path with
+  thousands of values, is refused as too complex, like other WHERE clauses
+  that expand past the engine's limits.
 - A PartiQL condition whose `?` has no parameter to fill it no longer
   matches an item. `flag <> ?` with no parameters used to hold for every item
   without `flag`, so a `DELETE` or `UPDATE` short of its parameters could
