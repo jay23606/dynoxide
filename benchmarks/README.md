@@ -1,6 +1,6 @@
 # Dynoxide Benchmarks
 
-Reproducible benchmarks comparing Dynoxide against DynamoDB Local and LocalStack.
+Reproducible benchmarks comparing Dynoxide against DynamoDB Local, LocalStack, Floci and MiniStack.
 
 ## Quick Start
 
@@ -36,7 +36,7 @@ cargo bench --bench iai_core --features iai-callgrind
 python3 scripts/generate_report.py --results-dir results --output-dir results/charts
 ```
 
-## Four-Tier Comparison Model
+## Comparison Model
 
 | Tier | What | How |
 |------|------|-----|
@@ -44,8 +44,12 @@ python3 scripts/generate_report.py --results-dir results --output-dir results/ch
 | **Dynoxide HTTP** | Axum server via `http-server` feature | Quantifies the HTTP overhead eliminated by embedded mode |
 | **DynamoDB Local** | Docker container, JVM-based | The incumbent to beat |
 | **LocalStack** | Docker container, Python + DynamoDB Local | Startup, image size, idle memory only |
+| **Floci** | Docker container, with the Docker socket mounted | Startup, image size, idle memory only |
+| **MiniStack** | Docker container, Python | Startup, image size, idle memory only |
 
 LocalStack uses DynamoDB Local internally as its DynamoDB engine — its emulation layer is DynamoDB Local's JVM process wrapped with Python routing. This is why its startup and memory numbers are higher than DynamoDB Local alone: you're paying for both runtimes. We benchmark LocalStack for startup time, image size, and idle memory only — operation-level benchmarks would measure DynamoDB Local's performance through an additional network hop.
+
+Floci and MiniStack are multi-service AWS emulators with their own DynamoDB implementations. They're measured the same way as LocalStack, from the `:latest` image each project publishes, started the way its docs show. For Floci that means mounting the Docker socket, which its CLI also does by default. Without the socket it retries the connection before serving anything, and its first ListTables lands about 15 seconds after start rather than well under a second, so the number would be measuring the missing socket rather than Floci. MiniStack's docs only add the socket for services backed by real containers (RDS, ECS, Lambda), so it runs without one.
 
 ## Results: Local Development (Apple Silicon)
 
@@ -106,7 +110,7 @@ Results from a Mac Studio (M-series). These reflect the experience of a develope
 
 ## Results: CI (GitHub Actions)
 
-Results from `ubuntu-latest` (<!-- prose:ci_runner_hardware -->4-core Intel(R) Xeon(R) 6973P-C, 16GB RAM<!-- /bench -->). Commit <!-- bench:ci_commit_link_benchmarks -->[`49c6338`](../../../commit/49c6338adf3ea2efea9991033183ffaaefe1b08a)<!-- /bench -->. Absolute wall-clock numbers vary between runners; ratios are stable across runs.
+Results from `ubuntu-latest` (<!-- prose:ci_runner_hardware -->4-core Intel(R) Xeon(R) 6973P-C, 16GB RAM<!-- /bench -->). Commit <!-- bench:ci_commit_link_benchmarks -->[`49c6338`](../../../commit/49c6338adf3ea2efea9991033183ffaaefe1b08a)<!-- /bench -->. Absolute wall-clock numbers vary between runners; ratios are stable across runs. Emulator images measured: <!-- bench:ci_image_versions -->pending<!-- /bench -->.
 
 ### Cold Startup
 
@@ -116,6 +120,8 @@ Results from `ubuntu-latest` (<!-- prose:ci_runner_hardware -->4-core Intel(R) X
 | Dynoxide HTTP | <!-- bench:ci_startup_http_mean -->1.6ms<!-- /bench --> | <!-- bench:ci_startup_http_stddev -->±1.6ms<!-- /bench --> | <!-- bench:ci_startup_http_ratio -->**~1,730x faster**<!-- /bench --> |
 | DynamoDB Local | <!-- bench:ci_startup_ddb_local_mean -->2,831ms<!-- /bench --> | <!-- bench:ci_startup_ddb_local_stddev -->±477ms<!-- /bench --> | — |
 | LocalStack | <!-- bench:ci_startup_localstack_mean -->13,473ms<!-- /bench --> | <!-- bench:ci_startup_localstack_stddev -->±2,138ms<!-- /bench --> | <!-- bench:ci_startup_localstack_ratio -->4.8x slower<!-- /bench --> |
+| Floci | <!-- bench:ci_startup_floci_mean -->pending<!-- /bench --> | <!-- bench:ci_startup_floci_stddev -->pending<!-- /bench --> | <!-- bench:ci_startup_floci_ratio -->pending<!-- /bench --> |
+| MiniStack | <!-- bench:ci_startup_ministack_mean -->pending<!-- /bench --> | <!-- bench:ci_startup_ministack_stddev -->pending<!-- /bench --> | <!-- bench:ci_startup_ministack_ratio -->pending<!-- /bench --> |
 
 DynamoDB Local warm start (after JVM JIT): ~2ms. The cold start cost is what CI pipelines actually pay.
 
@@ -180,16 +186,16 @@ the GetItem PDF (shows the tight distribution). To include them:
 
 ## Memory & Disk
 
-| Metric | In-Memory | File-Backed | DynamoDB Local (Docker) | LocalStack (Docker) |
-|--------|-----------|-------------|------------------------|---------------------|
-| Idle | <!-- bench:ci_mem_memory_idle -->5.3 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_idle -->46.0 MB<!-- /bench --> RSS | <!-- bench:ci_mem_ddb_local_idle -->204.8 MB<!-- /bench --> RSS | <!-- bench:ci_mem_localstack_idle -->388.0 MB<!-- /bench --> RSS |
-| After 10K items (~1KB each) | <!-- bench:ci_mem_memory_loaded -->46.0 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_loaded -->46.0 MB<!-- /bench --> RSS | — | — |
-| Disk (10K items) | — | <!-- bench:ci_disk_file_loaded -->15.6 MB<!-- /bench --> | — | — |
-| Disk (empty table) | — | <!-- bench:ci_disk_file_empty -->121 KB<!-- /bench --> | — | — |
+| Metric | In-Memory | File-Backed | DynamoDB Local (Docker) | LocalStack (Docker) | Floci (Docker) | MiniStack (Docker) |
+|--------|-----------|-------------|------------------------|---------------------|----------------|--------------------|
+| Idle | <!-- bench:ci_mem_memory_idle -->5.3 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_idle -->46.0 MB<!-- /bench --> RSS | <!-- bench:ci_mem_ddb_local_idle -->204.8 MB<!-- /bench --> RSS | <!-- bench:ci_mem_localstack_idle -->388.0 MB<!-- /bench --> RSS | <!-- bench:ci_mem_floci_idle -->pending<!-- /bench --> RSS | <!-- bench:ci_mem_ministack_idle -->pending<!-- /bench --> RSS |
+| After 10K items (~1KB each) | <!-- bench:ci_mem_memory_loaded -->46.0 MB<!-- /bench --> RSS | <!-- bench:ci_mem_file_loaded -->46.0 MB<!-- /bench --> RSS | — | — | - | - |
+| Disk (10K items) | — | <!-- bench:ci_disk_file_loaded -->15.6 MB<!-- /bench --> | — | — | - | - |
+| Disk (empty table) | — | <!-- bench:ci_disk_file_empty -->121 KB<!-- /bench --> | — | — | - | - |
 
 File-backed mode shows higher RSS at creation because SQLite memory-maps the file. Both modes converge at 10K items. The ~46MB for 10K items is ~4.6KB per item — roughly 4x the raw item size, which accounts for SQLite structures, indexes, and the GSI.
 
-Docker idle memory is the mean of 3 samples taken 10s apart, 30s after first successful health check, no requests served.
+Docker idle memory is the mean of 3 samples taken 10s apart, 30s after the first successful ListTables, no requests served.
 
 ## Why the Numbers Differ Between Local and CI
 
@@ -272,6 +278,8 @@ We publish relative claims ("6.9x faster"), never absolute CI wall-clock numbers
 
 - Criterion benchmarks use configurable sample sizes (10-100)
 - Startup benchmarks report mean and standard deviation over 5 repetitions
+- A container start is timed from `docker run` to the first ListTables that succeeds. Readiness is polled every 10ms with the SDK's own retries switched off, because a retry backoff inside one call can hide the moment a target came up by up to a few seconds
+- The startup and memory benchmarks skip any emulator image that isn't already pulled, so no timed start includes a download
 - CI pipeline benchmarks report per-test timing breakdowns (all 50 tests)
 - Workload driver collects per-request latencies for p50/p95/p99 percentiles
 
@@ -317,7 +325,7 @@ Neither benchmark workflow blocks a merge.
 Runs criterion micro-benchmarks (wall-clock, compared against the median of the last five runs stored on the `benchmark-data` branch; anything over 1.5x that median is flagged in the PR comment, as advice rather than a failure) and iai-callgrind instruction-count benchmarks (deterministic, reported without a stored baseline; CI keeps no counts from `main`, so to see whether a change does more work, run `cargo bench --bench iai_core --features iai-callgrind` here on `main` and on the branch, on the same Linux machine or container, and compare).
 
 ### `benchmark-refresh.yml` (run by hand)
-Runs the full comparative benchmarks (Dynoxide vs DynamoDB Local and LocalStack), appends the run to the `benchmark-data` branch for historical tracking, and opens a pull request that updates the benchmark numbers in `README.md` and this file.
+Runs the full comparative benchmarks (Dynoxide vs DynamoDB Local, LocalStack, Floci and MiniStack), appends the run to the `benchmark-data` branch for historical tracking, and opens a pull request that updates the benchmark numbers in `README.md` and this file.
 
 To view historical results:
 ```bash
@@ -329,7 +337,7 @@ git show benchmark-data:runs/<dir>/run_summary.json
 ## System Requirements
 
 - Rust stable toolchain
-- Docker (for DynamoDB Local / LocalStack comparison)
+- Docker (for the DynamoDB Local, LocalStack, Floci and MiniStack comparisons; `docker pull` an image to include it)
 - Python 3 + matplotlib (for chart generation: `pip install matplotlib`)
 - Valgrind (for iai-callgrind, Linux only: `apt-get install valgrind`)
 - `iai-callgrind-runner` (matching version: `cargo install iai-callgrind-runner --version 0.14.2`)

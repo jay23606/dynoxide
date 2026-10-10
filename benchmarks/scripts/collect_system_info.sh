@@ -51,10 +51,22 @@ DYNOXIDE_BINARY_BYTES=$(stat --format=%s target/release/dynoxide 2>/dev/null || 
 # Docker image sizes (if Docker available)
 DDB_LOCAL_IMAGE_BYTES="null"
 LOCALSTACK_IMAGE_BYTES="null"
+FLOCI_IMAGE_BYTES="null"
+MINISTACK_IMAGE_BYTES="null"
 if command -v docker &>/dev/null; then
     DDB_LOCAL_IMAGE_BYTES=$(docker image inspect amazon/dynamodb-local:latest --format='{{.Size}}' 2>/dev/null || echo "null")
     LOCALSTACK_IMAGE_BYTES=$(docker image inspect localstack/localstack:latest --format='{{.Size}}' 2>/dev/null || echo "null")
+    FLOCI_IMAGE_BYTES=$(docker image inspect floci/floci:latest --format='{{.Size}}' 2>/dev/null || echo "null")
+    MINISTACK_IMAGE_BYTES=$(docker image inspect ministackorg/ministack:latest --format='{{.Size}}' 2>/dev/null || echo "null")
 fi
+
+# What each emulator's :latest tag pointed at for this run: digest, image ID
+# and declared version. The same images as benchmarks/src/containers.rs.
+IMAGES_JSON=$(python3 "$(dirname "$0")/image_info.py" \
+    dynamodb_local=amazon/dynamodb-local:latest \
+    localstack=localstack/localstack:latest \
+    floci=floci/floci:latest \
+    ministack=ministackorg/ministack:latest)
 
 # Rust version
 RUST_VERSION=$(rustc --version 2>/dev/null || echo "unknown")
@@ -76,10 +88,14 @@ info = {
     'dynoxide_binary_bytes': None if sys.argv[11] == 'null' else int(sys.argv[11]),
     'dynamodb_local_image_bytes': None if sys.argv[12] == 'null' else int(sys.argv[12]),
     'localstack_image_bytes': None if sys.argv[13] == 'null' else int(sys.argv[13]),
+    'floci_image_bytes': None if sys.argv[14] == 'null' else int(sys.argv[14]),
+    'ministack_image_bytes': None if sys.argv[15] == 'null' else int(sys.argv[15]),
+    'images': json.loads(sys.argv[16]),
     'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()
 }
 json.dump(info, sys.stdout, indent=2)
 print()
 " "$OS" "$KERNEL" "$ARCH" "$CPU_MODEL" "$CPU_CORES" "$TOTAL_RAM_GB" \
   "$RUST_VERSION" "$DYNOXIDE_VERSION" "$DYNOXIDE_COMMIT" "$DDB_LOCAL_TAG" \
-  "$DYNOXIDE_BINARY_BYTES" "$DDB_LOCAL_IMAGE_BYTES" "$LOCALSTACK_IMAGE_BYTES"
+  "$DYNOXIDE_BINARY_BYTES" "$DDB_LOCAL_IMAGE_BYTES" "$LOCALSTACK_IMAGE_BYTES" \
+  "$FLOCI_IMAGE_BYTES" "$MINISTACK_IMAGE_BYTES" "$IMAGES_JSON"

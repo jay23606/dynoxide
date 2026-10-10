@@ -49,8 +49,15 @@ jobs:
       - name: Create results directory
         run: mkdir -p benchmarks/results
 
-      - name: Pull LocalStack image
-        run: docker pull localstack/localstack:latest
+      # DynamoDB Local arrives as the service container above. The startup
+      # and memory benchmarks skip an image that is not already pulled, so
+      # no timed start ever includes a download, and the system info step
+      # below records what each :latest tag pointed at for this run.
+      - name: Pull emulator images
+        run: |
+          docker pull localstack/localstack:latest
+          docker pull floci/floci:latest
+          docker pull ministackorg/ministack:latest
 
       - name: Build Dynoxide server and benchmarks
         run: |
