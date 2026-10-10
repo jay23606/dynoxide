@@ -3914,3 +3914,58 @@ fn format_bigdecimal(n: &bigdecimal::BigDecimal) -> String {
         normalized.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::partiql::parser::parse;
+
+    fn where_of(statement: &str) -> WhereClause {
+        match parse(statement).unwrap() {
+            Statement::Select {
+                where_clause: Some(wc),
+                ..
+            } => wc,
+            other => panic!("expected a SELECT with WHERE: {other:?}"),
+        }
+    }
+
+    /// A placeholder with no parameter to fill it decides nothing, whatever
+    /// the condition: each of these would hold of the item if the missing
+    /// value were simply skipped (a `<>`, a negation, or an IN list whose
+    /// other member matches).
+    #[test]
+    fn a_condition_short_of_its_parameters_never_matches() {
+        let item: Item = [
+            ("pk".to_string(), AttributeValue::S("a".to_string())),
+            ("tag".to_string(), AttributeValue::S("x".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let matched: Vec<&str> = [
+            ("Comparison", "flag <> ?"),
+            ("NotComparison", "NOT flag = ?"),
+            ("In", "tag IN [?, 'x']"),
+            ("Compare", "size(tag) <> ?"),
+            ("Compare, parameter first", "? <> size(tag)"),
+        ]
+        .into_iter()
+        .filter(|(_, clause)| {
+            let wc = where_of(&format!(r#"SELECT * FROM "t" WHERE {clause}"#));
+            matches_where(&item, Some(&wc), &[])
+        })
+        .map(|(kind, _)| kind)
+        .collect();
+        assert!(
+            matched.is_empty(),
+            "matched with no parameters: {matched:?}"
+        );
+        // The same conditions with their parameter supplied are evaluated.
+        let wc = where_of(r#"SELECT * FROM "t" WHERE tag IN [?, 'x']"#);
+        assert!(matches_where(
+            &item,
+            Some(&wc),
+            &[AttributeValue::S("y".to_string())]
+        ));
+    }
+}

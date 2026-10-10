@@ -43,7 +43,8 @@ fn s(v: &str) -> AttributeValue {
 }
 
 /// Each condition is true of an item without `flag` once its parameters are
-/// supplied (the control), and selects nothing without them.
+/// supplied (the control), and is refused without them. Behind the refusal,
+/// the executor never lets an unfilled placeholder match (see its unit test).
 #[test]
 fn a_condition_short_of_its_parameters_selects_nothing() {
     let db = db_with_item();
@@ -63,10 +64,10 @@ fn a_condition_short_of_its_parameters_selects_nothing() {
             Ok(1),
             "control: `{condition}` holds for an item without flag"
         );
-        let unbound = run(&db, &statement, None);
-        assert!(
-            matches!(unbound, Err(_) | Ok(0)),
-            "`{condition}` with no parameters selected the item: {unbound:?}"
+        assert_eq!(
+            run(&db, &statement, None),
+            Err(MISMATCH.to_string()),
+            "`{condition}` with no parameters"
         );
     }
 }
@@ -74,10 +75,13 @@ fn a_condition_short_of_its_parameters_selects_nothing() {
 #[test]
 fn a_delete_short_of_its_parameters_deletes_nothing() {
     let db = db_with_item();
-    let _ = run(
-        &db,
-        r#"DELETE FROM "Tbl" WHERE pk = 'a' AND flag <> ?"#,
-        None,
+    assert_eq!(
+        run(
+            &db,
+            r#"DELETE FROM "Tbl" WHERE pk = 'a' AND flag <> ?"#,
+            None,
+        ),
+        Err(MISMATCH.to_string())
     );
     assert_eq!(
         run(&db, r#"SELECT * FROM "Tbl" WHERE pk = 'a'"#, None),
