@@ -2157,6 +2157,50 @@ fn a_bad_parameter_in_a_batch_on_the_wire_fails_only_its_statement() {
     assert_eq!(pks(resp), vec!["61".to_string()], "its sibling ran");
 }
 
+#[test]
+fn a_null_false_parameter_in_a_batch_fails_only_its_statement() {
+    // Captured eu-west-2 and us-east-1, 2026-10-10: a `{"NULL": false}`
+    // parameter, first or second of two statements, fails that statement
+    // with `One or more parameter values were invalid: Null attribute value
+    // types must have the value of true`, and the other statement runs.
+    let db = seeded();
+    const NULL_FALSE: &str = "One or more parameter values were invalid: \
+                              Null attribute value types must have the value of true";
+    for (first, second, refused) in [
+        (
+            serde_json::json!({"Statement": "SELECT * FROM \"Nums\" WHERE pk = ?", "Parameters": [{"NULL": false}]}),
+            serde_json::json!({"Statement": "INSERT INTO \"Nums\" VALUE {'pk': 70}"}),
+            0,
+        ),
+        (
+            serde_json::json!({"Statement": "INSERT INTO \"Nums\" VALUE {'pk': 71}"}),
+            serde_json::json!({"Statement": "INSERT INTO \"Nums\" VALUE {'pk': 72, 'n': ?}", "Parameters": [{"NULL": false}]}),
+            1,
+        ),
+    ] {
+        let request: BatchExecuteStatementRequest =
+            serde_json::from_value(serde_json::json!({"Statements": [first, second]}))
+                .expect("a NULL false parameter doesn't stop the request decoding");
+        let resp = db.batch_execute_statement(request).unwrap();
+        for (i, response) in resp.responses.iter().enumerate() {
+            match response.error.as_ref() {
+                Some(e) if i == refused => {
+                    assert_eq!(
+                        (e.code.as_str(), e.message.as_str()),
+                        ("ValidationError", NULL_FALSE)
+                    );
+                }
+                Some(e) => panic!("statement {i} should have run: {e:?}"),
+                None => assert_ne!(i, refused, "statement {i} should have been refused"),
+            }
+        }
+    }
+    for (pk, written) in [("70", true), ("71", true), ("72", false)] {
+        let resp = run(&db, &format!("SELECT * FROM \"Nums\" WHERE pk = {pk}")).unwrap();
+        assert_eq!(!pks(resp).is_empty(), written, "pk {pk}");
+    }
+}
+
 const KEY_SCHEMA_MISMATCH: &str =
     "Key attribute's data type should match its data type in table's schema: Key";
 

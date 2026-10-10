@@ -82,11 +82,18 @@ impl<'de> Deserialize<'de> for BatchStatementRequest {
                     }) {
                         Ok(parameter) => parameters.push(parameter),
                         // A value refusal belongs to this statement, an empty
-                        // value among them; anything else, a malformed value,
+                        // value among them, and `{"NULL": false}`, which is
+                        // raised in the request-validation class (captured
+                        // eu-west-2 and us-east-1, 2026-10-10: only its
+                        // statement fails); anything else, a malformed value,
                         // still fails the request.
                         Err(e) => {
                             let message = e.to_string();
+                            // `VALIDATION_REQUEST:` extends `VALIDATION`, but
+                            // not `VALIDATION:`, so both are checked.
                             if !message.starts_with(crate::serde_errors::VALIDATION_MARKER)
+                                && !message
+                                    .starts_with(crate::serde_errors::REQUEST_VALIDATION_MARKER)
                                 && !message.starts_with(EMPTY)
                             {
                                 return Err(serde::de::Error::custom(message));

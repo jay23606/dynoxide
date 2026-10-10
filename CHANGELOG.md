@@ -254,8 +254,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   statement, as any attribute value is checked (its numbers, and empty or
   duplicated sets), so a parameter DynamoDB can't store is refused even when
   the statement doesn't use it: on `ExecuteStatement`, against the statement in
-  a `BatchExecuteStatement` (an empty value included), and for the whole
-  request in an `ExecuteTransaction`, which writes nothing.
+  a `BatchExecuteStatement` (an empty value and `{"NULL": false}` included,
+  where a `{"NULL": false}` parameter used to refuse the whole batch), and for
+  the whole request in an `ExecuteTransaction`, which writes nothing.
 - A PartiQL statement against a table that doesn't exist says `Requested
   resource not found`, as DynamoDB does, without `: Table: <name> not found`;
   in a transaction it cancels with the `ResourceNotFound` reason rather than
