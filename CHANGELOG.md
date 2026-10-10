@@ -673,6 +673,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs. Captured against eu-west-2 and us-east-1.
 - PartiQL accepts `x NOT IN [...]`, read as `NOT x IN [...]`; it was refused
   as an unknown operator. Captured against eu-west-2 and us-east-1.
+- A PartiQL `IN` or `BETWEEN` on a path that also stands among its own
+  members or bounds, such as `x IN [1, x]` or `x BETWEEN 1 AND x`, is refused
+  with DynamoDB's "The first operand must be distinct from the remaining
+  operands" message, as `x = x` already was. The message names a path by its
+  parts, `[m, a]` for `m.a` and `[l, [0]]` for `l[0]`, in a comparison too.
+  Where a WHERE clause holds more than one refusal, `MISSING` compared
+  without `IS` now outranks a refused operand whichever is written first, and
+  an `IN` with too many operands is reported in the order written against a
+  refused operand rather than ahead of it. Captured against eu-west-2 and
+  us-east-1.
 - PartiQL `size()` calls nested inside one another, and arithmetic after a
   `size()`, are held to the same depth as nested brackets.
 - A PartiQL `IN` with more than 100 operands, negated or not, written as

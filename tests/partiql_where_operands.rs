@@ -605,6 +605,178 @@ fn two_literals_or_two_paths_compare() {
     );
 }
 
+/// IN and BETWEEN refuse the path they test among their own members or
+/// bounds, wherever it stands, as a comparison refuses `s = s`. A path is
+/// named by its parts: `m.a` as `[m, a]` and `l[0]` as `[l, [0]]`, in a
+/// comparison too. Only a path is checked, by name as written (a quoted name
+/// is the same path, another case isn't). The first refusal in the clause is
+/// the one reported, and it comes before the table is looked up and before an
+/// IN with too many operands later in the clause (captured eu-west-2 and
+/// us-east-1, 2026-10-10).
+#[test]
+fn in_and_between_refuse_the_path_among_their_own_operands() {
+    let db = db();
+    let distinct = |operator: &str, first: &str| {
+        format!(
+            "The first operand must be distinct from the remaining operands for this operator \
+             or function; operator: {operator}, first operand: [{first}]"
+        )
+    };
+    let long_in = (0..101)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (condition, operator, first) in [
+        ("s IN [s]".to_string(), "IN", "s"),
+        ("s IN ['a', s]".to_string(), "IN", "s"),
+        ("s IN [s, 'a']".to_string(), "IN", "s"),
+        ("s NOT IN [s]".to_string(), "IN", "s"),
+        ("NOT s IN [s]".to_string(), "IN", "s"),
+        (r#""s" IN [s]"#.to_string(), "IN", "s"),
+        ("s BETWEEN s AND 'z'".to_string(), "BETWEEN", "s"),
+        ("s BETWEEN 'a' AND s".to_string(), "BETWEEN", "s"),
+        ("s BETWEEN s AND s".to_string(), "BETWEEN", "s"),
+        ("m.sub IN [m.sub]".to_string(), "IN", "m, sub"),
+        (
+            "m.sub BETWEEN m.sub AND 'z'".to_string(),
+            "BETWEEN",
+            "m, sub",
+        ),
+        ("l[0] IN [l[0]]".to_string(), "IN", "l, [0]"),
+        ("m.sub = m.sub".to_string(), "=", "m, sub"),
+        ("s IN [s] AND n = n".to_string(), "IN", "s"),
+        (format!("s IN [s] AND n IN [{long_in}]"), "IN", "s"),
+    ] {
+        assert_eq!(
+            where_refusal(&db, &condition),
+            distinct(operator, first),
+            "{condition}"
+        );
+    }
+    assert_eq!(
+        refusal(&db, r#"SELECT pk FROM "Missing" WHERE s IN [s]"#),
+        distinct("IN", "s")
+    );
+    // Not the path itself: these run.
+    for (condition, expected) in [
+        ("s IN [s2, s2]", NONE),
+        ("size(s) IN [size(s)]", IT1),
+        ("size(s) BETWEEN size(s) AND 9", IT1),
+        ("s IN [S]", NONE),
+        ("'a' IN ['a']", IT1),
+        ("s BETWEEN 'str' AND 'str'", IT1),
+    ] {
+        assert_eq!(keys_where(&db, condition), expected, "{condition}");
+    }
+}
+
+/// Which refusal DynamoDB reports when a WHERE clause holds two. A function
+/// it doesn't recognise, a number it can't store and `MISSING` compared
+/// without IS outrank the rest, the first written of them winning. Below them,
+/// an operand that isn't distinct and an IN with too many operands are
+/// reported in the order written, and either one written first wins over an
+/// operand of the wrong type (captured eu-west-2 and us-east-1, 2026-10-10;
+/// the regions agree on every row).
+#[test]
+fn refusals_rank_as_dynamodb_ranks_them() {
+    let db = db();
+    let long_in = format!(
+        "n IN [{}]",
+        (0..101)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let in_count = "The IN operator is provided with too many operands; number of operands: 101";
+    let distinct = |operator: &str| {
+        format!(
+            "The first operand must be distinct from the remaining operands for this operator \
+             or function; operator: {operator}, first operand: [s]"
+        )
+    };
+    let missing = "MISSING must be compared using IS operator";
+    let overflow = "Number overflow. Attempting to store a number with magnitude larger than \
+                    supported range under root";
+    let unrecognised = "Unrecognized function: foo at ";
+    for (condition, expected) in [
+        (format!("{long_in} AND s IN [s]"), in_count.to_string()),
+        (format!("s = s AND {long_in}"), distinct("=")),
+        (format!("{long_in} AND s = s"), in_count.to_string()),
+        ("s IN [s] AND size(s) < true".to_string(), distinct("IN")),
+        (
+            format!("s BETWEEN s AND 1 AND {long_in}"),
+            distinct("BETWEEN"),
+        ),
+        (
+            format!("{long_in} AND s BETWEEN s AND 1"),
+            in_count.to_string(),
+        ),
+        (
+            format!("attribute_type(s, s) AND {long_in}"),
+            distinct("attribute_type"),
+        ),
+        (
+            format!("{long_in} AND attribute_type(s, s)"),
+            in_count.to_string(),
+        ),
+        (
+            format!("{long_in} AND size(s) < true"),
+            in_count.to_string(),
+        ),
+        ("s IN [s] AND x = MISSING".to_string(), missing.to_string()),
+        ("x = MISSING AND s IN [s]".to_string(), missing.to_string()),
+        (format!("x = MISSING AND {long_in}"), missing.to_string()),
+        (format!("{long_in} AND x = MISSING"), missing.to_string()),
+        (
+            "size(s) < true AND x = MISSING".to_string(),
+            missing.to_string(),
+        ),
+        (
+            "x = MISSING AND size(s) < true".to_string(),
+            missing.to_string(),
+        ),
+        ("s = s AND x = MISSING".to_string(), missing.to_string()),
+        (
+            "s IN [s] AND x = 1e999999999".to_string(),
+            overflow.to_string(),
+        ),
+        (
+            "x = 1e999999999 AND s IN [s]".to_string(),
+            overflow.to_string(),
+        ),
+        (
+            format!("x = 1e999999999 AND {long_in}"),
+            overflow.to_string(),
+        ),
+        (
+            format!("{long_in} AND x = 1e999999999"),
+            overflow.to_string(),
+        ),
+        (
+            "x = MISSING AND x = 1e999999999".to_string(),
+            missing.to_string(),
+        ),
+        (
+            "x = 1e999999999 AND x = MISSING".to_string(),
+            overflow.to_string(),
+        ),
+        ("x = MISSING AND foo(s)".to_string(), missing.to_string()),
+    ] {
+        assert_eq!(where_refusal(&db, &condition), expected, "{condition}");
+    }
+    for condition in [
+        "foo(s) AND s IN [s]".to_string(),
+        "s IN [s] AND foo(s)".to_string(),
+        "s = s AND foo(s)".to_string(),
+        format!("foo(s) AND {long_in}"),
+        format!("{long_in} AND foo(s)"),
+        "foo(s) AND x = MISSING".to_string(),
+    ] {
+        let message = where_refusal(&db, &condition);
+        assert!(message.starts_with(unrecognised), "{condition}: {message}");
+    }
+}
+
 #[test]
 fn missing_is_tested_only_with_is() {
     let db = db();

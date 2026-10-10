@@ -2584,6 +2584,10 @@ const ATTRIBUTE_TYPES: &[&str] = &["N", "BS", "L", "B", "NULL", "M", "S", "SS", 
 const ATTRIBUTE_TYPE_OPERAND_TYPES: &str = "{S,HDS,N,FS,BS,NULL,DOUBLE,NS,DECIMAL,SS,DECIMALSET,\
      BOOL,HD,DICT,INTSET,M,L,B,FLOAT,INT,DOUBLESET}";
 
+/// `MISSING` anywhere but after IS. It outranks a refused operand, whichever
+/// is written first, and is reported in the order written against a refused
+/// term or literal, so it is noted as a term (captured eu-west-2 and
+/// us-east-1, 2026-10-10).
 const MISSING_COMPARED: &str = "MISSING must be compared using IS operator";
 
 /// A comparison operator, as a WHERE clause writes one.
@@ -2962,10 +2966,9 @@ fn parse_attribute_type(
         }
         Operand::Value(PartiqlValue::Literal(other)) => Some(operand_type(other.type_name())),
         Operand::Value(PartiqlValue::Parameter(_)) => None,
-        Operand::Path(path) if operand == Operand::Path(path.clone()) => Some(format!(
-            "The first operand must be distinct from the remaining operands for this \
-             operator or function; operator: attribute_type, first operand: [{path}]"
-        )),
+        Operand::Path(path) if operand == Operand::Path(path.clone()) => {
+            Some(not_distinct("attribute_type", path))
+        }
         Operand::Path(_) => Some(operand_type(ATTRIBUTE_TYPE_OPERAND_TYPES)),
         Operand::Size(_) => Some(operand_type("N")),
     };
@@ -3005,7 +3008,7 @@ fn parse_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
     };
     if is_keyword(&tok, "MISSING") {
         t.next_token()?;
-        t.note_operand_refusal(MISSING_COMPARED.to_string());
+        t.note_term(MISSING_COMPARED.to_string());
         return Ok(Operand::Value(PartiqlValue::Literal(AttributeValue::NULL(
             true,
         ))));
@@ -3037,7 +3040,7 @@ fn parse_bound(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
         .is_some_and(|tok| is_keyword(&tok, "MISSING"))
     {
         t.next_token()?;
-        t.note_operand_refusal(MISSING_COMPARED.to_string());
+        t.note_term(MISSING_COMPARED.to_string());
         return Ok(PartiqlValue::Literal(AttributeValue::NULL(true)));
     }
     parse_value(t, depth)
@@ -3071,8 +3074,11 @@ fn parse_in_list<T>(
         let peek = t.peek_token()?.ok_or("Unexpected end of IN list")?;
         if peek == close {
             t.next_token()?;
+            // Reported in the order written against a refused operand,
+            // below a refused term or literal (captured eu-west-2 and
+            // us-east-1, 2026-10-10).
             if values.len() > MAX_IN_OPERANDS {
-                t.note_term(format!(
+                t.note_operand_refusal(format!(
                     "The IN operator is provided with too many operands; number of operands: {}",
                     values.len()
                 ));
@@ -3181,10 +3187,7 @@ fn comparison(
             value,
         }),
         (Operand::Path(a), Operand::Path(b)) if a == b => {
-            t.note_operand_refusal(format!(
-                "The first operand must be distinct from the remaining operands for this \
-                 operator or function; operator: {op_tok}, first operand: [{a}]"
-            ));
+            t.note_operand_refusal(not_distinct(op_tok, &a));
             WhereCondition::Exists(String::new())
         }
         (left, right) => WhereCondition::Compare(left, op, right),
@@ -3624,6 +3627,10 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                     let low = parse_bound_operand(t, depth)?;
                     expect_between_and(t)?;
                     let high = parse_bound_operand(t, depth)?;
+                    if names_path(&[&low, &high], &path) {
+                        t.note_operand_refusal(not_distinct("BETWEEN", &path));
+                        return Ok(WhereCondition::Exists(String::new()));
+                    }
                     Ok(match (low, high) {
                         (Operand::Value(low), Operand::Value(high)) => {
                             WhereCondition::Between(path, low, high)
@@ -3636,7 +3643,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                 "IN" => {
                     t.next_token()?; // consume IN
                     let members = parse_in_list(t, depth, parse_bound_operand)?;
-                    Ok(path_in(path, members))
+                    Ok(path_in(t, path, members))
                 }
                 // `x NOT IN [...]` reads as `NOT x IN [...]` (DynamoDB runs it:
                 // captured eu-west-2 and us-east-1, 2026-10-10); the caller
@@ -3648,7 +3655,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                     t.next_token()?; // consume NOT
                     t.next_token()?; // consume IN
                     let members = parse_in_list(t, depth, parse_bound_operand)?;
-                    Ok(WhereCondition::Not(Box::new(path_in(path, members))))
+                    Ok(WhereCondition::Not(Box::new(path_in(t, path, members))))
                 }
                 "IS" => {
                     t.next_token()?; // consume IS
@@ -3693,12 +3700,68 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
 
 /// `path IN [...]`: members that are all values keep the form the key
 /// pushdown reads; a path or size among them makes it a comparison of
-/// operands, read item by item.
-fn path_in(path: String, members: Vec<Operand>) -> WhereCondition {
+/// operands, read item by item. The path itself among the members is refused.
+fn path_in(t: &mut Tokenizer, path: String, members: Vec<Operand>) -> WhereCondition {
+    if names_path(&members.iter().collect::<Vec<_>>(), &path) {
+        t.note_operand_refusal(not_distinct("IN", &path));
+        return WhereCondition::Exists(String::new());
+    }
     match all_values(&members) {
         Some(values) => WhereCondition::In(path, values),
         None => WhereCondition::CompareIn(Operand::Path(path), members),
     }
+}
+
+/// Whether any of `operands` is `path` itself. A size of it, or a value, is
+/// a different operand (captured eu-west-2 and us-east-1, 2026-10-10).
+fn names_path(operands: &[&Operand], path: &str) -> bool {
+    operands
+        .iter()
+        .any(|operand| matches!(operand, Operand::Path(other) if other == path))
+}
+
+/// DynamoDB's refusal of an operator or function handed the path it tests
+/// among its other operands, wherever it stands among them: `x = x`,
+/// `x IN [1, x]`, `x BETWEEN 1 AND x`. The path is named by its parts, so
+/// `m.a` is `[m, a]` and `l[0]` is `[l, [0]]` (captured eu-west-2 and
+/// us-east-1, 2026-10-10).
+fn not_distinct(operator: &str, path: &str) -> String {
+    format!(
+        "The first operand must be distinct from the remaining operands for this operator or \
+         function; operator: {operator}, first operand: [{}]",
+        path_parts(path)
+    )
+}
+
+/// A path's parts as DynamoDB lists them: `a.b[0]` is `a, b, [0]`.
+fn path_parts(path: &str) -> String {
+    let mut parts = Vec::new();
+    let mut name = String::new();
+    let mut chars = path.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '.' | '[' => {
+                if !name.is_empty() {
+                    parts.push(std::mem::take(&mut name));
+                }
+                if c == '[' {
+                    let mut index = String::from("[");
+                    for c in chars.by_ref() {
+                        index.push(c);
+                        if c == ']' {
+                            break;
+                        }
+                    }
+                    parts.push(index);
+                }
+            }
+            c => name.push(c),
+        }
+    }
+    if !name.is_empty() {
+        parts.push(name);
+    }
+    parts.join(", ")
 }
 
 /// Parse a dotted path starting from an already-consumed first token.
