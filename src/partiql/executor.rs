@@ -2183,13 +2183,8 @@ fn statement_fingerprint(
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // The groups are the walk. `wrote_or` records how the clause was spelled,
-    // which only decides the wording of a write's refusal, and a clause with no
-    // groups at all is not the same as no clause.
-    match where_clause {
-        Some(wc) => format!("{:?}", wc.groups).hash(&mut hasher),
-        None => "no-where".hash(&mut hasher),
-    }
+    // Writing into a hasher can't fail.
+    let _ = write_clause_shape(&mut HashWriter(&mut hasher), where_clause);
     // The index is part of the walk, not just of the filter: a token minted
     // against one index would otherwise resume against another at a position
     // that means nothing there.
@@ -2204,6 +2199,35 @@ fn statement_fingerprint(
         format!("{order_by:?}").hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// A `fmt::Write` that feeds a hasher, so a clause is hashed as it is written
+/// out rather than formatted into a string first.
+struct HashWriter<'a, H>(&'a mut H);
+
+impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// The WHERE clause as a fingerprint reads it: the clause as parsed, which
+/// holds each condition once and decides the groups, rather than the groups
+/// themselves, which repeat every condition outside an alternation once per
+/// group. A clause built from groups alone has no tree and is read off its
+/// groups. A clause with no groups at all is not the same as no clause.
+fn write_clause_shape(
+    out: &mut impl std::fmt::Write,
+    where_clause: Option<&WhereClause>,
+) -> std::fmt::Result {
+    match where_clause {
+        Some(wc) => match wc.tree {
+            Some(ref tree) => write!(out, "tree {tree:?}"),
+            None => write!(out, "groups {:?}", wc.groups),
+        },
+        None => out.write_str("no-where"),
+    }
 }
 
 /// Callers should treat this as opaque, but it is only base64 and anyone can
@@ -3933,6 +3957,58 @@ mod tests {
             } => wc,
             other => panic!("expected a SELECT with WHERE: {other:?}"),
         }
+    }
+
+    /// A NextToken's fingerprint is read off the clause as written, which
+    /// holds each condition once, not off the flattened groups, which repeat
+    /// every condition outside an alternation in each group. Here the 100
+    /// conditions De Morgan makes of a negated IN, each naming a
+    /// 7,700-character path, sit beside five alternations: the tree holds them
+    /// once (about 770 KB), the 32 groups hold them 32 times (about 25 MB).
+    #[test]
+    fn a_clause_is_fingerprinted_once_per_condition() {
+        struct Count(usize);
+        impl std::fmt::Write for Count {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0 += s.len();
+                Ok(())
+            }
+        }
+        let operands = (0..100)
+            .map(|i| (i % 10).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let statement = format!(
+            r#"SELECT * FROM "t" WHERE pk = 'k' AND {} AND NOT "{}" IN [{operands}]"#,
+            ["(a = 1 OR a = 2)"; 5].join(" AND "),
+            "a".repeat(7_700),
+        );
+        assert!(statement.chars().count() <= 8_192);
+        let wc = where_of(&statement);
+        assert_eq!(wc.groups.len(), 32);
+        let mut written = Count(0);
+        write_clause_shape(&mut written, Some(&wc)).unwrap();
+        assert!(
+            written.0 < 2_000_000,
+            "fingerprinting wrote {} bytes",
+            written.0
+        );
+    }
+
+    /// The fingerprint still tells statements apart, and gives the same
+    /// answer for the same statement, so a NextToken resumes only the read
+    /// it was minted for.
+    #[test]
+    fn a_fingerprint_follows_the_clause() {
+        let fingerprint =
+            |statement: &str| statement_fingerprint(Some(&where_of(statement)), &[], None, &[]);
+        let a = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#;
+        let b = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 3)"#;
+        let c = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 AND b = 2)"#;
+        assert_eq!(fingerprint(a), fingerprint(a));
+        assert_ne!(fingerprint(a), fingerprint(b));
+        assert_ne!(fingerprint(a), fingerprint(c));
+        assert_ne!(fingerprint(a), statement_fingerprint(None, &[], None, &[]));
     }
 
     /// A placeholder with no parameter to fill it decides nothing, whatever
