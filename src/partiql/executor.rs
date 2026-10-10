@@ -10,6 +10,7 @@ use crate::partiql::parser::{
     CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause,
     WhereCondition,
 };
+use crate::partiql::{PathSegment, split_path_segments};
 use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item, ScalarAttributeType};
 use std::collections::HashMap;
@@ -4137,62 +4138,6 @@ fn resolve_nested_path<'a>(item: &'a Item, path: &str) -> Option<&'a AttributeVa
     }
 
     Some(current)
-}
-
-enum PathSegment<'a> {
-    Key(&'a str),
-    Index(usize),
-}
-
-/// Split a path like `"a.b[0].c"` into segments.
-/// Returns None if the path contains malformed bracket expressions (e.g. `a[xyz]`).
-fn split_path_segments(path: &str) -> Option<Vec<PathSegment<'_>>> {
-    let mut segments = Vec::new();
-    let bytes = path.as_bytes();
-    let mut start = 0;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'.' => {
-                if start < i {
-                    segments.push(PathSegment::Key(&path[start..i]));
-                }
-                i += 1;
-                start = i;
-            }
-            b'[' => {
-                if start < i {
-                    segments.push(PathSegment::Key(&path[start..i]));
-                }
-                i += 1;
-                let idx_start = i;
-                while i < bytes.len() && bytes[i] != b']' {
-                    i += 1;
-                }
-                let idx = path[idx_start..i].parse::<usize>().ok()?;
-                segments.push(PathSegment::Index(idx));
-                if i < bytes.len() {
-                    i += 1; // skip ']'
-                }
-                start = i;
-                // Skip a trailing dot after ']' (e.g. `a[0].b`)
-                if i < bytes.len() && bytes[i] == b'.' {
-                    i += 1;
-                    start = i;
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    if start < bytes.len() {
-        segments.push(PathSegment::Key(&path[start..]));
-    }
-
-    Some(segments)
 }
 
 /// Format a BigDecimal number, stripping unnecessary trailing zeros.

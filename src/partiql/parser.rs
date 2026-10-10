@@ -3827,35 +3827,20 @@ fn not_distinct(operator: &str, path: &str) -> String {
     )
 }
 
-/// A path's parts as DynamoDB lists them: `a.b[0]` is `a, b, [0]`.
+/// A path's parts as DynamoDB lists them: `a.b[0]` is `a, b, [0]`. A path
+/// the splitter can't read is listed whole.
 fn path_parts(path: &str) -> String {
-    let mut parts = Vec::new();
-    let mut name = String::new();
-    let mut chars = path.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '.' | '[' => {
-                if !name.is_empty() {
-                    parts.push(std::mem::take(&mut name));
-                }
-                if c == '[' {
-                    let mut index = String::from("[");
-                    for c in chars.by_ref() {
-                        index.push(c);
-                        if c == ']' {
-                            break;
-                        }
-                    }
-                    parts.push(index);
-                }
-            }
-            c => name.push(c),
-        }
+    match super::split_path_segments(path) {
+        Some(segments) => segments
+            .iter()
+            .map(|segment| match segment {
+                super::PathSegment::Key(key) => (*key).to_string(),
+                super::PathSegment::Index(index) => format!("[{index}]"),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => path.to_string(),
     }
-    if !name.is_empty() {
-        parts.push(name);
-    }
-    parts.join(", ")
 }
 
 /// How many tokens ahead a path starting at the next token ends: a name, then

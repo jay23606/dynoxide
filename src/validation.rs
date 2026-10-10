@@ -656,22 +656,18 @@ pub fn validate_attribute_definitions(defs: &[AttributeDefinition]) -> Result<()
 /// quarters full. Captured eu-west-2 and us-east-1, 2026-10-09, over 24 lists of
 /// one to sixteen names.
 pub(crate) fn java_hash_order<'a>(names: &[&'a str], sized_to_count: bool) -> Vec<&'a str> {
-    let mut unique: Vec<&str> = Vec::new();
-    for name in names {
-        if !unique.contains(name) {
-            unique.push(name);
-        }
-    }
-    let mut capacity: usize = if sized_to_count {
+    let mut seen = std::collections::HashSet::with_capacity(names.len());
+    let unique: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| seen.insert(*name))
+        .collect();
+    let initial = if sized_to_count {
         unique.len().max(1).next_power_of_two()
     } else {
         16
     };
-    for added in 1..=unique.len() {
-        if added * 4 > capacity * 3 {
-            capacity *= 2;
-        }
-    }
+    let capacity = java_table_capacity(initial, unique.len());
     let mut ordered: Vec<(usize, usize, &str)> = unique
         .iter()
         .enumerate()
@@ -679,6 +675,17 @@ pub(crate) fn java_hash_order<'a>(names: &[&'a str], sized_to_count: bool) -> Ve
         .collect();
     ordered.sort_unstable();
     ordered.into_iter().map(|(_, _, name)| name).collect()
+}
+
+/// How many buckets a Java hash table that starts with `initial` (a power of
+/// two) holds once `len` names are in it: it doubles whenever it is more than
+/// three quarters full.
+pub(crate) fn java_table_capacity(initial: usize, len: usize) -> usize {
+    let mut capacity = initial;
+    while len * 4 > capacity * 3 {
+        capacity *= 2;
+    }
+    capacity
 }
 
 /// The bucket a name lands in in a Java hash table of `capacity` buckets (a

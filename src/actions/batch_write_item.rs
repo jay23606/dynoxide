@@ -683,15 +683,10 @@ fn write_write_request(out: &mut dyn std::fmt::Write, request: &WriteRequest) ->
 /// full (captured us-east-1, eu-west-1 and us-west-2, 2026-10-10, on a
 /// transaction's item). Names sharing a bucket would keep the order they were
 /// sent in, which a decoded map no longer holds; they are taken in order of
-/// name. A map's names are distinct already, so they are sorted once rather
-/// than run through [`crate::validation::java_hash_order`]'s deduplication,
-/// which is quadratic in their number.
+/// name.
 fn java_map_order<'a, I: Iterator<Item = &'a String>>(names: I) -> Vec<&'a str> {
     let mut names: Vec<&str> = names.map(String::as_str).collect();
-    let mut capacity = 16usize;
-    while names.len() * 4 > capacity * 3 {
-        capacity *= 2;
-    }
+    let capacity = crate::validation::java_table_capacity(16, names.len());
     names.sort_by_cached_key(|name| (crate::validation::java_hash_bucket(name, capacity), *name));
     names
 }
