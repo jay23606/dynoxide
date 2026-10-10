@@ -15,6 +15,17 @@ else a user installs carries 1.3.0.
 
 ### Security
 
+- **An expression containing a multi-byte character could stop the server**
+  ([GHSA-gwhp-7jch-7xj6](https://github.com/nubo-db/dynoxide/security/advisories/GHSA-gwhp-7jch-7xj6),
+  High). From 0.9.10 to 1.2.1, a character such as `€` or an emoji outside a
+  string in an `UpdateExpression` or `ProjectionExpression` made Dynoxide panic
+  while building the syntax error, and release builds abort on panic. It is
+  now refused with DynamoDB's syntax error.
+- **`--help` showed the MCP auth token**
+  ([GHSA-3rv6-mrj3-vf9j](https://github.com/nubo-db/dynoxide/security/advisories/GHSA-3rv6-mrj3-vf9j),
+  Low). From 0.10.0 to 1.2.1, subcommand help printed the value of
+  `DYNOXIDE_MCP_AUTH_TOKEN` when it was set. Help now names the variable
+  without showing its value.
 - **`aws-smithy-json` moves to 0.63.1** for GHSA-8ffr-xgwf-xj56. It reaches the
   tree only through the AWS SDK the tests and the benchmarks use, never in a
   released artefact, and the advisory covers smithy-rs generated servers,
