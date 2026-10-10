@@ -2313,10 +2313,11 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
 
 /// A digest binding a continuation token to its statement and parameters.
 /// DynamoDB binds it to the statement exactly as written, so with the text at
-/// hand (`written`) that is what is hashed, beside the parameters by value: a
-/// space, a keyword's case, the projection or a map literal's key order
-/// changed between pages is a different statement, and `0` and `0.0` are
-/// different parameters (captured eu-west-2 and us-east-1, 2026-10-10).
+/// hand (`written`) that is what is hashed, beside the parameters by value
+/// (see `hash_parameters`): a space, a keyword's case, the projection or a map
+/// literal's key order changed between pages is a different statement, and
+/// `0` and `0.0` are different parameters (captured eu-west-2 and us-east-1,
+/// 2026-10-10).
 ///
 /// Without the text, the digest is of the parts of the SELECT that determine
 /// its row walk: the WHERE clause as parsed (see `write_clause_shape`), the
@@ -2342,7 +2343,7 @@ fn statement_fingerprint(
     match written {
         Some(text) => {
             text.hash(&mut hasher);
-            crate::canonical_json(parameters).hash(&mut hasher);
+            hash_parameters(parameters, &mut hasher);
         }
         None => fingerprint_into(&mut hasher, where_clause, parameters, index_name, order_by),
     }
@@ -2365,16 +2366,93 @@ fn fingerprint_into<H: std::hash::Hasher>(
     // against one index would otherwise resume against another at a position
     // that means nothing there.
     index_name.hash(hasher);
-    // With every map's keys sorted, so a map's digest doesn't hang on the
-    // order its `HashMap` iterates in. A list or map parameter never resumes
-    // a read anyway (see `execute_select`).
-    crate::canonical_json(parameters).hash(hasher);
+    hash_parameters(parameters, hasher);
     // So is the order: a position in an ascending read resumed in a
     // descending one would start from the wrong end. Mixed in only when there
     // is an ORDER BY, so a statement without one hashes as it always did.
     if !order_by.is_empty() {
         format!("{order_by:?}").hash(hasher);
     }
+}
+
+/// Feed a statement's parameters into a hasher as DynamoDB matches them when
+/// a NextToken comes back (captured eu-west-2 and us-east-1, 2026-10-10):
+///
+/// - a number as the same decimal, value and scale both, as Java's
+///   `BigDecimal.equals` compares them. The exponent's case, a `+` in the
+///   exponent or in front, leading zeros and the sign of zero don't matter;
+///   `1.0` is not `1`, `100` is not `1E2`, and `1.5E1` is `15`;
+/// - a set as a set, in any order: a number set's members by value whatever
+///   their scale, a string or binary set's exactly;
+/// - anything else as sent, a map with its keys sorted so its digest doesn't
+///   hang on the order its `HashMap` iterates in. A list or map parameter
+///   never resumes a read anyway (see `execute_select`).
+fn hash_parameters<H: std::hash::Hasher>(parameters: &[AttributeValue], hasher: &mut H) {
+    use std::hash::Hash;
+    parameters.len().hash(hasher);
+    for parameter in parameters {
+        match parameter {
+            AttributeValue::N(n) => {
+                "N".hash(hasher);
+                decimal_identity(n).hash(hasher);
+            }
+            AttributeValue::NS(members) => {
+                let mut values: Vec<String> = members
+                    .iter()
+                    .map(|n| crate::types::normalize_dynamo_number(n))
+                    .collect();
+                values.sort_unstable();
+                "NS".hash(hasher);
+                values.hash(hasher);
+            }
+            AttributeValue::SS(members) => {
+                let mut members: Vec<&String> = members.iter().collect();
+                members.sort_unstable();
+                "SS".hash(hasher);
+                members.hash(hasher);
+            }
+            AttributeValue::BS(members) => {
+                let mut members: Vec<&Vec<u8>> = members.iter().collect();
+                members.sort_unstable();
+                "BS".hash(hasher);
+                members.hash(hasher);
+            }
+            other => crate::canonical_json(other).hash(hasher),
+        }
+    }
+}
+
+/// A number as Java's `BigDecimal` holds it: its sign, its unscaled digits
+/// without leading zeros, and its scale (the digits after the point less the
+/// exponent). Zero has no sign. Text that isn't a number is kept whole, so it
+/// matches only itself.
+fn decimal_identity(n: &str) -> (bool, String, i64) {
+    let negative = n.starts_with('-');
+    let unsigned = n.trim_start_matches(['+', '-']);
+    let (coefficient, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => match unsigned[at + 1..].parse::<i64>() {
+            Ok(exponent) => (&unsigned[..at], exponent),
+            Err(_) => return (false, n.to_string(), i64::MIN),
+        },
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = coefficient.split_once('.').unwrap_or((coefficient, ""));
+    if !whole
+        .chars()
+        .chain(fraction.chars())
+        .all(|c| c.is_ascii_digit())
+    {
+        return (false, n.to_string(), i64::MIN);
+    }
+    let digits: String = whole
+        .chars()
+        .chain(fraction.chars())
+        .skip_while(|&d| d == '0')
+        .collect();
+    let scale = i64::try_from(fraction.len())
+        .unwrap_or(i64::MAX)
+        .saturating_sub(exponent);
+    (negative && !digits.is_empty(), digits, scale)
 }
 
 /// A `fmt::Write` that feeds a hasher, so a clause is hashed as it is written

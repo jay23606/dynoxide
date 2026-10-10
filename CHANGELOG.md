@@ -13,14 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the statement's text exactly as written, and to its parameters by value.
   The same statement pages on, and may change its `Limit`. A page whose
   statement differs at all (a space, a keyword's case, the projection, a map
-  literal's key order) or whose parameters differ (`0` against `0.0`) is
-  refused with `NextToken does not match request`, where a statement that
-  parsed alike used to resume. A statement with a list or map parameter is
-  never resumed, even with the same parameter sent again: its first page
-  still hands out a token, and the next page is refused with it. A map
-  literal with more than one key used to be refused on its own next page,
-  because its key order was drawn afresh for every request; it pages now.
-  Captured against eu-west-2 and us-east-1.
+  literal's key order) or whose parameters are different values is refused
+  with `NextToken does not match request`, where a statement that parsed
+  alike used to resume. A number parameter is the same value when it is the
+  same decimal at the same scale, so `1E2` against `1e+2`, `01` against `1`
+  and `1.5E1` against `15` resume, and `0` against `0.0` or `100` against
+  `1E2` are refused. A set parameter is the same value with its members in
+  any order, a number set's members compared by value whatever their scale.
+  A statement with a list or map parameter is never resumed, even with the
+  same parameter sent again: its first page still hands out a token, and the
+  next page is refused with it. A map literal with more than one key used to
+  be refused on its own next page, because its key order was drawn afresh
+  for every request; it pages now. Captured against eu-west-2 and us-east-1.
 - `UpdateItem` is held to the 400KB limit the way DynamoDB holds it: by a
   charge worked out from the request, alongside the finished item's own size,
   rather than by the finished item less its key. Nothing the table already

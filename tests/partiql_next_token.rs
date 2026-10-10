@@ -1,10 +1,12 @@
 //! Which second-page requests a PartiQL NextToken resumes. DynamoDB binds the
 //! token to the statement exactly as written and to its parameters by value:
 //! a page that changes a space, a keyword's case, the projection or a trailing
-//! semicolon is refused, as is one whose parameters differ in any way, even
-//! `0` against `0.0`. A list or map parameter never resumes, even sent
-//! identically. Limit may change from page to page. Captured eu-west-2 and
-//! us-east-1, 2026-10-10; the regions agree on every row.
+//! semicolon is refused, as is one whose parameters are different values. A
+//! number is the same value only at the same scale, so `0` against `0.0` is
+//! refused while `1E2` against `1e+2` resumes, and a set is the same value in
+//! any order. A list or map parameter never resumes, even sent identically.
+//! Limit may change from page to page. Captured eu-west-2 and us-east-1,
+//! 2026-10-10; the regions agree on every row.
 
 use dynoxide::Database;
 use dynoxide::actions::create_table::CreateTableRequest;
@@ -192,4 +194,125 @@ fn a_list_or_map_parameter_never_resumes() {
         ),
         Err(MISMATCH.to_string())
     );
+}
+
+/// A number parameter matches when it is the same decimal, value and scale
+/// both: the exponent's case, a `+` in the exponent or before the number,
+/// leading zeros and the sign of zero don't matter, but `1.0` is not `1` and
+/// `100` is not `1E2`. Captured eu-west-2 and us-east-1, 2026-10-10.
+#[test]
+fn a_number_parameter_resumes_as_the_same_decimal() {
+    let statement = r#"SELECT pk FROM "Tok" WHERE z = ?"#;
+    let page = |first: &str, second: &str| {
+        second_page(
+            (statement, json!([{"N": first}])),
+            (statement, json!([{"N": second}])),
+            1,
+        )
+    };
+    for (first, second) in [
+        ("1e2", "1E2"),
+        ("1E2", "1e2"),
+        ("1E+2", "1E2"),
+        ("1E2", "1E+2"),
+        ("1e-2", "1E-2"),
+        ("-0", "0"),
+        ("01", "1"),
+        ("+1", "1"),
+        ("1.5E1", "15"),
+        ("1", "1"),
+        ("1E2", "1E2"),
+    ] {
+        assert_eq!(page(first, second), Ok(()), "{first} then {second}");
+    }
+    for (first, second) in [
+        ("1.0", "1"),
+        ("0.0", "0"),
+        ("0", "0.0"),
+        ("1.50", "1.5"),
+        ("100", "1E2"),
+        ("1E2", "100"),
+        ("100", "100.0"),
+        ("1E2", "1.0E2"),
+        ("0E2", "0"),
+    ] {
+        assert_eq!(
+            page(first, second),
+            Err(MISMATCH.to_string()),
+            "{first} then {second}"
+        );
+    }
+}
+
+/// A set parameter matches as a set: its members in any order, a number set's
+/// members by value whatever their scale, a string or binary set's exactly.
+/// Captured eu-west-2 and us-east-1, 2026-10-10.
+#[test]
+fn a_set_parameter_resumes_as_the_same_set() {
+    let statement = r#"SELECT pk FROM "Tok" WHERE z = ?"#;
+    let page = |first: Value, second: Value| {
+        second_page((statement, json!([first])), (statement, json!([second])), 1)
+    };
+    let numbers = [
+        ("1e2", "1E2"),
+        ("1E+2", "1E2"),
+        ("1e-2", "1E-2"),
+        ("1.0", "1"),
+        ("0.0", "0"),
+        ("-0", "0"),
+        ("01", "1"),
+        ("+1", "1"),
+        ("1.50", "1.5"),
+        ("100", "1E2"),
+        ("100", "100.0"),
+        ("1.5E1", "15"),
+        ("1E2", "1.0E2"),
+        ("0E2", "0"),
+        ("1", "1"),
+    ];
+    for (first, second) in numbers {
+        assert_eq!(
+            page(json!({"NS": [first]}), json!({"NS": [second]})),
+            Ok(()),
+            "[{first}] then [{second}]"
+        );
+        assert_eq!(
+            page(json!({"NS": [first, "7"]}), json!({"NS": [second, "7"]})),
+            Ok(()),
+            "[{first}, 7] then [{second}, 7]"
+        );
+    }
+    for (first, second) in [
+        (json!({"NS": ["1", "2"]}), json!({"NS": ["2", "1"]})),
+        (json!({"NS": ["1", "2"]}), json!({"NS": ["1.0", "2"]})),
+        (json!({"NS": ["1", "2"]}), json!({"NS": ["2", "1.0"]})),
+        (json!({"SS": ["a", "b"]}), json!({"SS": ["b", "a"]})),
+        (
+            json!({"BS": ["AQ==", "Ag=="]}),
+            json!({"BS": ["Ag==", "AQ=="]}),
+        ),
+        (json!({"S": "abc"}), json!({"S": "abc"})),
+    ] {
+        assert_eq!(
+            page(first.clone(), second.clone()),
+            Ok(()),
+            "{first} then {second}"
+        );
+    }
+    for (first, second) in [
+        (json!({"SS": ["a", "b", "c"]}), json!({"SS": ["a", "b"]})),
+        (json!({"SS": ["a", "b"]}), json!({"SS": ["a", "b", "c"]})),
+        (json!({"SS": ["a", "b"]}), json!({"SS": ["A", "b"]})),
+        (
+            json!({"BS": ["AQ==", "Ag==", "Aw=="]}),
+            json!({"BS": ["AQ==", "Ag=="]}),
+        ),
+        (json!({"S": "abc"}), json!({"S": "ABC"})),
+    ] {
+        assert_eq!(
+            page(first.clone(), second.clone()),
+            Err(MISMATCH.to_string()),
+            "{first} then {second}"
+        );
+    }
 }
