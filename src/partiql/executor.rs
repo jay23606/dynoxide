@@ -2567,16 +2567,40 @@ fn statement_key(
         })
     };
 
+    // An UPDATE or DELETE writes the item its top-level key equalities name,
+    // so that is the item it holds in the transaction: in
+    // `(pk = 'b' OR x = 1) AND pk = 'a'` the OR group is a condition on item
+    // a, not a second key (captured eu-west-2 and us-east-1, 2026-10-10).
+    // Equalities that disagree name no item here; the statement refuses
+    // itself for them.
+    let from_top_level = |where_clause: &Option<WhereClause>| -> Option<(String, String)> {
+        let wc = where_clause.as_ref()?;
+        key_of(&|name: &str| {
+            let mut values = wc
+                .top_level_equalities
+                .iter()
+                .filter(|cond| cond.path == name)
+                .map(|cond| resolve_value(&cond.value, parameters).ok());
+            let first = values.next()??;
+            let first_key = first.to_key_string();
+            if values.any(|v| v.and_then(|v| v.to_key_string()) != first_key) {
+                return None;
+            }
+            Some(first)
+        })
+    };
+
     match stmt {
         Statement::Insert { item, .. } => key_of(&|name: &str| {
             item.get(name)
                 .and_then(|v| resolve_value(v, parameters).ok())
         }),
-        Statement::Update { where_clause, .. }
-        | Statement::Delete { where_clause, .. }
+        Statement::Update { where_clause, .. } | Statement::Delete { where_clause, .. } => {
+            from_top_level(where_clause)
+        }
         // A SELECT resolves only when its WHERE pins every key attribute; one
         // spanning a partition yields nothing and takes no part in the check.
-        | Statement::Select { where_clause, .. } => from_where(where_clause),
+        Statement::Select { where_clause, .. } => from_where(where_clause),
     }
 }
 

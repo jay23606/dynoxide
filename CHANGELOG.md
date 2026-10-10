@@ -322,7 +322,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IN`, or no WHERE clause at all, is refused with `Where clause does not
   contain a mandatory equality on all key attributes`, and a key given two
   values with `Multiple conditions on same key`. `pk = 'a' AND pk = 'b'` used
-  to update the first item it named.
+  to update the first item it named. In a transaction, the duplicate-item
+  check takes the same key: `(pk = 'b' OR x = 1) AND pk = 'a'` beside another
+  statement on `a` is refused as two operations on one item, and beside one on
+  `b` it isn't; the check used to read the key from the OR group. Captured
+  against eu-west-2 and us-east-1.
 - A PartiQL WHERE clause takes `attribute_exists(path)` and
   `attribute_not_exists(path)`, in any case and compared with a boolean, as
   DynamoDB does; both used to fail with `Unknown operator: (`. An operand that

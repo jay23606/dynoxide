@@ -971,3 +971,70 @@ fn an_index_qualified_select_is_rejected_inside_a_transaction() {
         "got {msg}"
     );
 }
+
+// -----------------------------------------------------------------------
+// An UPDATE's item is the one its top-level key equalities name
+// -----------------------------------------------------------------------
+
+/// `(pk = 'b' OR x = 1) AND pk = 'a'` writes item a: the OR group is a
+/// condition on it, not a second key. So the duplicate-item check has to see
+/// item a too: alongside another statement on a the transaction is refused,
+/// and alongside one on b it runs (and is cancelled by the unmet condition on
+/// a). Captured eu-west-2 and us-east-1, 2026-10-10, with items a (x = 0) and
+/// b (x = 1).
+#[test]
+fn test_duplicate_check_takes_the_key_an_update_writes() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "OrGroup");
+    let seed = |db: &Database| {
+        for item in [
+            "{'pk': 'a', 's': 'abc', 'x': 0}",
+            "{'pk': 'b', 's': 'bcd', 'x': 1}",
+        ] {
+            db.execute_statement(ExecuteStatementRequest {
+                statement: format!("INSERT INTO \"OrGroup\" VALUE {item}"),
+                ..Default::default()
+            })
+            .ok();
+        }
+    };
+    seed(&db);
+    let or_group = "UPDATE \"OrGroup\" SET w = 1 WHERE (pk = 'b' OR x = 1) AND pk = 'a'";
+    let cancellation_codes = |result: Result<_, DynoxideError>| match result {
+        Err(DynoxideError::TransactionCanceledException(_, reasons)) => reasons
+            .iter()
+            .map(|r: &dynoxide::errors::CancellationReason| r.code.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("expected TransactionCanceledException, got {other:?}"),
+    };
+
+    let alone = db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: vec![stmt(or_group)],
+        ..Default::default()
+    });
+    assert_eq!(cancellation_codes(alone), ["ConditionalCheckFailed"]);
+
+    let on_a = db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: vec![
+            stmt(or_group),
+            stmt("UPDATE \"OrGroup\" SET v = 2 WHERE pk = 'a'"),
+        ],
+        ..Default::default()
+    });
+    match on_a {
+        Err(DynoxideError::ValidationException(m)) => assert_eq!(
+            m,
+            "Transaction request cannot include multiple operations on one item"
+        ),
+        other => panic!("expected the duplicate-item refusal, got {other:?}"),
+    }
+
+    let on_b = db.execute_transaction(ExecuteTransactionRequest {
+        transact_statements: vec![
+            stmt(or_group),
+            stmt("UPDATE \"OrGroup\" SET v = 2 WHERE pk = 'b'"),
+        ],
+        ..Default::default()
+    });
+    assert_eq!(cancellation_codes(on_b), ["ConditionalCheckFailed", "None"]);
+}
