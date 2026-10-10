@@ -224,12 +224,12 @@ async fn execute_inner<S: StorageBackend>(
         ));
     }
 
-    // Validate key attribute values (unsupported datatypes, invalid numbers)
     // A key or Expected value nested too deep is refused, inside the envelope,
     // before the key is matched to the schema or the table looked up.
     crate::value_nesting::check_key_enveloped(&request.key)?;
     crate::value_nesting::check_expected(request.expected.as_ref())?;
 
+    // Validate key attribute values (unsupported datatypes, invalid numbers).
     // A duplicated set member or a number it can't store comes back in the
     // envelope (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
     crate::validation::validate_key_values(&request.key, crate::validation::ValueLayer::Current)

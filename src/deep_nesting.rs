@@ -70,7 +70,18 @@ pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
     let Some(values) = scan(body) else {
         return DeepBody::Unreadable;
     };
-    let deep: Vec<&Value> = values.iter().filter(|v| v.nesting >= MAX_NESTING).collect();
+    let run_as_usual = matches!(
+        operation,
+        "ExecuteStatement" | "ExecuteTransaction" | "BatchExecuteStatement"
+    );
+    // A PartiQL parameter is refused from 33 levels, one more than any other
+    // value, so one at 32 is left to run.
+    let limit = if run_as_usual {
+        MAX_NESTING + 1
+    } else {
+        MAX_NESTING
+    };
+    let deep: Vec<&Value> = values.iter().filter(|v| v.nesting >= limit).collect();
     // The depth came from somewhere that isn't an attribute value, or a value
     // went past where DynamoDB itself stops reading.
     let Some(first) = deep.first() else {
@@ -80,10 +91,6 @@ pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
         return DeepBody::Unreadable;
     }
 
-    let run_as_usual = matches!(
-        operation,
-        "ExecuteStatement" | "ExecuteTransaction" | "BatchExecuteStatement"
-    );
     let stand_in = if run_as_usual {
         just_past_the_limit()
     } else {
@@ -92,6 +99,10 @@ pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
     let mut rewritten = String::with_capacity(body.len());
     let mut copied = 0;
     for value in &deep {
+        // A value inside one already replaced went with it.
+        if value.start < copied {
+            continue;
+        }
         rewritten.push_str(&body[copied..value.start]);
         rewritten.push_str(&stand_in);
         copied = value.end;
@@ -257,6 +268,10 @@ enum Role {
     MapMembers,
     /// The list under `L`: its elements are attribute values one level down.
     ListElements,
+    /// Inside an attribute value but not under its `M` or `L`, or an `M` or
+    /// `L` of the wrong shape: nothing in it is request structure or another
+    /// attribute value, however its members are named.
+    Opaque,
 }
 
 struct Frame {
@@ -301,8 +316,9 @@ fn child_role(parent: Option<&Frame>, key: &[u8]) -> Role {
         Role::Attribute => match key {
             b"M" => Role::MapMembers,
             b"L" => Role::ListElements,
-            _ => Role::Other,
+            _ => Role::Opaque,
         },
+        Role::Opaque => Role::Opaque,
     }
 }
 
@@ -390,7 +406,7 @@ fn scan(body: &str) -> Option<Vec<Value>> {
                         let p = parent.expect("an attribute value holds its list");
                         (value, nesting) = (p.value, p.nesting);
                     }
-                    Role::Attribute | Role::MapMembers | Role::ListElements => role = Role::Other,
+                    Role::Attribute | Role::MapMembers | Role::ListElements => role = Role::Opaque,
                     _ => {}
                 }
                 stack.push(Frame {
@@ -535,6 +551,44 @@ mod tests {
         assert!(scan(r#"{"Item":{"pk":{"S":"a"]}}"#).is_none());
         assert!(scan(r#"{} {}"#).is_none());
         assert!(scan(&"[".repeat(MAX_JSON_DEPTH + 1)).is_none());
+    }
+
+    /// A deep value whose innermost attribute hides request-shaped members:
+    /// `{"S":{"Item":{"y":<deep>}}}`, or an `M` holding a list. The members
+    /// aren't attribute values, so nothing inside them starts a second value.
+    fn hostile(outer: &str) -> String {
+        let inner = format!(r#"{{"Item":{{"y":{}}}}}"#, deep_map(40));
+        let leaf = outer.replace("LEAF", &format!(r#"{{"S":{inner}}}"#));
+        format!(r#"{{"TableName":"Tbl","Item":{{"pk":{{"S":"p"}},"data":{leaf}}}}}"#)
+    }
+
+    #[test]
+    fn members_of_a_value_other_than_m_and_l_hold_no_values() {
+        let in_maps = hostile(&format!(
+            "{}LEAF{}",
+            "{\"M\":{\"n\":".repeat(70),
+            "}}".repeat(70)
+        ));
+        let in_lists = hostile(&format!("{}LEAF{}", "{\"L\":[".repeat(70), "]}".repeat(70)));
+        let wrong_shape_value = format!(
+            "{}{{\"M\":[{{\"Item\":{{\"y\":{}}}}}]}}{}",
+            "{\"M\":{\"n\":".repeat(70),
+            deep_map(40),
+            "}}".repeat(70)
+        );
+        let wrong_shape = format!(
+            r#"{{"TableName":"Tbl","Item":{{"pk":{{"S":"p"}},"data":{wrong_shape_value}}}}}"#
+        );
+        for body in [in_maps, in_lists, wrong_shape] {
+            let values = scan(&body).unwrap();
+            for pair in values.windows(2) {
+                assert!(pair[0].end <= pair[1].start, "values overlap");
+            }
+            match resolve("PutItem", &body) {
+                DeepBody::Refuse(e) => assert_eq!(e.to_string(), NESTING_LIMIT_MESSAGE),
+                other => panic!("expected the nesting refusal, got {other:?}"),
+            }
+        }
     }
 
     #[test]

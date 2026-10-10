@@ -1125,3 +1125,93 @@ async fn values_nested_31_levels_in_these_positions_are_not_refused_for_nesting(
     .await;
     assert_eq!(status, 200, "{body}");
 }
+
+/// Send a raw body, returning `None` when the server doesn't answer at all.
+async fn try_send(url: &str, operation: &str, body: String) -> Option<(u16, Value)> {
+    let resp = reqwest::Client::new()
+        .post(url)
+        .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+        )
+        .header("x-amz-date", "20260101T000000Z")
+        .body(body)
+        .send()
+        .await
+        .ok()?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.ok()?;
+    Some((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
+}
+
+/// Members of an attribute value other than `M` and `L` hold no attribute
+/// values, whatever they are called, so `{"S":{"Item":{...}}}` deep inside a
+/// value is part of that value. The request gets the nesting refusal and the
+/// server answers the next one.
+#[tokio::test]
+async fn request_shaped_members_inside_a_deep_value_are_part_of_it() {
+    let url = start().await;
+    create_table(&url, "Deep").await;
+    put_base_item(&url).await;
+
+    let inner = format!(r#"{{"Item":{{"y":{}}}}}"#, deep_map(40));
+    let in_maps = format!(
+        "{}{{\"S\":{inner}}}{}",
+        "{\"M\":{\"n\":".repeat(70),
+        "}}".repeat(70)
+    );
+    let in_lists = format!(
+        "{}{{\"S\":{inner}}}{}",
+        "{\"L\":[".repeat(70),
+        "]}".repeat(70)
+    );
+    for value in [in_maps, in_lists] {
+        let body = format!(r#"{{"TableName":"Deep","Item":{{"pk":{{"S":"p"}},"data":{value}}}}}"#);
+        let (status, answer) = try_send(&url, "PutItem", body)
+            .await
+            .expect("the server answers the request");
+        assert_validation(status, &answer, NEST);
+        assert!(
+            item_exists(&url, "base").await,
+            "the server answers the next request"
+        );
+    }
+}
+
+/// A PartiQL parameter at 32 levels runs even when another statement in the
+/// same batch nests deep enough that the body has to be walked: its condition
+/// is evaluated, where the 63-level one is refused before it runs.
+#[tokio::test]
+async fn a_batch_statement_parameter_at_32_levels_runs_beside_a_63_level_one() {
+    let url = start().await;
+    create_table(&url, "Deep").await;
+    put_base_item(&url).await;
+    let (status, body) = send(
+        &url,
+        "BatchExecuteStatement",
+        format!(
+            r#"{{"Statements":[{},{}]}}"#,
+            statement(
+                r#"DELETE FROM \"Deep\" WHERE pk = 'base' AND data = ?"#,
+                &deep_map(32)
+            ),
+            statement(
+                r#"DELETE FROM \"Deep\" WHERE pk = 'other' AND data = ?"#,
+                &deep_map(63)
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let responses = body["Responses"].as_array().expect("Responses");
+    // The first ran: its condition was evaluated, and failed.
+    assert_eq!(
+        responses[0]["Error"]["Code"], "ConditionalCheckFailed",
+        "{body}"
+    );
+    assert_eq!(responses[1]["Error"]["Code"], "ValidationError", "{body}");
+    assert_eq!(responses[1]["Error"]["Message"], NEST, "{body}");
+    assert!(item_exists(&url, "base").await);
+}
