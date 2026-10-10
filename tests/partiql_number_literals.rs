@@ -2351,6 +2351,26 @@ fn key_values_of_the_wrong_type_get_dynamodbs_messages() {
     assert!(pks(resp).is_empty());
 }
 
+/// The values of an `IN` on a key are a set, so the same list written in
+/// another order is the same condition, and the key-type check still sees a
+/// single condition on the key.
+#[test]
+fn a_reordered_in_list_on_a_key_is_the_same_condition() {
+    let db = seeded();
+    for statement in [
+        "SELECT * FROM \"Nums\" WHERE pk IN [1, 'x']",
+        "SELECT * FROM \"Nums\" WHERE pk IN [1, 'x'] AND pk IN ['x', 1]",
+        "SELECT * FROM \"Nums\" WHERE pk IN [1, 'x', 1] AND pk IN ['x', 1]",
+    ] {
+        let err = run(&db, statement).expect_err(statement);
+        assert_eq!(
+            message(err),
+            format!("{KEY_SCHEMA_MISMATCH} pk"),
+            "{statement}"
+        );
+    }
+}
+
 #[test]
 fn key_values_of_the_wrong_type_in_batches_and_transactions() {
     // Captured eu-west-2 and us-east-1, 2026-10-09. A batch reports either

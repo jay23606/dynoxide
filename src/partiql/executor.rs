@@ -249,11 +249,22 @@ fn key_conditions(
         });
     }
     Some(first_of_each(found, |condition| {
-        let mut key = condition.op.as_bytes().to_vec();
+        let mut encoded = Vec::with_capacity(condition.values.len());
         for value in &condition.values {
-            if !encode_scalar(value, &mut key) {
+            let mut one = Vec::new();
+            if !encode_scalar(value, &mut one) {
                 return None;
             }
+            encoded.push(one);
+        }
+        // An equality's values (an `IN` list) are a set, so the same list in
+        // another order is the same condition; BETWEEN's two are not.
+        if condition.op == "=" {
+            encoded.sort_unstable();
+        }
+        let mut key = condition.op.as_bytes().to_vec();
+        for one in encoded {
+            key.extend_from_slice(&one);
         }
         Some(key)
     }))
