@@ -1,6 +1,6 @@
 [package]
 name = "dynoxide-rs"
-version = "2.0.1"
+version = "3.0.0"
 edition = "2024"
 description = "An embeddable DynamoDB emulator backed by SQLite. Starts in under a millisecond, and is verified against real AWS by a public conformance suite."
 license = "MIT OR Apache-2.0"
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/dynoxide-rs"
 readme = "README-crate.md"
 keywords = ["dynamodb", "sqlite", "emulator", "aws", "testing"]
 categories = ["database-implementations", "emulators"]
-rust-version = "1.94.1"
+rust-version = "1.88"
 
 [lib]
 name = "dynoxide"
@@ -143,11 +143,15 @@ proptest = "1"
 # set already selects. That path carried its own h2 0.3, rustls 0.101 and
 # rustls-pemfile 1.0, none of which have a patched release, and all of which
 # were reported against a dev-dependency the published crate never ships.
-aws-sdk-dynamodb = { version = "1", default-features = false, features = [
+# The minimums keep aws-smithy-json at 0.63 or later (GHSA-8ffr-xgwf-xj56).
+# These releases need Rust 1.94.1, above the crate's 1.88, so without them the
+# MSRV-aware resolver would fall back to the vulnerable versions. Only the
+# tests and benchmarks build them.
+aws-sdk-dynamodb = { version = "1.130", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
-aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-config = { version = "1.12", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 # Already in the tree behind `default-https-client`; named directly so the SDK
 # integration test can hand the client a plain-HTTP connector. Without one the
