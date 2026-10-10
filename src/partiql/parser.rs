@@ -1210,14 +1210,32 @@ fn read_operand(t: &mut Tokenizer, read: fn(&mut Tokenizer) -> ExprResult) -> Ex
     read(t)
 }
 
-fn read_expression(t: &mut Tokenizer) -> ExprResult {
-    let mut kind = term!(read_and(t));
-    while t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "OR")) {
-        t.next_token()?;
-        term!(read_operand(t, read_and));
-        kind = ExprKind::Other;
+/// Read with one more level of nesting. A statement nested past
+/// [`MAX_EXPR_DEPTH`] (brackets, list or bag openers, CASE, path indexes) is
+/// refused as too deep to parse rather than read any further, so no input can
+/// run the reader out of stack. DynamoDB's own parser answers a 500 for a
+/// statement of 8,192 `(` (captured eu-west-2 and us-east-1, 2026-10-10);
+/// refusing it is a deliberate difference.
+fn nested(t: &mut Tokenizer, read: impl FnOnce(&mut Tokenizer) -> ExprResult) -> ExprResult {
+    if t.depth >= MAX_EXPR_DEPTH {
+        return Err(TOO_DEEP.to_string());
     }
-    Ok(Ok(kind))
+    t.depth += 1;
+    let result = read(t);
+    t.depth -= 1;
+    result
+}
+
+fn read_expression(t: &mut Tokenizer) -> ExprResult {
+    nested(t, |t| {
+        let mut kind = term!(read_and(t));
+        while t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "OR")) {
+            t.next_token()?;
+            term!(read_operand(t, read_and));
+            kind = ExprKind::Other;
+        }
+        Ok(Ok(kind))
+    })
 }
 
 fn read_and(t: &mut Tokenizer) -> ExprResult {
@@ -1231,12 +1249,15 @@ fn read_and(t: &mut Tokenizer) -> ExprResult {
 }
 
 fn read_not(t: &mut Tokenizer) -> ExprResult {
-    if t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "NOT")) {
+    // A run of NOTs is read in a loop: it nests nothing, and a run with no
+    // term after it ends in "Unexpected term", as on DynamoDB.
+    let mut negated = false;
+    while t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "NOT")) {
         t.next_token()?;
-        term!(read_not(t));
-        return Ok(Ok(ExprKind::Other));
+        negated = true;
     }
-    read_comparison(t)
+    let kind = term!(read_comparison(t));
+    Ok(Ok(if negated { ExprKind::Other } else { kind }))
 }
 
 fn read_comparison(t: &mut Tokenizer) -> ExprResult {
@@ -1324,22 +1345,27 @@ fn read_multiplicative(t: &mut Tokenizer) -> ExprResult {
 }
 
 fn read_unary(t: &mut Tokenizer) -> ExprResult {
-    // `NOT` can start a term too (`FOO = NOT BAR`).
-    if t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "NOT")) {
+    // `NOT` can start a term too (`FOO = NOT BAR`), and signs stack (`- -1`).
+    // Both are read in a loop rather than by recursion, so a long run of them
+    // nests nothing and ends in "Unexpected term" if no term follows.
+    let (mut negated, mut signed) = (false, false);
+    loop {
+        match t.peek_token()? {
+            Some(tok) if is_keyword(&tok, "NOT") => negated = true,
+            Some(tok) if tok == "-" || tok == "+" => signed = true,
+            _ => break,
+        }
         t.next_token()?;
-        term!(read_unary(t));
-        return Ok(Ok(ExprKind::Other));
     }
-    if t.peek_token()?.is_some_and(|tok| tok == "-" || tok == "+") {
-        t.next_token()?;
-        // A sign on a number is part of the number (`-1`, `- -1`); on anything
-        // else it is an operation (`-'a'`, `-FOO`).
-        return Ok(Ok(match term!(read_unary(t)) {
-            ExprKind::Number => ExprKind::Number,
-            _ => ExprKind::Other,
-        }));
-    }
-    read_primary(t)
+    let kind = term!(read_primary(t));
+    // A sign on a number is part of the number (`-1`, `- -1`); on anything
+    // else it is an operation (`-'a'`, `-FOO`), and so is a NOT.
+    Ok(Ok(match kind {
+        _ if negated => ExprKind::Other,
+        ExprKind::Number => ExprKind::Number,
+        _ if signed => ExprKind::Other,
+        kind => kind,
+    }))
 }
 
 /// Read the elements of a list, a bag or a call's arguments up to `close`,
@@ -1580,6 +1606,10 @@ fn parse_order_by(t: &mut Tokenizer) -> Result<Vec<OrderByTerm>, String> {
     expect_keyword(t, "ORDER")?;
     expect_keyword(t, "BY")?;
     let mut terms = Vec::new();
+    // Only the first rejected term is ever reported (the executor stops at
+    // it), so a position is worked out for that one alone: each walks the
+    // statement from its start.
+    let mut rejected = false;
     loop {
         let span = t.span_at(t.pos);
         let tok = t
@@ -1601,12 +1631,13 @@ fn parse_order_by(t: &mut Tokenizer) -> Result<Vec<OrderByTerm>, String> {
         } else {
             None
         };
-        let rejection = found.map(|found| {
+        let rejection = found.filter(|_| !rejected).map(|found| {
             format!(
                 "Argument to ORDER BY must be of type VariableReference. Type: {found} at {}",
                 t.position(span)
             )
         });
+        rejected |= rejection.is_some();
         let path = parse_dotted_path_from_token(&tok, t)?;
         let mut descending = false;
         if let Some(direction) = t
@@ -2346,9 +2377,9 @@ enum BoolExpr {
 }
 
 /// `depth` counts the nesting levels above this expression: one per set of
-/// parentheses and one per `NOT`, which are the two edges that come back round
-/// to a parser already on the stack. Alternation and conjunction chains are
-/// loops rather than recursion, so a long `a OR b OR c ...` does not spend it.
+/// parentheses, the one edge that comes back round to a parser already on the
+/// stack. A run of NOTs and the alternation and conjunction chains are loops
+/// rather than recursion, so a long `a OR b OR c ...` does not spend it.
 fn parse_or_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     if depth > MAX_EXPR_DEPTH {
         return Err(TOO_DEEP.to_string());
@@ -2356,6 +2387,7 @@ fn parse_or_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     let mut terms = vec![parse_and_expr(t, depth)?];
     while matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("OR")) {
         t.next_token()?;
+        t.count_operator();
         require_right_hand_side(t)?;
         terms.push(parse_and_expr(t, depth)?);
     }
@@ -2370,6 +2402,7 @@ fn parse_and_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     let mut terms = vec![parse_not_expr(t, depth)?];
     while matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("AND")) {
         t.next_token()?;
+        t.count_operator();
         require_right_hand_side(t)?;
         terms.push(parse_not_expr(t, depth)?);
     }
@@ -2397,15 +2430,23 @@ fn parse_not_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     // `NOT BEGINS_WITH(x, y)` is a single condition with its own variant, so it
     // belongs to parse_single_condition and is left to it. A `NOT` in front of
     // anything else is the boolean operator.
-    if matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("NOT")) {
+    let mut nots = 0usize;
+    while matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("NOT")) {
         let next = t.peek_token_at(1)?.unwrap_or_default();
-        let is_condition_form = next.eq_ignore_ascii_case("BEGINS_WITH");
-        if !is_condition_form {
-            t.next_token()?;
-            return Ok(BoolExpr::Not(Box::new(parse_not_expr(t, depth + 1)?)));
+        if next.eq_ignore_ascii_case("BEGINS_WITH") {
+            break;
         }
+        t.next_token()?;
+        t.count_operator();
+        nots += 1;
     }
-    parse_primary(t, depth)
+    let mut expr = parse_primary(t, depth)?;
+    // Past the operator limit the statement is refused once it has parsed,
+    // so the NOTs beyond it needn't be built.
+    for _ in 0..nots.min(MAX_OPERATORS + 1) {
+        expr = BoolExpr::Not(Box::new(expr));
+    }
+    Ok(expr)
 }
 
 fn parse_primary(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
@@ -3154,6 +3195,12 @@ const TOO_COMPLEX: &str = "WHERE clause is too complex to evaluate";
 
 /// The rejection both descents share when they run past `MAX_EXPR_DEPTH`.
 const TOO_DEEP: &str = "Statement is nested too deeply to parse";
+
+/// How many operators a WHERE clause may hold: DynamoDB refuses the 301st
+/// (`operator count: 301` for 1,020 NOTs; captured eu-west-2 and us-east-1,
+/// 2026-10-10). NOT, AND and OR are counted; whether a comparison or a
+/// function counts as well wasn't captured.
+const MAX_OPERATORS: usize = 300;
 
 /// Flatten an AND/OR tree into the OR-of-ANDs the rest of the engine reads.
 fn to_dnf(expr: BoolExpr) -> Result<Vec<Vec<WhereCondition>>, String> {
@@ -4301,6 +4348,10 @@ struct Tokenizer {
     /// The first operand an operator or function can't take, as its refusal:
     /// reported after every refusal above and before the table lookup.
     operand_refusal: Option<String>,
+    /// How deep the reader for a statement with no verb has nested.
+    depth: usize,
+    /// How many operators the WHERE clause has held so far.
+    operators: usize,
 }
 
 /// One refusal DynamoDB makes as it reads a statement's terms.
@@ -4337,6 +4388,8 @@ impl Tokenizer {
             value_path: Vec::new(),
             refusals: Vec::new(),
             operand_refusal: None,
+            depth: 0,
+            operators: 0,
         })
     }
 
@@ -4344,6 +4397,9 @@ impl Tokenizer {
     /// recognise. It names the function in lower case, as written otherwise,
     /// and where it stands: `Unrecognized function: exists at 1:61:6`.
     fn note_unrecognized_function(&mut self, index: usize) {
+        if self.clause_refused() {
+            return;
+        }
         let name = self.tokens[index].to_lowercase();
         let at = self.position(self.span_at(index));
         self.note_term(format!("Unrecognized function: {name} at {at}"));
@@ -4354,6 +4410,9 @@ impl Tokenizer {
     /// against the literals DynamoDB refuses, WHERE clause first, and ahead of
     /// any operand refusal (captured eu-west-2 and us-east-1, 2026-10-09).
     fn note_term(&mut self, message: String) {
+        if self.clause_refused() {
+            return;
+        }
         self.refusals.push(Refusal {
             clause: self.clause,
             message,
@@ -4361,8 +4420,31 @@ impl Tokenizer {
         });
     }
 
+    /// Whether the clause being read already holds a refusal. Only the first
+    /// in a clause is reported, so a later one isn't built or kept: a
+    /// statement full of refused literals under a long path would otherwise
+    /// store a message per literal.
+    fn clause_refused(&self) -> bool {
+        self.refusals.iter().any(|r| r.clause == self.clause)
+    }
+
+    /// Count an operator in the WHERE clause, refusing the one past
+    /// [`MAX_OPERATORS`] in DynamoDB's words once the statement has parsed.
+    fn count_operator(&mut self) {
+        self.operators += 1;
+        if self.operators == MAX_OPERATORS + 1 {
+            self.note_term(format!(
+                "The expression contains too many operators; operator count: {}",
+                self.operators
+            ));
+        }
+    }
+
     /// Note a literal DynamoDB refuses as it reads it, in the same order.
     fn note_literal(&mut self, message: String) {
+        if self.clause_refused() {
+            return;
+        }
         self.refusals.push(Refusal {
             clause: self.clause,
             message,
@@ -4383,6 +4465,9 @@ impl Tokenizer {
     /// validation layer's words, with no path (captured eu-west-2, us-east-1,
     /// eu-west-1 and us-west-2, 2026-10-09).
     fn note_set_literal(&mut self, value: &AttributeValue) {
+        if self.clause_refused() {
+            return;
+        }
         let message = match value {
             AttributeValue::NS(members) => {
                 let mut seen = std::collections::HashSet::new();
@@ -4418,6 +4503,9 @@ impl Tokenizer {
     /// recorded with its path, `root` being the value it was written as part
     /// of, and reported once the statement has parsed.
     fn note_number(&mut self, text: &str) {
+        if self.clause_refused() {
+            return;
+        }
         if let Err(message) = check_literal_number(text) {
             let path: String = self.value_path.concat();
             self.note_literal(format!("{message} under root{path}"));
@@ -4440,7 +4528,7 @@ impl Tokenizer {
     /// us-east-1, 2026-10-09: 31 levels are accepted, and 32 and 63 both fail
     /// at the 32nd).
     fn note_depth(&mut self) {
-        if self.value_path.len() == LITERAL_NESTING_LIMIT {
+        if self.value_path.len() == LITERAL_NESTING_LIMIT && !self.clause_refused() {
             let path: String = self.value_path.concat();
             self.note_literal(format!(
                 "Nesting Levels have exceeded supported limits under root{path}"
@@ -4817,6 +4905,85 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long run of NOTs is read in a loop, so it nests nothing: the WHERE
+    /// clause's operator limit refuses it, however long the run.
+    #[test]
+    fn a_long_run_of_nots_is_refused_by_the_operator_limit() {
+        let statement = format!(r#"SELECT * FROM "t" WHERE {}pk='1'"#, "NOT ".repeat(5_000));
+        match parse(&statement) {
+            Err(ParseError::Validation(message)) => assert_eq!(
+                message,
+                "The expression contains too many operators; operator count: 301"
+            ),
+            other => panic!("expected the operator limit, got {other:?}"),
+        }
+    }
+
+    /// A negated `IN` is one group as wide as the list under De Morgan, and
+    /// each negated conjunction after it clones that whole group once per
+    /// alternative; capping groups alone left that work unbounded. The
+    /// statement limit keeps such a clause out of the parser now, so this
+    /// guards the cap behind it.
+    #[test]
+    fn a_clause_too_wide_to_flatten_is_rejected_rather_than_grinding() {
+        let values = (0..4_000)
+            .map(|i| format!("'v{i}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut clause = format!("NOT a IN ({values})");
+        for i in 0..8 {
+            clause.push_str(&format!(" AND NOT (b='p{i}' AND b='q{i}')"));
+        }
+        let start = std::time::Instant::now();
+        let err = parse(&format!(r#"SELECT * FROM "t" WHERE {clause}"#)).unwrap_err();
+        assert!(err.to_string().contains("too complex"), "got {err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// The group cap trips while an alternation is flattened, not after every
+    /// arm has been built.
+    #[test]
+    fn a_wide_alternation_is_rejected_without_building_it_first() {
+        let clause = (0..40_000)
+            .map(|i| format!("a='v{i}'"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let start = std::time::Instant::now();
+        let err = parse(&format!(r#"SELECT * FROM "t" WHERE {clause}"#)).unwrap_err();
+        assert!(err.to_string().contains("too complex"), "got {err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Only the first refusal in a clause is ever reported, so later ones in
+    /// the same clause aren't built or kept, however many a statement holds
+    /// or however long the path to them.
+    #[test]
+    fn only_the_first_refusal_in_a_clause_is_kept() {
+        let mut t = Tokenizer::new("SELECT * FROM \"t\"").unwrap();
+        t.clause = LiteralClause::Value;
+        t.value_path = vec![format!(".{}", "k".repeat(10_000)); 31];
+        for _ in 0..1_000 {
+            t.note_number("1e999999999");
+            t.note_key("");
+            t.note_depth();
+            t.note_empty_bag();
+        }
+        assert_eq!(t.refusals.len(), 1);
+        assert!(
+            t.refusals[0].message.contains("under root.kkk"),
+            "{}",
+            &t.refusals[0].message[..80]
+        );
+
+        t.clause = LiteralClause::Where;
+        t.note_key("");
+        assert_eq!(t.refusals.len(), 2);
+        assert_eq!(
+            t.refusals[1].message,
+            "Path component cannot be an empty string"
+        );
+    }
 
     #[test]
     fn test_parse_select_star() {

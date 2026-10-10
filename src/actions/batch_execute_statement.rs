@@ -171,6 +171,14 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    // A statement of the wrong length refuses the whole request, as a member.
+    for (i, statement) in request.statements.iter().enumerate() {
+        let path = format!("statements.{}.member.statement", i + 1);
+        if let Some(e) = crate::partiql::statement_length_rejection(&statement.statement, &path) {
+            return Err(e);
+        }
+    }
+
     // Parse once, and carry the resolved target alongside. Statements that fail
     // to parse keep their error for the per-statement path below: a batch
     // holding one is not rejected outright, it reports `ValidationError` against

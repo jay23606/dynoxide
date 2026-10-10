@@ -68,6 +68,10 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    if let Some(e) = crate::partiql::statement_length_rejection(&request.statement, "statement") {
+        return Err(e);
+    }
+
     // A parameter holding an empty attribute name is refused bare, before the
     // statement is parsed or its table looked up (captured in ten regions).
     if crate::empty_names::parameters_have_empty_name(request.parameters.as_deref()) {

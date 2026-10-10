@@ -102,6 +102,12 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
             "Member must have length less than or equal to 100".to_string(),
         ));
     }
+    for (i, statement) in statements.iter().enumerate() {
+        let path = format!("transactStatements.{}.member.statement", i + 1);
+        if let Some(e) = crate::partiql::statement_length_rejection(&statement.statement, &path) {
+            return Err(e);
+        }
+    }
 
     // A parameter holding an empty attribute name is a top-level rejection,
     // before any statement is parsed (captured in ten regions).

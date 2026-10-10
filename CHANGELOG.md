@@ -560,6 +560,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DynamoDB's "Two document paths overlap" message, where it used to be
   applied. `UpdateItem` names the two paths in the order they were written.
   Captured against eu-west-2 and us-east-1.
+- A PartiQL statement longer than 8,192 characters, or an empty one, is
+  refused before it is parsed, as a request member with DynamoDB's message
+  (`Member must have length less than or equal to 8192`), on
+  `ExecuteStatement`, `BatchExecuteStatement` and `ExecuteTransaction`. The
+  limit counts characters, not bytes. Captured against eu-west-2 and
+  us-east-1.
+- A PartiQL WHERE clause with more than 300 operators is refused with
+  DynamoDB's "The expression contains too many operators" message. A run of
+  NOTs no longer counts as nesting, so one that was refused as nested too
+  deeply now runs. Captured against eu-west-2 and us-east-1.
 
 ## [1.2.1] - 2026-09-20
 

@@ -16,7 +16,6 @@ use dynoxide::Database;
 use dynoxide::actions::execute_statement::ExecuteStatementRequest;
 use dynoxide::types::AttributeValue;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 const TABLE: &str = "pq_bool";
 
@@ -403,21 +402,6 @@ fn a_deeply_parenthesised_clause_is_rejected_rather_than_overflowing_the_stack()
 }
 
 #[test]
-fn a_long_run_of_nots_is_rejected_rather_than_overflowing_the_stack() {
-    // `NOT` recurses on its own, so it reaches the same cliff by a different
-    // route: this one needs no parentheses at all.
-    let db = seeded();
-    let err = parse_rejection(
-        &db,
-        format!(
-            "SELECT * FROM \"{TABLE}\" WHERE {}pk='1'",
-            "NOT ".repeat(5000)
-        ),
-    );
-    assert!(err.contains("nested too deeply"), "got {err}");
-}
-
-#[test]
 fn a_clause_nested_within_the_budget_still_parses() {
     // The bound has to leave room for anything anyone would write. Ten levels
     // of parentheses is already far past that and must still run.
@@ -455,52 +439,6 @@ fn the_depth_budget_is_spent_across_both_descents() {
 // how much the flattening then builds. A clause can be shallow and still expand
 // enormously, and the flattener used to build the whole expansion before
 // noticing it was over the cap.
-
-#[test]
-fn a_wide_alternation_is_rejected_without_building_it_first() {
-    // The group cap used to be checked only after the whole alternation had been
-    // flattened, so a clause with tens of thousands of arms allocated every one
-    // of them on its way to a rejection it was always going to get.
-    let db = seeded();
-    let clause = (0..40_000)
-        .map(|i| format!("a='v{i}'"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let start = Instant::now();
-    let err = parse_rejection(&db, format!("SELECT * FROM \"{TABLE}\" WHERE {clause}"));
-    assert!(err.contains("too complex"), "got {err}");
-    assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "rejection took {:?}",
-        start.elapsed()
-    );
-}
-
-#[test]
-fn a_clause_too_wide_to_flatten_is_rejected_rather_than_grinding() {
-    // A negated `IN` is one group as wide as the list under De Morgan, and each
-    // negated conjunction after it clones that whole group once per alternative.
-    // Capping groups leaves that work unbounded, so a statement of a few tens of
-    // kilobytes used to spend tens of seconds of CPU cloning conditions before
-    // any cap tripped.
-    let db = seeded();
-    let values = (0..4_000)
-        .map(|i| format!("'v{i}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut clause = format!("NOT a IN ({values})");
-    for i in 0..8 {
-        clause.push_str(&format!(" AND NOT (b='p{i}' AND b='q{i}')"));
-    }
-    let start = Instant::now();
-    let err = parse_rejection(&db, format!("SELECT * FROM \"{TABLE}\" WHERE {clause}"));
-    assert!(err.contains("too complex"), "got {err}");
-    assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "rejection took {:?}",
-        start.elapsed()
-    );
-}
 
 #[test]
 fn a_clause_within_the_width_budget_still_runs() {

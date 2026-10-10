@@ -238,23 +238,66 @@ fn key_conditions(
         };
         let mut resolved = resolve(&values)?;
         if op == "=" {
-            let mut distinct = Vec::with_capacity(resolved.len());
-            for value in resolved {
-                if !distinct.contains(&value) {
-                    distinct.push(value);
-                }
-            }
-            resolved = distinct;
+            resolved = first_of_each(resolved, |value| {
+                let mut key = Vec::new();
+                encode_scalar(value, &mut key).then_some(key)
+            });
         }
-        let condition = KeyCondition {
+        found.push(KeyCondition {
             op,
             values: resolved,
+        });
+    }
+    Some(first_of_each(found, |condition| {
+        let mut key = condition.op.as_bytes().to_vec();
+        for value in &condition.values {
+            if !encode_scalar(value, &mut key) {
+                return None;
+            }
+        }
+        Some(key)
+    }))
+}
+
+/// Keep the first of each repeated item, in the order given. Items `key` can
+/// encode are found through a hash set; any it can't (a non-scalar value,
+/// which no key condition can use) are compared among themselves as before.
+fn first_of_each<T: PartialEq>(
+    items: impl IntoIterator<Item = T>,
+    key: impl Fn(&T) -> Option<Vec<u8>>,
+) -> Vec<T> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<T> = Vec::new();
+    let mut unkeyed: Vec<usize> = Vec::new();
+    for item in items {
+        let fresh = match key(&item) {
+            Some(k) => seen.insert(k),
+            None => !unkeyed.iter().any(|&i| out[i] == item),
         };
-        if !found.contains(&condition) {
-            found.push(condition);
+        if fresh {
+            if key(&item).is_none() {
+                unkeyed.push(out.len());
+            }
+            out.push(item);
         }
     }
-    Some(found)
+    out
+}
+
+/// Append an S, N or B value to `key` as a tag and its length-prefixed bytes,
+/// so two encodings match exactly when the values are equal. `false` for any
+/// other type.
+fn encode_scalar(value: &AttributeValue, key: &mut Vec<u8>) -> bool {
+    let (tag, bytes) = match value {
+        AttributeValue::S(s) => (b'S', s.as_bytes()),
+        AttributeValue::N(n) => (b'N', n.as_bytes()),
+        AttributeValue::B(b) => (b'B', b.as_slice()),
+        _ => return false,
+    };
+    key.push(tag);
+    key.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    key.extend_from_slice(bytes);
+    true
 }
 
 /// Refuse a SELECT key value DynamoDB can't read the key by, as
@@ -537,13 +580,20 @@ fn reject_overlapping_key_conditions(
         let mut narrow = |keys: Vec<String>| {
             partitions = Some(match partitions.take() {
                 None => keys,
-                Some(held) => held.into_iter().filter(|k| keys.contains(k)).collect(),
+                Some(held) => {
+                    let wanted: std::collections::HashSet<&str> =
+                        keys.iter().map(String::as_str).collect();
+                    held.into_iter()
+                        .filter(|k| wanted.contains(k.as_str()))
+                        .collect()
+                }
             });
         };
         // Each sort key condition as the atoms it stands for.
         let mut conditions: Vec<Vec<SortKeyAtom>> = Vec::new();
+        let mut seen_conditions = std::collections::HashSet::new();
         let mut add = |atoms: Vec<SortKeyAtom>| {
-            if !conditions.contains(&atoms) {
+            if seen_conditions.insert(encode_atoms(&atoms)) {
                 conditions.push(atoms);
             }
         };
@@ -683,6 +733,38 @@ fn key_groups(wc: &WhereClause, read_pk: &str, read_sk: Option<&str>) -> Vec<Vec
     }
 }
 
+/// The atoms of one sort key condition as bytes, equal exactly when the atoms
+/// are, for finding a repeated condition through a hash set.
+fn encode_atoms(atoms: &[SortKeyAtom]) -> Vec<u8> {
+    fn text(tag: u8, s: &str, key: &mut Vec<u8>) {
+        key.push(tag);
+        key.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        key.extend_from_slice(s.as_bytes());
+    }
+    let mut key = Vec::new();
+    for atom in atoms {
+        match atom {
+            SortKeyAtom::Points(values) => {
+                key.push(b'P');
+                key.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for v in values {
+                    text(b'v', v, &mut key);
+                }
+            }
+            SortKeyAtom::Above(v, inclusive) => {
+                text(b'A', v, &mut key);
+                key.push(u8::from(*inclusive));
+            }
+            SortKeyAtom::Below(v, inclusive) => {
+                text(b'W', v, &mut key);
+                key.push(u8::from(*inclusive));
+            }
+            SortKeyAtom::Prefix(v) => text(b'X', v, &mut key),
+        }
+    }
+    key
+}
+
 /// Whether some sort key satisfies every atom at once.
 fn sort_keys_meet(atoms: &[&SortKeyAtom]) -> bool {
     let mut low: Option<(&str, bool)> = None;
@@ -712,10 +794,11 @@ fn sort_keys_meet(atoms: &[&SortKeyAtom]) -> bool {
             SortKeyAtom::Points(values) => {
                 points = Some(match points {
                     None => values.iter().map(String::as_str).collect(),
-                    Some(held) => held
-                        .into_iter()
-                        .filter(|p| values.iter().any(|v| v == p))
-                        .collect(),
+                    Some(held) => {
+                        let wanted: std::collections::HashSet<&str> =
+                            values.iter().map(String::as_str).collect();
+                        held.into_iter().filter(|p| wanted.contains(p)).collect()
+                    }
                 });
             }
             SortKeyAtom::Prefix(p) => {
@@ -864,14 +947,12 @@ fn plan_order(
 
     // A stored partition key sorts the way its type orders, so sorting the
     // stored form is sorting the keys.
-    let mut partitions = Vec::new();
+    let mut partitions = Vec::with_capacity(partition_values.len());
     for value in partition_values {
-        let key = key_string(&resolve_value(value, parameters)?, read_pk)?;
-        if !partitions.contains(&key) {
-            partitions.push(key);
-        }
+        partitions.push(key_string(&resolve_value(value, parameters)?, read_pk)?);
     }
     partitions.sort();
+    partitions.dedup();
     if pk_term.is_some_and(|term| term.descending) {
         partitions.reverse();
     }
