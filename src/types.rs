@@ -226,10 +226,9 @@ impl<'de> Deserialize<'de> for AttributeValue {
         // Collect known type keys. A member set to JSON null counts as absent:
         // `{"S": null}` is an empty value and `{"S": "a", "N": null}` a string
         // (captured eu-west-2 and us-east-1, 2026-10-10).
-        let known_types = ["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS", "L", "M"];
         let present: Vec<&str> = obj
             .iter()
-            .filter(|(k, v)| known_types.contains(&k.as_str()) && !v.is_null())
+            .filter(|(k, v)| TYPE_MEMBERS.contains(&k.as_str()) && !v.is_null())
             .map(|(k, _)| k.as_str())
             .collect();
 
@@ -251,20 +250,42 @@ impl<'de> Deserialize<'de> for AttributeValue {
             None => None,
         };
 
+        // A value with more than one member is read by DynamoDB's older
+        // validation layer, and so is every other value in its request (see
+        // `reads_on_older_layer`): its refusals are bare. An empty set comes
+        // first, then a number it can't read, then a NULL that reads as false,
+        // and only then the second member itself (captured eu-west-2 and
+        // us-east-1, 2026-10-10).
+        let layer = if present.len() > 1 {
+            crate::validation::ValueLayer::Older
+        } else {
+            current_value_layer()
+        };
+        if present.len() > 1
+            && let Some(refusal) = present
+                .iter()
+                .find_map(|&type_key| empty_set_refusal(type_key, &obj[type_key]))
+        {
+            return Err(de::Error::custom(format!(
+                "{}{refusal}",
+                crate::serde_errors::VALIDATION_MARKER
+            )));
+        }
+
         // Validate numbers in ALL type keys before checking for multi-type.
         // DynamoDB validates number format before rejecting multi-type.
         for &type_key in &present {
             match type_key {
                 "N" => {
                     if let Some(n) = obj.get("N").and_then(|v| v.as_str()) {
-                        validate_number_in_deser(n).map_err(de::Error::custom)?;
+                        validate_number_in_deser(n, layer).map_err(de::Error::custom)?;
                     }
                 }
                 "NS" => {
                     if let Some(arr) = obj.get("NS").and_then(|v| v.as_array()) {
                         for item in arr {
                             if let Some(n) = item.as_str() {
-                                validate_number_in_deser(n).map_err(de::Error::custom)?;
+                                validate_number_in_deser(n, layer).map_err(de::Error::custom)?;
                             }
                         }
                     }
@@ -276,15 +297,16 @@ impl<'de> Deserialize<'de> for AttributeValue {
         // A NULL must read as true. JSON false on its own is refused by the
         // request's validation, in the envelope PutItem, UpdateItem and
         // DeleteItem give it, so it carries the request-validation marker. A
-        // string that reads as false, or a false NULL beside another member,
-        // is refused as the value is parsed: bare, and ahead of the check for
-        // more than one member (captured eu-west-2 and us-east-1, 2026-10-10).
+        // string that reads as false, or a false NULL beside another member or
+        // in a request read on the older layer, is refused as the value is
+        // parsed: bare, and ahead of the check for more than one member
+        // (captured eu-west-2 and us-east-1, 2026-10-10).
         if let Some(LenientBool {
             value: false,
             from_string,
         }) = null
         {
-            let marker = if from_string || present.len() > 1 {
+            let marker = if from_string || layer == crate::validation::ValueLayer::Older {
                 crate::serde_errors::VALIDATION_MARKER
             } else {
                 crate::serde_errors::REQUEST_VALIDATION_MARKER
@@ -494,12 +516,11 @@ fn lenient_bool_text(text: &str) -> Option<bool> {
 /// Error messages are returned WITHOUT the VALIDATION: prefix since they
 /// bypass the normal validation flow; the server routes them based on
 /// message content (see `crate::serde_errors::deserialize`).
-fn validate_number_in_deser(n: &str) -> Result<(), String> {
-    // The layer the request is read under decides the rule: the current
+fn validate_number_in_deser(n: &str, layer: crate::validation::ValueLayer) -> Result<(), String> {
+    // The layer the value is read under decides the rule: the current
     // layer's numbers are refused inside the envelope on PutItem, UpdateItem
     // and DeleteItem, so they carry the request-validation marker, and the
     // older layer's stay bare.
-    let layer = VALUE_LAYER.with(std::cell::Cell::get);
     let marker = match layer {
         crate::validation::ValueLayer::Current => crate::serde_errors::REQUEST_VALIDATION_MARKER,
         crate::validation::ValueLayer::Older => crate::serde_errors::VALIDATION_MARKER,
@@ -562,6 +583,58 @@ pub fn normalize_number_for_sort(num_str: &str) -> String {
     }
 }
 
+/// DynamoDB's refusal of `type_key`'s member when it is an empty set.
+fn empty_set_refusal(type_key: &str, member: &serde_json::Value) -> Option<&'static str> {
+    if !member.as_array().is_some_and(Vec::is_empty) {
+        return None;
+    }
+    match type_key {
+        "SS" => Some("One or more parameter values were invalid: An string set  may not be empty"),
+        "NS" => Some("One or more parameter values were invalid: An number set  may not be empty"),
+        "BS" => Some("One or more parameter values were invalid: Binary sets should not be empty"),
+        _ => None,
+    }
+}
+
+/// The type members an attribute value can carry.
+const TYPE_MEMBERS: [&str; 10] = ["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS", "L", "M"];
+
+/// Whether a request is read by DynamoDB's older validation layer whatever
+/// operation it is: it holds a `BOOL` or `NULL` member, or a legacy
+/// condition's `Exists`, written as a string, or an attribute value with more
+/// than one member. Every value refusal in such a request takes the older
+/// layer's form: bare on PutItem, UpdateItem and DeleteItem, where the current
+/// layer gives the envelope, and naming its key in UpdateItem's
+/// `ExpressionAttributeValues` (captured eu-west-2 and us-east-1, 2026-10-10).
+///
+/// A map whose members are all maps is an item or an attribute map, not a
+/// value, so an attribute named `S` beside one named `N` doesn't count.
+pub(crate) fn reads_on_older_layer(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let string_flag = ["BOOL", "NULL", "Exists"]
+                .iter()
+                .any(|member| map.get(*member).is_some_and(serde_json::Value::is_string));
+            let members: Vec<&serde_json::Value> = TYPE_MEMBERS
+                .iter()
+                .filter_map(|member| map.get(*member))
+                .filter(|member| !member.is_null())
+                .collect();
+            string_flag
+                || (members.len() > 1 && members.iter().any(|member| !member.is_object()))
+                || map.values().any(reads_on_older_layer)
+        }
+        serde_json::Value::Array(items) => items.iter().any(reads_on_older_layer),
+        _ => false,
+    }
+}
+
+/// The validation layer values are being read under on this thread: the one
+/// a wire seam set for the request in hand, or the current layer outside one.
+pub(crate) fn current_value_layer() -> crate::validation::ValueLayer {
+    VALUE_LAYER.with(std::cell::Cell::get)
+}
+
 thread_local! {
     /// The validation layer the values being decoded are read under. Set
     /// around a request's deserialisation, which runs synchronously; outside
@@ -585,6 +658,36 @@ pub(crate) fn with_value_layer<T>(
     }
     let _restore = Restore(VALUE_LAYER.with(|cell| cell.replace(layer)));
     read()
+}
+
+/// Run `future` with values read under `layer`, set around each of its polls
+/// and restored after, so the layer holds across the future's awaits without
+/// reaching anything polled in between. The wasm engine's single thread runs
+/// other requests between those polls.
+#[cfg(any(feature = "wasm-sqlite", test))]
+pub(crate) async fn with_value_layer_async<F: std::future::Future>(
+    layer: crate::validation::ValueLayer,
+    future: F,
+) -> F::Output {
+    struct Layered<F> {
+        layer: crate::validation::ValueLayer,
+        future: std::pin::Pin<Box<F>>,
+    }
+    impl<F: std::future::Future> std::future::Future for Layered<F> {
+        type Output = F::Output;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<F::Output> {
+            let layer = self.layer;
+            with_value_layer(layer, || self.future.as_mut().poll(cx))
+        }
+    }
+    Layered {
+        layer,
+        future: Box::pin(future),
+    }
+    .await
 }
 
 /// Run `read` with numbers read as PartiQL parameters are: the older layer's
@@ -640,7 +743,7 @@ pub(crate) fn deserialize_older_expression_values<'de, D: serde::Deserializer<'d
 pub(crate) fn deserialize_named_null_refusals<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
-    deserialize_named_refusals(deserializer, false)
+    deserialize_named_refusals(deserializer, false, true)
 }
 
 /// Deserialise Query's `ExpressionAttributeValues`, naming the key of an empty
@@ -649,12 +752,16 @@ pub(crate) fn deserialize_named_null_refusals<'de, D: serde::Deserializer<'de>>(
 pub(crate) fn deserialize_named_empty_and_null_refusals<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
-    deserialize_named_refusals(deserializer, true)
+    deserialize_named_refusals(deserializer, true, false)
 }
 
+/// Read `ExpressionAttributeValues`, naming the key of a NULL refused as it was
+/// parsed, of an empty value when `name_empty`, and, when `name_older` and the
+/// request is read on the older layer, of every other value refusal.
 fn deserialize_named_refusals<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
     name_empty: bool,
+    name_older: bool,
 ) -> std::result::Result<Option<HashMap<String, AttributeValue>>, D::Error> {
     let Some(raw) =
         Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer)?
@@ -669,10 +776,17 @@ fn deserialize_named_refusals<'de, D: serde::Deserializer<'de>>(
             }
             Err(e) => {
                 use crate::serde_errors::{
-                    EMPTY_VALUE, VALIDATION_MARKER, ValueRefusal, named_value_refusal,
-                    value_refusal,
+                    EMPTY_VALUE, MORE_THAN_ONE_TYPE, VALIDATION_MARKER, ValueRefusal,
+                    named_value_refusal, value_refusal,
                 };
                 let msg = e.to_string();
+                // UpdateItem, read on the older layer, names the key of every
+                // value refusal: a number, a value with more than one member
+                // (which puts the request on that layer), an empty set beside
+                // another member (captured eu-west-2 and us-east-1,
+                // 2026-10-10).
+                let older =
+                    name_older && current_value_layer() == crate::validation::ValueLayer::Older;
                 return Err(de::Error::custom(match value_refusal(&msg) {
                     ValueRefusal::ParsedNull(inner) => {
                         format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
@@ -682,6 +796,16 @@ fn deserialize_named_refusals<'de, D: serde::Deserializer<'de>>(
                             "{VALIDATION_MARKER}{}",
                             named_value_refusal(EMPTY_VALUE, &key)
                         )
+                    }
+                    ValueRefusal::MoreThanOneType if name_older => format!(
+                        "{VALIDATION_MARKER}{}",
+                        named_value_refusal(MORE_THAN_ONE_TYPE, &key)
+                    ),
+                    ValueRefusal::EmptySet(inner) if name_older => {
+                        format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
+                    }
+                    ValueRefusal::Number(inner) if older => {
+                        format!("{VALIDATION_MARKER}{}", named_value_refusal(inner, &key))
                     }
                     _ => msg,
                 }));

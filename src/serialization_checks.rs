@@ -16,9 +16,29 @@ const PARAMETERIZED_TYPE_CAST_ERROR: &str = "class sun.reflect.generics.reflecti
 /// This function inspects the raw JSON and returns the appropriate
 /// SerializationException before serde gets involved.
 pub(crate) fn pre_check_serialization_types(operation: &str, body: &str) -> crate::Result<()> {
+    pre_check_and_read_layer(operation, body).map(drop)
+}
+
+/// [`pre_check_serialization_types`], then the validation layer the request's
+/// values are read on: the operation's own, or the older layer for a request
+/// that holds a boolean member written as a string or a value with more than
+/// one member, whatever the operation (see
+/// [`crate::types::reads_on_older_layer`]). The body is parsed once for both.
+pub(crate) fn pre_check_and_read_layer(
+    operation: &str,
+    body: &str,
+) -> crate::Result<crate::validation::ValueLayer> {
     let json: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| crate::DynoxideError::SerializationException(e.to_string()))?;
+    check_types(operation, &json)?;
+    Ok(if crate::types::reads_on_older_layer(&json) {
+        crate::validation::ValueLayer::Older
+    } else {
+        crate::validation::ValueLayer::for_operation(operation)
+    })
+}
 
+fn check_types(operation: &str, json: &serde_json::Value) -> crate::Result<()> {
     let obj = match json.as_object() {
         Some(o) => o,
         None => return Ok(()),

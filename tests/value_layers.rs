@@ -414,3 +414,206 @@ async fn partiql_set_literals_name_their_duplicates() {
         assert_eq!(got, message, "{statement}");
     }
 }
+
+/// Send `body` exactly as written, so the order of its members is the order
+/// sent.
+async fn send_text(url: &str, operation: &str, body: &str) -> (u16, Value) {
+    let resp = reqwest::Client::new()
+        .post(url)
+        .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=fakekey/20260101/us-east-1/dynamodb/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=fakesig",
+        )
+        .header("x-amz-date", "20260101T000000Z")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap())
+}
+
+/// The error `operation` answers `body` with, as `(type, message)`.
+async fn answer(url: &str, operation: &str, body: &str) -> (String, String) {
+    let (status, resp) = send_text(url, operation, body).await;
+    assert_eq!(status, 400, "{operation} {body}: {resp}");
+    let kind = resp["__type"].as_str().unwrap();
+    let kind = kind.rsplit_once('#').map_or(kind, |(_, kind)| kind);
+    let message = resp["message"]
+        .as_str()
+        .or_else(|| resp["Message"].as_str())
+        .unwrap_or_default();
+    (kind.to_string(), message.to_string())
+}
+
+/// Attribute names and the JSON of their values, in the order sent.
+type Pairs<'a> = &'a [(&'a str, &'a str)];
+/// An error's type and message.
+type Answer = (String, String);
+
+fn bare(message: &str) -> (String, String) {
+    ("ValidationException".to_string(), message.to_string())
+}
+
+const ABC: &str = "The parameter cannot be converted to a numeric value: abc";
+const NULL_FALSE: &str = "One or more parameter values were invalid: Null attribute value types must have the value of true";
+const MORE_THAN_ONE: &str = "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes";
+const EMPTY_SS: &str = "One or more parameter values were invalid: An string set  may not be empty";
+
+/// A request that holds a `BOOL` or `NULL` written as a string, or a value with
+/// more than one member, is read whole by the older layer: every value refusal
+/// in it, wherever it is, comes back bare on PutItem and naming its key on
+/// UpdateItem, where the same refusal alone gets the envelope. Captured
+/// against eu-west-2 and us-east-1, 2026-10-10.
+#[tokio::test]
+async fn a_string_boolean_or_a_second_member_puts_the_request_on_the_older_layer() {
+    let url = start().await;
+    let put =
+        |values: &str| format!(r#"{{"TableName":"Vlt","Item":{{"pk":{{"S":"m1"}},{values}}}}}"#);
+    let update = |pairs: &[(&str, &str)]| {
+        let set: Vec<String> = pairs
+            .iter()
+            .map(|(name, _)| format!("{name} = :{name}"))
+            .collect();
+        let values: Vec<String> = pairs
+            .iter()
+            .map(|(name, value)| format!(r#"":{name}":{value}"#))
+            .collect();
+        format!(
+            r#"{{"TableName":"Vlt","Key":{{"pk":{{"S":"m1"}}}},"UpdateExpression":"SET {}","ExpressionAttributeValues":{{{}}}}}"#,
+            set.join(", "),
+            values.join(",")
+        )
+    };
+    let put_pairs = |pairs: &[(&str, &str)]| {
+        let values: Vec<String> = pairs
+            .iter()
+            .map(|(name, value)| format!(r#""{name}":{value}"#))
+            .collect();
+        put(&values.join(","))
+    };
+
+    let cases: [(Pairs, Answer, Answer); 6] = [
+        // Alone, a number DynamoDB can't read is refused in the envelope.
+        (&[("v", r#"{"N":"abc"}"#)], bare(&one(ABC)), bare(&one(ABC))),
+        // Beside a BOOL written as a string, in either order, it is not.
+        (
+            &[("v", r#"{"N":"abc"}"#), ("w", r#"{"BOOL":"no"}"#)],
+            bare(ABC),
+            bare(&for_key(ABC, ":v")),
+        ),
+        (
+            &[("w", r#"{"BOOL":"no"}"#), ("v", r#"{"N":"abc"}"#)],
+            bare(ABC),
+            bare(&for_key(ABC, ":v")),
+        ),
+        // A BOOL written as JSON leaves the request where it was.
+        (
+            &[("v", r#"{"N":"abc"}"#), ("w", r#"{"BOOL":true}"#)],
+            bare(&one(ABC)),
+            bare(&one(ABC)),
+        ),
+        // A NULL that is JSON false gets the envelope, and as a string doesn't.
+        (
+            &[("v", r#"{"NULL":false}"#)],
+            bare(&one(NULL_FALSE)),
+            bare(&one(NULL_FALSE)),
+        ),
+        (
+            &[("v", r#"{"NULL":"no"}"#)],
+            bare(NULL_FALSE),
+            bare(&for_key(NULL_FALSE, ":v")),
+        ),
+    ];
+    for (pairs, on_put, on_update) in cases {
+        assert_eq!(
+            answer(&url, "PutItem", &put_pairs(pairs)).await,
+            on_put,
+            "PutItem {pairs:?}"
+        );
+        assert_eq!(
+            answer(&url, "UpdateItem", &update(pairs)).await,
+            on_update,
+            "UpdateItem {pairs:?}"
+        );
+    }
+}
+
+/// A value with more than one member is checked in a fixed order: a BOOL or
+/// NULL that doesn't read as a boolean first (the whole request is malformed),
+/// then an empty set, then a number DynamoDB can't read, then a NULL that
+/// reads as false, and only then the second member. Each is refused bare, and
+/// UpdateItem names the key. Captured against eu-west-2 and us-east-1,
+/// 2026-10-10.
+#[tokio::test]
+async fn a_value_with_two_members_is_checked_in_dynamodbs_order() {
+    let url = start().await;
+    let serialization = |message: &str| ("SerializationException".to_string(), message.to_string());
+    let cases = [
+        (
+            r#"{"N":"abc","BOOL":"maybe"}"#,
+            Some(serialization("Unexpected token received from parser")),
+        ),
+        (
+            r#"{"BOOL":"maybe","N":"abc"}"#,
+            Some(serialization("Unexpected token received from parser")),
+        ),
+        (r#"{"SS":[],"S":"x"}"#, Some(bare(EMPTY_SS))),
+        (r#"{"N":"abc","SS":[]}"#, Some(bare(EMPTY_SS))),
+        (r#"{"N":"abc","S":"x"}"#, Some(bare(ABC))),
+        (r#"{"N":"abc","NULL":"no"}"#, Some(bare(ABC))),
+        (r#"{"NULL":"no","N":"abc"}"#, Some(bare(ABC))),
+        (r#"{"N":"abc","NULL":false}"#, Some(bare(ABC))),
+        (r#"{"S":"x","NULL":false}"#, Some(bare(NULL_FALSE))),
+        (r#"{"S":"x","NULL":"no"}"#, Some(bare(NULL_FALSE))),
+        (r#"{"S":"x","N":"1"}"#, Some(bare(MORE_THAN_ONE))),
+        (r#"{"S":"x","NULL":true}"#, Some(bare(MORE_THAN_ONE))),
+        (r#"{"S":"x","BOOL":"no"}"#, Some(bare(MORE_THAN_ONE))),
+        (r#"{"S":"x","BOOL":true}"#, Some(bare(MORE_THAN_ONE))),
+    ];
+    for (value, refusal) in cases {
+        let refusal = refusal.unwrap();
+        let put = format!(r#"{{"TableName":"Vlt","Item":{{"pk":{{"S":"m1"}},"v":{value}}}}}"#);
+        assert_eq!(
+            answer(&url, "PutItem", &put).await,
+            refusal,
+            "PutItem {value}"
+        );
+
+        let update = format!(
+            r#"{{"TableName":"Vlt","Key":{{"pk":{{"S":"m1"}}}},"UpdateExpression":"SET v = :v","ExpressionAttributeValues":{{":v":{value}}}}}"#
+        );
+        let named = if refusal.0 == "ValidationException" {
+            bare(&for_key(&refusal.1, ":v"))
+        } else {
+            refusal.clone()
+        };
+        assert_eq!(
+            answer(&url, "UpdateItem", &update).await,
+            named,
+            "UpdateItem {value}"
+        );
+    }
+
+    // A PartiQL parameter is refused the same way, bare.
+    for (value, refusal) in [
+        (
+            r#"{"N":"abc","BOOL":"maybe"}"#,
+            serialization("Unexpected token received from parser"),
+        ),
+        (r#"{"N":"abc","NULL":"no"}"#, bare(ABC)),
+        (r#"{"N":"abc","NULL":false}"#, bare(ABC)),
+        (r#"{"S":"x","NULL":"no"}"#, bare(NULL_FALSE)),
+    ] {
+        let statement = format!(
+            r#"{{"Statement":"UPDATE \"Vlt\" SET v = ? WHERE pk = 'm1'","Parameters":[{value}]}}"#
+        );
+        assert_eq!(
+            answer(&url, "ExecuteStatement", &statement).await,
+            refusal,
+            "ExecuteStatement {value}"
+        );
+    }
+}

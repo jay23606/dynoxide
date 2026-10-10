@@ -151,15 +151,17 @@ pub async fn execute<S: StorageBackend>(
 ) -> Result<PutItemResponse> {
     // Apply the request-validation envelope exactly once at the operation
     // boundary, so every early return inside is covered and the tagged
-    // variant never escapes.
-    execute_inner(storage, request)
+    // variant never escapes. A request read on the older layer never gets it.
+    let layer = crate::validation::single_write_layer(request.expected.as_ref());
+    execute_inner(storage, request, layer)
         .await
-        .map_err(crate::validation::envelope_request_validation)
+        .map_err(|e| crate::validation::resolve_for_layer(layer, e))
 }
 
 async fn execute_inner<S: StorageBackend>(
     storage: &S,
     mut request: PutItemRequest,
+    layer: crate::validation::ValueLayer,
 ) -> Result<PutItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_item_table_name(&request.table_name)?;
@@ -185,11 +187,8 @@ async fn execute_inner<S: StorageBackend>(
     // Validate attribute values (empty strings, empty sets, number precision)
     // DynamoDB validates item values before expression parameter checks for PutItem.
     // The set families are tagged for the request-validation envelope.
-    crate::validation::validate_item_attribute_values_classified(
-        &request.item,
-        crate::validation::ValueLayer::Current,
-    )
-    .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
+    crate::validation::validate_item_attribute_values_classified(&request.item, layer)
+        .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
 
     // Validate expression/non-expression parameter conflicts
     {
@@ -214,7 +213,7 @@ async fn execute_inner<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &None,
-            layer: crate::validation::ValueLayer::Current,
+            layer,
         };
         // Raw EAV not used for PutItem HTTP path. Enveloped families are
         // tagged for the request-validation envelope.

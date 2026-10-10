@@ -5,7 +5,7 @@
 mod auth;
 
 use crate::serde_errors::{deserialize, serialize};
-use crate::serialization_checks::pre_check_serialization_types;
+use crate::serialization_checks::pre_check_and_read_layer;
 use auth::validate_auth;
 
 use crate::Database;
@@ -359,32 +359,46 @@ fn dispatch(db: &Database, operation: &str, body: &str) -> crate::Result<String>
     // serde_json forgets for `-0` and integers past 64 bits.
     let body = crate::serde_errors::boolean_numbers_as_written(body);
     let body = body.as_ref();
+    // Pre-check JSON field types for operations that use serde_json::Value
+    // internally. These checks must run before serde deserialisation because
+    // serde_json::Value accepts any JSON type, so type mismatches on
+    // list/struct fields would silently pass through.
+    //
     // The request's values are read under the validation layer the operation
-    // runs on, which decides how a number it can't store is worded. The
-    // operation runs to completion on this thread (the database blocks on it),
-    // so the layer holds for the whole call.
-    let layer = crate::validation::ValueLayer::for_operation(operation);
-    let result = crate::types::with_value_layer(layer, || dispatch_operation(db, operation, body));
+    // runs on, or the older layer for a request that holds a boolean written
+    // as a string or a value with more than one member; the layer decides how
+    // a value it refuses is worded. The operation runs to completion on this
+    // thread (the database blocks on it), so the layer holds for the whole
+    // call.
+    let checked = pre_check_and_read_layer(operation, body);
+    let layer = checked.as_ref().map_or_else(
+        |_| crate::validation::ValueLayer::for_operation(operation),
+        |l| *l,
+    );
+    let result = checked.and_then(|layer| {
+        crate::types::with_value_layer(layer, || dispatch_operation(db, operation, body))
+    });
 
     // DynamoDB wraps the request-validation family in the
-    // "1 validation error detected: " envelope on PutItem and UpdateItem and
-    // reports it bare everywhere else. The wire-invisible EnvelopedValidation
-    // tag must never escape dispatch. ExecuteStatement's condition failure
-    // carrying an item is written in its own shape.
+    // "1 validation error detected: " envelope on PutItem, UpdateItem and
+    // DeleteItem read on the current layer, and reports it bare everywhere
+    // else. The wire-invisible EnvelopedValidation tag must never escape
+    // dispatch. ExecuteStatement's condition failure carrying an item is
+    // written in its own shape.
     result.map_err(|e| {
-        crate::errors::for_operation(
-            operation,
-            crate::validation::resolve_request_validation_tag(operation, e),
-        )
+        let resolved = match layer {
+            crate::validation::ValueLayer::Older => {
+                crate::validation::strip_request_validation_tag(e)
+            }
+            crate::validation::ValueLayer::Current => {
+                crate::validation::resolve_request_validation_tag(operation, e)
+            }
+        };
+        crate::errors::for_operation(operation, resolved)
     })
 }
 
 fn dispatch_operation(db: &Database, operation: &str, body: &str) -> crate::Result<String> {
-    // Pre-check JSON field types for operations that use serde_json::Value internally.
-    // These checks must run before serde deserialisation because serde_json::Value accepts
-    // any JSON type, so type mismatches on list/struct fields would silently pass through.
-    pre_check_serialization_types(operation, body)?;
-
     match operation {
         "CreateTable" => {
             let req = deserialize(body)?;

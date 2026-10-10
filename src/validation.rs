@@ -475,6 +475,32 @@ pub(crate) fn envelope_request_validation(err: DynoxideError) -> DynoxideError {
     }
 }
 
+/// The layer a PutItem, UpdateItem or DeleteItem request's values are checked
+/// on: the older layer when the request was read on it (a wire seam sets that
+/// from the whole body, see [`crate::types::reads_on_older_layer`]) or when its
+/// legacy `Expected` would put it there, and the current layer otherwise.
+pub(crate) fn single_write_layer(expected: Option<&serde_json::Value>) -> ValueLayer {
+    if crate::types::current_value_layer() == ValueLayer::Older
+        || expected.is_some_and(crate::types::reads_on_older_layer)
+    {
+        ValueLayer::Older
+    } else {
+        ValueLayer::Current
+    }
+}
+
+/// Resolve the request-validation tag at a single-item write's boundary: in
+/// the envelope on the current layer, and bare on the older one, which never
+/// gives it (captured eu-west-2 and us-east-1, 2026-10-10).
+pub(crate) fn resolve_for_layer(layer: ValueLayer, err: DynoxideError) -> DynoxideError {
+    match (layer, err) {
+        (ValueLayer::Older, DynoxideError::EnvelopedValidation(msg)) => {
+            DynoxideError::ValidationException(msg)
+        }
+        (_, err) => envelope_request_validation(err),
+    }
+}
+
 /// Tag a plain `ValidationException` for the request-validation envelope, for
 /// a PutItem or UpdateItem call site whose shared helper reports it plain.
 /// Every other error passes through unchanged.

@@ -116,6 +116,8 @@ pub(crate) enum ValueRefusal<'a> {
     Empty,
     /// More than one type set.
     MoreThanOneType,
+    /// An empty set beside another member, refused as the value is read.
+    EmptySet(&'a str),
     /// A number the value layer can't store, in the layer's words.
     Number(&'a str),
     /// A NULL refused as it was parsed: a string that reads as false, or false
@@ -135,6 +137,9 @@ pub(crate) fn value_refusal(msg: &str) -> ValueRefusal<'_> {
         ValueRefusal::Empty
     } else if inner.contains("more than one datatypes") {
         ValueRefusal::MoreThanOneType
+    } else if inner.contains("set  may not be empty") || inner.contains("sets should not be empty")
+    {
+        ValueRefusal::EmptySet(inner)
     } else if inner.contains("cannot be converted to a numeric value")
         || inner.contains("significant digits")
         || inner.contains("Number overflow")

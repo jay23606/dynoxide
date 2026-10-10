@@ -154,14 +154,17 @@ pub async fn execute<S: StorageBackend>(
     // Apply the request-validation envelope exactly once at the operation
     // boundary, as PutItem and UpdateItem do, so every early return inside is
     // covered and the tagged variant never escapes.
-    execute_inner(storage, request)
+    // A request read on the older layer never gets the envelope.
+    let layer = crate::validation::single_write_layer(request.expected.as_ref());
+    execute_inner(storage, request, layer)
         .await
-        .map_err(crate::validation::envelope_request_validation)
+        .map_err(|e| crate::validation::resolve_for_layer(layer, e))
 }
 
 async fn execute_inner<S: StorageBackend>(
     storage: &S,
     mut request: DeleteItemRequest,
+    layer: crate::validation::ValueLayer,
 ) -> Result<DeleteItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_item_table_name(&request.table_name)?;
@@ -201,7 +204,7 @@ async fn execute_inner<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &request.expression_attribute_values_raw,
-            layer: crate::validation::ValueLayer::Current,
+            layer,
         };
         // DeleteItem wraps the request-validation families in the envelope, as
         // PutItem and UpdateItem do: the nesting rejection, mixing expression
@@ -234,7 +237,7 @@ async fn execute_inner<S: StorageBackend>(
     // Validate key attribute values (unsupported datatypes, invalid numbers).
     // A duplicated set member or a number it can't store comes back in the
     // envelope (eu-west-2, us-east-1, eu-west-1 and us-west-2, 2026-10-09).
-    crate::validation::validate_key_values(&request.key, crate::validation::ValueLayer::Current)
+    crate::validation::validate_key_values(&request.key, layer)
         .map_err(crate::validation::ClassifiedValidationError::into_tagged)?;
 
     // Validate empty ConditionExpression, inside the envelope and before the

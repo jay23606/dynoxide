@@ -706,6 +706,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absent, so `{"S": null}` is an empty value and `{"S": "a", "N": null}` a
   string, and `Query` names the key of an empty expression value. Captured
   against eu-west-2 and us-east-1.
+- A request that holds a `BOOL` or `NULL` written as a string, or a value with
+  more than one member, is read whole by DynamoDB's older validation layer,
+  whatever the operation, and Dynoxide now reads it the same way: every value
+  it refuses, wherever it sits, comes back bare on `PutItem`, `UpdateItem` and
+  `DeleteItem`, where the same refusal alone is wrapped in `1 validation
+  error detected:`, and `UpdateItem` names the key of the expression value at
+  fault (`ExpressionAttributeValues contains invalid value: ... for key :v`).
+  A value with more than one member is checked in DynamoDB's order: a member
+  that doesn't read as a boolean, then an empty set, then a number it can't
+  read, then a `NULL` that reads as false, and only then the second member,
+  where the empty set came after the second member. Captured against
+  eu-west-2 and us-east-1.
 - A request's own `ConsistentRead`, on `GetItem`, `Query`, `Scan` and each
   table of `BatchGetItem`, and `Query`'s `ScanIndexForward`, read a string by
   the rule a `BOOL` member follows, as DynamoDB reads them: `"yes"` is a

@@ -1016,6 +1016,12 @@ pub fn parse_expression_attribute_values_raw(
                     ValueRefusal::MoreThanOneType => DynoxideError::ValidationException(
                         named_value_refusal(MORE_THAN_ONE_TYPE, key),
                     ),
+                    // Only a value with more than one member is refused for an
+                    // empty set as it is read, on the older layer, which names
+                    // the key (captured eu-west-2 and us-east-1, 2026-10-10).
+                    ValueRefusal::EmptySet(inner) => {
+                        DynoxideError::ValidationException(named_value_refusal(inner, key))
+                    }
                     // The current layer refuses it with no wrapper, in the
                     // envelope on DeleteItem; the older layer names the key.
                     ValueRefusal::Number(inner) => match layer {

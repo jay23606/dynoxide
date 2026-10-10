@@ -299,14 +299,26 @@ async fn route<S: StorageBackend>(
 ) -> crate::Result<String> {
     // Each arm: deserialise the request through the shared decoder (so a parse
     // failure classifies exactly as it does over HTTP), run the shared handler,
-    // then serialise the response. The request's values are read under the
-    // validation layer the operation runs on; deserialising doesn't await, so
-    // the layer is set around it alone.
-    let layer = crate::validation::ValueLayer::for_operation(op);
+    // then serialise the response.
+    //
     // A number given for a boolean is named by how it was written, which
     // serde_json forgets for `-0` and integers past 64 bits.
     let request_json = crate::serde_errors::boolean_numbers_as_written(request_json);
     let request_json = request_json.as_ref();
+    // The same pre-deserialisation type checks the HTTP server runs. Request
+    // structs hold several fields as `serde_json::Value`, which accepts any
+    // JSON type, so without this a mistyped field reaches serde and comes back
+    // as raw serde text here while the server answers with the captured
+    // SerializationException. Both surfaces read one implementation so they
+    // cannot drift. They also say which validation layer the request's values
+    // are read on: the operation's own, or the older layer for a request that
+    // holds a boolean written as a string or a value with more than one
+    // member. The layer is set around the read and around every poll of the
+    // handler, as the HTTP server holds it for the whole call.
+    let checked = crate::serialization_checks::pre_check_and_read_layer(op, request_json);
+    let layer = checked
+        .as_ref()
+        .map_or_else(|_| crate::validation::ValueLayer::for_operation(op), |l| *l);
     fn read<T: serde::de::DeserializeOwned>(
         layer: crate::validation::ValueLayer,
         json: &str,
@@ -316,7 +328,12 @@ async fn route<S: StorageBackend>(
     macro_rules! run {
         ($module:ident) => {{
             match read(layer, request_json) {
-                Ok(request) => match actions::$module::execute(backend, request).await {
+                Ok(request) => match crate::types::with_value_layer_async(
+                    layer,
+                    actions::$module::execute(backend, request),
+                )
+                .await
+                {
                     Ok(response) => serde_json::to_string(&response)
                         .map_err(|e| DynoxideError::InternalServerError(e.to_string())),
                     Err(e) => Err(e),
@@ -333,7 +350,12 @@ async fn route<S: StorageBackend>(
         ($module:ident) => {{
             match read(layer, request_json) {
                 Ok(request) => {
-                    match actions::$module::execute(backend, request, ctx.vector_lifecycle).await {
+                    match crate::types::with_value_layer_async(
+                        layer,
+                        actions::$module::execute(backend, request, ctx.vector_lifecycle),
+                    )
+                    .await
+                    {
                         Ok(response) => serde_json::to_string(&response)
                             .map_err(|e| DynoxideError::InternalServerError(e.to_string())),
                         Err(e) => Err(e),
@@ -344,45 +366,47 @@ async fn route<S: StorageBackend>(
         }};
     }
 
-    // The same pre-deserialisation type checks the HTTP server runs. Request
-    // structs hold several fields as `serde_json::Value`, which accepts any
-    // JSON type, so without this a mistyped field reaches serde and comes back
-    // as raw serde text here while the server answers with the captured
-    // SerializationException. Both surfaces read one implementation so they
-    // cannot drift.
-    let result: crate::Result<String> =
-        match crate::serialization_checks::pre_check_serialization_types(op, request_json) {
-            Err(e) => Err(e),
-            Ok(()) => match op {
-                "CreateTable" => run!(create_table),
-                "DeleteTable" => run_lifecycle!(delete_table),
-                "DescribeTable" => run_lifecycle!(describe_table),
-                "UpdateTable" => run_lifecycle!(update_table),
-                "ListTables" => run!(list_tables),
-                "PutItem" => run!(put_item),
-                "GetItem" => run!(get_item),
-                "DeleteItem" => run!(delete_item),
-                "UpdateItem" => run!(update_item),
-                "Query" => run!(query),
-                "Scan" => run!(scan),
-                "BatchGetItem" => run!(batch_get_item),
-                "BatchWriteItem" => run!(batch_write_item),
-                "TransactGetItems" => run!(transact_get_items),
-                "ExecuteStatement" => run!(execute_statement),
-                "BatchExecuteStatement" => run!(batch_execute_statement),
-                "ExecuteTransaction" => execute_transaction(backend, ctx, request_json).await,
-                "SearchVectors" => run_lifecycle!(search_vectors),
-                other => Err(DynoxideError::InternalServerError(format!(
-                    "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
-                ))),
-            },
-        };
+    let result: crate::Result<String> = match checked {
+        Err(e) => Err(e),
+        Ok(_) => match op {
+            "CreateTable" => run!(create_table),
+            "DeleteTable" => run_lifecycle!(delete_table),
+            "DescribeTable" => run_lifecycle!(describe_table),
+            "UpdateTable" => run_lifecycle!(update_table),
+            "ListTables" => run!(list_tables),
+            "PutItem" => run!(put_item),
+            "GetItem" => run!(get_item),
+            "DeleteItem" => run!(delete_item),
+            "UpdateItem" => run!(update_item),
+            "Query" => run!(query),
+            "Scan" => run!(scan),
+            "BatchGetItem" => run!(batch_get_item),
+            "BatchWriteItem" => run!(batch_write_item),
+            "TransactGetItems" => run!(transact_get_items),
+            "ExecuteStatement" => run!(execute_statement),
+            "BatchExecuteStatement" => run!(batch_execute_statement),
+            "ExecuteTransaction" => execute_transaction(backend, ctx, request_json).await,
+            "SearchVectors" => run_lifecycle!(search_vectors),
+            other => Err(DynoxideError::InternalServerError(format!(
+                "route reached with operation '{other}', which is absent from SUPPORTED_OPS"
+            ))),
+        },
+    };
 
     // Same seam as the HTTP dispatch: resolve the wire-invisible
-    // EnvelopedValidation tag for the operation before serialising, and give
-    // ExecuteStatement's condition failure carrying an item its own shape.
+    // EnvelopedValidation tag for the operation and the layer before
+    // serialising, and give ExecuteStatement's condition failure carrying an
+    // item its own shape.
     result.map_err(|e| {
-        crate::errors::for_operation(op, crate::validation::resolve_request_validation_tag(op, e))
+        let resolved = match layer {
+            crate::validation::ValueLayer::Older => {
+                crate::validation::strip_request_validation_tag(e)
+            }
+            crate::validation::ValueLayer::Current => {
+                crate::validation::resolve_request_validation_tag(op, e)
+            }
+        };
+        crate::errors::for_operation(op, resolved)
     })
 }
 
