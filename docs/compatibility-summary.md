@@ -439,18 +439,18 @@ equal to 2`), not the list.
 
 ### Legacy Pre-2015 API Parameters
 
-The legacy filter and update API (pre-expression-based API from before 2015) has partial support:
+The legacy parameters that came before the expression API are implemented:
 
 | Parameter | Supported | Notes |
 |-----------|-----------|-------|
-| `AttributeUpdates` (UpdateItem) | Partial | PUT, ADD, DELETE actions supported; used when `UpdateExpression` is absent |
-| `Expected` (PutItem, UpdateItem, DeleteItem) | Accepted, ignored | Use `ConditionExpression` instead |
-| `ScanFilter` / `QueryFilter` | Accepted, ignored | Use `FilterExpression` instead |
-| `KeyConditions` (Query) | Accepted, ignored | Use `KeyConditionExpression` instead |
-| `AttributesToGet` (GetItem, Query, Scan) | Accepted, ignored | Use `ProjectionExpression` instead |
-| `ConditionalOperator` | Accepted, ignored | Use `ConditionExpression` with `AND`/`OR` instead |
+| `AttributeUpdates` (UpdateItem) | Yes | `PUT`, `ADD` and `DELETE` actions |
+| `Expected` (PutItem, UpdateItem, DeleteItem) | Yes | `Value` and `Exists`, or a `ComparisonOperator` with `AttributeValueList` |
+| `QueryFilter` (Query) / `ScanFilter` (Scan) | Yes | Every comparison operator: `EQ`, `NE`, `LE`, `LT`, `GE`, `GT`, `NULL`, `NOT_NULL`, `CONTAINS`, `NOT_CONTAINS`, `BEGINS_WITH`, `IN`, `BETWEEN` |
+| `KeyConditions` (Query) | Yes | `EQ` on the partition key; `EQ`, `LE`, `LT`, `GE`, `GT`, `BEGINS_WITH` or `BETWEEN` on the sort key |
+| `AttributesToGet` (GetItem, BatchGetItem, Query, Scan) | Yes | Returns the named top-level attributes |
+| `ConditionalOperator` | Yes | `AND` or `OR` across the conditions in `Expected`, `QueryFilter` or `ScanFilter` |
 
-All legacy parameters are silently accepted during deserialisation (serde ignores unknown fields by default). `AttributeUpdates` is the only one actively processed. Users should prefer the expression-based API (`UpdateExpression`, `FilterExpression`, `KeyConditionExpression`, `ProjectionExpression`, `ConditionExpression`) for full functionality.
+A request that mixes a legacy parameter with its expression counterpart, such as `Expected` with `ConditionExpression`, is refused, as DynamoDB refuses it. The expression API (`UpdateExpression`, `ConditionExpression`, `FilterExpression`, `KeyConditionExpression`, `ProjectionExpression`) covers more, such as nested paths and functions, and is the one to use for new code.
 
 ---
 
