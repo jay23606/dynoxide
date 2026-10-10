@@ -1625,9 +1625,6 @@ fn validate_lsi_structure(
 }
 
 fn validate_gsi_structure(gsi: &GlobalSecondaryIndex) -> std::result::Result<(), String> {
-    if gsi.key_schema.is_empty() {
-        validate_key_schema_structure(&gsi.key_schema)?;
-    }
     crate::validation::check_gsi_key_schema(&gsi.key_schema)?;
     validate_proj_structure(&gsi.projection)?;
     Ok(())

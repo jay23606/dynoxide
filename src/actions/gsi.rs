@@ -405,7 +405,7 @@ pub(crate) async fn rebuild_multi_attribute_gsis<S: StorageBackend>(storage: &S)
             storage
                 .create_gsi_table(&table_name, &def.index_name)
                 .await?;
-            super::update_table::backfill_gsi(storage, &table_name, &key_schema, &def).await?;
+            backfill_gsi(storage, &table_name, &key_schema, &def).await?;
             rebuilt += 1;
         }
     }
@@ -429,6 +429,76 @@ pub fn parse_gsi_key_schema(
             ))
         })?;
     Ok((gsi.pk_attr, gsi.sk_attr))
+}
+
+/// Backfill existing items into a newly created GSI, processing in batches.
+pub(crate) async fn backfill_gsi<S: StorageBackend>(
+    storage: &S,
+    table_name: &str,
+    key_schema: &super::helpers::KeySchema,
+    gsi_def: &GsiDef,
+) -> Result<()> {
+    const BATCH_SIZE: usize = 1000;
+    let mut last_pk: Option<String> = None;
+    let mut last_sk: Option<String> = None;
+
+    loop {
+        let items = storage
+            .scan_items(
+                table_name,
+                &crate::storage::ScanParams {
+                    limit: Some(BATCH_SIZE),
+                    exclusive_start_pk: last_pk.as_deref(),
+                    exclusive_start_sk: last_sk.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if items.is_empty() {
+            break;
+        }
+
+        let mut rows: Vec<crate::storage_backend::GsiItemRow> = Vec::new();
+        for (pk, sk, item_json) in &items {
+            let item: crate::types::Item = serde_json::from_str(item_json)
+                .map_err(|e| DynoxideError::InternalServerError(format!("Bad item JSON: {e}")))?;
+
+            // Backfill only the items that belong in this index (sparse).
+            if let Some((gsi_pk, gsi_sk)) = gsi_def.index_key_strings(&item) {
+                let projected = build_index_item(
+                    &item,
+                    gsi_def,
+                    &key_schema.partition_key,
+                    key_schema.sort_key.as_deref(),
+                );
+                let projected_json = serde_json::to_string(&projected)
+                    .map_err(|e| DynoxideError::InternalServerError(e.to_string()))?;
+
+                rows.push(crate::storage_backend::GsiItemRow {
+                    gsi_pk,
+                    gsi_sk,
+                    table_pk: pk.clone(),
+                    table_sk: sk.clone(),
+                    item_json: projected_json,
+                });
+            }
+        }
+
+        storage
+            .insert_gsi_items(table_name, &gsi_def.index_name, &rows)
+            .await?;
+
+        let last = &items[items.len() - 1];
+        last_pk = Some(last.0.clone());
+        last_sk = Some(last.1.clone());
+
+        if items.len() < BATCH_SIZE {
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -750,11 +750,18 @@ pub fn validate_key_attributes_in_definitions(
 
 /// The shape rules for a global secondary index key, which can have up to four
 /// partition key (HASH) and four sort key (RANGE) attributes, HASH first, each
-/// named once. CreateTable and UpdateTable answer alike. `key_schema` must not
-/// be empty. Captured eu-west-2, 2026-10-09.
+/// named once. CreateTable and UpdateTable answer alike. Captured eu-west-2,
+/// 2026-10-09. An empty schema gets the length refusal both callers gave it.
 pub fn check_gsi_key_schema(key_schema: &[KeySchemaElement]) -> std::result::Result<(), String> {
     const MAX_PER_KIND: usize = 4;
-    if key_schema[0].key_type != KeyType::HASH {
+    let Some(first) = key_schema.first() else {
+        return Err(
+            "1 validation error detected: Value null at 'keySchema' failed to satisfy \
+                    constraint: Member must have length less than or equal to 2"
+                .to_string(),
+        );
+    };
+    if first.key_type != KeyType::HASH {
         return Err(
             "Invalid KeySchema: The first KeySchemaElement is not a HASH key type".to_string(),
         );
@@ -831,9 +838,6 @@ pub fn validate_gsi(
     }
 
     // Validate key schema
-    if gsi.key_schema.is_empty() {
-        validate_key_schema(&gsi.key_schema)?;
-    }
     check_gsi_key_schema(&gsi.key_schema).map_err(DynoxideError::ValidationException)?;
 
     // Validate projection
@@ -1633,6 +1637,21 @@ pub fn sort_key_name(key_schema: &[KeySchemaElement]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty GSI key schema is refused by the shape check itself, in the
+    /// words both callers used to give before calling it, rather than relying
+    /// on each caller to guard the first element.
+    #[test]
+    fn an_empty_gsi_key_schema_is_refused_by_the_shape_check() {
+        assert_eq!(
+            check_gsi_key_schema(&[]),
+            Err(
+                "1 validation error detected: Value null at 'keySchema' failed to satisfy \
+                 constraint: Member must have length less than or equal to 2"
+                    .to_string()
+            )
+        );
+    }
 
     #[test]
     fn java_hash_order_matches_the_captured_lists() {

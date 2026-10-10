@@ -211,9 +211,6 @@ impl WasmBridgeBackend {
         &self.persistence_mode
     }
 
-    /// Close the underlying SQLite connection. The wasm engine calls this
-    /// before a re-open swaps in a new database, so the old connection (and the
-    /// OPFS handles behind it) is released rather than leaked.
     /// Record `version` as the database's schema version, replacing any
     /// recorded one.
     pub(crate) async fn record_schema_version(&self, version: &str) -> Result<(), BackendError> {
@@ -224,6 +221,9 @@ impl WasmBridgeBackend {
         Ok(())
     }
 
+    /// Close the underlying SQLite connection. The wasm engine calls this
+    /// before a re-open swaps in a new database, so the old connection (and the
+    /// OPFS handles behind it) is released rather than leaked.
     pub async fn close(&self) -> Result<(), BackendError> {
         bridge_close(&self.handle).await.map_err(js_err)?;
         Ok(())
