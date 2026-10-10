@@ -554,7 +554,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them. A character such as `é`, `€` or an emoji outside a string is refused
   with the syntax error naming that character, in every expression and in
   transactions, and so is a no-break space, which DynamoDB doesn't treat as
-  whitespace. Captured against eu-west-2 and us-east-1.
+  whitespace. A placeholder whose own name holds one is refused as an invalid
+  key of its map, and a PartiQL statement with one outside a string as not
+  well formed. Captured against eu-west-2 and us-east-1; us-east-1 names an
+  emoji in a filter or a transaction as `?`, and Dynoxide follows eu-west-2.
 - A `TransactWriteItems` Update whose SET paths overlap, such as
   `SET a.b = :v, a = :m`, is refused before anything is written, with
   DynamoDB's "Two document paths overlap" message, where it used to be
@@ -582,8 +585,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that statement alone in `BatchExecuteStatement` (where it no longer counts
   towards the mixed read and write check), and with the statement's index on
   `ExecuteTransaction`. More parameters than placeholders are still accepted.
-  An empty `Parameters` list is refused as a request member. Captured against
-  eu-west-2 and us-east-1.
+  An empty `Parameters` list on `ExecuteStatement` is refused as a request
+  member. Captured against eu-west-2 and us-east-1.
 - A malformed `Expected` condition on `PutItem`, `UpdateItem` or `DeleteItem`
   is refused rather than ignored. An unknown `ComparisonOperator` gets
   DynamoDB's "Invalid comparison operator" message, and `EQ` with an empty
