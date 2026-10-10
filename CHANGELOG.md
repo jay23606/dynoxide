@@ -417,9 +417,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <line>:<column>:<length>` before the table is looked up; `EXISTS(path)` used
   to run as `attribute_exists`. An OR with no key condition under it no longer
   counts as a second key range for the overlap check, so `pk = 'a' AND (x = 1
-  OR x = 2)` runs. A condition function compares with a path, a size or a
-  parameter as the boolean it is, with `=`, `<>` or in an `IN` list, written
-  first or after a path (`b = attribute_exists(a)`), so
+  OR x = 2)` runs. A condition function compares with a path, a size, a
+  parameter or another call as the boolean it is, with `=`, `<>` or in an
+  `IN` list, written on either side (`b = attribute_exists(a)`,
+  `? = attribute_exists(a)`, `size(s) = attribute_exists(a)`) and as a
+  member of an `IN` list (`b IN [attribute_exists(a)]`), so
   `attribute_exists(a) = b` holds where `b` is the boolean the call is, and
   is unequal to a missing value or one of another type. Each such comparison
   is one condition, so ten `attribute_exists(x) <> y` ANDed run, and

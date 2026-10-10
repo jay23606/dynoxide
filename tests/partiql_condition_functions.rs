@@ -547,9 +547,7 @@ fn transactions_and_batches_read_a_condition_function() {
 
 /// The tables the comparisons below were captured against, item for item:
 /// `Hashed` (hash key) holds r1 to r5, q1 to q5 and d1, and `Sorted` (hash and
-/// numeric sort key) holds partition `p` with sort keys 1 to 5. `Hashed` also
-/// holds a large item of its own, `big`, so a scan of it costs more than a
-/// read of one small partition.
+/// numeric sort key) holds partition `p` with sort keys 1 to 5.
 fn captured_db() -> Database {
     let db = Database::memory().unwrap();
     db.create_table(
@@ -591,8 +589,7 @@ fn captured_db() -> Database {
         "q2": {"a": {"M": {"b": {"N": "1"}}}},
         "q3": {"a[0]": {"N": "1"}},
         "q4": {"a": {"L": [{"N": "1"}]}},
-        "q5": {},
-        "big": {"filler": {"S": "z".repeat(20_000)}}
+        "q5": {}
     });
     for (pk, rest) in h_items.as_object().unwrap() {
         let mut item = rest.clone();
@@ -690,6 +687,13 @@ fn sorted(keys: Result<Vec<String>, String>) -> Result<Vec<String>, String> {
 #[test]
 fn a_key_condition_beside_a_condition_function_comparison_is_a_key_read() {
     let db = captured_db();
+    // An item of the test's own, so a scan of the table costs more than a
+    // read of one small partition.
+    put_json(
+        &db,
+        "Hashed",
+        serde_json::json!({"pk": {"S": "big"}, "filler": {"S": "z".repeat(20_000)}}),
+    );
     let (alone, alone_cost) = answer(&db, r#"SELECT pk FROM "Hashed" WHERE pk = 'r1'"#, None);
     assert_eq!(alone, Ok(vec!["r1".to_string()]));
     let (scan, scan_cost) = answer(&db, r#"SELECT pk FROM "Hashed" WHERE pk <> 'zz'"#, None);
@@ -840,4 +844,140 @@ fn a_chain_of_condition_function_comparisons_is_held_to_the_operator_limit() {
         .0,
         Err("The expression contains too many operators; operator count: 301".to_string())
     );
+}
+
+/// A condition function compares from either side of `=` or `<>`, with a
+/// parameter or a size written first, with another call, and as a member of
+/// an IN list, in a SELECT and as an UPDATE's or a DELETE's condition. A
+/// parameter compares as the call's boolean, a size never equals it, two
+/// calls compare as booleans, and a call in a list is its boolean. Every row
+/// is DynamoDB's answer (captured eu-west-2 and us-east-1, 2026-10-10, cases
+/// 2; the regions agree on every row).
+#[test]
+fn a_condition_function_compares_from_either_side_and_in_a_list() {
+    let db = captured_db();
+    let failed = || Err("The conditional request failed".to_string());
+    let rows = |keys: &[&str]| {
+        let mut keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        keys.sort();
+        Ok(keys)
+    };
+    let a_there = ["r1", "r5", "q4", "d1", "r3", "q2"];
+    let a_missing = ["q3", "q1", "q5", "r2", "r4"];
+    let b_is_a = ["r1", "r2", "d1"];
+    let bool_param = |b: bool| Some(serde_json::json!([{"BOOL": b}]));
+    // The clause, its parameters, what the SELECT returns, and whether the
+    // UPDATE of r1, the UPDATE of r3 and the DELETE of d1 run.
+    type Case<'a> = (&'a str, Option<serde_json::Value>, &'a [&'a str], [bool; 3]);
+    let cases: Vec<Case> = vec![
+        (
+            "? = attribute_exists(a)",
+            bool_param(true),
+            &a_there,
+            [true; 3],
+        ),
+        (
+            "? = attribute_exists(a)",
+            bool_param(false),
+            &a_missing,
+            [false; 3],
+        ),
+        (
+            "attribute_exists(a) = ?",
+            bool_param(true),
+            &a_there,
+            [true; 3],
+        ),
+        (
+            "? <> attribute_exists(a)",
+            bool_param(true),
+            &a_missing,
+            [false; 3],
+        ),
+        ("size(s) = attribute_exists(a)", None, &[], [false; 3]),
+        ("attribute_exists(a) = size(s)", None, &[], [false; 3]),
+        ("true = attribute_exists(a)", None, &a_there, [true; 3]),
+        (
+            "attribute_exists(a) = attribute_exists(b)",
+            None,
+            &["q3", "q1", "r1", "q5", "r5", "d1", "r3"],
+            [true; 3],
+        ),
+        (
+            "? IN [attribute_exists(a)]",
+            bool_param(true),
+            &a_there,
+            [true; 3],
+        ),
+        (
+            "b IN [attribute_exists(a)]",
+            None,
+            &b_is_a,
+            [true, false, true],
+        ),
+        (
+            "b = attribute_exists(a)",
+            None,
+            &b_is_a,
+            [true, false, true],
+        ),
+        (
+            "bb.c = attribute_exists(a)",
+            None,
+            &b_is_a,
+            [true, false, true],
+        ),
+        (
+            "l[0] = attribute_exists(a)",
+            None,
+            &b_is_a,
+            [true, false, true],
+        ),
+        (
+            r#""b" = attribute_exists(a)"#,
+            None,
+            &b_is_a,
+            [true, false, true],
+        ),
+        (
+            "attribute_exists(a) = bb.c",
+            None,
+            &b_is_a,
+            [true, false, true],
+        ),
+        (
+            "attribute_exists(a) = l[0]",
+            None,
+            &b_is_a,
+            [true, false, true],
+        ),
+        (
+            r#"attribute_exists(a) = "b""#,
+            None,
+            &b_is_a,
+            [true, false, true],
+        ),
+    ];
+    for (clause, parameters, selected, writes) in cases {
+        let select = format!(r#"SELECT pk FROM "Hashed" WHERE {clause}"#);
+        assert_eq!(
+            sorted(answer(&db, &select, parameters.clone()).0),
+            rows(selected),
+            "{select}"
+        );
+        let statements = [
+            format!(r#"UPDATE "Hashed" SET w = 1 WHERE pk = 'r1' AND {clause}"#),
+            format!(r#"UPDATE "Hashed" SET w = 1 WHERE pk = 'r3' AND {clause}"#),
+            format!(r#"DELETE FROM "Hashed" WHERE pk = 'd1' AND {clause}"#),
+        ];
+        for (statement, runs) in statements.iter().zip(writes) {
+            let expected = if runs { Ok(Vec::new()) } else { failed() };
+            assert_eq!(
+                answer(&db, statement, parameters.clone()).0,
+                expected,
+                "{statement}"
+            );
+        }
+        put_json(&db, "Hashed", captured_d1());
+    }
 }

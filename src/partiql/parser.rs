@@ -2824,7 +2824,7 @@ fn condition_function_tail(
     };
     if is_comparison_operator(&next) {
         t.next_token()?;
-        let right = parse_operand(t, depth)?;
+        let right = parse_comparand(t, depth)?;
         return function.compared(t, &next, right);
     }
     // `NOT BETWEEN` takes BETWEEN's refusal and `NOT IN` is the negation of
@@ -2850,7 +2850,7 @@ fn condition_function_tail(
     // a string (captured eu-west-2 and us-east-1, 2026-10-10).
     if is_keyword(&next, "IN") {
         t.next_token()?;
-        let members = parse_in_list(t, depth, parse_bound_operand)?;
+        let members = parse_in_list(t, depth, parse_comparand)?;
         note_in_operand_count(t, members.len());
         let listed = function.listed(members);
         return Ok(if negated {
@@ -3124,11 +3124,32 @@ fn note_in_operand_count(t: &mut Tokenizer, count: usize) {
     }
 }
 
-/// A BETWEEN bound or IN member beside a path or another operand: a path or a
-/// size as well as a value, so `size(s) IN [n]` names the attribute `n` rather
-/// than the string `'n'` (captured eu-west-2 and us-east-1, 2026-10-09).
-/// `MISSING` is refused here as it is anywhere else an operand can stand.
+/// A BETWEEN bound beside a path: a path or a size as well as a value, as an
+/// IN member is, so `size(s) IN [n]` names the attribute `n` rather than the
+/// string `'n'` (captured eu-west-2 and us-east-1, 2026-10-09). `MISSING` is
+/// refused here as it is anywhere else an operand can stand. An IN member is
+/// read by `parse_comparand`, which takes a condition function as well.
 fn parse_bound_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
+    parse_operand(t, depth)
+}
+
+/// The right-hand side of a comparison or a member of an IN list: an operand,
+/// or a condition function's call as the boolean it returns (captured
+/// eu-west-2 and us-east-1, 2026-10-10: `attribute_exists(a) =
+/// attribute_exists(b)`, `? IN [attribute_exists(a)]` and `b IN
+/// [attribute_exists(a)]` run). A call whose refusal is noted stands as a
+/// NULL, never evaluated.
+fn parse_comparand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
+    let calls = t.peek_token_at(1)?.as_deref() == Some("(");
+    if calls
+        && t.peek_token()?
+            .is_some_and(|tok| is_condition_function(&tok))
+    {
+        return Ok(match parse_condition_function(t, depth)? {
+            Some(function) => function.operand(),
+            None => Operand::Value(PartiqlValue::Literal(AttributeValue::NULL(true))),
+        });
+    }
     parse_operand(t, depth)
 }
 
@@ -3174,8 +3195,16 @@ fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<B
         Some(op) if is_comparison_operator(op) => {
             let op_tok = t.next_token()?.unwrap_or_default();
             let op = comparison_operator(&op_tok)?;
-            let right = parse_operand(t, depth)?;
-            Ok(BoolExpr::Leaf(comparison(t, left, op, &op_tok, right)))
+            // A condition function on the right compares as it does written
+            // first: `? = attribute_exists(a)` and `size(s) =
+            // attribute_exists(a)` run (captured eu-west-2 and us-east-1,
+            // 2026-10-10).
+            match parse_comparand(t, depth)? {
+                Operand::Condition(holds) => {
+                    ConditionFunction { holds: *holds }.compared(t, &op_tok, left)
+                }
+                right => Ok(BoolExpr::Leaf(comparison(t, left, op, &op_tok, right))),
+            }
         }
         Some(tok) if is_keyword(tok, "BETWEEN") => {
             t.next_token()?;
@@ -3188,7 +3217,7 @@ fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<B
         }
         Some(tok) if is_keyword(tok, "IN") => {
             t.next_token()?;
-            let members = parse_in_list(t, depth, parse_bound_operand)?;
+            let members = parse_in_list(t, depth, parse_comparand)?;
             note_in_operand_count(t, members.len());
             Ok(BoolExpr::Leaf(WhereCondition::CompareIn(left, members)))
         }
@@ -3671,7 +3700,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                 }
                 "IN" => {
                     t.next_token()?; // consume IN
-                    let members = parse_in_list(t, depth, parse_bound_operand)?;
+                    let members = parse_in_list(t, depth, parse_comparand)?;
                     Ok(path_in(t, path, members))
                 }
                 // `x NOT IN [...]` and `x NOT BETWEEN lo AND hi` read as
@@ -3688,7 +3717,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                     if is_keyword(&after, "IN") {
                         t.next_token()?; // consume NOT
                         t.next_token()?; // consume IN
-                        let members = parse_in_list(t, depth, parse_bound_operand)?;
+                        let members = parse_in_list(t, depth, parse_comparand)?;
                         Ok(WhereCondition::Not(Box::new(path_in(t, path, members))))
                     } else if is_keyword(&after, "BETWEEN") {
                         t.next_token()?; // consume NOT
