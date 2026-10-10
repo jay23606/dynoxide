@@ -12,9 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`aws-smithy-json` moves to 0.63.1** for GHSA-8ffr-xgwf-xj56. It reaches the
   tree only through the AWS SDK the tests and the benchmarks use, never in a
   released artefact, and the advisory covers smithy-rs generated servers,
-  which Dynoxide isn't. The fixed release needs a newer Rust than the crate's
-  1.88, so the test suite now needs Rust 1.94.1 or later. The crate, and every
-  build of it, still compiles on 1.88.
+  which Dynoxide isn't. The fixed release needs Rust 1.94.1, which is why the
+  minimum supported Rust version moves (see Breaking (Rust API)).
 
 ### Behaviour changes
 
@@ -122,6 +121,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Breaking (Rust API)
 
+- The minimum supported Rust version is 1.94.1, up from 1.88. The AWS SDK the
+  tests use needs it for a security fix, and keeping the crate on the same
+  floor means one toolchain builds and tests it.
 - The `expressions` and `partiql` modules are no longer public. They hold the
   parsers for DynamoDB's expression syntax and for PartiQL, whose shape changes
   as compatibility work lands, and this release changed both substantially.
