@@ -789,12 +789,12 @@ fn test_update_returning_modified_deep_nested_path() {
     let db = Database::memory().unwrap();
     create_test_table(&db, "Users");
 
-    // Seed profile = { inner: { leaf: 'old', sib: 'keep' } } (three levels).
+    // Seed profile = { nested: { leaf: 'old', sib: 'keep' } } (three levels).
     let mut inner = HashMap::new();
     inner.insert("leaf".to_string(), AttributeValue::S("old".to_string()));
     inner.insert("sib".to_string(), AttributeValue::S("keep".to_string()));
     let mut profile = HashMap::new();
-    profile.insert("inner".to_string(), AttributeValue::M(inner));
+    profile.insert("nested".to_string(), AttributeValue::M(inner));
     let mut item = HashMap::new();
     item.insert("pk".to_string(), AttributeValue::S("d1".to_string()));
     item.insert("profile".to_string(), AttributeValue::M(profile));
@@ -806,13 +806,15 @@ fn test_update_returning_modified_deep_nested_path() {
     .unwrap();
 
     // A three-level SET projects only the changed leaf, nested all the way down.
+    // (`inner` is a keyword DynamoDB refuses as a dot component, so the
+    // middle map is `nested`.)
     let resp = exec(
         &db,
-        "UPDATE \"Users\" SET profile.inner.leaf = 'new' WHERE pk = 'd1' RETURNING MODIFIED NEW *",
+        "UPDATE \"Users\" SET profile.nested.leaf = 'new' WHERE pk = 'd1' RETURNING MODIFIED NEW *",
     );
     let items = resp.items.expect("RETURNING should return items");
     let inner = match items[0].get("profile") {
-        Some(AttributeValue::M(p)) => match p.get("inner") {
+        Some(AttributeValue::M(p)) => match p.get("nested") {
             Some(AttributeValue::M(i)) => i,
             other => panic!("expected inner map, got {other:?}"),
         },
@@ -3718,21 +3720,29 @@ fn test_count_is_rejected_per_statement_on_batch_execute() {
 #[test]
 fn test_count_is_rejected_at_the_top_level_on_execute_transaction() {
     // ExecuteTransaction surfaces the rejection where its parse errors live,
-    // at the top level, but with the bare captured message.
+    // at the top level, with the statement's index in front (captured
+    // eu-west-2 and us-east-1, 2026-10-09).
     let db = Database::memory().unwrap();
     create_test_table(&db, "Users");
 
     let err = db
         .execute_transaction(ExecuteTransactionRequest {
-            transact_statements: vec![ParameterizedStatement {
-                statement: "SELECT COUNT(*) FROM \"Users\"".to_string(),
-                parameters: None,
-            }],
+            transact_statements: vec![
+                ParameterizedStatement {
+                    statement: "SELECT * FROM \"Users\" WHERE pk = 'a'".to_string(),
+                    parameters: None,
+                },
+                ParameterizedStatement {
+                    statement: "SELECT count(pk) FROM \"Users\"".to_string(),
+                    parameters: None,
+                },
+            ],
             ..Default::default()
         })
         .unwrap_err();
     assert!(
-        matches!(err, DynoxideError::ValidationException(ref m) if m == "Unexpected path component at 1:8:5"),
+        matches!(err, DynoxideError::ValidationException(ref m)
+            if m == "Validation failed in TransactStatements[1]: Unexpected path component at 1:8:5"),
         "unexpected error: {err:?}"
     );
 }

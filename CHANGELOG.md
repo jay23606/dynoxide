@@ -330,6 +330,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already did. `DELETE FROM` with no table is `Expected identifier for simple
   path`, and `SELECT * FROM` with none is `Unexpected term` or `Unexpected
   keyword`.
+- A PartiQL WHERE clause takes `size(path)` and `attribute_type(path, type)`,
+  which used to fail with `Unknown operator: (`, and compares any two operands
+  as DynamoDB does: a literal or parameter on the left (`'a' = pk` names the
+  item an UPDATE or DELETE changes), two paths, two literals, and `size()` on
+  either side of a comparison, BETWEEN or IN. A size counts a string's UTF-16
+  code units, a binary's bytes and a collection's members. A comparison with a
+  missing attribute, or with the size of a value that has none, is true for
+  `<>`, as it is in a condition expression; it used to be false. An unknown
+  `attribute_type` type, the wrong number of operands, the same path on both
+  sides of a comparison, `MISSING` outside `IS`, an ordering operator on a
+  condition function and a size standing alone as a condition are each refused
+  with DynamoDB's message before the table is looked up, and a comparison with
+  nothing after its operator is `Missing right-hand side expression of infix
+  operator`.
+- PartiQL refuses a bag it can't store with DynamoDB's messages and positions:
+  one that starts with a string at its first member that isn't one, one that
+  starts with a number without a position, and a parameter, `null` or Ion
+  literal among its members with their own messages. These used to be `Mixed
+  types in ... set literal` or a parse error. An Ion literal between backticks
+  is refused by its type where it stands; `X'...'` is a syntax error, as in
+  DynamoDB, rather than a name and a string; and a list, map or bag whose
+  members aren't separated by commas is a syntax error too.
+- A PartiQL keyword such as `inner` or `value` can't be a path's dot component
+  unless it is quoted (`m."inner"`), as in DynamoDB; it used to be read as an
+  attribute name. Any call in a SELECT list is refused as `Unexpected path
+  component` at the function's name, and inside ExecuteTransaction with the
+  statement's index; only `COUNT` used to be refused, and without the index.
+  `EXISTS(SELECT ...)` in a WHERE clause is refused as `Unsupported token in
+  expression: SELECT`.
+- When a PartiQL statement has more than one problem, the one reported is the
+  one DynamoDB reports: an unrecognised function, an unsupported `IS` type, a
+  subquery and a literal it can't store come in the order written, WHERE clause
+  first, and ahead of an operand refusal.
 - PartiQL refuses a `begins_with` operand that isn't a string or binary, and
   BETWEEN bounds of different types or with the lower above the upper, with
   DynamoDB's messages, `NOT` or not, before the table is looked up.

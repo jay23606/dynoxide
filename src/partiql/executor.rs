@@ -7,7 +7,7 @@ use crate::errors::{DynoxideError, Result};
 use crate::expressions::condition::compare_values;
 use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
 use crate::partiql::parser::{
-    CompOp, OrderByTerm, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause,
+    CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause,
     WhereCondition,
 };
 use crate::storage_backend::StorageBackend;
@@ -634,8 +634,10 @@ fn reject_overlapping_key_conditions(
 fn key_groups(wc: &WhereClause, read_pk: &str, read_sk: Option<&str>) -> Vec<Vec<WhereCondition>> {
     use crate::partiql::parser::ConditionTree;
     let is_key = |cond: &WhereCondition| {
-        let root = root_attribute(condition_path(cond));
-        root == read_pk || Some(root) == read_sk
+        condition_path(cond).is_some_and(|path| {
+            let root = root_attribute(path);
+            root == read_pk || Some(root) == read_sk
+        })
     };
     fn mentions_key(tree: &ConditionTree, is_key: &dyn Fn(&WhereCondition) -> bool) -> bool {
         match tree {
@@ -1003,6 +1005,23 @@ fn bound_operand(value: &AttributeValue) -> String {
     }
 }
 
+/// Refuse a type given to `attribute_type` as a parameter that isn't the name
+/// of a DynamoDB type.
+fn check_attribute_type_parameter(
+    kind: &PartiqlValue,
+    parameters: &[AttributeValue],
+    reject: fn(&str, &AttributeValue) -> DynoxideError,
+) -> Result<()> {
+    match resolve_value(kind, parameters)? {
+        AttributeValue::S(name) => match crate::partiql::parser::attribute_type_name_refusal(&name)
+        {
+            Some(message) => Err(DynoxideError::ValidationException(message)),
+            None => Ok(()),
+        },
+        other => Err(reject("attribute_type", &other)),
+    }
+}
+
 /// Reject an operand of a type its operator does not take.
 ///
 /// DynamoDB orders `S`, `N` and `B` and nothing else, and it rejects the
@@ -1079,6 +1098,22 @@ fn validate_operand_types(
                         return Err(bounds(
                             "upper bound to be greater than or equal to lower bound",
                         ));
+                    }
+                }
+                // A type given to `attribute_type` as a parameter is checked
+                // once it is bound, negated or not (captured eu-west-2 and
+                // us-east-1, 2026-10-09).
+                WhereCondition::AttributeType(_, kind @ PartiqlValue::Parameter(_)) => {
+                    check_attribute_type_parameter(kind, parameters, reject)?;
+                }
+                WhereCondition::Not(inner)
+                    if matches!(
+                        **inner,
+                        WhereCondition::AttributeType(_, PartiqlValue::Parameter(_))
+                    ) =>
+                {
+                    if let WhereCondition::AttributeType(_, kind) = &**inner {
+                        check_attribute_type_parameter(kind, parameters, reject)?;
                     }
                 }
                 // `begins_with` takes a string or binary operand (captured
@@ -1921,10 +1956,11 @@ fn root_attribute(path: &str) -> &str {
     &path[..end]
 }
 
-/// The path a WHERE condition reads.
-fn condition_path(condition: &WhereCondition) -> &str {
+/// The path a WHERE condition on one path reads; `None` for a condition on
+/// other operands, which narrows no key range.
+fn condition_path(condition: &WhereCondition) -> Option<&str> {
     match condition {
-        WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => c.path.as_str(),
+        WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => Some(c.path.as_str()),
         WhereCondition::Exists(p)
         | WhereCondition::NotExists(p)
         | WhereCondition::BeginsWith(p, _)
@@ -1937,7 +1973,35 @@ fn condition_path(condition: &WhereCondition) -> &str {
         | WhereCondition::IsMissing(p)
         | WhereCondition::IsNotMissing(p)
         | WhereCondition::IsType(p, _)
-        | WhereCondition::IsNotType(p, _) => p.as_str(),
+        | WhereCondition::IsNotType(p, _) => Some(p.as_str()),
+        _ => None,
+    }
+}
+
+/// Every path a WHERE condition reads.
+fn condition_paths(condition: &WhereCondition) -> Vec<&str> {
+    fn operand_paths(operand: &Operand) -> Vec<&str> {
+        match operand {
+            Operand::Path(path) => vec![path.as_str()],
+            Operand::Size(inner) => operand_paths(inner),
+            _ => Vec::new(),
+        }
+    }
+    match condition {
+        WhereCondition::Compare(left, _, right) => {
+            [left, right].into_iter().flat_map(operand_paths).collect()
+        }
+        WhereCondition::CompareBetween(operand, low, high) => [operand, low, high]
+            .into_iter()
+            .flat_map(operand_paths)
+            .collect(),
+        WhereCondition::CompareIn(operand, list) => std::iter::once(operand)
+            .chain(list)
+            .flat_map(operand_paths)
+            .collect(),
+        WhereCondition::AttributeType(operand, _) => operand_paths(operand),
+        WhereCondition::Not(inner) => condition_paths(inner),
+        other => condition_path(other).into_iter().collect(),
     }
 }
 
@@ -1949,9 +2013,11 @@ fn where_attributes(where_clause: Option<&WhereClause>) -> Vec<String> {
     let mut out = Vec::new();
     for group in &wc.groups {
         for condition in group {
-            let root = root_attribute(condition_path(condition)).to_string();
-            if !out.contains(&root) {
-                out.push(root);
+            for path in condition_paths(condition) {
+                let root = root_attribute(path).to_string();
+                if !out.contains(&root) {
+                    out.push(root);
+                }
             }
         }
     }
@@ -3345,8 +3411,11 @@ fn matches_conditions(
     for cond in conditions {
         match cond {
             WhereCondition::Comparison(c) => {
+                // A missing attribute is unequal to anything, and neither less
+                // nor greater (captured eu-west-2 and us-east-1, 2026-10-09).
                 let item_val = match resolve_nested_path(item, &c.path) {
                     Some(v) => v,
+                    None if c.op == CompOp::Ne => continue,
                     None => return false,
                 };
                 let target = match resolve_value(&c.value, parameters) {
@@ -3370,6 +3439,8 @@ fn matches_conditions(
                     if compare_values(item_val, &c.op, &target) {
                         return false;
                     }
+                } else if c.op == CompOp::Ne {
+                    return false;
                 }
             }
             WhereCondition::Exists(path) | WhereCondition::IsNotMissing(path) => {
@@ -3487,10 +3558,85 @@ fn matches_conditions(
                     return false;
                 }
             }
+            WhereCondition::Not(inner) => {
+                if matches_conditions(item, std::slice::from_ref(inner), parameters) {
+                    return false;
+                }
+            }
+            other => {
+                if !operand_condition_holds(item, other, parameters) {
+                    return false;
+                }
+            }
         }
     }
 
     true
+}
+
+/// Whether a condition on operands other than a path and a value holds. A
+/// missing value, or the size of one that has none, makes `=`, the ordering
+/// operators, BETWEEN and IN false and `<>` true (captured eu-west-2 and
+/// us-east-1, 2026-10-09).
+fn operand_condition_holds(
+    item: &Item,
+    condition: &WhereCondition,
+    parameters: &[AttributeValue],
+) -> bool {
+    let value = |operand: &Operand| operand_value(item, operand, parameters);
+    match condition {
+        WhereCondition::Compare(left, op, right) => match (value(left), value(right)) {
+            (Some(left), Some(right)) => compare_values(&left, op, &right),
+            _ => *op == CompOp::Ne,
+        },
+        WhereCondition::CompareBetween(operand, low, high) => {
+            match (value(operand), value(low), value(high)) {
+                (Some(v), Some(low), Some(high)) => {
+                    compare_values(&v, &CompOp::Ge, &low) && compare_values(&v, &CompOp::Le, &high)
+                }
+                _ => false,
+            }
+        }
+        WhereCondition::CompareIn(operand, list) => value(operand).is_some_and(|v| {
+            list.iter()
+                .any(|member| value(member).is_some_and(|m| compare_values(&v, &CompOp::Eq, &m)))
+        }),
+        WhereCondition::AttributeType(operand, kind) => {
+            match (value(operand), resolve_value(kind, parameters)) {
+                (Some(v), Ok(AttributeValue::S(kind))) => v.type_name() == kind,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// An operand's value for an item, or `None` when it has none: a missing path,
+/// or the size of a value that has no size. A string's size is its length in
+/// UTF-16 code units, as Java counts it (captured eu-west-2 and us-east-1,
+/// 2026-10-09: `héllo` is 5 and an emoji 2).
+fn operand_value(
+    item: &Item,
+    operand: &Operand,
+    parameters: &[AttributeValue],
+) -> Option<AttributeValue> {
+    match operand {
+        Operand::Path(path) => resolve_nested_path(item, path).cloned(),
+        Operand::Value(value) => resolve_value(value, parameters).ok(),
+        Operand::Size(inner) => {
+            let size = match operand_value(item, inner, parameters)? {
+                AttributeValue::S(s) => s.encode_utf16().count(),
+                AttributeValue::B(b) => b.len(),
+                AttributeValue::SS(set) => set.len(),
+                AttributeValue::NS(set) => set.len(),
+                AttributeValue::BS(set) => set.len(),
+                AttributeValue::L(list) => list.len(),
+                AttributeValue::M(map) => map.len(),
+                _ => return None,
+            };
+            Some(AttributeValue::N(size.to_string()))
+        }
+    }
 }
 
 /// Whether `path` holds a value containing `substr_val`: a substring of a

@@ -204,22 +204,23 @@ pub(crate) fn select_target(input: &str) -> Option<(String, Option<String>)> {
     Some((target.name, target.index))
 }
 
-/// DynamoDB's rejection message for a `COUNT` projection, if the statement
+/// DynamoDB's rejection message for a call in a SELECT list, if the statement
 /// carries one.
 ///
-/// Real DynamoDB does not support aggregate functions in PartiQL: a `COUNT`
-/// token in a SELECT's projection list is rejected with a bare
-/// `ValidationException` reading `Unexpected path component at
-/// <line>:<column>:<length>`, where line and column are the 1-based position
-/// of the token and the length is always 5 (the `COUNT` keyword itself,
-/// whatever is inside the parens). The rejection fires before the
-/// table-existence check (captured eu-west-2, 2026-07-29).
+/// DynamoDB's PartiQL takes no function in a projection, aggregate or not: the
+/// first call is rejected with a bare `ValidationException` reading
+/// `Unexpected path component at <line>:<column>:<length>`, where line and
+/// column are the 1-based position of the function's name and the length is
+/// the name's, whatever is inside the parentheses: 5 for `COUNT`, 16 for
+/// `attribute_exists`. The rejection fires before the table-existence check
+/// (captured eu-west-2, 2026-07-29, for COUNT; eu-west-2 and us-east-1,
+/// 2026-10-09, for the others).
 ///
 /// Returns `Some(message)` when `statement` is a SELECT and, before its first
-/// unquoted `FROM`, an unquoted word-bounded `count` (any case) is followed by
-/// optional whitespace and `(`. String literals and quoted identifiers are
-/// skipped, so a `'count('` literal or a quoted `"COUNT"` attribute name never
-/// triggers. Returns `None` otherwise.
+/// unquoted `FROM`, an unquoted word (any case) is followed by optional
+/// whitespace and `(`. String literals and quoted identifiers are skipped, so
+/// a `'count('` literal or a quoted `"COUNT"` attribute name never triggers.
+/// Returns `None` otherwise.
 pub(crate) fn count_projection_rejection(statement: &str) -> Option<String> {
     fn advance(c: char, line: &mut usize, col: &mut usize) {
         if c == '\n' {
@@ -282,16 +283,15 @@ pub(crate) fn count_projection_rejection(statement: &str) -> Option<String> {
             if word.eq_ignore_ascii_case("FROM") {
                 return None;
             }
-            if word.eq_ignore_ascii_case("COUNT") {
-                let mut j = i;
-                while j < len && chars[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                if j < len && chars[j] == '(' {
-                    return Some(format!(
-                        "Unexpected path component at {word_line}:{word_col}:5"
-                    ));
-                }
+            let mut j = i;
+            while j < len && chars[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < len && chars[j] == '(' {
+                let length = word.chars().count();
+                return Some(format!(
+                    "Unexpected path component at {word_line}:{word_col}:{length}"
+                ));
             }
             continue;
         }
@@ -384,6 +384,8 @@ impl ConditionTree {
             BoolExpr::Not(_) => {
                 unreachable!("push_not_down removes every Not before the tree is kept")
             }
+            // push_not_down replaces it with a refused condition.
+            BoolExpr::NonBoolean(_) => ConditionTree::Leaf(WhereCondition::Exists(String::new())),
         }
     }
 }
@@ -447,6 +449,29 @@ pub enum WhereCondition {
     IsType(String, TypeTest),
     /// `path IS NOT <type>`: true for a missing attribute too.
     IsNotType(String, TypeTest),
+    /// A comparison whose sides aren't a path and a value: `size(s) = 3`,
+    /// `'a' = 'b'`, `s = s2`.
+    Compare(Operand, CompOp, Operand),
+    /// `operand BETWEEN low AND high` for an operand that isn't a path.
+    CompareBetween(Operand, Operand, Operand),
+    /// `operand IN [...]` for an operand that isn't a path.
+    CompareIn(Operand, Vec<Operand>),
+    /// `attribute_type(operand, type)`: the operand's DynamoDB type is `type`.
+    AttributeType(Operand, PartiqlValue),
+    /// A negated condition with no negated form of its own.
+    Not(Box<WhereCondition>),
+}
+
+/// One side of a comparison that isn't `path op value`.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum Operand {
+    Path(String),
+    Value(PartiqlValue),
+    /// `size(operand)`: a string's length in UTF-16 code units, a binary's in
+    /// bytes, and a set's, list's or map's member count; nothing for any other
+    /// value, which then compares as a missing one does.
+    Size(Box<Operand>),
 }
 
 /// What `IS <type>` tests in a WHERE clause: the types DynamoDB supports there
@@ -588,21 +613,14 @@ pub(crate) fn parse_statement(input: &str) -> Result<Statement, ParseFailure> {
     // a second statement (captured eu-west-2 and us-east-1, 2026-10-09).
     end_of_statement(&mut tokenizer)?;
 
-    // A function DynamoDB doesn't recognise, or an operand a condition
-    // function can't take, is refused once the statement has parsed and
-    // before the table is looked up, without the syntax envelope (captured
-    // eu-west-2 and us-east-1, 2026-10-09).
-    if let Some(message) = tokenizer.first_refusal() {
-        return Err(ParseFailure::Statement(ParseError::Validation(message)));
-    }
-
-    // A literal DynamoDB can't read is refused once the statement has parsed,
-    // before anything is looked up: a missing table, a missing item or an
-    // ordering comparison on a type with no ordering all come second. The
-    // message is DynamoDB's own, with the path inside the value, `under
-    // root.x` (captured eu-west-2 and us-east-1, 2026-10-09).
-    if let Some(message) = tokenizer.first_literal_error() {
-        return Err(ParseFailure::Literal(message));
+    // A term or literal DynamoDB refuses, or an operand an operator can't
+    // take, is refused once the statement has parsed and before anything is
+    // looked up, without the syntax envelope: a missing table, a missing item
+    // or an ordering comparison on a type with no ordering all come second.
+    // A literal's message is DynamoDB's own, with the path inside the value,
+    // `under root.x` (captured eu-west-2 and us-east-1, 2026-10-09).
+    if let Some(failure) = tokenizer.first_refusal() {
+        return Err(failure);
     }
 
     Ok(statement)
@@ -817,6 +835,278 @@ fn is_any(tok: &str, words: &[&str]) -> bool {
 }
 
 /// An identifier: a quoted name, or a bare word that isn't a keyword.
+/// The words DynamoDB's PartiQL reads as keywords, which can't be a path's dot
+/// component unless quoted: `m.inner` is `Invalid path dot component` and
+/// `m."inner"` reads the attribute. Each of the 249 was refused in eu-west-2 and
+/// us-east-1 (2026-10-09), out of 286 tried; the date parts (`year`, `day`,
+/// `hour` ...), `both`, `leading`, `trailing`, `every`, `to_string`,
+/// `to_timestamp` and `txctx` were accepted, as were names DynamoDB doesn't
+/// reserve. Lower case, sorted.
+const DOT_COMPONENT_KEYWORDS: &[&str] = &[
+    "absolute",
+    "action",
+    "add",
+    "all",
+    "allocate",
+    "alter",
+    "and",
+    "any",
+    "are",
+    "as",
+    "asc",
+    "assertion",
+    "at",
+    "authorization",
+    "avg",
+    "bag",
+    "begin",
+    "between",
+    "bigint",
+    "bit",
+    "bit_length",
+    "blob",
+    "bool",
+    "boolean",
+    "by",
+    "can_cast",
+    "can_lossless_cast",
+    "cascade",
+    "cascaded",
+    "case",
+    "cast",
+    "catalog",
+    "char",
+    "char_length",
+    "character",
+    "character_length",
+    "check",
+    "clob",
+    "close",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "commit",
+    "conflict",
+    "connect",
+    "connection",
+    "constraint",
+    "constraints",
+    "continue",
+    "convert",
+    "corresponding",
+    "count",
+    "create",
+    "cross",
+    "current",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "cursor",
+    "date",
+    "date_add",
+    "date_diff",
+    "deallocate",
+    "dec",
+    "decimal",
+    "declare",
+    "default",
+    "deferrable",
+    "deferred",
+    "delete",
+    "desc",
+    "describe",
+    "descriptor",
+    "diagnostics",
+    "disconnect",
+    "distinct",
+    "do",
+    "domain",
+    "double",
+    "drop",
+    "else",
+    "end",
+    "escape",
+    "except",
+    "exception",
+    "exec",
+    "execute",
+    "exists",
+    "external",
+    "extract",
+    "false",
+    "fetch",
+    "first",
+    "float",
+    "for",
+    "foreign",
+    "found",
+    "from",
+    "full",
+    "get",
+    "global",
+    "go",
+    "goto",
+    "grant",
+    "group",
+    "having",
+    "identity",
+    "immediate",
+    "in",
+    "index",
+    "indicator",
+    "initially",
+    "inner",
+    "input",
+    "insensitive",
+    "insert",
+    "int",
+    "integer",
+    "integer2",
+    "integer4",
+    "integer8",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isolation",
+    "join",
+    "key",
+    "language",
+    "last",
+    "left",
+    "let",
+    "level",
+    "like",
+    "limit",
+    "list",
+    "local",
+    "lower",
+    "match",
+    "max",
+    "min",
+    "missing",
+    "modified",
+    "module",
+    "names",
+    "national",
+    "natural",
+    "nchar",
+    "new",
+    "next",
+    "no",
+    "not",
+    "nothing",
+    "null",
+    "nullif",
+    "nulls",
+    "numeric",
+    "octet_length",
+    "of",
+    "offset",
+    "old",
+    "on",
+    "only",
+    "open",
+    "option",
+    "or",
+    "order",
+    "outer",
+    "output",
+    "overlaps",
+    "pad",
+    "partial",
+    "pivot",
+    "position",
+    "precision",
+    "prepare",
+    "preserve",
+    "primary",
+    "prior",
+    "privileges",
+    "procedure",
+    "public",
+    "read",
+    "real",
+    "references",
+    "relative",
+    "remove",
+    "restrict",
+    "returning",
+    "revoke",
+    "right",
+    "rollback",
+    "rows",
+    "schema",
+    "scroll",
+    "section",
+    "select",
+    "session",
+    "session_user",
+    "set",
+    "sexp",
+    "size",
+    "smallint",
+    "some",
+    "space",
+    "sql",
+    "sqlcode",
+    "sqlerror",
+    "sqlstate",
+    "string",
+    "struct",
+    "substring",
+    "sum",
+    "symbol",
+    "system_user",
+    "table",
+    "temporary",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "transaction",
+    "translate",
+    "trim",
+    "true",
+    "tuple",
+    "union",
+    "unique",
+    "unknown",
+    "unpivot",
+    "update",
+    "upper",
+    "usage",
+    "user",
+    "using",
+    "value",
+    "values",
+    "varchar",
+    "varying",
+    "view",
+    "when",
+    "whenever",
+    "where",
+    "with",
+    "work",
+    "write",
+    "zone",
+];
+
+/// Refuse a dot component that is a keyword, unless it is quoted.
+fn check_dot_component(segment: &str) -> Result<(), String> {
+    let lower = segment.to_ascii_lowercase();
+    if !segment.starts_with('"')
+        && DOT_COMPONENT_KEYWORDS
+            .binary_search(&lower.as_str())
+            .is_ok()
+    {
+        return Err("Invalid path dot component".to_string());
+    }
+    Ok(())
+}
+
 fn is_name(tok: &str) -> bool {
     tok.starts_with('"')
         || (tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
@@ -1429,6 +1719,7 @@ fn parse_projections(t: &mut Tokenizer) -> Result<Vec<String>, String> {
                 Some(ref s) if s == "." => {
                     t.next_token()?; // consume dot
                     let segment = t.next_token()?.ok_or("Expected attribute name after '.'")?;
+                    check_dot_component(&segment)?;
                     path.push('.');
                     path.push_str(&unquote(&segment));
                 }
@@ -1967,6 +2258,15 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
 /// reports an `OR` in a clause that never had one.
 fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, String> {
     let expr = parse_or_expr(t, 0)?;
+    if let Some((operator, kind)) = non_boolean(&expr, None) {
+        t.note_operand_refusal(match operator {
+            Some(operator) => format!(
+                "Incorrect operand type for operator or function; operator or function: \
+                 {operator}, operand type: {kind}"
+            ),
+            None => "WHERE clause must contain an expression that resolves to a boolean".into(),
+        });
+    }
     let wrote_or = contains_or(&expr);
     let mut top_level_equalities = Vec::new();
     collect_top_level_equalities(&expr, &mut top_level_equalities);
@@ -2004,13 +2304,28 @@ fn collect_top_level_equalities(expr: &BoolExpr, out: &mut Vec<Condition>) {
     }
 }
 
+/// The first value in an expression that stands where a condition should, as
+/// the operator it stands under (`None` for the whole clause) and its type.
+fn non_boolean(
+    expr: &BoolExpr,
+    operator: Option<&'static str>,
+) -> Option<(Option<&'static str>, &'static str)> {
+    match expr {
+        BoolExpr::NonBoolean(kind) => Some((operator, kind)),
+        BoolExpr::And(terms) => terms.iter().find_map(|e| non_boolean(e, Some("AND"))),
+        BoolExpr::Or(terms) => terms.iter().find_map(|e| non_boolean(e, Some("OR"))),
+        BoolExpr::Not(inner) => non_boolean(inner, Some("NOT")),
+        BoolExpr::Leaf(_) => None,
+    }
+}
+
 /// Whether an expression as parsed holds an `OR` anywhere.
 fn contains_or(expr: &BoolExpr) -> bool {
     match expr {
         BoolExpr::Or(_) => true,
         BoolExpr::And(terms) => terms.iter().any(contains_or),
         BoolExpr::Not(inner) => contains_or(inner),
-        BoolExpr::Leaf(_) => false,
+        BoolExpr::Leaf(_) | BoolExpr::NonBoolean(_) => false,
     }
 }
 
@@ -2025,6 +2340,9 @@ enum BoolExpr {
     And(Vec<BoolExpr>),
     Or(Vec<BoolExpr>),
     Not(Box<BoolExpr>),
+    /// A value standing where a condition should, by its DynamoDB type: refused
+    /// once the clause is read, naming the operator it stands under.
+    NonBoolean(&'static str),
 }
 
 /// `depth` counts the nesting levels above this expression: one per set of
@@ -2076,13 +2394,12 @@ fn parse_not_expr(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     if depth > MAX_EXPR_DEPTH {
         return Err(TOO_DEEP.to_string());
     }
-    // `NOT EXISTS(x)` and `NOT BEGINS_WITH(x, y)` are single conditions with
-    // their own variants, so they belong to parse_single_condition and are left
-    // to it. A `NOT` in front of anything else is the boolean operator.
+    // `NOT BEGINS_WITH(x, y)` is a single condition with its own variant, so it
+    // belongs to parse_single_condition and is left to it. A `NOT` in front of
+    // anything else is the boolean operator.
     if matches!(t.peek_token()?, Some(ref s) if s.eq_ignore_ascii_case("NOT")) {
         let next = t.peek_token_at(1)?.unwrap_or_default();
-        let is_condition_form =
-            next.eq_ignore_ascii_case("EXISTS") || next.eq_ignore_ascii_case("BEGINS_WITH");
+        let is_condition_form = next.eq_ignore_ascii_case("BEGINS_WITH");
         if !is_condition_form {
             t.next_token()?;
             return Ok(BoolExpr::Not(Box::new(parse_not_expr(t, depth + 1)?)));
@@ -2108,8 +2425,7 @@ fn parse_primary(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
 }
 
 /// The functions DynamoDB recognises in a WHERE clause. A call to anything
-/// else is refused as an unrecognised function; `size` and `attribute_type`
-/// are recognised but not supported here, and keep the refusal they had.
+/// else is refused as an unrecognised function.
 const WHERE_FUNCTIONS: &[&str] = &[
     "attribute_exists",
     "attribute_not_exists",
@@ -2119,54 +2435,112 @@ const WHERE_FUNCTIONS: &[&str] = &[
     "attribute_type",
 ];
 
+/// The types `attribute_type` tests for, in the order DynamoDB lists them.
+const ATTRIBUTE_TYPES: &[&str] = &["N", "BS", "L", "B", "NULL", "M", "S", "SS", "NS", "BOOL"];
+
+/// What DynamoDB says when `attribute_type` is given a path as the type: the
+/// operand types it would take, in the order of a Java hash set. The order
+/// differs from host to host (us-east-1 gave another); this is eu-west-2's
+/// (captured 2026-10-09).
+const ATTRIBUTE_TYPE_OPERAND_TYPES: &str = "{S,HDS,N,FS,BS,NULL,DOUBLE,NS,DECIMAL,SS,DECIMALSET,\
+     BOOL,HD,DICT,INTSET,M,L,B,FLOAT,INT,DOUBLESET}";
+
+const MISSING_COMPARED: &str = "MISSING must be compared using IS operator";
+
 /// A comparison operator, as a WHERE clause writes one.
 fn is_comparison_operator(tok: &str) -> bool {
     matches!(tok, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
 }
 
-/// `attribute_exists(path)` or `attribute_not_exists(path)` as parsed: which
-/// one, and the path (empty when the operand was refused).
+/// The operator a comparison token writes.
+fn comparison_operator(tok: &str) -> Result<CompOp, String> {
+    Ok(match tok {
+        "=" => CompOp::Eq,
+        "<>" | "!=" => CompOp::Ne,
+        "<" => CompOp::Lt,
+        "<=" => CompOp::Le,
+        ">" => CompOp::Gt,
+        ">=" => CompOp::Ge,
+        other => return Err(format!("Unknown operator: {other}")),
+    })
+}
+
+/// The operator that reads the same with its operands swapped: `3 < n` is
+/// `n > 3`.
+fn mirrored(op: CompOp) -> CompOp {
+    match op {
+        CompOp::Lt => CompOp::Gt,
+        CompOp::Le => CompOp::Ge,
+        CompOp::Gt => CompOp::Lt,
+        CompOp::Ge => CompOp::Le,
+        other => other,
+    }
+}
+
+/// A function that is a condition: `attribute_exists`, `attribute_not_exists`
+/// or `attribute_type`, as the condition it is when it holds.
 struct ConditionFunction {
-    exists: bool,
-    path: String,
+    holds: WhereCondition,
 }
 
 impl ConditionFunction {
     /// The condition the call is true for, or the one it is false for.
-    fn condition(&self, holds: bool) -> BoolExpr {
-        let path = self.path.clone();
-        BoolExpr::Leaf(if self.exists == holds {
-            WhereCondition::Exists(path)
+    fn condition(&self, holds: bool) -> Result<BoolExpr, String> {
+        if holds {
+            Ok(BoolExpr::Leaf(self.holds.clone()))
         } else {
-            WhereCondition::NotExists(path)
-        })
+            negate_condition(self.holds.clone())
+        }
     }
 
-    /// The call compared with a value. Equal to a boolean is the call or its
-    /// negation; equal to anything else is never true, and unequal to it
-    /// always (captured eu-west-2 and us-east-1, 2026-10-09, for `= false`,
-    /// `<> true`, `= 1` and `= 'true'`).
-    fn compared(&self, op: &str, value: PartiqlValue) -> Result<BoolExpr, String> {
+    /// The call compared with a value. It is a boolean: equal to a boolean is
+    /// the call or its negation, equal to anything else is never true and
+    /// unequal to it always, and the ordering operators refuse it (captured
+    /// eu-west-2 and us-east-1, 2026-10-09).
+    fn compared(&self, t: &mut Tokenizer, op: &str, value: Operand) -> Result<BoolExpr, String> {
         let equal = match op {
             "=" => true,
             "<>" | "!=" => false,
-            other => return Err(format!("Unknown operator: {other}")),
+            other => {
+                t.note_operand_refusal(bool_operand_refusal(other));
+                return self.condition(true);
+            }
         };
         match value {
-            PartiqlValue::Literal(AttributeValue::BOOL(b)) => Ok(self.condition(b == equal)),
-            PartiqlValue::Literal(_) => {
-                let both = vec![self.condition(true), self.condition(false)];
+            Operand::Value(PartiqlValue::Literal(AttributeValue::BOOL(b))) => {
+                self.condition(b == equal)
+            }
+            Operand::Value(PartiqlValue::Literal(_)) => {
+                let both = vec![self.condition(true)?, self.condition(false)?];
                 Ok(if equal {
                     BoolExpr::And(both)
                 } else {
                     BoolExpr::Or(both)
                 })
             }
-            PartiqlValue::Parameter(_) => {
-                Err("Comparing a condition function with a parameter is not supported".into())
-            }
+            _ => Err("Comparing a condition function with a parameter is not supported".into()),
         }
     }
+
+    /// The call in a list: true when the list holds the boolean it is.
+    fn listed(&self, values: &[PartiqlValue]) -> Result<BoolExpr, String> {
+        let has = |b: bool| values.contains(&PartiqlValue::Literal(AttributeValue::BOOL(b)));
+        let both = vec![self.condition(true)?, self.condition(false)?];
+        Ok(match (has(true), has(false)) {
+            (true, true) => BoolExpr::Or(both),
+            (true, false) => self.condition(true)?,
+            (false, true) => self.condition(false)?,
+            (false, false) => BoolExpr::And(both),
+        })
+    }
+}
+
+/// DynamoDB's refusal of a boolean as the operand of `op`.
+fn bool_operand_refusal(op: &str) -> String {
+    format!(
+        "Incorrect operand type for operator or function; operator or function: {op}, \
+         operand type: BOOL"
+    )
 }
 
 /// Which condition function a name calls, by its canonical name.
@@ -2176,8 +2550,24 @@ fn condition_function_name(tok: &str) -> Option<&'static str> {
         .find(|name| is_keyword(tok, name))
 }
 
-/// One WHERE condition: a condition function, a call DynamoDB doesn't
-/// recognise, or a comparison and the other single conditions.
+/// Whether a name calls a function that is itself a condition.
+fn is_condition_function(tok: &str) -> bool {
+    condition_function_name(tok).is_some() || is_keyword(tok, "attribute_type")
+}
+
+/// Whether a token starts a term that is a value rather than a path: a
+/// literal, a parameter or `MISSING`.
+fn starts_value(t: &Tokenizer, tok: &str) -> Result<bool, String> {
+    Ok(tok == "?"
+        || tok.starts_with(['\'', '`', '[', '{', '<'])
+        || is_number_token(tok)
+        || ((tok == "-" || tok == "+") && t.peek_token_at(1)?.is_some_and(|n| is_number_token(&n)))
+        || is_any(tok, &["TRUE", "FALSE", "NULL", "MISSING"]))
+}
+
+/// One WHERE condition: a condition function, a subquery or a call DynamoDB
+/// doesn't recognise, a comparison that starts with a value or `size(...)`,
+/// or a comparison and the other single conditions on a path.
 fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> {
     let Some(tok) = t.peek_token()? else {
         return Ok(BoolExpr::Leaf(parse_single_condition(t, depth)?));
@@ -2191,45 +2581,108 @@ fn parse_condition(t: &mut Tokenizer, depth: usize) -> Result<BoolExpr, String> 
         && t.peek_token_at(1)?
             .is_some_and(|op| is_comparison_operator(&op))
         && t.peek_token_at(2)?
-            .is_some_and(|f| condition_function_name(&f).is_some())
+            .is_some_and(|f| is_condition_function(&f))
         && calls(2, t)?
     {
         let left = parse_value(t, depth)?;
         let op = t.next_token()?.unwrap_or_default();
-        let function = parse_condition_function(t, depth)?;
-        return function.compared(&op, left);
+        return match parse_condition_function(t, depth)? {
+            Some(function) => function.compared(t, &op, Operand::Value(left)),
+            None => Ok(refused_condition()),
+        };
     }
 
     let bare_word = tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
     if bare_word && calls(0, t)? {
-        if condition_function_name(&tok).is_some() {
-            let function = parse_condition_function(t, depth)?;
-            if let Some(op) = t.peek_token()?
-                && is_comparison_operator(&op)
-            {
-                t.next_token()?;
-                let right = parse_value(t, depth)?;
-                return function.compared(&op, right);
-            }
-            return Ok(function.condition(true));
+        // `EXISTS (SELECT ...)`: DynamoDB takes no subquery in a WHERE clause,
+        // and refuses the SELECT where it stands (captured eu-west-2 and
+        // us-east-1, 2026-10-09).
+        if is_keyword(&tok, "EXISTS")
+            && let Some(select) = subquery_select(t)
+        {
+            let at = t.position(t.span_at(select));
+            t.note_term(format!("Unsupported token in expression: SELECT at {at}"));
+            skip_call(t, depth)?;
+            return Ok(refused_condition());
         }
-        // `EXISTS (SELECT ...)` keeps the handling it had; `EXISTS(path)` is a
-        // function DynamoDB doesn't recognise in a WHERE clause.
-        let subquery = t
-            .peek_token_at(2)?
-            .is_some_and(|next| is_keyword(&next, "SELECT"));
-        if !is_any(&tok, WHERE_FUNCTIONS) && !subquery {
-            skip_unrecognized_call(t, depth)?;
-            // Never evaluated: the statement is refused once it has parsed.
-            return Ok(BoolExpr::Leaf(WhereCondition::Exists(String::new())));
+        if is_condition_function(&tok) {
+            let Some(function) = parse_condition_function(t, depth)? else {
+                skip_comparison(t, depth)?;
+                return Ok(refused_condition());
+            };
+            return condition_function_tail(t, depth, function);
         }
+        if is_keyword(&tok, "size") {
+            let left = parse_operand(t, depth)?;
+            return finish_comparison(t, depth, left);
+        }
+        if !is_any(&tok, WHERE_FUNCTIONS) {
+            t.note_unrecognized_function(t.pos);
+            skip_call(t, depth)?;
+            return Ok(refused_condition());
+        }
+    }
+    // A literal or a parameter on the left of a comparison.
+    if starts_value(t, &tok)? {
+        let left = parse_operand(t, depth)?;
+        return finish_comparison(t, depth, left);
     }
     Ok(BoolExpr::Leaf(parse_single_condition(t, depth)?))
 }
 
-/// Read `attribute_exists(...)` or `attribute_not_exists(...)`, noting the
-/// refusal of an operand it can't take: anything but one document path.
-fn parse_condition_function(t: &mut Tokenizer, depth: usize) -> Result<ConditionFunction, String> {
+/// A condition standing for one the statement is refused for, so it is never
+/// evaluated.
+fn refused_condition() -> BoolExpr {
+    BoolExpr::Leaf(WhereCondition::Exists(String::new()))
+}
+
+/// Whatever follows a condition function: a comparison, BETWEEN or IN, or
+/// nothing.
+fn condition_function_tail(
+    t: &mut Tokenizer,
+    depth: usize,
+    function: ConditionFunction,
+) -> Result<BoolExpr, String> {
+    let Some(next) = t.peek_token()? else {
+        return function.condition(true);
+    };
+    if is_comparison_operator(&next) {
+        t.next_token()?;
+        let right = parse_operand(t, depth)?;
+        return function.compared(t, &next, right);
+    }
+    if is_keyword(&next, "BETWEEN") {
+        t.note_operand_refusal(bool_operand_refusal("BETWEEN"));
+        t.next_token()?;
+        parse_bound(t, depth)?;
+        expect_between_and(t)?;
+        parse_bound(t, depth)?;
+        return Ok(refused_condition());
+    }
+    if is_keyword(&next, "IN") {
+        t.next_token()?;
+        let values = parse_in_list(t, depth)?;
+        return function.listed(&values);
+    }
+    function.condition(true)
+}
+
+/// Read `attribute_exists(...)`, `attribute_not_exists(...)` or
+/// `attribute_type(...)`, noting the refusal of operands it can't take; `None`
+/// once a refusal is noted.
+fn parse_condition_function(
+    t: &mut Tokenizer,
+    depth: usize,
+) -> Result<Option<ConditionFunction>, String> {
+    if t.peek_token()?
+        .is_some_and(|tok| is_keyword(&tok, "attribute_type"))
+    {
+        return Ok(
+            parse_attribute_type(t, depth)?.map(|(operand, kind)| ConditionFunction {
+                holds: WhereCondition::AttributeType(operand, kind),
+            }),
+        );
+    }
     let name_tok = t.next_token()?.unwrap_or_default();
     let name = condition_function_name(&name_tok).unwrap_or("attribute_exists");
     expect_char(t, "(")?;
@@ -2264,26 +2717,293 @@ fn parse_condition_function(t: &mut Tokenizer, depth: usize) -> Result<Condition
             String::new()
         }
         _ => {
-            t.note_operand_refusal(format!(
-                "Incorrect number of operands for operator or function; operator or \
-                 function: {name}, number of operands: {}",
-                operands.len()
-            ));
+            t.note_operand_refusal(operand_count_refusal(name, operands.len()));
             String::new()
         }
     };
-    Ok(ConditionFunction {
-        exists: name == "attribute_exists",
-        path,
+    Ok(Some(ConditionFunction {
+        holds: if name == "attribute_exists" {
+            WhereCondition::Exists(path)
+        } else {
+            WhereCondition::NotExists(path)
+        },
+    }))
+}
+
+fn operand_count_refusal(name: &str, count: usize) -> String {
+    format!(
+        "Incorrect number of operands for operator or function; operator or function: \
+         {name}, number of operands: {count}"
+    )
+}
+
+/// The arguments of a call, each read as an operand.
+fn call_operands(t: &mut Tokenizer, depth: usize) -> Result<Vec<Operand>, String> {
+    t.next_token()?;
+    expect_char(t, "(")?;
+    let mut operands = Vec::new();
+    if t.peek_token()?.as_deref() == Some(")") {
+        t.next_token()?;
+        return Ok(operands);
+    }
+    loop {
+        operands.push(parse_operand(t, depth)?);
+        match t.next_token()?.as_deref() {
+            Some(",") => continue,
+            Some(")") => return Ok(operands),
+            Some(other) => return Err(format!("Expected ')' but got '{other}'")),
+            None => return Err("Expected ')'".to_string()),
+        }
+    }
+}
+
+/// Read `attribute_type(operand, type)`, noting the refusal of a type it
+/// can't take; `None` once a refusal is noted. A type given as a parameter is
+/// checked once the parameter is bound (captured eu-west-2 and us-east-1,
+/// 2026-10-09).
+fn parse_attribute_type(
+    t: &mut Tokenizer,
+    depth: usize,
+) -> Result<Option<(Operand, PartiqlValue)>, String> {
+    let mut operands = call_operands(t, depth)?;
+    if operands.len() != 2 {
+        t.note_operand_refusal(operand_count_refusal("attribute_type", operands.len()));
+        return Ok(None);
+    }
+    let kind = operands
+        .pop()
+        .unwrap_or(Operand::Value(PartiqlValue::Parameter(0)));
+    let operand = operands
+        .pop()
+        .unwrap_or(Operand::Value(PartiqlValue::Parameter(0)));
+    let operand_type = |kind: &str| {
+        format!(
+            "Incorrect operand type for operator or function; operator or function: \
+             attribute_type, operand type: {kind}"
+        )
+    };
+    let refusal = match &kind {
+        Operand::Value(PartiqlValue::Literal(AttributeValue::S(name))) => {
+            attribute_type_name_refusal(name)
+        }
+        Operand::Value(PartiqlValue::Literal(other)) => Some(operand_type(other.type_name())),
+        Operand::Value(PartiqlValue::Parameter(_)) => None,
+        Operand::Path(path) if operand == Operand::Path(path.clone()) => Some(format!(
+            "The first operand must be distinct from the remaining operands for this \
+             operator or function; operator: attribute_type, first operand: [{path}]"
+        )),
+        Operand::Path(_) => Some(operand_type(ATTRIBUTE_TYPE_OPERAND_TYPES)),
+        Operand::Size(_) => Some(operand_type("N")),
+    };
+    if let Some(message) = refusal {
+        t.note_operand_refusal(message);
+        return Ok(None);
+    }
+    let Operand::Value(kind) = kind else {
+        return Ok(None);
+    };
+    Ok(Some((operand, kind)))
+}
+
+/// DynamoDB's refusal of a type `attribute_type` doesn't know, if it doesn't.
+pub(crate) fn attribute_type_name_refusal(name: &str) -> Option<String> {
+    (!ATTRIBUTE_TYPES.contains(&name)).then(|| {
+        format!(
+            "Invalid attribute type name found; type: {name}, valid types: \
+             {{N,BS,L,B,NULL,M,S,SS,NS,BOOL}}"
+        )
     })
 }
 
-/// Read a call to a function DynamoDB doesn't recognise, noting its refusal,
-/// and any comparison it is part of.
-fn skip_unrecognized_call(t: &mut Tokenizer, depth: usize) -> Result<(), String> {
-    let index = t.pos;
+/// One side of a comparison: `size(...)`, a path, `MISSING` (refused), or a
+/// literal or a parameter. Nothing where it should be is an infix operator
+/// missing its right-hand side.
+fn parse_operand(t: &mut Tokenizer, depth: usize) -> Result<Operand, String> {
+    let tok = match t.peek_token()? {
+        None => return Err(MISSING_RIGHT_HAND_SIDE.to_string()),
+        Some(tok) if tok == ";" => return Err(MISSING_RIGHT_HAND_SIDE.to_string()),
+        Some(tok) => tok,
+    };
+    if is_keyword(&tok, "MISSING") {
+        t.next_token()?;
+        t.note_operand_refusal(MISSING_COMPARED.to_string());
+        return Ok(Operand::Value(PartiqlValue::Literal(AttributeValue::NULL(
+            true,
+        ))));
+    }
+    if is_keyword(&tok, "size") && t.peek_token_at(1)?.as_deref() == Some("(") {
+        let mut operands = call_operands(t, depth)?;
+        if operands.len() != 1 {
+            t.note_operand_refusal(operand_count_refusal("size", operands.len()));
+            return Ok(Operand::Value(PartiqlValue::Literal(AttributeValue::NULL(
+                true,
+            ))));
+        }
+        let inner = operands
+            .pop()
+            .unwrap_or(Operand::Value(PartiqlValue::Parameter(0)));
+        return Ok(Operand::Size(Box::new(inner)));
+    }
+    if is_name(&tok) {
+        t.next_token()?;
+        return Ok(Operand::Path(parse_dotted_path_from_token(&tok, t)?));
+    }
+    Ok(Operand::Value(parse_value(t, depth)?))
+}
+
+/// A bound of BETWEEN or a member of an IN list: a value, with `MISSING`
+/// refused.
+fn parse_bound(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> {
+    if t.peek_token()?
+        .is_some_and(|tok| is_keyword(&tok, "MISSING"))
+    {
+        t.next_token()?;
+        t.note_operand_refusal(MISSING_COMPARED.to_string());
+        return Ok(PartiqlValue::Literal(AttributeValue::NULL(true)));
+    }
+    parse_value(t, depth)
+}
+
+/// The AND between BETWEEN's bounds, with something after it.
+fn expect_between_and(t: &mut Tokenizer) -> Result<(), String> {
+    expect_keyword(t, "AND")?;
+    match t.peek_token()?.as_deref() {
+        None | Some(";") => Err("Expected expression after AND".to_string()),
+        Some(_) => Ok(()),
+    }
+}
+
+/// An IN list, `[...]` or `(...)`, its members read as values.
+fn parse_in_list(t: &mut Tokenizer, depth: usize) -> Result<Vec<PartiqlValue>, String> {
+    let open = t.next_token()?.ok_or("Expected '(' or '[' after IN")?;
+    let close = match open.as_str() {
+        "(" => ")",
+        "[" => "]",
+        other => return Err(format!("Expected '(' or '[' after IN, got '{other}'")),
+    };
+    let mut values = Vec::new();
+    loop {
+        let peek = t.peek_token()?.ok_or("Unexpected end of IN list")?;
+        if peek == close {
+            t.next_token()?;
+            return Ok(values);
+        }
+        if peek == "," {
+            t.next_token()?;
+            continue;
+        }
+        values.push(parse_bound(t, depth)?);
+    }
+}
+
+/// Read what follows the left operand of a comparison that isn't on a path:
+/// a comparison, BETWEEN or IN. A size on its own isn't a condition, and DynamoDB
+/// says so by naming the operator it stands under once the clause is read
+/// (captured eu-west-2 and us-east-1, 2026-10-09).
+fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<BoolExpr, String> {
+    let next = t.peek_token()?;
+    match next.as_deref() {
+        Some(op) if is_comparison_operator(op) => {
+            let op_tok = t.next_token()?.unwrap_or_default();
+            let op = comparison_operator(&op_tok)?;
+            let right = parse_operand(t, depth)?;
+            Ok(BoolExpr::Leaf(comparison(t, left, op, &op_tok, right)))
+        }
+        Some(tok) if is_keyword(tok, "BETWEEN") => {
+            t.next_token()?;
+            let low = parse_operand(t, depth)?;
+            expect_between_and(t)?;
+            let high = parse_operand(t, depth)?;
+            Ok(BoolExpr::Leaf(WhereCondition::CompareBetween(
+                left, low, high,
+            )))
+        }
+        Some(tok) if is_keyword(tok, "IN") => {
+            t.next_token()?;
+            let values = parse_in_list(t, depth)?;
+            Ok(BoolExpr::Leaf(WhereCondition::CompareIn(
+                left,
+                values.into_iter().map(Operand::Value).collect(),
+            )))
+        }
+        Some(tok) if is_keyword(tok, "IS") && matches!(left, Operand::Size(_)) => {
+            t.note_operand_refusal(
+                "The left hand side argument to IS must be a Variable Reference, Literal, or \
+                 Path"
+                    .to_string(),
+            );
+            t.next_token()?;
+            if t.peek_token()?.is_some_and(|tok| is_keyword(&tok, "NOT")) {
+                t.next_token()?;
+            }
+            read_type_name(t)?;
+            Ok(refused_condition())
+        }
+        Some(op) if matches!(left, Operand::Size(_)) && (op == "+" || op == "-") => {
+            t.note_operand_refusal(format!(
+                "Unsupported operator in Condition Expression. Operator: {op}"
+            ));
+            t.next_token()?;
+            parse_operand(t, depth)?;
+            finish_comparison(t, depth, left)
+        }
+        _ if matches!(left, Operand::Size(_)) => Ok(BoolExpr::NonBoolean("N")),
+        _ => Err("Expected operator after attribute path".to_string()),
+    }
+}
+
+/// A comparison of two operands, in the form the executor and the key
+/// pushdown read when one side is a path and the other a value.
+fn comparison(
+    t: &mut Tokenizer,
+    left: Operand,
+    op: CompOp,
+    op_tok: &str,
+    right: Operand,
+) -> WhereCondition {
+    match (left, right) {
+        (Operand::Path(path), Operand::Value(value)) => {
+            WhereCondition::Comparison(Condition { path, op, value })
+        }
+        (Operand::Value(value), Operand::Path(path)) => WhereCondition::Comparison(Condition {
+            path,
+            op: mirrored(op),
+            value,
+        }),
+        (Operand::Path(a), Operand::Path(b)) if a == b => {
+            t.note_operand_refusal(format!(
+                "The first operand must be distinct from the remaining operands for this \
+                 operator or function; operator: {op_tok}, first operand: [{a}]"
+            ));
+            WhereCondition::Exists(String::new())
+        }
+        (left, right) => WhereCondition::Compare(left, op, right),
+    }
+}
+
+/// The index of the SELECT in a call's arguments, if they hold a subquery: the
+/// call's name is at `t.pos` and its `(` after it.
+fn subquery_select(t: &Tokenizer) -> Option<usize> {
+    let mut open = 0usize;
+    for i in t.pos + 1..t.tokens.len() {
+        match t.tokens[i].as_str() {
+            "(" => open += 1,
+            ")" => {
+                open -= 1;
+                if open == 0 {
+                    return None;
+                }
+            }
+            tok if is_keyword(tok, "SELECT") => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Read past a call whose refusal is noted, and any comparison it is part of.
+fn skip_call(t: &mut Tokenizer, depth: usize) -> Result<(), String> {
     t.next_token()?;
-    t.note_unrecognized_function(index);
     let mut open = 0usize;
     loop {
         match t.next_token()?.as_deref() {
@@ -2294,11 +3014,16 @@ fn skip_unrecognized_call(t: &mut Tokenizer, depth: usize) -> Result<(), String>
             None => return Err("Expected ')'".to_string()),
         }
     }
+    skip_comparison(t, depth)
+}
+
+/// Read past a comparison after a term whose refusal is noted.
+fn skip_comparison(t: &mut Tokenizer, depth: usize) -> Result<(), String> {
     if let Some(op) = t.peek_token()?
         && is_comparison_operator(&op)
     {
         t.next_token()?;
-        parse_value(t, depth)?;
+        parse_operand(t, depth)?;
     }
     Ok(())
 }
@@ -2337,6 +3062,7 @@ fn push_not_down(expr: BoolExpr, negated: bool) -> Result<BoolExpr, String> {
                 Ok(BoolExpr::Leaf(cond))
             }
         }
+        BoolExpr::NonBoolean(_) => Ok(refused_condition()),
     }
 }
 
@@ -2379,6 +3105,11 @@ fn negate_condition(cond: WhereCondition) -> Result<BoolExpr, String> {
                 .map(|v| not_cmp(p.clone(), CompOp::Eq, v))
                 .collect(),
         ),
+        W::Not(inner) => (*inner).into(),
+        other @ (W::Compare(..)
+        | W::CompareBetween(..)
+        | W::CompareIn(..)
+        | W::AttributeType(..)) => W::Not(Box::new(other)).into(),
     })
 }
 
@@ -2431,6 +3162,8 @@ fn to_dnf(expr: BoolExpr) -> Result<Vec<Vec<WhereCondition>>, String> {
         BoolExpr::Not(_) => {
             unreachable!("push_not_down removes every Not before to_dnf sees the tree")
         }
+        // push_not_down replaces it with a refused condition.
+        BoolExpr::NonBoolean(_) => vec![vec![WhereCondition::Exists(String::new())]],
         BoolExpr::Or(terms) => {
             let mut out = Vec::new();
             for term in terms {
@@ -2545,24 +3278,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
         }
         "NOT" => {
             let func = t.next_token()?.ok_or("Expected function name after NOT")?;
-            if func.eq_ignore_ascii_case("EXISTS")
-                && t.peek_token()?.as_deref() == Some("(")
-                && !t
-                    .peek_token_at(1)?
-                    .is_some_and(|next| is_keyword(&next, "SELECT"))
-            {
-                // `EXISTS(path)` is a function DynamoDB doesn't recognise in a
-                // WHERE clause, negated or not (captured eu-west-2 and
-                // us-east-1, 2026-10-09).
-                t.pos -= 1;
-                skip_unrecognized_call(t, depth)?;
-                Ok(WhereCondition::Exists(String::new()))
-            } else if func.eq_ignore_ascii_case("EXISTS") {
-                expect_char(t, "(")?;
-                let path = parse_function_path(t)?;
-                expect_char(t, ")")?;
-                Ok(WhereCondition::NotExists(path))
-            } else if func.eq_ignore_ascii_case("BEGINS_WITH") {
+            if func.eq_ignore_ascii_case("BEGINS_WITH") {
                 expect_char(t, "(")?;
                 let path = parse_function_path(t)?;
                 let comma = t.next_token()?.ok_or("Expected ',' in NOT BEGINS_WITH")?;
@@ -2590,9 +3306,9 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
             match next_upper.as_str() {
                 "BETWEEN" => {
                     t.next_token()?; // consume BETWEEN
-                    let low = parse_value(t, depth)?;
-                    expect_keyword(t, "AND")?;
-                    let high = parse_value(t, depth)?;
+                    let low = parse_bound(t, depth)?;
+                    expect_between_and(t)?;
+                    let high = parse_bound(t, depth)?;
                     Ok(WhereCondition::Between(path, low, high))
                 }
                 "IN" => {
@@ -2619,7 +3335,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                             t.next_token()?; // consume comma
                             continue;
                         }
-                        values.push(parse_value(t, depth)?);
+                        values.push(parse_bound(t, depth)?);
                     }
                     Ok(WhereCondition::In(path, values))
                 }
@@ -2641,7 +3357,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                         Some(TypeName::Test(test)) => Ok(WhereCondition::IsType(path, test)),
                         Some(TypeName::Unsupported(name)) => {
                             let at = t.position(t.span_at(path_start));
-                            t.note_operand_refusal(format!(
+                            t.note_term(format!(
                                 "Unsupported data type for IS operator: {name}. Supported \
                                  data types are [MISSING, NULL, BOOLEAN, BLOB, STRING, \
                                  NUMERIC, STRUCT, TUPLE, LIST] at {at}"
@@ -2653,19 +3369,11 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                     }
                 }
                 _ => {
-                    // Standard comparison: path op value
+                    // Standard comparison: path op operand
                     let op_tok = t.next_token()?.ok_or("Expected comparison operator")?;
-                    let op = match op_tok.as_str() {
-                        "=" => CompOp::Eq,
-                        "<>" | "!=" => CompOp::Ne,
-                        "<" => CompOp::Lt,
-                        "<=" => CompOp::Le,
-                        ">" => CompOp::Gt,
-                        ">=" => CompOp::Ge,
-                        other => return Err(format!("Unknown operator: {other}")),
-                    };
-                    let value = parse_value(t, depth)?;
-                    Ok(WhereCondition::Comparison(Condition { path, op, value }))
+                    let op = comparison_operator(&op_tok)?;
+                    let right = parse_operand(t, depth)?;
+                    Ok(comparison(t, Operand::Path(path), op, &op_tok, right))
                 }
             }
         }
@@ -2680,6 +3388,7 @@ fn parse_dotted_path_from_token(first_tok: &str, t: &mut Tokenizer) -> Result<St
         if next == "." {
             t.next_token()?; // consume dot
             let seg = t.next_token()?.ok_or("Expected attribute name after '.'")?;
+            check_dot_component(&seg)?;
             path.push('.');
             path.push_str(&unquote(&seg));
         } else if next == "[" {
@@ -2756,38 +3465,13 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
     }
 
     // Set literal: << val1, val2 >>
-    if tok == "<"
-        && let Some(ref next) = t.peek_token()?
-        && next == "<"
-    {
+    if tok == "<" && t.peek_token()?.as_deref() == Some("<") {
         t.next_token()?; // consume second <
-        let mut elements = Vec::new();
-        loop {
-            let peek = t.peek_token()?.ok_or("Unexpected end of set literal")?;
-            if peek == ">" {
-                t.next_token()?; // consume first >
-                // Consume second >
-                let next_close = t.peek_token()?;
-                if next_close.as_deref() == Some(">") {
-                    t.next_token()?;
-                }
-                break;
-            }
-            if peek == "," {
-                t.next_token()?;
-                continue;
-            }
-            elements.push(parse_value(t, depth + 1)?);
-        }
-        if elements.is_empty() {
-            t.note_empty_bag();
-            return Ok(PartiqlValue::Literal(AttributeValue::SS(Vec::new())));
-        }
-        let set = set_literal_to_value(elements)?;
-        if let PartiqlValue::Literal(ref value) = set {
-            t.note_set_literal(value);
-        }
-        return Ok(set);
+        return Ok(PartiqlValue::Literal(parse_bag(t, depth)?));
+    }
+
+    if tok.starts_with('`') {
+        return Ok(PartiqlValue::Literal(ion_literal(t, &tok)?));
     }
 
     // List literal: [val1, val2]
@@ -2807,6 +3491,7 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
             let item = parse_value(t, depth + 1);
             t.value_path.pop();
             items.push(item?);
+            expect_separator(t, "]", "Expected RIGHT_BRACKET")?;
         }
         // We can only produce a Literal list if all elements are literals
         let mut avs = Vec::new();
@@ -2861,6 +3546,7 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
                     );
                 }
             }
+            expect_separator(t, "}", "Expected RIGHT_CURLY")?;
         }
         return Ok(PartiqlValue::Literal(AttributeValue::M(map)));
     }
@@ -2903,6 +3589,7 @@ fn parse_value(t: &mut Tokenizer, depth: usize) -> Result<PartiqlValue, String> 
             if next == "." {
                 t.next_token()?;
                 let seg = t.next_token()?.ok_or("Expected attribute name after '.'")?;
+                check_dot_component(&seg)?;
                 path.push('.');
                 path.push_str(&unquote(&seg));
             } else {
@@ -2977,45 +3664,310 @@ fn is_number_token(tok: &str) -> bool {
     }
 }
 
-/// Convert parsed set literal elements into a DynamoDB set type (SS, NS, or BS).
-fn set_literal_to_value(elements: Vec<PartiqlValue>) -> Result<PartiqlValue, String> {
-    if elements.is_empty() {
-        return Err("Set literals cannot be empty".to_string());
-    }
+/// What a bag literal's member is, as far as DynamoDB's bag rules go.
+enum BagMember {
+    Str(String),
+    Num(String),
+    Null,
+    Parameter,
+    Ion(&'static str),
+    /// Anything else a bag can't hold: a boolean, a list, a map, a bag, a path.
+    Other,
+}
 
-    // Determine type from first element
-    let first = match &elements[0] {
-        PartiqlValue::Literal(av) => av,
-        PartiqlValue::Parameter(_) => {
-            return Err("Parameter placeholders in set literals are not supported".to_string());
+const BAG_REFUSAL: &str =
+    "Unsupported data type in Bag. DynamoDB only supports either numbers or strings in bags";
+
+/// Read a bag literal after its `<<`: a string set, a number set, or the
+/// refusal DynamoDB gives the first member it can't hold.
+///
+/// A bag that starts with a string is refused at the first member that isn't
+/// one, and a bag that starts with a number without a position; a parameter,
+/// an Ion literal or a `null` after the first member gets a refusal of its own,
+/// and a bag that starts with anything else is refused at its first member
+/// (captured eu-west-2 and us-east-1, 2026-10-09). A refused bag reads as an
+/// empty string set, which is never used: the statement is refused once it has
+/// parsed.
+fn parse_bag(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, String> {
+    let mut members: Vec<(BagMember, Span)> = Vec::new();
+    loop {
+        let peek = t.peek_token()?.ok_or("Unexpected end of set literal")?;
+        if peek == ">" {
+            t.next_token()?;
+            if t.peek_token()?.as_deref() == Some(">") {
+                t.next_token()?;
+            }
+            break;
         }
+        if peek == "," {
+            t.next_token()?;
+            continue;
+        }
+        let start = t.pos;
+        let member = read_bag_member(t, depth)?;
+        let span = member_span(t, start, &member);
+        members.push((member, span));
+        expect_separator(t, ">", "Expected RIGHT_DOUBLE_ANGLE_BRACKET")?;
+    }
+    let Some((first, first_span)) = members.first() else {
+        t.note_empty_bag();
+        return Ok(AttributeValue::SS(Vec::new()));
     };
-
-    match first {
-        AttributeValue::S(_) => {
-            let mut ss = Vec::new();
-            for elem in &elements {
-                match elem {
-                    PartiqlValue::Literal(AttributeValue::S(s)) => ss.push(s.clone()),
-                    _ => return Err("Mixed types in string set literal".to_string()),
-                }
-            }
-            Ok(PartiqlValue::Literal(AttributeValue::SS(ss)))
-        }
-        AttributeValue::N(_) => {
-            let mut ns = Vec::new();
-            for elem in &elements {
-                match elem {
-                    PartiqlValue::Literal(AttributeValue::N(n)) => ns.push(n.clone()),
-                    _ => return Err("Mixed types in number set literal".to_string()),
-                }
-            }
-            Ok(PartiqlValue::Literal(AttributeValue::NS(ns)))
-        }
-        _ => Err(format!(
-            "Unsupported element type in set literal: {first:?}"
+    let strings = matches!(first, BagMember::Str(_));
+    let path: String = t.value_path.concat();
+    let own_refusal = |member: &BagMember, span: &Span| match member {
+        BagMember::Parameter => Some(format!(
+            "Unsupported data type: Parameter under key root{path} at {}",
+            t.position(*span)
         )),
+        BagMember::Ion(kind) => Some(format!(
+            "Ion Literals are not supported: {kind} under key root{path} at {}",
+            t.position(*span)
+        )),
+        _ => None,
+    };
+    let refusal = match first {
+        BagMember::Str(_) => members[1..]
+            .iter()
+            .find(|(m, _)| !matches!(m, BagMember::Str(_)))
+            .map(|(m, span)| {
+                own_refusal(m, span)
+                    .unwrap_or_else(|| format!("{BAG_REFUSAL} at {}", t.position(*span)))
+            }),
+        BagMember::Num(_) => members[1..]
+            .iter()
+            .find(|(m, _)| !matches!(m, BagMember::Num(_)))
+            .map(|(m, span)| {
+                own_refusal(m, span).unwrap_or_else(|| match m {
+                    BagMember::Null => format!(
+                        "One or more parameter values were invalid: Numeric sets may not \
+                         contain null under root{path}"
+                    ),
+                    _ => BAG_REFUSAL.to_string(),
+                })
+            }),
+        _ => Some(format!("{BAG_REFUSAL} at {}", t.position(*first_span))),
+    };
+    if let Some(message) = refusal {
+        t.note_literal(message);
+        return Ok(AttributeValue::SS(Vec::new()));
     }
+    let set = if strings {
+        AttributeValue::SS(
+            members
+                .into_iter()
+                .filter_map(|(m, _)| match m {
+                    BagMember::Str(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+        )
+    } else {
+        AttributeValue::NS(
+            members
+                .into_iter()
+                .filter_map(|(m, _)| match m {
+                    BagMember::Num(n) => Some(n),
+                    _ => None,
+                })
+                .collect(),
+        )
+    };
+    t.note_set_literal(&set);
+    Ok(set)
+}
+
+/// Read one member of a bag literal.
+fn read_bag_member(t: &mut Tokenizer, depth: usize) -> Result<BagMember, String> {
+    let tok = t.peek_token()?.ok_or("Unexpected end of set literal")?;
+    if tok == "?" {
+        t.next_token()?;
+        t.next_param_index();
+        return Ok(BagMember::Parameter);
+    }
+    if tok.starts_with('`') {
+        t.next_token()?;
+        return ion_type(&tok).map(BagMember::Ion).ok_or_else(String::new);
+    }
+    if tok.starts_with('\'') && tok.ends_with('\'') && tok.len() >= 2 {
+        t.next_token()?;
+        return Ok(BagMember::Str(tok[1..tok.len() - 1].to_string()));
+    }
+    if is_keyword(&tok, "NULL") {
+        t.next_token()?;
+        return Ok(BagMember::Null);
+    }
+    // A name is a path, which a bag can't hold. One that runs straight into
+    // another term leaves the bag unclosed: `X'616263'` is not a binary
+    // literal.
+    if tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && !is_any(&tok, &["TRUE", "FALSE"])
+    {
+        t.next_token()?;
+        parse_dotted_path_from_token(&tok, t)?;
+        return Ok(BagMember::Other);
+    }
+    // A number, which parse_value notes if DynamoDB can't store it, or anything
+    // else parse_value reads or refuses.
+    Ok(match parse_value(t, depth + 1)? {
+        PartiqlValue::Literal(AttributeValue::N(n)) => BagMember::Num(n),
+        _ => BagMember::Other,
+    })
+}
+
+/// Where a bag member stands, as DynamoDB points at it: its first token, a
+/// number with its sign, or a nested bag's `<<`.
+fn member_span(t: &Tokenizer, start: usize, member: &BagMember) -> Span {
+    let first = t.span_at(start);
+    let token = |i: usize| t.tokens.get(i).map(String::as_str);
+    if matches!(member, BagMember::Num(_)) && matches!(token(start), Some("-" | "+")) {
+        let number = t.span_at(start + 1);
+        return Span {
+            start: first.start,
+            len: number.start + number.len - first.start,
+        };
+    }
+    if token(start) == Some("<") {
+        return Span {
+            start: first.start,
+            len: 2,
+        };
+    }
+    first
+}
+
+/// After a member of a list, map or bag literal, the next token must separate
+/// it from the next member or close the literal.
+fn expect_separator(t: &mut Tokenizer, close: &str, missing: &str) -> Result<(), String> {
+    match t.peek_token()?.as_deref() {
+        Some(",") => Ok(()),
+        Some(tok) if tok == close => Ok(()),
+        _ => Err(missing.to_string()),
+    }
+}
+
+/// An Ion literal, read as the token before `t.pos`, refused by its type where
+/// it stands; the statement ends there if it doesn't read as Ion (captured
+/// eu-west-2 and us-east-1, 2026-10-09). Read as `NULL`, which is never used.
+fn ion_literal(t: &mut Tokenizer, tok: &str) -> Result<AttributeValue, String> {
+    let kind = ion_type(tok).ok_or_else(String::new)?;
+    let path: String = t.value_path.concat();
+    let at = t.position(t.span_at(t.pos - 1));
+    t.note_literal(format!(
+        "Ion Literals are not supported: {kind} under key root{path} at {at}"
+    ));
+    Ok(AttributeValue::NULL(true))
+}
+
+/// The type DynamoDB names when it refuses an Ion literal written between
+/// backticks, or `None` when the text doesn't read as Ion. BLOB, CLOB, INT,
+/// DECIMAL, STRING, SYMBOL, STRUCT, LIST, TIMESTAMP, NULL and BOOL were
+/// captured (eu-west-2 and us-east-1, 2026-10-09); FLOAT and SEXP follow Ion's
+/// own type names.
+fn ion_type(literal: &str) -> Option<&'static str> {
+    let text = literal.strip_prefix('`')?.strip_suffix('`')?.trim();
+    if let Some(inner) = text.strip_prefix("{{") {
+        let inner = inner.strip_suffix("}}")?.trim();
+        if inner.starts_with('"') || inner.starts_with("'''") {
+            return Some("CLOB");
+        }
+        let base64 = inner.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=') || c.is_ascii_whitespace()
+        });
+        return base64.then_some("BLOB");
+    }
+    let wrapped = |open: char, close: char| {
+        text.len() >= 2 && text.starts_with(open) && text.ends_with(close)
+    };
+    if wrapped('{', '}') {
+        return Some("STRUCT");
+    }
+    if wrapped('[', ']') {
+        return Some("LIST");
+    }
+    if wrapped('(', ')') {
+        return Some("SEXP");
+    }
+    if wrapped('"', '"') || (text.len() >= 6 && text.starts_with("'''") && text.ends_with("'''")) {
+        return Some("STRING");
+    }
+    if wrapped('\'', '\'') {
+        return Some("SYMBOL");
+    }
+    match text {
+        "null" => return Some("NULL"),
+        "true" | "false" => return Some("BOOL"),
+        "nan" | "+inf" | "-inf" => return Some("FLOAT"),
+        _ => {}
+    }
+    if let Some(kind) = text.strip_prefix("null.") {
+        return kind
+            .chars()
+            .all(|c| c.is_ascii_alphabetic())
+            .then_some("NULL");
+    }
+    if is_ion_timestamp(text) {
+        return Some("TIMESTAMP");
+    }
+    if let Some(kind) = ion_number(text) {
+        return Some(kind);
+    }
+    let symbol = text.starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '_' | '$'))
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'));
+    symbol.then_some("SYMBOL")
+}
+
+/// Whether Ion text is a timestamp: a four-digit year followed by `-` or `T`.
+fn is_ion_timestamp(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 5
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && matches!(bytes[4], b'-' | b'T')
+        && text
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | ':' | 'T' | 'Z' | '.' | '+'))
+}
+
+/// The Ion number type of `text`, if it is one: INT, DECIMAL or FLOAT.
+fn ion_number(text: &str) -> Option<&'static str> {
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '_');
+    let radix = [("0x", 16), ("0X", 16), ("0b", 2), ("0B", 2)];
+    if let Some((rest, base)) = radix
+        .iter()
+        .find_map(|(prefix, base)| unsigned.strip_prefix(prefix).map(|rest| (rest, *base)))
+    {
+        let ok = !rest.is_empty() && rest.chars().all(|c| c == '_' || c.is_digit(base));
+        return ok.then_some("INT");
+    }
+    let (mantissa, exponent, float) = if let Some(at) = unsigned.find(['e', 'E']) {
+        (&unsigned[..at], Some(&unsigned[at + 1..]), true)
+    } else if let Some(at) = unsigned.find(['d', 'D']) {
+        (&unsigned[..at], Some(&unsigned[at + 1..]), false)
+    } else {
+        (unsigned, None, false)
+    };
+    if let Some(exponent) = exponent
+        && !digits(exponent.strip_prefix(['+', '-']).unwrap_or(exponent))
+    {
+        return None;
+    }
+    let (whole, fraction) = match mantissa.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (mantissa, None),
+    };
+    if !digits(whole) || fraction.is_some_and(|f| !f.is_empty() && !digits(f)) {
+        return None;
+    }
+    Some(if float {
+        "FLOAT"
+    } else if fraction.is_some() || exponent.is_some() {
+        "DECIMAL"
+    } else {
+        "INT"
+    })
 }
 
 /// Parse a `{ 'key': 'value', ... }` item literal into a DynamoDB attribute map.
@@ -3058,6 +4010,7 @@ fn parse_item_literal(
         let val = parse_item_value(t, depth);
         t.value_path.pop();
         item.insert(key, val?);
+        expect_separator(t, "}", "Expected RIGHT_CURLY")?;
     }
 
     Ok(item)
@@ -3095,6 +4048,7 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
             let item = parse_item_value(t, depth + 1);
             t.value_path.pop();
             items.push(item?);
+            expect_separator(t, "]", "Expected RIGHT_BRACKET")?;
         }
         return Ok(AttributeValue::L(items));
     }
@@ -3112,39 +4066,18 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
     }
 
     // Set literal: << val1, val2 >>
-    if tok == "<"
-        && let Some(ref next_tok) = t.peek_token_at(1)?
-        && next_tok == "<"
-    {
+    if tok == "<" && t.peek_token_at(1)?.as_deref() == Some("<") {
         t.next_token()?; // consume first <
         t.next_token()?; // consume second <
-        let mut elements = Vec::new();
-        loop {
-            let peek = t.peek_token()?.ok_or("Unexpected end of set literal")?;
-            if peek == ">" {
-                t.next_token()?; // consume first >
-                if t.peek_token()?.as_deref() == Some(">") {
-                    t.next_token()?; // consume second >
-                }
-                break;
-            }
-            if peek == "," {
-                t.next_token()?;
-                continue;
-            }
-            elements.push(parse_item_value(t, depth + 1)?);
-        }
-        if elements.is_empty() {
-            t.note_empty_bag();
-            return Ok(AttributeValue::SS(Vec::new()));
-        }
-        let set = item_value_set_literal(elements)?;
-        t.note_set_literal(&set);
-        return Ok(set);
+        return parse_bag(t, depth);
     }
 
     // Scalar value
     let tok = t.next_token()?.ok_or("Expected value")?;
+
+    if tok.starts_with('`') {
+        return ion_literal(t, &tok);
+    }
 
     // A function call is a value DynamoDB can't store. It names the function
     // when the call is an attribute's whole value and calls it `Call` deeper
@@ -3161,9 +4094,8 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
         };
         let path: String = t.value_path.concat();
         let at = t.position(t.span_at(index));
-        t.literal_errors.push((
-            t.clause,
-            format!("Unsupported data type: {name} under key root{path} at {at}"),
+        t.note_literal(format!(
+            "Unsupported data type: {name} under key root{path} at {at}"
         ));
         let mut open = 0usize;
         loop {
@@ -3204,40 +4136,16 @@ fn parse_item_value(t: &mut Tokenizer, depth: usize) -> Result<AttributeValue, S
         "TRUE" => Ok(AttributeValue::BOOL(true)),
         "FALSE" => Ok(AttributeValue::BOOL(false)),
         "NULL" => Ok(AttributeValue::NULL(true)),
+        // A name that runs straight into a string leaves the literal around it
+        // unclosed, which the caller reports: `X'616263'` is not a binary
+        // literal (captured eu-west-2 and us-east-1, 2026-10-09). Read as
+        // `NULL`, which is never used.
+        _ if tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && t.peek_token()?.is_some_and(|next| next.starts_with('\'')) =>
+        {
+            Ok(AttributeValue::NULL(true))
+        }
         _ => Err(format!("Unexpected value in item literal: {tok}")),
-    }
-}
-
-/// Convert a list of item-literal values into a DynamoDB set type.
-fn item_value_set_literal(elements: Vec<AttributeValue>) -> Result<AttributeValue, String> {
-    if elements.is_empty() {
-        return Err("Set literals cannot be empty".to_string());
-    }
-    match &elements[0] {
-        AttributeValue::S(_) => {
-            let mut ss = Vec::new();
-            for e in elements {
-                match e {
-                    AttributeValue::S(s) => ss.push(s),
-                    _ => return Err("Mixed types in string set literal".to_string()),
-                }
-            }
-            Ok(AttributeValue::SS(ss))
-        }
-        AttributeValue::N(_) => {
-            let mut ns = Vec::new();
-            for e in elements {
-                match e {
-                    AttributeValue::N(n) => ns.push(n),
-                    _ => return Err("Mixed types in number set literal".to_string()),
-                }
-            }
-            Ok(AttributeValue::NS(ns))
-        }
-        _ => Err(format!(
-            "Unsupported element type in set literal: {:?}",
-            elements[0]
-        )),
     }
 }
 
@@ -3289,6 +4197,7 @@ fn parse_item_literal_partiql(
             t.value_path.pop();
         }
         item.insert(key, val?);
+        expect_separator(t, "}", "Expected RIGHT_CURLY")?;
     }
 
     Ok(item)
@@ -3384,18 +4293,23 @@ struct Tokenizer {
     /// Where the value being read sits inside the value it belongs to, as the
     /// segments after `root`: `.x` for a map entry, `[1]` for a list element.
     value_path: Vec<String>,
-    /// Every literal DynamoDB would refuse as it reads it (a number it can't
-    /// store, a value nested too deep), in the order written, with the clause
-    /// it was written in and the message, path included.
-    literal_errors: Vec<(LiteralClause, String)>,
-    /// The first call to a function DynamoDB doesn't recognise, as its
-    /// refusal. It is reported once the statement has parsed, ahead of any
-    /// operand refusal and of the table lookup (captured eu-west-2 and
-    /// us-east-1, 2026-10-09).
-    unrecognized_function: Option<String>,
-    /// The first operand a condition function can't take, as its refusal:
-    /// reported after an unrecognised function and before the table lookup.
+    /// Everything DynamoDB refuses as it reads the statement's terms, in the
+    /// order written, with the clause each was written in: a literal it can't
+    /// store (a number out of range, a value nested too deep, a bag it can't
+    /// hold), a function it doesn't recognise, a type `IS` can't test.
+    refusals: Vec<Refusal>,
+    /// The first operand an operator or function can't take, as its refusal:
+    /// reported after every refusal above and before the table lookup.
     operand_refusal: Option<String>,
+}
+
+/// One refusal DynamoDB makes as it reads a statement's terms.
+struct Refusal {
+    clause: LiteralClause,
+    message: String,
+    /// A literal's refusal, which a transaction reports as the statement's own
+    /// rather than as a parse failure.
+    literal: bool,
 }
 
 /// How deep a literal value may nest: a value 32 levels inside the value it is
@@ -3421,8 +4335,7 @@ impl Tokenizer {
             param_counter: 0,
             clause: LiteralClause::Where,
             value_path: Vec::new(),
-            literal_errors: Vec::new(),
-            unrecognized_function: None,
+            refusals: Vec::new(),
             operand_refusal: None,
         })
     }
@@ -3431,19 +4344,37 @@ impl Tokenizer {
     /// recognise. It names the function in lower case, as written otherwise,
     /// and where it stands: `Unrecognized function: exists at 1:61:6`.
     fn note_unrecognized_function(&mut self, index: usize) {
-        if self.unrecognized_function.is_none() {
-            let name = self.tokens[index].to_lowercase();
-            let at = self.position(self.span_at(index));
-            self.unrecognized_function = Some(format!("Unrecognized function: {name} at {at}"));
-        }
+        let name = self.tokens[index].to_lowercase();
+        let at = self.position(self.span_at(index));
+        self.note_term(format!("Unrecognized function: {name} at {at}"));
+    }
+
+    /// Note a refusal of a term as it is read: a function, a subquery or an
+    /// `IS` type DynamoDB doesn't support. It is reported in the order written
+    /// against the literals DynamoDB refuses, WHERE clause first, and ahead of
+    /// any operand refusal (captured eu-west-2 and us-east-1, 2026-10-09).
+    fn note_term(&mut self, message: String) {
+        self.refusals.push(Refusal {
+            clause: self.clause,
+            message,
+            literal: false,
+        });
+    }
+
+    /// Note a literal DynamoDB refuses as it reads it, in the same order.
+    fn note_literal(&mut self, message: String) {
+        self.refusals.push(Refusal {
+            clause: self.clause,
+            message,
+            literal: true,
+        });
     }
 
     /// Note an empty bag, `<<>>`, which DynamoDB refuses wherever it is
     /// written, once the statement has parsed (captured eu-west-2, us-east-1,
     /// eu-west-1 and us-west-2, 2026-10-09).
     fn note_empty_bag(&mut self) {
-        self.literal_errors
-            .push((self.clause, "Empty bags are not supported".to_string()));
+        self.note_literal("Empty bags are not supported".to_string());
     }
 
     /// Note a set literal once it is read. A number set with a repeated value
@@ -3474,7 +4405,7 @@ impl Tokenizer {
             _ => None,
         };
         if let Some(message) = message {
-            self.literal_errors.push((self.clause, message));
+            self.note_literal(message);
         }
     }
 
@@ -3483,22 +4414,13 @@ impl Tokenizer {
         self.operand_refusal.get_or_insert(message);
     }
 
-    /// The refusal of a statement that parsed but names a function DynamoDB
-    /// doesn't recognise, or gives one an operand it can't take.
-    fn first_refusal(&self) -> Option<String> {
-        self.unrecognized_function
-            .clone()
-            .or_else(|| self.operand_refusal.clone())
-    }
-
     /// Note a number literal as it is read. One DynamoDB would refuse is
     /// recorded with its path, `root` being the value it was written as part
     /// of, and reported once the statement has parsed.
     fn note_number(&mut self, text: &str) {
         if let Err(message) = check_literal_number(text) {
             let path: String = self.value_path.concat();
-            self.literal_errors
-                .push((self.clause, format!("{message} under root{path}")));
+            self.note_literal(format!("{message} under root{path}"));
         }
     }
 
@@ -3508,10 +4430,7 @@ impl Tokenizer {
     /// and us-east-1, 2026-10-09).
     fn note_key(&mut self, key: &str) {
         if key.is_empty() {
-            self.literal_errors.push((
-                self.clause,
-                "Path component cannot be an empty string".to_string(),
-            ));
+            self.note_literal("Path component cannot be an empty string".to_string());
         }
     }
 
@@ -3523,29 +4442,35 @@ impl Tokenizer {
     fn note_depth(&mut self) {
         if self.value_path.len() == LITERAL_NESTING_LIMIT {
             let path: String = self.value_path.concat();
-            self.literal_errors.push((
-                self.clause,
-                format!("Nesting Levels have exceeded supported limits under root{path}"),
+            self.note_literal(format!(
+                "Nesting Levels have exceeded supported limits under root{path}"
             ));
         }
     }
 
-    /// The first literal DynamoDB would refuse, from the clause it
-    /// reports first: an UPDATE's WHERE clause comes before its SET clause,
-    /// and within a clause the first one written comes first (captured
-    /// eu-west-2 and us-east-1, 2026-10-09).
-    fn first_literal_error(&self) -> Option<String> {
+    /// What DynamoDB reports first for a statement that parsed: the first
+    /// refusal from the clause it reads first (an UPDATE's WHERE clause comes
+    /// before its SET clause), the first written within a clause, and only
+    /// then an operand refusal (captured eu-west-2 and us-east-1, 2026-10-09).
+    fn first_refusal(&self) -> Option<ParseFailure> {
         [
             LiteralClause::Where,
             LiteralClause::Set,
             LiteralClause::Value,
         ]
         .into_iter()
-        .find_map(|clause| {
-            self.literal_errors
-                .iter()
-                .find(|(c, _)| *c == clause)
-                .map(|(_, message)| message.clone())
+        .find_map(|clause| self.refusals.iter().find(|r| r.clause == clause))
+        .map(|r| {
+            if r.literal {
+                ParseFailure::Literal(r.message.clone())
+            } else {
+                ParseFailure::Statement(ParseError::Validation(r.message.clone()))
+            }
+        })
+        .or_else(|| {
+            self.operand_refusal
+                .clone()
+                .map(|m| ParseFailure::Statement(ParseError::Validation(m)))
         })
     }
 
@@ -3726,6 +4651,20 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
         if matches!(chars[i], '=' | '<' | '>') {
             let tok = chars[i].to_string();
             i += 1;
+            emit(&mut tokens, &mut spans, tok, start, i);
+            continue;
+        }
+
+        // An Ion literal, between backticks, read whole so it can be refused by
+        // type where it stands. One that never closes ends the statement with
+        // nothing after the envelope (captured eu-west-2 and us-east-1,
+        // 2026-10-09).
+        if chars[i] == '`' {
+            let Some(close) = (i + 1..len).find(|&j| chars[j] == '`') else {
+                return Err(String::new());
+            };
+            i = close + 1;
+            let tok: String = chars[start..i].iter().collect();
             emit(&mut tokens, &mut spans, tok, start, i);
             continue;
         }
@@ -4391,8 +5330,7 @@ mod tests {
 
     #[test]
     fn test_count_rejection_ignores_quotes_and_word_boundaries() {
-        // A quoted "COUNT" identifier, a 'count(' string literal, and a word
-        // merely containing count are all fine.
+        // A quoted "COUNT" identifier and a 'count(' string literal are fine.
         assert_eq!(
             count_projection_rejection("SELECT \"COUNT\" FROM \"T\""),
             None
@@ -4401,9 +5339,10 @@ mod tests {
             count_projection_rejection("SELECT 'count(' FROM \"T\""),
             None
         );
+        // Any call is refused, at its own name's length.
         assert_eq!(
             count_projection_rejection("SELECT recount(x) FROM \"T\""),
-            None
+            Some("Unexpected path component at 1:8:7".to_string())
         );
     }
 

@@ -286,9 +286,12 @@ fn binary_orders_by_bytes() {
 }
 
 #[test]
-fn an_absent_attribute_matches_nothing() {
+fn an_absent_attribute_is_unequal_to_everything() {
     let db = db_with("name", s("plain"));
     assert!(!matches(&db, "missing", "=", s("plain")));
-    // An absent attribute is not unequal either: there is nothing to compare.
-    assert!(!matches(&db, "missing", "<>", s("plain")));
+    // An absent attribute is unequal to anything, as it is in a
+    // ConditionExpression: this exact statement selects the row (captured
+    // eu-west-2 and us-east-1, 2026-10-09).
+    assert!(matches(&db, "missing", "<>", s("plain")));
+    assert!(!matches(&db, "missing", "<", s("plain")));
 }

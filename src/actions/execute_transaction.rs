@@ -133,11 +133,14 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         ) {
             return Err(crate::value_nesting::deep_parameter_error());
         }
-        // A COUNT projection is rejected before parsing, at the same top level
-        // as a parse error but with the bare message captured on
-        // ExecuteStatement, not the wasn't-well-formed wrapper.
+        // A call in a SELECT list is rejected before parsing, with the
+        // statement's index in front of the bare message, not the
+        // wasn't-well-formed wrapper (captured eu-west-2 and us-east-1,
+        // 2026-10-09).
         if let Some(msg) = partiql::parser::count_projection_rejection(&stmt.statement) {
-            return Err(DynoxideError::ValidationException(msg));
+            return Err(DynoxideError::ValidationException(format!(
+                "Validation failed in TransactStatements[{index}]: {msg}"
+            )));
         }
         // A statement that does not parse, or carries a literal DynamoDB
         // refuses, is reported with its index in front, as the RETURNING and
