@@ -78,3 +78,26 @@ fn the_exact_actions_still_work() {
     .unwrap();
     assert_eq!(stored(&db), json!({"pk": {"S": "a"}, "a": {"N": "2"}}));
 }
+
+/// A mis-cased action is refused whatever else is wrong with another update in
+/// the same request: every action is checked first. A map's order varies from
+/// one request to the next, so the request is sent many times.
+#[test]
+fn a_mis_cased_action_wins_over_another_updates_error() {
+    let db = db();
+    for _ in 0..64 {
+        let got = db.update_item(request(json!({
+            "TableName": "Tbl",
+            "Key": {"pk": {"S": "a"}},
+            "AttributeUpdates": {
+                "a": {"Value": {"N": "1"}, "Action": "put"},
+                "b": {"Action": "PUT"}
+            }
+        })));
+        assert_eq!(
+            got.expect_err("the request is refused").to_string(),
+            REFUSAL
+        );
+    }
+    assert_eq!(stored(&db), json!({"pk": {"S": "a"}, "a": {"N": "0"}}));
+}

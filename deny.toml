@@ -8,7 +8,7 @@
 #
 # RUSTSEC-2026-0009 (`time`, stack exhaustion on a hostile RFC 2822 date) sat
 # here while the fix in 0.3.47 needed Rust 1.88 and the crate declared 1.85.
-# The declared MSRV is now 1.88, so `time` moved to a fixed version and the
+# Once the declared MSRV reached 1.88, `time` moved to a fixed version and the
 # ignore went with it.
 ignore = []
 

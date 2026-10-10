@@ -408,16 +408,21 @@ async fn execute_inner<S: StorageBackend>(
     if request.update_expression.is_none()
         && let Some(ref updates) = request.attribute_updates
     {
+        // The action is matched exactly: `put` or `Delete` is refused before
+        // the table is looked up (eu-west-2 and us-east-1, 2026-10-10). The
+        // stray quote is DynamoDB's own. Every action is checked before any
+        // other update's own checks, so the answer doesn't depend on the
+        // order the map happens to iterate in.
+        if updates
+            .values()
+            .any(|update| !["ADD", "DELETE", "PUT"].contains(&update.action.as_str()))
+        {
+            return Err(DynoxideError::EnvelopedValidation(
+                ATTRIBUTE_UPDATE_ACTION_REJECTION.to_string(),
+            ));
+        }
         for update in updates.values() {
-            // The action is matched exactly: `put` or `Delete` is refused
-            // before the table is looked up (eu-west-2 and us-east-1,
-            // 2026-10-10). The stray quote is DynamoDB's own.
             let action = update.action.as_str();
-            if !["ADD", "DELETE", "PUT"].contains(&action) {
-                return Err(DynoxideError::EnvelopedValidation(
-                    ATTRIBUTE_UPDATE_ACTION_REJECTION.to_string(),
-                ));
-            }
             if update.value.is_none() && action != "DELETE" {
                 return Err(DynoxideError::ValidationException(
                     "One or more parameter values were invalid: \

@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tree only through the AWS SDK the tests and the benchmarks use, never in a
   released artefact, and the advisory covers smithy-rs generated servers,
   which Dynoxide isn't. The fixed release needs Rust 1.94.1, which is why the
-  minimum supported Rust version moves (see Breaking (Rust API)).
+  minimum supported Rust version moves (see Changed).
 
 ### Behaviour changes
 
@@ -119,11 +119,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-#### Breaking (Rust API)
-
 - The minimum supported Rust version is 1.94.1, up from 1.88. The AWS SDK the
   tests use needs it for a security fix, and keeping the crate on the same
   floor means one toolchain builds and tests it.
+
+#### Breaking (Rust API)
+
 - The `expressions` and `partiql` modules are no longer public. They hold the
   parsers for DynamoDB's expression syntax and for PartiQL, whose shape changes
   as compatibility work lands, and this release changed both substantially.
@@ -151,11 +152,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whitespace too, in the envelope on `PutItem`, `UpdateItem` and `DeleteItem`
   and bare elsewhere. A transaction's `Update` with an empty
   `UpdateExpression` is refused up front with `Invalid UpdateExpression: The
-  expression can not be empty;`, where it wrote an item holding only its key,
-  and `TransactGetItems` refuses an empty or whitespace `ProjectionExpression`
-  as `GetItem` does, before it looks up any table. Captured against eu-west-2
-  and us-east-1, the transactions also against ap-southeast-2 and
-  eu-central-1.
+  expression can not be empty;`, where it wrote an item holding only its key.
+  Captured against eu-west-2 and us-east-1, the transactions also against
+  ap-southeast-2 and eu-central-1. `TransactGetItems` refuses an empty or
+  whitespace `ProjectionExpression` with the same messages `GetItem` gives,
+  and does so before it looks up any table, so a `Get` on a table that doesn't
+  exist gets the projection error (captured against eu-west-2).
 - A legacy `QueryFilter` or `ScanFilter` condition with a `ComparisonOperator`
   DynamoDB doesn't have, such as `FOO`, or with none at all, was dropped, so
   the Query or Scan ran without it, and one whose every condition dropped

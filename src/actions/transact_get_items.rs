@@ -225,9 +225,16 @@ pub async fn execute<S: StorageBackend>(
     // ProjectionExpressions are checked before any table is looked up: an
     // empty or whitespace-only one on a Get against a missing table is refused
     // as a ValidationException, not reported as the missing table (captured
-    // eu-west-2, 2026-10-10).
+    // eu-west-2, 2026-10-10). Each Get's names are checked in the same pass,
+    // undefined and unused alike, so between two Gets the earlier one's name
+    // error still wins (uncaptured; TransactWriteItems checks its names
+    // together per action the same way).
     for transact_item in &request.transact_items {
         let get = &transact_item.get;
+        let tracker = crate::expressions::TrackedExpressionAttributes::new(
+            &get.expression_attribute_names,
+            &None,
+        );
         if let Some(proj_expr) = &get.projection_expression {
             if proj_expr.is_empty() {
                 return Err(DynoxideError::ValidationException(
@@ -236,14 +243,11 @@ pub async fn execute<S: StorageBackend>(
             }
             let projection = expressions::projection::parse(proj_expr)
                 .map_err(DynoxideError::ValidationException)?;
-            let tracker = crate::expressions::TrackedExpressionAttributes::new(
-                &get.expression_attribute_names,
-                &None,
-            );
             tracker.track_projection_expr(&projection);
             expressions::projection::validate(&projection, &tracker)
                 .map_err(DynoxideError::ValidationException)?;
         }
+        tracker.check_unused()?;
     }
 
     // Per-action validation pass.
@@ -380,8 +384,6 @@ pub async fn execute<S: StorageBackend>(
         } else {
             item
         };
-
-        tracker.check_unused()?;
 
         responses.push(TransactGetResponse { item });
     }

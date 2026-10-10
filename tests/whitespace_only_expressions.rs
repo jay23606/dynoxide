@@ -322,3 +322,27 @@ fn a_transaction_projection_is_refused_before_the_table_is_looked_up() {
         );
     }
 }
+
+/// Between two Gets, the earlier Get's name error wins whichever kind it is:
+/// an unused name on the first beats an undefined name on the second, as it
+/// did when these checks ran after the read (order uncaptured).
+#[test]
+fn the_first_gets_name_error_wins_in_a_transaction() {
+    let db = db();
+    let got = db.transact_get_items(request(json!({
+        "TransactItems": [
+            {"Get": {
+                "TableName": "Tbl", "Key": key(),
+                "ExpressionAttributeNames": {"#u": "x"}
+            }},
+            {"Get": {
+                "TableName": "Tbl", "Key": {"pk": {"S": "e"}, "sk": {"S": "2"}},
+                "ProjectionExpression": "#m"
+            }}
+        ]
+    })));
+    assert_eq!(
+        refusal(got, "two Gets with name errors"),
+        "Value provided in ExpressionAttributeNames unused in expressions: keys: {#u}"
+    );
+}
