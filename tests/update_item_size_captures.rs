@@ -10,11 +10,15 @@
 //!
 //! The fixture writes the padding as `{"$pad": "<char>"}` wherever it appears
 //! (in the request and in the finished item), and this file expands it to the
-//! length a case needs. Each case runs against a fresh copy of its seed item.
+//! length eu-west-2 accepted (`padding`). The padding comes from the capture,
+//! not from the engine's own sizing, so a case also checks that the engine
+//! sizes the finished item at the figure DynamoDB measured. Each case runs
+//! against a fresh copy of its seed item.
 
 use dynoxide::Database;
 use dynoxide::actions::create_table::CreateTableRequest;
 use dynoxide::actions::delete_item::DeleteItemRequest;
+use dynoxide::actions::describe_table::DescribeTableRequest;
 use dynoxide::actions::get_item::GetItemRequest;
 use dynoxide::actions::put_item::PutItemRequest;
 use dynoxide::actions::update_item::UpdateItemRequest;
@@ -96,6 +100,17 @@ fn canonical_item(item: &HashMap<String, AttributeValue>) -> HashMap<String, Att
         .collect()
 }
 
+/// The table's `ItemCount` and `TableSizeBytes` as DescribeTable reports them.
+fn table_figures(db: &Database) -> (Option<i64>, Option<i64>) {
+    let table = db
+        .describe_table(DescribeTableRequest {
+            table_name: TABLE.to_string(),
+        })
+        .unwrap()
+        .table;
+    (table.item_count, table.table_size_bytes)
+}
+
 struct Case<'a> {
     id: &'a str,
     what: &'a str,
@@ -103,12 +118,19 @@ struct Case<'a> {
     request: &'a Value,
     finished: &'a Value,
     accepted_finished: usize,
+    padding: usize,
 }
 
 impl Case<'_> {
     /// Put the seed item back (or clear the key), then send the update padded
     /// to `len`.
     fn run(&self, db: &Database, len: usize) -> Result<(), String> {
+        self.reset(db, len);
+        self.update(db, len)
+    }
+
+    /// Put the seed item back with its padding at `len`, or clear the key.
+    fn reset(&self, db: &Database, len: usize) {
         match self.seed {
             Value::Null => {
                 db.delete_item(DeleteItemRequest {
@@ -127,7 +149,10 @@ impl Case<'_> {
                 .unwrap();
             }
         }
+    }
 
+    /// Send the update padded to `len`, against whatever is stored.
+    fn update(&self, db: &Database, len: usize) -> Result<(), String> {
         let mut request = expand(self.request, len);
         let fields = request.as_object_mut().expect("fixture request");
         fields.insert("TableName".to_string(), json!(TABLE));
@@ -151,36 +176,57 @@ impl Case<'_> {
         .unwrap_or_default()
     }
 
-    /// Accepted at DynamoDB's figure, stored exactly as DynamoDB stored it, and
-    /// refused one byte larger. Returns what went wrong, if anything.
+    /// Sized at DynamoDB's figure, accepted at the padding DynamoDB accepted,
+    /// stored exactly as DynamoDB stored it, and refused one byte larger with
+    /// nothing changed. Returns what went wrong, if anything.
     fn check(&self, db: &Database) -> Option<String> {
-        let base = item_size(&item_from(self.finished, 0));
-        let len = self.accepted_finished - base;
+        let len = self.padding;
         let label = format!("{} ({})", self.id, self.what);
 
+        let expected = item_from(self.finished, len);
+        let size = item_size(&expected);
+        if size != self.accepted_finished {
+            return Some(format!(
+                "{label}: the finished item sizes at {size} bytes, where eu-west-2 measured {}",
+                self.accepted_finished
+            ));
+        }
         if let Err(e) = self.run(db, len) {
             return Some(format!(
                 "{label}: refused at {}, which eu-west-2 accepts: {e}",
                 self.accepted_finished
             ));
         }
-        let expected = item_from(self.finished, len);
         let stored = self.stored(db);
         if canonical_item(&stored) != canonical_item(&expected) {
             return Some(format!(
                 "{label}: stored item differs from the one eu-west-2 stored"
             ));
         }
-        match self.run(db, len + 1) {
-            Ok(()) => Some(format!(
-                "{label}: accepted at {}, which eu-west-2 refuses",
-                self.accepted_finished + 1
-            )),
-            Err(e) if e != REFUSAL => Some(format!(
-                "{label}: refused one byte over for the wrong reason: {e}"
-            )),
-            Err(_) => None,
+
+        self.reset(db, len + 1);
+        let before = (canonical_item(&self.stored(db)), table_figures(db));
+        match self.update(db, len + 1) {
+            Ok(()) => {
+                return Some(format!(
+                    "{label}: accepted at {}, which eu-west-2 refuses",
+                    self.accepted_finished + 1
+                ));
+            }
+            Err(e) if e != REFUSAL => {
+                return Some(format!(
+                    "{label}: refused one byte over for the wrong reason: {e}"
+                ));
+            }
+            Err(_) => {}
         }
+        let after = (canonical_item(&self.stored(db)), table_figures(db));
+        if after != before {
+            return Some(format!(
+                "{label}: the refused update changed the stored item or the table's figures"
+            ));
+        }
+        None
     }
 }
 
@@ -200,6 +246,7 @@ fn every_captured_update_lands_on_the_ceiling_eu_west_2_measured() {
             request: &case["request"],
             finished: &case["finished"],
             accepted_finished: case["accepted_finished"].as_u64().unwrap() as usize,
+            padding: case["padding"].as_u64().unwrap() as usize,
         };
         if let Some(failure) = case.check(&db) {
             failures.push(failure);

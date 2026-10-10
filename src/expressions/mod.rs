@@ -416,8 +416,8 @@ pub fn resolve_path(
     Some(current)
 }
 
-/// Set a value at a document path, creating intermediate maps/lists as needed.
-/// Returns the modified item.
+/// Set a value at a document path. Intermediate maps and lists must already
+/// exist; an index past the end of a list appends.
 pub fn set_path(
     item: &mut HashMap<String, AttributeValue>,
     path: &[PathElement],

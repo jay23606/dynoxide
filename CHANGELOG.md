@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes
+
+- `UpdateItem` is held to the 400KB limit the way DynamoDB holds it: by a
+  charge worked out from the request, alongside the finished item's own size,
+  rather than by the finished item less its key. Nothing the table already
+  stores enters the charge, so an update beside large attributes, maps, lists
+  or sets it leaves alone now succeeds where it was refused. Operands are
+  charged for what the request writes, so an arithmetic update, an
+  `if_not_exists`, a `list_append` or a copy from another path near the limit
+  can now be refused where it succeeded, though the item barely grows. An
+  update whose charge is over the limit is refused before its condition is
+  evaluated. The legacy `AttributeUpdates` parameter is measured by the
+  finished item alone. Captured against eu-west-2. `TransactWriteItems`
+  updates and PartiQL `UPDATE` are measured as before.
+- A `SET` through a list index past the end of the list appends the value, as
+  DynamoDB does, where it used to pad the gap with NULLs; several such writes
+  to one list append in the order of their indexes. A path that steps through
+  an element past the end of a list, or through a NULL, is refused with
+  DynamoDB's document path error where it used to create a map or a list
+  there. This covers `UpdateItem` and `TransactWriteItems` updates; PartiQL
+  `UPDATE` already appended. Captured against eu-west-2.
+
 ### Added
 
 - The MCP tools that wrap a DynamoDB read or write take
@@ -478,25 +500,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ExecuteStatement and ExecuteTransaction, where a transaction used to be
   cancelled, and against that statement alone in a BatchExecuteStatement. It
   used to run, or come back as "Invalid key value".
-- `UpdateItem` is held to the 400KB limit the way DynamoDB holds it: by a
-  charge worked out from the request, alongside the finished item's own size,
-  rather than by the finished item less its key. Nothing the table already
-  stores enters the charge, so an update beside large attributes, maps, lists
-  or sets it leaves alone now succeeds where it was refused. Operands are
-  charged for what the request writes, so an arithmetic update, an
-  `if_not_exists`, a `list_append` or a copy from another path near the limit
-  can now be refused where it succeeded, though the item barely grows. An
-  update whose charge is over the limit is refused before its condition is
-  evaluated. The legacy `AttributeUpdates` parameter is measured by the
-  finished item alone. Captured against eu-west-2. `TransactWriteItems`
-  updates and PartiQL `UPDATE` are measured as before.
-- A `SET` through a list index past the end of the list appends the value, as
-  DynamoDB does, where it used to pad the gap with NULLs; several such writes
-  to one list append in the order of their indexes. A path that steps through
-  an element past the end of a list, or through a NULL, is refused with
-  DynamoDB's document path error where it used to create a map or a list
-  there. This covers `UpdateItem` and `TransactWriteItems` updates; PartiQL
-  `UPDATE` already appended. Captured against eu-west-2.
 - Set members come back in DynamoDB's order instead of the order they were
   written in. String and binary sets are sorted by their bytes everywhere.
   Number sets are sorted by value from GetItem, BatchGetItem, Query and the

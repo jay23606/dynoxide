@@ -998,7 +998,9 @@ async fn execute_update<S: StorageBackend>(
 
     // A transacted update is measured flat against the resulting item, unlike the
     // standalone UpdateItem, which is also charged for what its request carries.
-    // Both were captured against eu-west-2; the two really do differ.
+    // The flat measure is what 30 regions applied on 2026-10-08. eu-west-2,
+    // eu-north-1 and ap-northeast-2 began charging a transacted update for its
+    // request up front that day, mid-rollout; this follows the majority.
     if types::item_size(&item) > types::MAX_ITEM_SIZE {
         return Err(DynoxideError::ValidationException(
             "Item size to update has exceeded the maximum allowed size".to_string(),
