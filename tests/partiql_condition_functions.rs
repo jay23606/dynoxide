@@ -818,8 +818,9 @@ fn ten_condition_function_inequalities_run() {
 
 /// DynamoDB counts each call and each comparison operator against its 300
 /// operator limit, so a long enough chain of condition-function comparisons
-/// is refused for its operators rather than run. Inferred from the captured
-/// counting rule (each `attribute_exists(x) <> y` costs two, each AND one).
+/// is refused for its operators rather than run: each `attribute_exists(a)
+/// <> b` costs two and each AND one, so 100 run and 101 are refused (captured
+/// eu-west-2 and us-east-1, 2026-10-10).
 #[test]
 fn a_chain_of_condition_function_comparisons_is_held_to_the_operator_limit() {
     let db = captured_db();

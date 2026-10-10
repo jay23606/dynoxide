@@ -146,8 +146,8 @@ fn a_quoted_name_with_a_dot_or_a_bracket_is_one_attribute_in_an_update() {
 }
 
 /// An item holding both a top-level `a.b` and an `a` with a `b` inside it
-/// keeps the two apart. Inferred from the captured cases above, which held
-/// them on separate items.
+/// keeps the two apart, in a WHERE clause, a projection and one SET writing
+/// both (captured eu-west-2 and us-east-1, 2026-10-10).
 #[test]
 fn a_top_level_name_with_a_dot_and_a_nested_path_are_told_apart() {
     let db = setup();
@@ -176,9 +176,10 @@ fn a_top_level_name_with_a_dot_and_a_nested_path_are_told_apart() {
     );
 }
 
-/// A key attribute whose name holds a dot is named by quoting it, and the
-/// statement is then a key read or names the item to write, as any other key
-/// is. Inferred from the captured cases above: no capture has a key named so.
+/// A key attribute whose name holds a dot or a bracket is named by quoting
+/// it, and the statement is then a key read, ordered by its sort key, or
+/// names the item to write, as any other key is (captured eu-west-2 and
+/// us-east-1, 2026-10-10).
 #[test]
 fn a_key_attribute_whose_name_holds_a_dot_is_named_by_quoting_it() {
     let db = Database::memory().unwrap();
