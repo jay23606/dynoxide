@@ -271,11 +271,25 @@ pub async fn execute<S: StorageBackend>(
     // rather than one fallible value.
     let (prepared, tables) = prepare(storage, &request.statements).await;
 
+    // A statement refused for its own parameters, or for anything else about
+    // it alone, fails on its own and takes no part in the batch-wide checks
+    // below, as one that does not parse doesn't (captured eu-west-2 and
+    // us-east-1, 2026-10-09, for a parameter nested 63 levels and for an empty
+    // attribute name in a parameter; inferred for the other refusals here).
+    let own_refusals: Vec<Option<String>> = request.statements.iter().map(own_refusal).collect();
+    let counted = || {
+        prepared
+            .iter()
+            .zip(&own_refusals)
+            .filter(|(_, refusal)| refusal.is_none())
+            .map(|(p, _)| p)
+    };
+
     // A batch is all-read or all-write. AWS rejects a mixed one up front,
     // before any statement runs, rather than per statement. A statement that
     // did not parse takes no part in the classification, and its presence does
     // not stop the check firing on the ones that did.
-    let kinds = prepared.iter().filter_map(|p| p.stmt.as_ref().ok());
+    let kinds = counted().filter_map(|p| p.stmt.as_ref().ok());
     let (reads, writes): (Vec<_>, Vec<_>) =
         kinds.partition(|stmt| matches!(stmt, partiql::parser::Statement::Select { .. }));
     if !reads.is_empty() && !writes.is_empty() {
@@ -288,7 +302,7 @@ pub async fn execute<S: StorageBackend>(
     // statement whose key cannot be read off the request has no target and is
     // left to fail on its own terms below.
     let mut seen_targets = HashSet::new();
-    for target in prepared.iter().filter_map(|p| p.target.as_ref()) {
+    for target in counted().filter_map(|p| p.target.as_ref()) {
         if !seen_targets.insert(target) {
             return Err(DynoxideError::ValidationException(
                 "Provided list of item keys contains duplicates".to_string(),
@@ -302,57 +316,14 @@ pub async fn execute<S: StorageBackend>(
     let mut read_units: Vec<(String, usize, bool)> = Vec::new();
     let mut failures: Vec<(String, f64)> = Vec::new();
 
-    for (stmt_req, prepared) in request.statements.iter().zip(prepared) {
-        // A statement's parameters are checked before anything else about it,
-        // used or not and ahead of a missing table, and a failure is reported
-        // against that statement while the rest run (captured eu-west-2 and
-        // us-east-1, 2026-10-09). A parameter nested too deep fails it with the
-        // nesting message ahead of the value checks.
-        let rejection = stmt_req.parameter_rejection.clone().or_else(|| {
-            let parameters = stmt_req.parameters.as_deref().unwrap_or_default();
-            if crate::value_nesting::parameters_nest_too_deep(parameters) {
-                return Some(crate::value_nesting::deep_parameter_error().to_string());
-            }
-            parameters
-                .iter()
-                .try_for_each(partiql::executor::check_parameter_value)
-                .err()
-                .map(|e| e.to_string())
-        });
-        if let Some(message) = rejection {
+    for ((stmt_req, prepared), own_refusal) in
+        request.statements.iter().zip(prepared).zip(own_refusals)
+    {
+        if let Some(message) = own_refusal {
             responses.push(BatchStatementResponse {
                 error: Some(BatchStatementError {
                     code: "ValidationError".to_string(),
                     message,
-                }),
-                item: None,
-                table_name: None,
-            });
-            continue;
-        }
-
-        // A COUNT projection is rejected before parsing with the bare message
-        // captured on ExecuteStatement, carried here under the same
-        // per-statement ValidationError code a parse failure uses.
-        if let Some(msg) = partiql::parser::count_projection_rejection(&stmt_req.statement) {
-            responses.push(BatchStatementResponse {
-                error: Some(BatchStatementError {
-                    code: "ValidationError".to_string(),
-                    message: msg,
-                }),
-                item: None,
-                table_name: None,
-            });
-            continue;
-        }
-
-        // A parameter holding an empty attribute name fails its own statement,
-        // and the rest of the batch runs (captured in ten regions).
-        if crate::empty_names::parameters_have_empty_name(stmt_req.parameters.as_deref()) {
-            responses.push(BatchStatementResponse {
-                error: Some(BatchStatementError {
-                    code: "ValidationError".to_string(),
-                    message: crate::empty_names::MESSAGE.to_string(),
                 }),
                 item: None,
                 table_name: None,
@@ -547,6 +518,36 @@ struct Prepared {
     /// does not resolve to one, which covers a partition-spanning `SELECT` and
     /// anything whose key cannot be read off the request.
     target: Option<(String, String, String)>,
+}
+
+/// What fails a batch member on its own, before its statement runs: in this
+/// order, a parameter refused as it was decoded, one nested too deep (the
+/// nesting message ahead of the value checks), one DynamoDB can't store, a
+/// COUNT projection (refused before parsing with the bare message captured on
+/// ExecuteStatement) and an empty attribute name in a parameter. Each is
+/// reported against that member while the rest run (captured eu-west-2 and
+/// us-east-1, 2026-10-09, and the empty name in ten regions).
+fn own_refusal(stmt_req: &BatchStatementRequest) -> Option<String> {
+    if let Some(rejection) = &stmt_req.parameter_rejection {
+        return Some(rejection.clone());
+    }
+    let parameters = stmt_req.parameters.as_deref().unwrap_or_default();
+    if crate::value_nesting::parameters_nest_too_deep(parameters) {
+        return Some(crate::value_nesting::deep_parameter_error().to_string());
+    }
+    if let Err(e) = parameters
+        .iter()
+        .try_for_each(partiql::executor::check_parameter_value)
+    {
+        return Some(e.to_string());
+    }
+    if let Some(message) = partiql::parser::count_projection_rejection(&stmt_req.statement) {
+        return Some(message);
+    }
+    if crate::empty_names::parameters_have_empty_name(stmt_req.parameters.as_deref()) {
+        return Some(crate::empty_names::MESSAGE.to_string());
+    }
+    None
 }
 
 /// Parse every statement and resolve its target, once each.

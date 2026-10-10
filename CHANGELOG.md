@@ -521,6 +521,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ExecuteStatement and ExecuteTransaction, where a transaction used to be
   cancelled, and against that statement alone in a BatchExecuteStatement. It
   used to run, or come back as "Invalid key value".
+- A BatchExecuteStatement member that fails on its own, for a parameter
+  nested too deep or holding an empty attribute name, takes no part in the
+  batch's read/write and duplicate checks, as DynamoDB does: a read beside a
+  write whose parameter is too deep, or two updates of one item where one is,
+  now return 200 and run the rest, where the whole batch used to be refused
+  (captured against eu-west-2 and us-east-1). The same is applied to a member
+  refused for a parameter value DynamoDB can't store or for a COUNT
+  projection, not yet captured.
 - Set members come back in DynamoDB's order instead of the order they were
   written in. String and binary sets are sorted by their bytes everywhere.
   Number sets are sorted by value from GetItem, BatchGetItem, Query and the

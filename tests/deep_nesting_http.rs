@@ -611,6 +611,110 @@ async fn a_batch_statement_parameter_nested_63_levels_fails_that_statement_only(
     assert_eq!(responses[1]["Error"]["Message"], NEST, "{body}");
 }
 
+/// Send a BatchExecuteStatement and return its status and body.
+async fn batch(url: &str, statements: &[String]) -> (u16, Value) {
+    send(
+        url,
+        "BatchExecuteStatement",
+        format!(r#"{{"Statements":[{}]}}"#, statements.join(",")),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_statement_refused_for_its_own_parameter_drops_out_of_the_batch_checks() {
+    // Captured eu-west-2 and us-east-1, 2026-10-09: a statement whose
+    // parameter is nested 63 levels fails on its own and takes no part in the
+    // mixed read/write or duplicate checks, so the batch returns 200 and runs
+    // the rest. Without such a statement the checks refuse as before. An
+    // empty attribute name in a parameter drops out the same way.
+    let url = start().await;
+    create_table(&url, "Deep").await;
+    put_base_item(&url).await;
+    let (status, body) = send(
+        &url,
+        "PutItem",
+        r#"{"TableName":"Deep","Item":{"pk":{"S":"b"},"x":{"S":"old"}}}"#.to_string(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let select = statement("SELECT * FROM \\\"Deep\\\" WHERE pk = ?", r#"{"S":"base"}"#);
+    let deep_update = statement(
+        "UPDATE \\\"Deep\\\" SET x = ? WHERE pk = 'b'",
+        &deep_map(63),
+    );
+    let plain_update = statement(
+        "UPDATE \\\"Deep\\\" SET x = ? WHERE pk = 'b'",
+        r#"{"S":"v"}"#,
+    );
+    let deep_select = format!(
+        r#"{{"Statement":"SELECT * FROM \"Deep\" WHERE pk = 'base' AND x = ?","Parameters":[{}]}}"#,
+        deep_map(63)
+    );
+    let empty_name_insert = statement(
+        "INSERT INTO \\\"Deep\\\" VALUE {'pk': 'e', 'm': ?}",
+        r#"{"M":{"":{"S":"x"}}}"#,
+    );
+
+    let outcome = |body: &Value| -> Vec<String> {
+        body["Responses"]
+            .as_array()
+            .expect("Responses")
+            .iter()
+            .map(|r| match r["Error"]["Message"].as_str() {
+                Some(m) => format!("error: {m}"),
+                None => "ran".to_string(),
+            })
+            .collect()
+    };
+    let nest = format!("error: {NEST}");
+    for (statements, expected) in [
+        (
+            vec![select.clone(), deep_update.clone()],
+            vec!["ran".to_string(), nest.clone()],
+        ),
+        (
+            vec![deep_update.clone(), select.clone()],
+            vec![nest.clone(), "ran".to_string()],
+        ),
+        (
+            vec![deep_select.clone(), plain_update.clone()],
+            vec![nest.clone(), "ran".to_string()],
+        ),
+        (
+            vec![plain_update.clone(), deep_update.clone()],
+            vec!["ran".to_string(), nest.clone()],
+        ),
+        (
+            vec![deep_update.clone(), plain_update.clone()],
+            vec![nest.clone(), "ran".to_string()],
+        ),
+        (
+            vec![select.clone(), empty_name_insert.clone()],
+            vec!["ran".to_string(), "error: Empty attribute name".to_string()],
+        ),
+    ] {
+        let (status, body) = batch(&url, &statements).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(outcome(&body), expected, "{body}");
+    }
+
+    // Without a statement refused on its own, the batch-wide checks still fire.
+    let (status, body) = batch(&url, &[select.clone(), plain_update.clone()]).await;
+    assert_validation(
+        status,
+        &body,
+        "Read and write requests together in the same batch is not supported.",
+    );
+    let (status, body) = batch(&url, &[plain_update.clone(), plain_update.clone()]).await;
+    assert_validation(
+        status,
+        &body,
+        "Provided list of item keys contains duplicates",
+    );
+}
+
 // ---- PartiQL parameters are checked before the statement runs -----------------
 //
 // From 33 levels a parameter is refused before its statement is parsed or its
