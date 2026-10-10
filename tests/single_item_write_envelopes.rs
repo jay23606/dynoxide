@@ -277,3 +277,77 @@ fn the_library_delete_item_envelopes_too() {
         one("Invalid ConditionExpression: The expression can not be empty;")
     );
 }
+
+/// A malformed legacy `Expected` is refused before anything is written. It
+/// used to be dropped as unreadable, so the write ran with no condition at
+/// all, and a DeleteItem guarded by it deleted the item (captured eu-west-2
+/// and us-east-1, 2026-10-10: DynamoDB refuses each shape and writes nothing).
+#[tokio::test]
+async fn a_malformed_expected_is_refused_and_nothing_is_written() {
+    let url = start().await;
+    let cases = [
+        (
+            json!({"a": {"Value": {}}}),
+            "Supplied AttributeValue is empty, must contain exactly one of the supported \
+             datatypes"
+                .to_string(),
+        ),
+        (
+            json!({"a": {"ComparisonOperator": "BOGUS", "AttributeValueList": [{"S": "x"}]}}),
+            one(&format!("{INVALID}Invalid comparison operator")),
+        ),
+        (
+            json!({"a": {"ComparisonOperator": "EQ", "AttributeValueList": []}}),
+            one(&format!(
+                "{INVALID}Invalid number of argument(s) for the EQ ComparisonOperator"
+            )),
+        ),
+    ];
+    let original = json!({"pk": {"S": "a"}, "v": {"S": "original"}});
+    for (expected, message) in cases {
+        for operation in ["PutItem", "UpdateItem", "DeleteItem"] {
+            let (status, _) = send(
+                &url,
+                "PutItem",
+                json!({"TableName": "Env", "Item": original}),
+            )
+            .await;
+            assert_eq!(status, 200);
+            let body = match operation {
+                "PutItem" => json!({
+                    "TableName": "Env",
+                    "Item": {"pk": {"S": "a"}, "v": {"S": "overwritten"}},
+                    "Expected": expected
+                }),
+                "UpdateItem" => json!({
+                    "TableName": "Env",
+                    "Key": {"pk": {"S": "a"}},
+                    "AttributeUpdates": {"v": {"Action": "PUT", "Value": {"S": "overwritten"}}},
+                    "Expected": expected
+                }),
+                _ => json!({
+                    "TableName": "Env",
+                    "Key": {"pk": {"S": "a"}},
+                    "Expected": expected
+                }),
+            };
+            let (status, resp) = send(&url, operation, body).await;
+            assert_eq!(status, 400, "{operation} {expected}: {resp}");
+            assert_eq!(
+                resp["message"].as_str().or(resp["Message"].as_str()),
+                Some(message.as_str()),
+                "{operation} {expected}"
+            );
+            let (_, got) = send(
+                &url,
+                "GetItem",
+                json!({"TableName": "Env", "Key": {"pk": {"S": "a"}}, "ConsistentRead": true}),
+            )
+            .await;
+            assert_eq!(
+                got["Item"], original,
+                "{operation} {expected} left the item alone"
+            );
+        }
+    }
+}

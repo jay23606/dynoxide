@@ -1026,9 +1026,11 @@ pub fn parse_expression_attribute_values_raw(
 ///
 /// A value in it that DynamoDB refuses (`{"NULL": false}`, a number it can't
 /// read or store) is refused here, tagged for the request-validation envelope,
-/// as DynamoDB refuses it (eu-west-2 and us-east-1, 2026-10-09). A map whose
-/// shape doesn't read as conditions yields `None`; the request-model checks
-/// report those.
+/// as DynamoDB refuses it (eu-west-2 and us-east-1, 2026-10-09). A map that
+/// doesn't read as conditions is refused too, classified as a request body
+/// would be, and never dropped: dropping it ran the write with no condition
+/// at all. An empty attribute value gets DynamoDB's bare "Supplied
+/// AttributeValue is empty" (eu-west-2 and us-east-1, 2026-10-10).
 pub(crate) fn read_expected(
     expected: &serde_json::Value,
 ) -> Result<Option<HashMap<String, ExpectedCondition>>> {
@@ -1064,7 +1066,24 @@ pub(crate) fn read_expected(
                     crate::serde_errors::clean_serde_message(&msg).to_string(),
                 ))
             } else {
-                Ok(None)
+                // Classified as the request body's own errors are, where that
+                // mapping is built; a plain library build, whose requests are
+                // typed values, refuses with the reader's message.
+                let fallback = || {
+                    DynoxideError::ValidationException(
+                        crate::serde_errors::clean_serde_message(&msg).to_string(),
+                    )
+                };
+                #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]
+                let refused =
+                    crate::serde_errors::deserialize::<HashMap<String, ExpectedCondition>>(
+                        &expected.to_string(),
+                    )
+                    .err()
+                    .unwrap_or_else(fallback);
+                #[cfg(not(any(feature = "http-server", feature = "wasm-sqlite", test)))]
+                let refused = fallback();
+                Err(refused)
             }
         }
     }
@@ -1512,7 +1531,10 @@ pub fn validate_expected_conditions(expected: &HashMap<String, ExpectedCondition
                 "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "CONTAINS" | "NOT_CONTAINS"
                 | "BEGINS_WITH" => {
                     if arg_count != 1 {
-                        if arg_count == 0 {
+                        // An AttributeValueList that is there but empty is a
+                        // wrong count, not a missing value (EQ captured
+                        // eu-west-2 and us-east-1, 2026-10-10).
+                        if arg_count == 0 && !has_avl {
                             return Err(DynoxideError::ValidationException(format!(
                                 "One or more parameter values were invalid: \
                                  Value or AttributeValueList must be used with ComparisonOperator: {op} for Attribute: {attr_name}"
@@ -1547,12 +1569,13 @@ pub fn validate_expected_conditions(expected: &HashMap<String, ExpectedCondition
                     }
                 }
                 _ => {
-                    if arg_count == 0 && !has_value {
-                        return Err(DynoxideError::ValidationException(format!(
-                            "One or more parameter values were invalid: \
-                             Value or AttributeValueList must be used with ComparisonOperator: {op} for Attribute: {attr_name}"
-                        )));
-                    }
+                    // An operator DynamoDB doesn't have is refused as such,
+                    // ahead of its arguments (captured eu-west-2 and
+                    // us-east-1, 2026-10-10).
+                    return Err(DynoxideError::ValidationException(
+                        "One or more parameter values were invalid: Invalid comparison operator"
+                            .to_string(),
+                    ));
                 }
             }
 

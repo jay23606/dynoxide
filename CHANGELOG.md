@@ -584,6 +584,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExecuteTransaction`. More parameters than placeholders are still accepted.
   An empty `Parameters` list is refused as a request member. Captured against
   eu-west-2 and us-east-1.
+- A malformed `Expected` condition on `PutItem`, `UpdateItem` or `DeleteItem`
+  is refused rather than ignored. An unknown `ComparisonOperator` gets
+  DynamoDB's "Invalid comparison operator" message, and `EQ` with an empty
+  `AttributeValueList` its "Invalid number of argument(s)" message. Captured
+  against eu-west-2 and us-east-1.
 
 ## [1.2.1] - 2026-09-20
 
