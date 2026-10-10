@@ -436,7 +436,7 @@ async fn execute_transaction<S: StorageBackend>(
     let response = crate::run_idempotent_async(
         ctx.tokens.execute_transaction(),
         token.as_deref(),
-        &statements,
+        &actions::execute_transaction::token_statements(&statements),
         actions::execute_transaction::execute_cached(backend, request),
         |cached| actions::execute_transaction::replay_response(cached, &capacity_mode),
     )

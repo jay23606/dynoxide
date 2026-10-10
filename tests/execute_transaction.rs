@@ -781,6 +781,64 @@ fn test_execute_transaction_same_token_differing_only_in_capacity_mode_replays()
     assert_eq!(counter_value(&db, "Counters", "c1"), 1);
 }
 
+/// A statement written out through serde and read back keeps a mode that was
+/// left out as left out, and one that was sent as sent. Only the token match
+/// counts a left-out mode as `NONE`.
+#[test]
+fn a_statement_keeps_its_mode_through_serde() {
+    let left_out = stmt("UPDATE \"Counters\" SET n = n + 1 WHERE pk = 'c1'");
+    let sent = ParameterizedStatement {
+        return_values_on_condition_check_failure: Some("ALL_OLD".to_string()),
+        ..left_out.clone()
+    };
+    for (statement, expected) in [(left_out, None), (sent, Some("ALL_OLD"))] {
+        let read_back: ParameterizedStatement =
+            serde_json::from_value(serde_json::to_value(&statement).unwrap()).unwrap();
+        assert_eq!(read_back.statement, statement.statement);
+        assert!(read_back.parameters.is_none());
+        assert_eq!(
+            read_back
+                .return_values_on_condition_check_failure
+                .as_deref(),
+            expected
+        );
+    }
+}
+
+/// Under one token, a statement whose mode is left out matches the same
+/// statement sending `NONE`, both ways round, and mismatches one sending
+/// `ALL_OLD`.
+#[test]
+fn a_left_out_mode_counts_as_none_in_the_token_match() {
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Counters");
+    seed_counter(&db, "Counters", "c1");
+    let call = |token: &str, mode: Option<&str>| {
+        db.execute_transaction(ExecuteTransactionRequest {
+            transact_statements: vec![ParameterizedStatement {
+                return_values_on_condition_check_failure: mode.map(str::to_string),
+                ..stmt("UPDATE \"Counters\" SET n = n + 1 WHERE pk = 'c1'")
+            }],
+            client_request_token: Some(token.to_string()),
+            return_consumed_capacity: None,
+        })
+    };
+
+    call("left-out-first", None).unwrap();
+    call("left-out-first", Some("NONE")).unwrap();
+    assert_eq!(counter_value(&db, "Counters", "c1"), 1, "NONE replays");
+    call("none-first", Some("NONE")).unwrap();
+    call("none-first", None).unwrap();
+    assert_eq!(counter_value(&db, "Counters", "c1"), 2, "left out replays");
+
+    let err = call("left-out-first", Some("ALL_OLD")).unwrap_err();
+    assert!(
+        matches!(err, DynoxideError::IdempotentParameterMismatchException(_)),
+        "expected IdempotentParameterMismatchException, got: {err:?}"
+    );
+    assert_eq!(counter_value(&db, "Counters", "c1"), 2);
+}
+
 /// A tokenless transaction is never cached: repeated calls re-execute.
 #[test]
 fn test_execute_transaction_tokenless_reexecutes() {

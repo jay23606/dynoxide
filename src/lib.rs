@@ -1222,7 +1222,7 @@ impl Database<RusqliteBackend> {
         run_idempotent(
             &self.tokens.execute_transaction,
             request.client_request_token.as_deref(),
-            &request.transact_statements,
+            &actions::execute_transaction::token_statements(&request.transact_statements),
             || {
                 self.with_storage(|s| {
                     pollster::block_on(actions::execute_transaction::execute_cached(

@@ -20,10 +20,6 @@ pub struct ExecuteTransactionRequest {
     pub return_consumed_capacity: Option<String>,
 }
 
-// `Serialize` backs the idempotency request hash (the statements, their
-// parameters and their modes are serialised via `serde_json`), so a same-token
-// call differing only in `ReturnConsumedCapacity` replays rather than
-// mismatches.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ParameterizedStatement {
     #[serde(rename = "Statement")]
@@ -37,23 +33,40 @@ pub struct ParameterizedStatement {
     /// `ALL_OLD` hands back the item this statement's UPDATE or DELETE failed
     /// its condition on, on the statement's cancellation reason; `NONE`, or
     /// leaving it out, does not.
-    #[serde(
-        rename = "ReturnValuesOnConditionCheckFailure",
-        default,
-        serialize_with = "mode_or_none"
-    )]
+    #[serde(rename = "ReturnValuesOnConditionCheckFailure", default)]
     pub return_values_on_condition_check_failure: Option<String>,
 }
 
-/// A statement's mode as the idempotency hash sees it: leaving it out is
+/// One statement as a `ClientRequestToken` match compares it.
+#[derive(Serialize)]
+pub(crate) struct TokenStatement<'a> {
+    #[serde(rename = "Statement")]
+    statement: &'a str,
+    #[serde(rename = "Parameters")]
+    parameters: Option<&'a [AttributeValue]>,
+    #[serde(rename = "ReturnValuesOnConditionCheckFailure")]
+    mode: &'a str,
+}
+
+/// The statements as the idempotency hash sees them: each one's text,
+/// parameters and mode, and not `ReturnConsumedCapacity`, so a same-token call
+/// differing only in that replays rather than mismatches. A mode left out is
 /// `NONE`, so a same-token retry that leaves it out replays a call that sent
 /// `NONE`, and one sending `ALL_OLD` mismatches (captured eu-west-2 and
-/// us-east-1, 2026-10-10).
-fn mode_or_none<S: serde::Serializer>(
-    mode: &Option<String>,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    serializer.serialize_str(mode.as_deref().unwrap_or("NONE"))
+/// us-east-1, 2026-10-10). The statements' own `Serialize` writes a left-out
+/// mode as left out.
+pub(crate) fn token_statements(statements: &[ParameterizedStatement]) -> Vec<TokenStatement<'_>> {
+    statements
+        .iter()
+        .map(|s| TokenStatement {
+            statement: &s.statement,
+            parameters: s.parameters.as_deref(),
+            mode: s
+                .return_values_on_condition_check_failure
+                .as_deref()
+                .unwrap_or("NONE"),
+        })
+        .collect()
 }
 
 // `Clone` so the idempotency cache can store the first-call response and clone
