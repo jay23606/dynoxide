@@ -135,9 +135,10 @@ pub fn is_duplicate_column_error(message: &str) -> bool {
     message.contains("duplicate column name")
 }
 
-/// Record the schema version if none is recorded yet (`INSERT OR IGNORE`,
-/// mirroring the native `initialize` step). Never downgrades a version a
-/// newer build has already stamped.
+/// Record the schema version if none is recorded yet (`INSERT OR IGNORE`).
+/// The native open records it only on a database it is creating; the wasm open
+/// records it once its migrations have run. Never downgrades a version a newer
+/// build has already stamped.
 pub fn init_schema_version(version: u32) -> (String, Vec<SqlParam<'static>>) {
     (
         "INSERT OR IGNORE INTO _config (key, value) VALUES ('schema_version', ?1)".to_string(),

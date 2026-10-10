@@ -438,23 +438,14 @@ impl Storage {
     /// the recorded schema version calls for. Runs on open, and on the scratch
     /// copy a restore brings up to date before it replaces this database.
     fn migrate_to_current(&self) -> Result<()> {
-        // Create metadata tables (schema shared with the wasm backend).
-        self.conn.execute_batch(sql_builders::INIT_SCHEMA)?;
-
-        // Migrate: add user_identity column if it doesn't exist (for databases created before Phase 11)
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE _stream_records ADD COLUMN user_identity TEXT");
-
-        // Set schema version if not present
-        let (version_sql, version_params) = sql_builders::init_schema_version(SCHEMA_VERSION);
-        self.conn.execute(
-            &version_sql,
-            rusqlite::params_from_iter(version_params.iter()),
-        )?;
-
-        // Run schema migrations. A version that isn't a number runs them all.
-        let version = self.recorded_schema_version()?.unwrap_or(1);
+        // A database with tables and no recorded version, which the browser
+        // build wrote from Dynoxide 0.10 to 0.13, or one whose version isn't a
+        // number, runs every step. Each is safe on a database that already
+        // has what it adds: a column already there is left alone, an index is
+        // created only where it is missing, only a table without an id is
+        // given one, and the steps from version 10 on rebuild from the base
+        // table.
+        let version = self.create_metadata_tables()?.unwrap_or(1);
 
         if version < 2 {
             self.migrate_v1_to_v2()?;
@@ -487,6 +478,33 @@ impl Storage {
             self,
             crate::storage_backend::schema::open_migrations(Some(version)),
         ))
+    }
+
+    /// Create the metadata tables if they are missing and, on a new database,
+    /// record this build's version, in one write transaction, so another
+    /// process opening the same file never finds the tables without the
+    /// version. Returns the version recorded once that is done.
+    fn create_metadata_tables(&self) -> Result<Option<u32>> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let new_database = !table_exists(&self.conn, "_tables")?;
+        // The metadata tables, shared with the wasm backend.
+        self.conn.execute_batch(sql_builders::INIT_SCHEMA)?;
+        // A stream record table made before records carried a user identity
+        // gains the column; one that has it fails the ALTER harmlessly.
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE _stream_records ADD COLUMN user_identity TEXT");
+        if new_database {
+            let (sql, params) = sql_builders::init_schema_version(SCHEMA_VERSION);
+            self.conn
+                .execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        }
+        let recorded = self.recorded_schema_version()?;
+        transaction.commit()?;
+        Ok(recorded)
     }
 
     /// Migrate from schema v1 to v2: add `cached_at REAL` column to all data tables.
@@ -3475,6 +3493,64 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(recorded_version(&Connection::open(&path).unwrap()), "9");
+    }
+
+    /// A database that records no version, as the browser build left one
+    /// from Dynoxide 0.10 to 0.13, is taken through every step on open rather
+    /// than taken to be current. It already has every column and index the
+    /// earlier steps add, so this also shows each of them leaves those alone.
+    #[test]
+    fn a_database_that_records_no_version_is_brought_up_to_date() {
+        let (_dir, path) = v9_snapshot_path();
+        write_v9_database(&path, 0);
+        let table_id = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT table_id FROM _tables WHERE table_name = 'Legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (stale_size, id_before) = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("DELETE FROM _config WHERE key = 'schema_version'", [])
+                .unwrap();
+            (vec_size(&conn), table_id(&conn))
+        };
+
+        let storage = Storage::new(&path).unwrap();
+        assert_eq!(recorded_version(storage.conn()), SCHEMA_VERSION.to_string());
+        assert_eq!(
+            vec_size(storage.conn()),
+            stale_size - 7,
+            "vector table sizes are recomputed"
+        );
+        let composite = crate::actions::gsi::composite_key_string(&[
+            &AttributeValue::S("m".into()),
+            &AttributeValue::S("2".into()),
+        ])
+        .unwrap();
+        assert!(
+            gsi_rows(storage.conn(), "byKey")
+                .iter()
+                .any(|[_, gsi_sk, _, _, _]| *gsi_sk == composite),
+            "multi-attribute indexes are rebuilt"
+        );
+        assert_eq!(table_id(storage.conn()), id_before, "a table keeps its id");
+        drop(storage);
+
+        let db = crate::Database::new(&path).unwrap();
+        let item = db
+            .get_item(
+                serde_json::from_value(serde_json::json!({
+                    "TableName": "Legacy",
+                    "Key": {"pk": {"S": "1"}}
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .item;
+        assert!(item.is_some(), "the items read back");
     }
 
     /// Record a version one past this build's in the database at `conn`, as a
