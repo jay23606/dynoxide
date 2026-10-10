@@ -748,6 +748,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that also holds its own path is refused for the path, wherever it stands
   in the list, where the operand count used to be reported. Captured against
   eu-west-2 and us-east-1.
+- A PartiQL `UPDATE` that sets or removes a key attribute is refused with
+  `Cannot update attribute <name>. This attribute is part of the key`, and
+  writes nothing. It used to store the item under its old key with the new
+  key value inside it, so the item no longer matched its own key. The words
+  are `UpdateItem`'s, captured against eu-west-2 and us-east-1; that PartiQL
+  uses the same ones is not yet captured.
 - A quoted name in a PartiQL statement is one attribute whatever it holds,
   as DynamoDB reads it: `"a.b"` and `"a[0]"` name the top-level attributes
   `a.b` and `a[0]` in a WHERE clause, a condition function, `IS NOT MISSING`

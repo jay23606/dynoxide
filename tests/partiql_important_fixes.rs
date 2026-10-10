@@ -465,3 +465,52 @@ fn test_insert_without_if_not_exists_on_duplicate_fails() {
         "Expected duplicate key error, got: {err}"
     );
 }
+
+/// An UPDATE that sets or removes a key attribute is refused and writes
+/// nothing. It used to store the item under its old key with the new key
+/// value inside it, so the item no longer matched its own key. The message is
+/// UpdateItem's (captured eu-west-2, us-east-1 and ap-southeast-2 for
+/// UpdateItem); that PartiQL refuses with the same words is inferred.
+#[test]
+fn an_update_of_a_key_attribute_is_refused_and_writes_nothing() {
+    let db = Database::memory().unwrap();
+    create_composite_table(&db, "Keyed");
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("a".to_string())),
+        ("sk".to_string(), AttributeValue::S("1".to_string())),
+        ("v".to_string(), AttributeValue::N("0".to_string())),
+    ]);
+    put_item(&db, "Keyed", item.clone());
+    let refusal = |attribute: &str| {
+        format!(
+            "One or more parameter values were invalid: Cannot update attribute \
+             {attribute}. This attribute is part of the key"
+        )
+    };
+    for (statement, attribute) in [
+        (
+            r#"UPDATE "Keyed" SET pk = 'b' WHERE pk = 'a' AND sk = '1'"#,
+            "pk",
+        ),
+        (
+            r#"UPDATE "Keyed" SET v = 1, sk = '2' WHERE pk = 'a' AND sk = '1'"#,
+            "sk",
+        ),
+        (
+            r#"UPDATE "Keyed" SET pk = 'a' WHERE pk = 'a' AND sk = '1'"#,
+            "pk",
+        ),
+        (
+            r#"UPDATE "Keyed" REMOVE pk WHERE pk = 'a' AND sk = '1'"#,
+            "pk",
+        ),
+        (
+            r#"UPDATE "Keyed" REMOVE sk WHERE pk = 'a' AND sk = '1'"#,
+            "sk",
+        ),
+    ] {
+        assert_eq!(exec_err(&db, statement), refusal(attribute), "{statement}");
+    }
+    let stored = exec(&db, r#"SELECT * FROM "Keyed" WHERE pk = 'a' AND sk = '1'"#);
+    assert_eq!(stored.items, Some(vec![item]));
+}

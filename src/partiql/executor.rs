@@ -3139,6 +3139,26 @@ async fn execute_update<S: StorageBackend>(
     // equalities: see `single_item_key`.
     let (pk_str, sk_str) = single_item_key(wc, key_schema, parameters)?;
 
+    // A key attribute can't be set or removed: the item would be stored under
+    // its old key with another key value in it. UpdateItem's words (captured
+    // eu-west-2, us-east-1 and ap-southeast-2); PartiQL's are inferred to be
+    // the same, and so is where the refusal falls among the others.
+    let paths = set_clauses
+        .iter()
+        .map(|clause| clause.path.as_str())
+        .chain(remove_paths.iter().map(String::as_str));
+    for path in paths {
+        let key = std::iter::once(key_schema.partition_key.as_str())
+            .chain(key_schema.sort_key.as_deref())
+            .find(|key| names_attribute(path, key));
+        if let Some(key) = key {
+            return Err(DynoxideError::ValidationException(format!(
+                "One or more parameter values were invalid: Cannot update attribute {key}. \
+                 This attribute is part of the key"
+            )));
+        }
+    }
+
     // Get existing item
     let existing_json = storage.get_item(table_name, &pk_str, &sk_str).await?;
     let mut item: Item = existing_json
