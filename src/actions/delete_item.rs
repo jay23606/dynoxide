@@ -317,21 +317,20 @@ async fn execute_inner<S: StorageBackend>(
             .map_err(crate::validation::tag_for_envelope)?;
 
         if !expected.is_empty() {
-            let (cond_expr, values) = helpers::convert_expected_to_condition(
+            let converted = helpers::convert_expected_to_condition(
                 &expected,
                 request.conditional_operator.as_deref(),
             )?;
-            if !cond_expr.is_empty() {
-                let names = helpers::expected_attr_names(&expected);
-                request.condition_expression = Some(cond_expr);
+            if !converted.expression.is_empty() {
+                request.condition_expression = Some(converted.expression);
                 let expr_values = request
                     .expression_attribute_values
                     .get_or_insert_with(HashMap::new);
-                expr_values.extend(values);
+                expr_values.extend(converted.attribute_values);
                 let expr_names = request
                     .expression_attribute_names
                     .get_or_insert_with(HashMap::new);
-                expr_names.extend(names);
+                expr_names.extend(converted.attribute_names);
             }
         }
     }

@@ -156,6 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ap-southeast-2, eu-central-1 and us-east-1; us-east-1 answers an unknown
   operator with the member's enum constraint instead, and the other three
   regions are followed.
+- A legacy condition on an attribute whose name holds a `-`, a `.` or a
+  character outside ASCII, such as `user-id` or `s.k`, was refused with a
+  syntax error naming an internal placeholder, such as `near: "#kc_user-id"`.
+  1.2.1 did this too. `KeyConditions`, `QueryFilter`, `ScanFilter` and
+  `Expected` now run on any attribute name, as DynamoDB runs them. Captured
+  against eu-west-2 and us-east-1.
 - A legacy `QueryFilter` or `ScanFilter` condition whose value didn't read,
   such as `{"NULL": false}` or `{"BOOL": "maybe"}`, was dropped, so the Query
   or Scan ran without that condition and returned items it should have

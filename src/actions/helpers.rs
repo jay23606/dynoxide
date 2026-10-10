@@ -1271,22 +1271,30 @@ pub fn attributes_to_get_to_projection(
 }
 
 /// Convert legacy `Expected` parameter to a `ConditionExpression` string
-/// and matching `ExpressionAttributeValues`.
-///
-/// Returns `(condition_expression, expression_attribute_values)` or an error.
+/// with the `ExpressionAttributeNames` and `ExpressionAttributeValues` it
+/// uses. Each attribute is named through a placeholder by its position,
+/// `#expected_0`, never by its own name, which may hold a character the
+/// expression reader stops at (`-`, `.`, anything outside ASCII).
 pub fn convert_expected_to_condition(
     expected: &HashMap<String, ExpectedCondition>,
     conditional_operator: Option<&str>,
-) -> Result<(String, HashMap<String, crate::types::AttributeValue>)> {
+) -> Result<ConvertedCondition> {
     let joiner = match conditional_operator {
         Some(op) if op.eq_ignore_ascii_case("OR") => " OR ",
         _ => " AND ",
     };
     let mut parts = Vec::new();
     let mut values = HashMap::new();
+    let mut names = HashMap::new();
     let mut val_idx = 0u32;
 
-    for (attr_name, cond) in expected {
+    // In name order, so the placeholders and the expression are the same
+    // for the same request.
+    let mut ordered: Vec<(&String, &ExpectedCondition)> = expected.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    for (index, (attr_name, cond)) in ordered.into_iter().enumerate() {
+        let name_ref = format!("#expected_{index}");
+        names.insert(name_ref.clone(), attr_name.clone());
         // Validate conflicting options
         if cond.exists.is_some() && cond.comparison_operator.is_some() {
             return Err(DynoxideError::ValidationException(format!(
@@ -1310,16 +1318,16 @@ pub fn convert_expected_to_condition(
 
             match comp_upper.as_str() {
                 "NULL" => {
-                    parts.push(format!("attribute_not_exists(#expected_{attr_name})"));
+                    parts.push(format!("attribute_not_exists({name_ref})"));
                 }
                 "NOT_NULL" => {
-                    parts.push(format!("attribute_exists(#expected_{attr_name})"));
+                    parts.push(format!("attribute_exists({name_ref})"));
                 }
                 "EQ" => {
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} = {val_name}"));
+                        parts.push(format!("{name_ref} = {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1331,7 +1339,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} <> {val_name}"));
+                        parts.push(format!("{name_ref} <> {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1343,7 +1351,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} <= {val_name}"));
+                        parts.push(format!("{name_ref} <= {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1355,7 +1363,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} < {val_name}"));
+                        parts.push(format!("{name_ref} < {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1367,7 +1375,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} >= {val_name}"));
+                        parts.push(format!("{name_ref} >= {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1379,7 +1387,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} > {val_name}"));
+                        parts.push(format!("{name_ref} > {val_name}"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1394,7 +1402,7 @@ pub fn convert_expected_to_condition(
                         val_idx += 1;
                         let v2 = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("#expected_{attr_name} BETWEEN {v1} AND {v2}"));
+                        parts.push(format!("{name_ref} BETWEEN {v1} AND {v2}"));
                         values.insert(v1, list[0].clone());
                         values.insert(v2, list[1].clone());
                     } else {
@@ -1407,7 +1415,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("begins_with(#expected_{attr_name}, {val_name})"));
+                        parts.push(format!("begins_with({name_ref}, {val_name})"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1419,7 +1427,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("contains(#expected_{attr_name}, {val_name})"));
+                        parts.push(format!("contains({name_ref}, {val_name})"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1431,7 +1439,7 @@ pub fn convert_expected_to_condition(
                     if let Some(val) = single_val() {
                         let val_name = format!(":expected_v{val_idx}");
                         val_idx += 1;
-                        parts.push(format!("NOT contains(#expected_{attr_name}, {val_name})"));
+                        parts.push(format!("NOT contains({name_ref}, {val_name})"));
                         values.insert(val_name, val);
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
@@ -1451,10 +1459,7 @@ pub fn convert_expected_to_condition(
                                 name
                             })
                             .collect();
-                        parts.push(format!(
-                            "#expected_{attr_name} IN ({})",
-                            val_names.join(", ")
-                        ));
+                        parts.push(format!("{name_ref} IN ({})", val_names.join(", ")));
                     } else {
                         return Err(DynoxideError::ValidationException(format!(
                             "One or more parameter values were invalid: Value or AttributeValueList must be used with ComparisonOperator: IN for Attribute: {attr_name}"
@@ -1469,37 +1474,24 @@ pub fn convert_expected_to_condition(
             }
         } else if let Some(false) = cond.exists {
             // { Exists: false } => attribute_not_exists
-            parts.push(format!("attribute_not_exists(#expected_{attr_name})"));
+            parts.push(format!("attribute_not_exists({name_ref})"));
         } else if let Some(ref value) = cond.value {
             // { Value: ... } (with Exists: true or Exists omitted) => attr = value
             let val_name = format!(":expected_v{val_idx}");
             val_idx += 1;
-            parts.push(format!("#expected_{attr_name} = {val_name}"));
+            parts.push(format!("{name_ref} = {val_name}"));
             values.insert(val_name, value.clone());
         } else {
             // { Exists: true } without Value => attribute_exists
-            parts.push(format!("attribute_exists(#expected_{attr_name})"));
+            parts.push(format!("attribute_exists({name_ref})"));
         }
     }
 
-    if parts.is_empty() {
-        return Ok((String::new(), values));
-    }
-
-    // Sort parts for deterministic output (attribute names are unordered in HashMap)
-    parts.sort();
-    Ok((parts.join(joiner), values))
-}
-
-/// Build ExpressionAttributeNames for the Expected conversion.
-/// Maps `#expected_<attr>` to `<attr>` for each attribute in the Expected map.
-pub fn expected_attr_names(
-    expected: &HashMap<String, ExpectedCondition>,
-) -> HashMap<String, String> {
-    expected
-        .keys()
-        .map(|attr| (format!("#expected_{attr}"), attr.clone()))
-        .collect()
+    Ok(ConvertedCondition {
+        expression: parts.join(joiner),
+        attribute_values: values,
+        attribute_names: names,
+    })
 }
 
 /// Legacy `Expected` condition for a single attribute.
@@ -1746,9 +1738,12 @@ pub fn convert_key_conditions(
         ordered_keys.insert(0, removed);
     }
 
-    for attr_name in ordered_keys {
+    // Each attribute is named through a placeholder by its position, never by
+    // its own name, which may hold a character the expression reader stops at
+    // (`-`, `.`, anything outside ASCII).
+    for (index, attr_name) in ordered_keys.into_iter().enumerate() {
         let cond = &key_conditions[attr_name];
-        let name_ref = format!("#kc_{attr_name}");
+        let name_ref = format!("#kc_{index}");
         names.insert(name_ref.clone(), attr_name.clone());
 
         // Operators are matched as written: DynamoDB refuses `eq`.
@@ -1817,8 +1812,13 @@ pub fn convert_filter_conditions(
     let mut names = HashMap::new();
     let mut val_idx = 0u32;
 
-    for (attr_name, cond) in conditions {
-        let name_ref = format!("#qf_{attr_name}");
+    // In name order, each attribute named through a placeholder by its
+    // position, never by its own name, which may hold a character the
+    // expression reader stops at (`-`, `.`, anything outside ASCII).
+    let mut ordered: Vec<(&String, &FilterCondition)> = conditions.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    for (index, (attr_name, cond)) in ordered.into_iter().enumerate() {
+        let name_ref = format!("#qf_{index}");
         names.insert(name_ref.clone(), attr_name.clone());
 
         // Operators are matched as written: DynamoDB refuses `eq`. An unknown
@@ -1847,7 +1847,6 @@ pub fn convert_filter_conditions(
         parts.push(legacy_condition_text(op, &name_ref, &refs));
     }
 
-    parts.sort();
     Ok(ConvertedCondition {
         expression: parts.join(joiner),
         attribute_values: values,
