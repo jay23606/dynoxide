@@ -1781,7 +1781,10 @@ impl Storage {
     /// contents and the metadata cache get cleared. A copy or migration that
     /// fails leaves this database as it was. SQLite keeps the temporary copy
     /// in its page cache and spills it to a temporary file as it grows, so a
-    /// large snapshot doesn't need its own size in memory.
+    /// large snapshot doesn't need its own size in memory. Builds with
+    /// encryption are the exception: SQLCipher is compiled to keep temporary
+    /// databases in memory (`SQLITE_TEMP_STORE=2`), so there the copy does take
+    /// its own size in memory, and never reaches the disk unencrypted.
     pub fn restore_from_connection(&mut self, source: &Connection) -> Result<()> {
         ensure_snapshot(source)?;
         let staged = self.staged_copy(source)?;
@@ -1799,7 +1802,9 @@ impl Storage {
     fn staged_copy(&self, source: &Connection) -> Result<Storage> {
         let mut staged = Storage {
             // An empty path opens a private temporary database: on disk once
-            // it outgrows the page cache, and deleted when it is closed.
+            // it outgrows the page cache (in memory throughout on encryption
+            // builds, whose SQLCipher keeps temporary databases there), and
+            // deleted when it is closed.
             conn: Connection::open("")?,
             metadata_cache: RefCell::new(HashMap::new()),
             // A countdown armed on this database fires in the migration that
@@ -2161,8 +2166,8 @@ fn row_to_metadata(row: &rusqlite::Row) -> rusqlite::Result<TableMetadata> {
 const BACKUP_LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// How long a backup keeps retrying a busy or locked database before giving
-/// up: the same patience as a connection's busy timeout, and shorter under
-/// test so a test of the limit runs quickly.
+/// up, by the clock: the same patience as a connection's busy timeout, and
+/// shorter under test so a test of the limit runs quickly.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 const BACKUP_LOCK_PATIENCE: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_millis(200)
@@ -2170,31 +2175,132 @@ const BACKUP_LOCK_PATIENCE: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(5)
 };
 
+/// How many times a backup starts over, because another connection changed
+/// the database being copied, before it gives up.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+const BACKUP_RESTART_LIMIT: u32 = 50;
+
+/// What one backup step reported, as far as [`BackupWatch`] cares.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BackupStep {
+    Done,
+    /// Pages copied and more to go; `remaining` is what's left to copy.
+    More {
+        remaining: i32,
+    },
+    /// The database was busy or locked.
+    Busy,
+}
+
+/// What [`run_backup`] does next.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BackupNext {
+    Finish,
+    Step,
+    Pause,
+    GiveUpLocked,
+    GiveUpRestarting,
+}
+
+/// The bookkeeping behind [`run_backup`]: how long the database has been
+/// busy, by the clock, and how often the copy has started over.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+#[derive(Default)]
+struct BackupWatch {
+    busy_since: Option<std::time::Instant>,
+    last_remaining: Option<i32>,
+    restarts: u32,
+}
+
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+impl BackupWatch {
+    /// Decide what follows a step that started at `started` and ended at `now`.
+    ///
+    /// A busy spell is timed from the start of the first step that found the
+    /// database busy, so the time SQLite's own busy handler spends inside that
+    /// step counts towards the patience. Progress ends the spell. A copy whose
+    /// remaining page count goes back up has started over, which SQLite does
+    /// when another connection changes the database being copied.
+    fn observe(
+        &mut self,
+        step: BackupStep,
+        started: std::time::Instant,
+        now: std::time::Instant,
+        patience: std::time::Duration,
+    ) -> BackupNext {
+        match step {
+            BackupStep::Done => BackupNext::Finish,
+            BackupStep::More { remaining } => {
+                self.busy_since = None;
+                if self.last_remaining.is_some_and(|last| remaining > last) {
+                    self.restarts += 1;
+                    if self.restarts > BACKUP_RESTART_LIMIT {
+                        return BackupNext::GiveUpRestarting;
+                    }
+                }
+                self.last_remaining = Some(remaining);
+                BackupNext::Step
+            }
+            BackupStep::Busy => {
+                let since = *self.busy_since.get_or_insert(started);
+                if now.saturating_duration_since(since) >= patience {
+                    BackupNext::GiveUpLocked
+                } else {
+                    BackupNext::Pause
+                }
+            }
+        }
+    }
+}
+
 /// Copy every remaining page through `backup`.
 ///
-/// Steps run back to back while they make progress. A busy or locked
-/// database is retried every [`BACKUP_LOCK_PAUSE`] for up to
-/// [`BACKUP_LOCK_PATIENCE`] and then reported as locked, rather than spun on
-/// at full CPU for as long as the lock lasts, or slept on after every step.
+/// Steps run back to back while they make progress. A busy or locked database
+/// is retried every [`BACKUP_LOCK_PAUSE`] until it has been busy for
+/// [`BACKUP_LOCK_PATIENCE`] by the clock, then reported as locked. A step can
+/// overrun that by up to one busy-timeout wait of its own inside SQLite. A
+/// copy that keeps starting over because the database being copied keeps
+/// changing gives up after [`BACKUP_RESTART_LIMIT`] restarts.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 fn run_backup(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<()> {
     use rusqlite::backup::StepResult;
-    let mut waited = std::time::Duration::ZERO;
+    let mut watch = BackupWatch::default();
     loop {
-        match backup.step(100)? {
-            StepResult::Done => return Ok(()),
-            StepResult::More => {}
+        let started = std::time::Instant::now();
+        let step = match backup.step(100)? {
+            StepResult::Done => BackupStep::Done,
+            StepResult::More => BackupStep::More {
+                remaining: backup.progress().remaining,
+            },
             // Busy, Locked and any later variant: wait and retry, within limits.
-            _ => {
-                if waited >= BACKUP_LOCK_PATIENCE {
-                    return Err(rusqlite::Error::SqliteFailure(
-                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                        Some("database is locked".to_string()),
-                    )
-                    .into());
-                }
-                std::thread::sleep(BACKUP_LOCK_PAUSE);
-                waited += BACKUP_LOCK_PAUSE;
+            _ => BackupStep::Busy,
+        };
+        match watch.observe(
+            step,
+            started,
+            std::time::Instant::now(),
+            BACKUP_LOCK_PATIENCE,
+        ) {
+            BackupNext::Finish => return Ok(()),
+            BackupNext::Step => {}
+            BackupNext::Pause => std::thread::sleep(BACKUP_LOCK_PAUSE),
+            BackupNext::GiveUpLocked => {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some("database is locked".to_string()),
+                )
+                .into());
+            }
+            BackupNext::GiveUpRestarting => {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some(format!(
+                        "the database being copied kept changing; gave up after {BACKUP_RESTART_LIMIT} restarts"
+                    )),
+                )
+                .into());
             }
         }
     }
@@ -3090,11 +3196,12 @@ mod tests {
             .execute_batch("BEGIN EXCLUSIVE; INSERT INTO t VALUES (2);")
             .unwrap();
 
+        // The copier keeps the connection's default busy timeout, so a busy
+        // step waits inside SQLite too, and the patience counts that time.
         let (done, outcome) = std::sync::mpsc::channel();
         let copier_path = path.clone();
         std::thread::spawn(move || {
             let source = Connection::open(&copier_path).unwrap();
-            source.busy_timeout(std::time::Duration::ZERO).unwrap();
             let mut dest = Connection::open_in_memory().unwrap();
             let result = rusqlite::backup::Backup::new(&source, &mut dest)
                 .map_err(DynoxideError::from)
@@ -3102,12 +3209,148 @@ mod tests {
             let _ = done.send(result.map_err(|e| e.to_string()));
         });
 
+        // The first busy step waits out SQLite's busy timeout (5 s), which is
+        // already past the patience under test, so the copy gives up after
+        // about five seconds.
         let result = outcome
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("a backup of a locked source must give up, not spin until the lock goes");
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("a backup of a locked source must give up within its patience");
         let err = result.expect_err("the source stayed locked, so the copy must fail");
         assert!(err.contains("locked") || err.contains("busy"), "{err}");
         drop(holder);
+    }
+
+    /// A source locked briefly by another connection, released after `hold`.
+    fn briefly_locked_source(hold: std::time::Duration) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("briefly-locked.db");
+        let path = path.to_str().unwrap().to_string();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode = DELETE; CREATE TABLE t (v); INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+        }
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        let holder_path = path.clone();
+        std::thread::spawn(move || {
+            let holder = Connection::open(&holder_path).unwrap();
+            holder
+                .execute_batch("BEGIN EXCLUSIVE; INSERT INTO t VALUES (2);")
+                .unwrap();
+            let _ = locked.send(());
+            std::thread::sleep(hold);
+            holder.execute_batch("COMMIT").unwrap();
+        });
+        is_locked.recv().unwrap();
+        (dir, path)
+    }
+
+    fn copy_rows(source: &Connection) -> Result<i64> {
+        let mut dest = Connection::open_in_memory().unwrap();
+        {
+            let backup = rusqlite::backup::Backup::new(source, &mut dest)?;
+            run_backup(&backup)?;
+        }
+        Ok(dest.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))?)
+    }
+
+    #[test]
+    fn a_backup_waits_out_a_short_lock() {
+        let (_dir, path) = briefly_locked_source(std::time::Duration::from_millis(50));
+        // SQLite's own busy wait covers a short lock.
+        let source = Connection::open(&path).unwrap();
+        assert_eq!(
+            copy_rows(&source).unwrap(),
+            2,
+            "the copy sees the committed row"
+        );
+    }
+
+    #[test]
+    fn a_backup_retries_a_lock_that_clears() {
+        let (_dir, path) = briefly_locked_source(std::time::Duration::from_millis(50));
+        // With no busy wait inside SQLite, the retry loop is what waits.
+        let source = Connection::open(&path).unwrap();
+        source.busy_timeout(std::time::Duration::ZERO).unwrap();
+        assert_eq!(
+            copy_rows(&source).unwrap(),
+            2,
+            "the copy sees the committed row"
+        );
+    }
+
+    #[test]
+    fn a_backup_watch_times_a_busy_spell_from_the_step_that_found_it() {
+        let patience = std::time::Duration::from_secs(5);
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        let mut watch = BackupWatch::default();
+        // The first busy step spent 4.9 s waiting inside SQLite: still patient.
+        assert_eq!(
+            watch.observe(BackupStep::Busy, at(0), at(4_900), patience),
+            BackupNext::Pause
+        );
+        // The next busy step ends past five seconds from the first one's start.
+        assert_eq!(
+            watch.observe(BackupStep::Busy, at(4_910), at(5_000), patience),
+            BackupNext::GiveUpLocked
+        );
+        // Progress ends a spell, so the next busy spell is timed afresh.
+        let mut watch = BackupWatch::default();
+        assert_eq!(
+            watch.observe(BackupStep::Busy, at(0), at(4_000), patience),
+            BackupNext::Pause
+        );
+        assert_eq!(
+            watch.observe(
+                BackupStep::More { remaining: 10 },
+                at(4_010),
+                at(4_020),
+                patience
+            ),
+            BackupNext::Step
+        );
+        assert_eq!(
+            watch.observe(BackupStep::Busy, at(4_030), at(8_000), patience),
+            BackupNext::Pause
+        );
+        assert_eq!(
+            watch.observe(BackupStep::Done, at(8_010), at(8_020), patience),
+            BackupNext::Finish
+        );
+    }
+
+    #[test]
+    fn a_backup_watch_gives_up_on_a_copy_that_keeps_starting_over() {
+        let patience = std::time::Duration::from_secs(5);
+        let t = std::time::Instant::now();
+        let mut watch = BackupWatch::default();
+        assert_eq!(
+            watch.observe(BackupStep::More { remaining: 100 }, t, t, patience),
+            BackupNext::Step
+        );
+        // Steady progress isn't a restart.
+        assert_eq!(
+            watch.observe(BackupStep::More { remaining: 50 }, t, t, patience),
+            BackupNext::Step
+        );
+        // Each jump back up is a restart; the limit's worth are tolerated.
+        for _ in 0..BACKUP_RESTART_LIMIT {
+            assert_eq!(
+                watch.observe(BackupStep::More { remaining: 100 }, t, t, patience),
+                BackupNext::Step
+            );
+            assert_eq!(
+                watch.observe(BackupStep::More { remaining: 50 }, t, t, patience),
+                BackupNext::Step
+            );
+        }
+        assert_eq!(
+            watch.observe(BackupStep::More { remaining: 100 }, t, t, patience),
+            BackupNext::GiveUpRestarting
+        );
     }
 
     #[test]

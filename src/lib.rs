@@ -224,18 +224,42 @@ impl TokenCaches {
         &self.execute_transaction
     }
 
-    /// Forget every cached transaction, for a restore that replaces the data
-    /// those results were computed against.
+    /// Lock both caches, for a restore that replaces the data their results
+    /// were computed against.
+    ///
+    /// A restore takes these before the storage lock, keeping the
+    /// cache-then-storage order [`run_idempotent`] relies on, and holds them
+    /// until the restore is done so no transaction can cache a result against
+    /// the data being replaced. A poisoned cache is still taken: it is about to
+    /// be emptied.
     #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-    pub(crate) fn clear(&self) {
-        self.transact_write
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.execute_transaction
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+    pub(crate) fn lock_all(&self) -> TokenCacheGuards<'_> {
+        TokenCacheGuards {
+            transact_write: self
+                .transact_write
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            execute_transaction: self
+                .execute_transaction
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+}
+
+/// Both token caches, held for the length of a restore.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+pub(crate) struct TokenCacheGuards<'a> {
+    transact_write: std::sync::MutexGuard<'a, TransactWriteTokenCache>,
+    execute_transaction: std::sync::MutexGuard<'a, ExecuteTransactionTokenCache>,
+}
+
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
+impl TokenCacheGuards<'_> {
+    /// Forget every cached transaction.
+    pub(crate) fn clear(&mut self) {
+        self.transact_write.clear();
+        self.execute_transaction.clear();
     }
 }
 
@@ -350,8 +374,9 @@ fn token_window() -> Duration {
 ///
 /// Lock ordering is cache-then-storage: `execute` takes the storage lock
 /// second, and nothing takes storage first and then a token cache, so there is
-/// no reverse path to deadlock against. Any future code touching both locks
-/// must keep this order.
+/// no reverse path to deadlock against. A restore takes both caches
+/// (transact-write, then execute-transaction) before storage. Any future code
+/// touching both locks must keep this order.
 ///
 /// A failed `execute` is propagated without caching, so a same-token retry
 /// re-executes.
@@ -1323,18 +1348,28 @@ impl Database<RusqliteBackend> {
     /// cached for idempotent retries and vector index creation windows are
     /// forgotten, as the data they described has been replaced.
     pub fn restore_from(&self, path: &str) -> Result<()> {
-        self.with_storage_mut(|s| {
-            s.restore_from(path)?;
-            self.forget_engine_state();
-            Ok(())
-        })
+        self.restore_with(|s| s.restore_from(path))
     }
 
-    /// Forget what this engine remembers about data a restore has replaced:
-    /// the idempotency caches and the vector index creation windows.
-    fn forget_engine_state(&self) {
-        self.tokens.clear();
-        self.vector_lifecycle.forget_all();
+    /// Run `restore` and forget what this engine remembers about the data it
+    /// replaced: the idempotency caches and the vector index creation windows.
+    ///
+    /// Lock ordering is cache-then-storage, as in [`run_idempotent`]: both
+    /// token caches are taken before the storage lock, never after it, so a
+    /// restore can't deadlock against a tokened transaction that holds its
+    /// cache and is waiting for storage. The vector lifecycle's lock is only
+    /// ever taken briefly inside the storage lock, as it is here.
+    fn restore_with(
+        &self,
+        restore: impl FnOnce(&mut storage::Storage) -> Result<()>,
+    ) -> Result<()> {
+        let mut tokens = self.tokens.lock_all();
+        self.with_storage_mut(|s| {
+            restore(s)?;
+            tokens.clear();
+            self.vector_lifecycle.forget_all();
+            Ok(())
+        })
     }
 
     /// Backup the current database to a new in-memory SQLite connection.
@@ -1353,11 +1388,7 @@ impl Database<RusqliteBackend> {
     /// [`Database::restore_from`] does.
     #[cfg(feature = "mcp-server")]
     pub(crate) fn restore_from_connection(&self, source: &rusqlite::Connection) -> Result<()> {
-        self.with_storage_mut(|s| {
-            s.restore_from_connection(source)?;
-            self.forget_engine_state();
-            Ok(())
-        })
+        self.restore_with(|s| s.restore_from_connection(source))
     }
 }
 
@@ -1533,6 +1564,102 @@ impl Database<WasmBridgeBackend> {
 #[cfg(all(test, any(feature = "native-sqlite", feature = "_has-encryption")))]
 mod tests {
     use super::*;
+
+    /// A database with one table and a snapshot of it, for the restore tests.
+    fn database_with_snapshot(dir: &tempfile::TempDir) -> (Database, String) {
+        let snapshot = dir.path().join("before.db");
+        let snapshot = snapshot.to_str().unwrap().to_string();
+        let db = Database::memory().unwrap();
+        db.create_table(
+            serde_json::from_value(serde_json::json!({
+                "TableName": "tbl",
+                "BillingMode": "PAY_PER_REQUEST",
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        db.vacuum_into(&snapshot).unwrap();
+        (db, snapshot)
+    }
+
+    /// Stand in for a tokened transaction that has taken its cache (the first
+    /// half of `run_idempotent`), let `restore` run on another thread, then
+    /// take the storage lock (the transaction's second half). The storage step
+    /// must not end up waiting on a restore that is itself waiting on the
+    /// cache this thread holds.
+    fn assert_restore_keeps_cache_then_storage_order<T: Send + 'static>(
+        db: &Database,
+        cache: &Mutex<TokenCache<T>>,
+        restore: impl FnOnce(Database) -> Result<()> + Send + 'static,
+    ) {
+        let held = cache.lock().unwrap();
+        let restorer = {
+            let db = db.clone();
+            std::thread::spawn(move || restore(db))
+        };
+        // Long enough for the restore to take whatever it takes first.
+        std::thread::sleep(Duration::from_millis(200));
+        let (sent, got) = std::sync::mpsc::channel();
+        {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let _ = sent.send(db.with_storage(|_| Ok(())).is_ok());
+            });
+        }
+        let storage_step = got.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        assert!(
+            matches!(storage_step, Ok(true)),
+            "a transaction holding its token cache must still get the storage lock while a restore waits"
+        );
+        restorer
+            .join()
+            .unwrap()
+            .expect("the restore finishes once the cache is free");
+    }
+
+    #[test]
+    fn a_restore_cannot_deadlock_against_a_tokened_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, snapshot) = database_with_snapshot(&dir);
+        let path = snapshot.clone();
+        assert_restore_keeps_cache_then_storage_order(&db, &db.tokens.transact_write, move |db| {
+            db.restore_from(&path)
+        });
+        assert_restore_keeps_cache_then_storage_order(
+            &db,
+            &db.tokens.execute_transaction,
+            move |db| db.restore_from(&snapshot),
+        );
+    }
+
+    #[cfg(feature = "mcp-server")]
+    #[test]
+    fn a_connection_restore_cannot_deadlock_against_a_tokened_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = database_with_snapshot(&dir);
+        for cache in [0, 1] {
+            let restore = move |db: Database| {
+                let copy = db.backup_to_memory()?;
+                db.restore_from_connection(&copy)
+            };
+            if cache == 0 {
+                assert_restore_keeps_cache_then_storage_order(
+                    &db,
+                    &db.tokens.transact_write,
+                    restore,
+                );
+            } else {
+                assert_restore_keeps_cache_then_storage_order(
+                    &db,
+                    &db.tokens.execute_transaction,
+                    restore,
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_restore_forgets_cached_transactions_and_vector_windows() {
