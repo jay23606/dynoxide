@@ -314,31 +314,24 @@ pub fn track_references(
     expr: &UpdateExpr,
     tracker: &TrackedExpressionAttributes,
 ) -> Result<(), String> {
-    // Collect all target paths for overlap/conflict detection
-    let mut all_target_paths: Vec<Vec<PathElement>> = Vec::new();
-
     for action in &expr.set_actions {
         track_path_refs(&action.path, tracker)?;
         track_set_value_refs(&action.value, tracker)?;
-        all_target_paths.push(resolve_tracked_path(&action.path, tracker));
     }
     for path in &expr.remove_actions {
         track_path_refs(path, tracker)?;
-        all_target_paths.push(resolve_tracked_path(path, tracker));
     }
     for action in &expr.add_actions {
         track_path_refs(&action.path, tracker)?;
         let val = tracker.resolve_value(&action.value_ref)?;
         // Validate ADD operand type statically
         validate_add_type(val)?;
-        all_target_paths.push(resolve_tracked_path(&action.path, tracker));
     }
     for action in &expr.delete_actions {
         track_path_refs(&action.path, tracker)?;
         let val = tracker.resolve_value(&action.value_ref)?;
         // Validate DELETE operand type statically
         validate_delete_type(val)?;
-        all_target_paths.push(resolve_tracked_path(&action.path, tracker));
     }
 
     // Static type validation for SET value expressions
@@ -346,10 +339,26 @@ pub fn track_references(
         validate_set_value_types(&action.value, tracker)?;
     }
 
-    // Check for overlapping/conflicting paths
-    check_path_overlaps(&all_target_paths)?;
+    check_target_overlaps(expr, tracker)
+}
 
-    Ok(())
+/// Refuse an update whose target paths overlap or conflict, as DynamoDB does
+/// on UpdateItem and on a TransactWriteItems Update (captured eu-west-2 and
+/// us-east-1, 2026-10-09). Names resolve through `tracker`; no value is read.
+pub fn check_target_overlaps(
+    expr: &UpdateExpr,
+    tracker: &TrackedExpressionAttributes,
+) -> Result<(), String> {
+    let paths: Vec<Vec<PathElement>> = expr
+        .set_actions
+        .iter()
+        .map(|action| &action.path)
+        .chain(&expr.remove_actions)
+        .chain(expr.add_actions.iter().map(|action| &action.path))
+        .chain(expr.delete_actions.iter().map(|action| &action.path))
+        .map(|path| resolve_tracked_path(path, tracker))
+        .collect();
+    check_path_overlaps(&paths)
 }
 
 /// Validate that an ADD operand has a compatible type.
@@ -500,7 +509,8 @@ fn resolve_tracked_path(
         .collect()
 }
 
-/// Check for overlapping or conflicting document paths.
+/// Check for overlapping or conflicting document paths, naming the two in the
+/// order they were written (captured eu-west-2 and us-east-1, 2026-10-09).
 ///
 /// Two paths overlap if one is a prefix of the other (e.g., `a.b` and `a.b.c`).
 /// Two paths conflict if they share elements but diverge in type at the same
@@ -528,13 +538,12 @@ fn check_path_overlaps(paths: &[Vec<PathElement>]) -> Result<(), String> {
 
             // If one path is a prefix of the other, they overlap
             if common == a.len() || common == b.len() {
-                let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
                 return Err(format!(
                     "Invalid UpdateExpression: Two document paths overlap with each other; \
                      must remove or rewrite one of these paths; \
                      path one: {}, path two: {}",
-                    format_path_for_error(longer),
-                    format_path_for_error(shorter)
+                    format_path_for_error(a),
+                    format_path_for_error(b)
                 ));
             }
 

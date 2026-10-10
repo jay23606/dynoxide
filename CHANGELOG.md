@@ -555,6 +555,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the syntax error naming that character, in every expression and in
   transactions, and so is a no-break space, which DynamoDB doesn't treat as
   whitespace. Captured against eu-west-2 and us-east-1.
+- A `TransactWriteItems` Update whose SET paths overlap, such as
+  `SET a.b = :v, a = :m`, is refused before anything is written, with
+  DynamoDB's "Two document paths overlap" message, where it used to be
+  applied. `UpdateItem` names the two paths in the order they were written.
+  Captured against eu-west-2 and us-east-1.
 
 ## [1.2.1] - 2026-09-20
 

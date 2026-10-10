@@ -744,6 +744,10 @@ fn validate_expression_references(
     let tracker = crate::expressions::TrackedExpressionAttributes::new(names, values);
     if let Some(update) = update {
         tracker.track_update_expr(update);
+        // Overlapping target paths are refused here, before anything is
+        // written, without the envelope UpdateItem's carries.
+        crate::expressions::update::check_target_overlaps(update, &tracker)
+            .map_err(DynoxideError::ValidationException)?;
     }
     if let Some(condition) = condition {
         // Syntax has already been checked, so this parses.
