@@ -70,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covers the item tools, `query`, `scan`, `search_vectors`, `batch_get_item`,
   `batch_write_item`, both transaction tools and the three PartiQL tools. Any
   other value is refused with DynamoDB's validation error.
+- The MCP `execute_partiql` tool takes `return_values_on_condition_check_failure`
+  (`ALL_OLD` or `NONE`), as `ExecuteStatement` does. A tool error for a failed
+  condition now carries the item the condition was evaluated against when
+  `ALL_OLD` was asked for, on `execute_partiql` and on the item tools, which
+  took the argument before but never handed the item back.
 - `--log quiet` suppresses informational startup and shutdown messages on
   stderr. It works on `serve` and the no-subcommand form, `serve --mcp`, `mcp`
   (stdio and `--http`), and `import --serve` or `--mcp`. Warnings, errors, the

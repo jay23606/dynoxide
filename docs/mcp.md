@@ -158,6 +158,21 @@ The single-item tools, `query`, `scan` and `execute_partiql` return one object. 
 
 When `--max-items` caps a `query` or `scan`, the figure is for the capped read, because that is the read that ran. On `query`, `scan` and `search_vectors` the block counts towards `--max-size-bytes`, so a page that only just fitted can be refused once capacity is asked for.
 
+## Failed conditions
+
+`put_item`, `update_item`, `delete_item` and `execute_partiql` take an optional `return_values_on_condition_check_failure`, with the values `ReturnValuesOnConditionCheckFailure` takes on the wire: `ALL_OLD` or `NONE`. With `ALL_OLD`, a write whose condition fails comes back as a `ConditionalCheckFailedException` tool error that also carries the item the condition was evaluated against, under `item`:
+
+```json
+{
+  "error_type": "ConditionalCheckFailedException",
+  "message": "The conditional request failed",
+  "retryable": false,
+  "item": {"pk": {"S": "user#1"}, "version": {"N": "3"}}
+}
+```
+
+On `execute_partiql` that covers an UPDATE or DELETE whose WHERE condition is false for an item that exists. Leaving the argument out is the same as `NONE`, and any other value is refused with DynamoDB's validation error.
+
 ## Logging
 
 `--log quiet` suppresses the `MCP HTTP server listening on ...` line and the

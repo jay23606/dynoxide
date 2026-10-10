@@ -416,6 +416,94 @@ fn an_item_tool_reads_bool_and_null_strings_as_dynamodb_does() {
     let _ = child.wait();
 }
 
+/// `return_values_on_condition_check_failure` on `execute_partiql` is
+/// ExecuteStatement's `ReturnValuesOnConditionCheckFailure`: `ALL_OLD` hands
+/// back the item an UPDATE or DELETE failed its condition on, `NONE` doesn't,
+/// and anything else is refused in DynamoDB's words (captured eu-west-2 and
+/// us-east-1, 2026-10-10). The item tools' `ALL_OLD` hands it back the same
+/// way.
+#[test]
+fn a_failed_condition_hands_back_the_item_when_asked() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+    call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Guarded",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}]
+        }),
+    );
+    let stored = json!({"pk": {"S": "a"}, "v": {"N": "1"}});
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Guarded", "item": stored}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let update = r#"UPDATE "Guarded" SET w = 1 WHERE pk = 'a' AND v = 99"#;
+    let resp = call_tool(
+        &mut child,
+        3,
+        "execute_partiql",
+        json!({"statement": update, "return_values_on_condition_check_failure": "ALL_OLD"}),
+    );
+    assert!(is_tool_error(&resp), "{resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ConditionalCheckFailedException");
+    assert_eq!(content["message"], "The conditional request failed");
+    assert_eq!(content["item"], stored);
+
+    for (id, mode) in [(4, json!("NONE")), (5, Value::Null)] {
+        let mut args = json!({"statement": update});
+        if !mode.is_null() {
+            args["return_values_on_condition_check_failure"] = mode.clone();
+        }
+        let resp = call_tool(&mut child, id, "execute_partiql", args);
+        assert!(is_tool_error(&resp), "{resp}");
+        let content = tool_content(&resp);
+        assert_eq!(content["error_type"], "ConditionalCheckFailedException");
+        assert!(content.get("item").is_none(), "{mode}: {content}");
+    }
+
+    let resp = call_tool(
+        &mut child,
+        6,
+        "execute_partiql",
+        json!({"statement": update, "return_values_on_condition_check_failure": "BOGUS"}),
+    );
+    assert!(is_tool_error(&resp), "{resp}");
+    let content = tool_content(&resp);
+    assert_eq!(content["error_type"], "ValidationException");
+    assert_eq!(
+        content["message"],
+        "1 validation error detected: Value 'BOGUS' at \
+         'returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must \
+         satisfy enum value set: [ALL_OLD, NONE]"
+    );
+
+    let resp = call_tool(
+        &mut child,
+        7,
+        "put_item",
+        json!({
+            "table_name": "Guarded",
+            "item": {"pk": {"S": "a"}, "v": {"N": "2"}},
+            "condition_expression": "attribute_not_exists(pk)",
+            "return_values_on_condition_check_failure": "ALL_OLD"
+        }),
+    );
+    assert!(is_tool_error(&resp), "{resp}");
+    assert_eq!(tool_content(&resp)["item"], stored);
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 #[test]
 fn the_instructions_say_capacity_can_be_requested() {
     let mut child = spawn_mcp();

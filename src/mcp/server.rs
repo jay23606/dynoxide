@@ -618,6 +618,13 @@ pub struct ExecutePartiqlParams {
     )]
     #[serde(default)]
     pub return_consumed_capacity: Option<String>,
+
+    #[schemars(
+        description = "What to return when an UPDATE or DELETE fails its WHERE condition: ALL_OLD hands back the item the condition was evaluated against as the error's item; NONE, the default, does not. Any other value is rejected with a ValidationException.",
+        extend("enum" = ["ALL_OLD", "NONE"])
+    )]
+    #[serde(default)]
+    pub return_values_on_condition_check_failure: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1798,7 +1805,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Execute a PartiQL statement. Supports SELECT (with LIMIT, nested paths), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. UPDATE and DELETE accept a RETURNING clause, surfaced in the response Items: DELETE allows only RETURNING ALL OLD * (returning the deleted item; other variants are rejected), UPDATE allows all four RETURNING <ALL|MODIFIED> <OLD|NEW> * variants. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, AND, OR, NOT, parenthesised grouping up to 64 levels deep, and nested paths; AND binds tighter than OR, and a NOT over a group is applied by De Morgan. An index is named in the FROM clause as \"table\".\"index\", which serves the read from that GSI or LSI on SELECT only; a write statement rejects the qualifier. Write statements are blocked in read-only mode."
+        description = "Execute a PartiQL statement. Supports SELECT (with LIMIT, nested paths), INSERT (with IF NOT EXISTS, parameter placeholders), UPDATE (with SET arithmetic, REMOVE, nested paths), DELETE. UPDATE and DELETE accept a RETURNING clause, surfaced in the response Items: DELETE allows only RETURNING ALL OLD * (returning the deleted item; other variants are rejected), UPDATE allows all four RETURNING <ALL|MODIFIED> <OLD|NEW> * variants. WHERE supports BETWEEN, IN, CONTAINS, IS MISSING, IS NOT MISSING, AND, OR, NOT, parenthesised grouping up to 64 levels deep, and nested paths; AND binds tighter than OR, and a NOT over a group is applied by De Morgan. An index is named in the FROM clause as \"table\".\"index\", which serves the read from that GSI or LSI on SELECT only; a write statement rejects the qualifier. An UPDATE or DELETE whose WHERE condition fails is a ConditionalCheckFailedException; with return_values_on_condition_check_failure set to ALL_OLD the error carries the item the condition was evaluated against. Write statements are blocked in read-only mode."
     )]
     fn execute_partiql(
         &self,
@@ -1856,7 +1863,8 @@ impl McpServer {
             next_token: params.next_token,
             consistent_read: params.consistent_read,
             return_consumed_capacity: params.return_consumed_capacity,
-            ..Default::default()
+            return_values_on_condition_check_failure: params
+                .return_values_on_condition_check_failure,
         };
         match self.db.execute_statement(request) {
             Ok(resp) => json_result(&resp),
