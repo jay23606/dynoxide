@@ -813,9 +813,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TransactGetItems` as `TransactWriteItem(...)` and `TransactGetItem(...)`,
   every field named, where they echoed nothing or Dynoxide's own debugging
   form. An attribute map in any of these echoes, and in `BatchWriteItem`'s,
-  lists its entries in the order of a Java hash map, as DynamoDB's do, rather
-  than by name. Captured against us-east-1, eu-west-1 and us-west-2 (eu-west-2
-  echoes no action list).
+  lists its entries in the order of a Java hash map sized to its entries, as
+  DynamoDB's do, rather than by name: an item, a nested map or
+  `ExpressionAttributeNames` of 2 to 6 entries is laid out over four or eight
+  buckets, not sixteen. Entries that share a bucket are listed in name order,
+  where DynamoDB keeps the order they were sent in. Captured against
+  us-east-1, eu-west-1 and us-west-2 (eu-west-2 echoes no action list), the
+  map sizes against us-east-1 and eu-west-2.
 - A PartiQL WHERE clause's alternatives are held to 16,384 condition slots
   between them, where each alternative was already held to 4,096. Every slot is
   evaluated against every item read, and a clause of a few hundred operators

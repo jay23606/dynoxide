@@ -402,6 +402,7 @@ DynamoDB Local fails a share of the suite that real DynamoDB passes, clustered i
 - **Single-shard stream model** - DescribeStream returns a single shard; `ExclusiveStartShardId` and `Limit` accepted but ignored
 - **Number arithmetic precision** - uses `rust_decimal` for arbitrary-precision arithmetic, which may have minor differences from DynamoDB's proprietary implementation at extreme edge cases
 - **Transaction contention errors** - `TransactionConflictException` and `TransactionInProgressException` not emulated (concurrent transaction contention doesn't apply to single-process emulator)
+- **Map order in a refused request's echo** - when a request too long to accept is echoed back in its error (`BatchWriteItem` over 25 requests, a transaction over 100 actions), each map lists its entries in the order of the Java hash map DynamoDB reads it into, sized to the map. Two entries that land in the same bucket are listed in the order they were sent on DynamoDB, and in name order on Dynoxide, which no longer has the order they were sent in once the request is read
 
 ### Where AWS answers the same request differently
 

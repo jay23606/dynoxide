@@ -257,3 +257,235 @@ fn a_get_list_over_100_is_echoed_in_the_java_form() {
         34969,
     );
 }
+
+/// The names of the map that opens at `start` in `message` (just after its
+/// `{`), in the order the echo lists them.
+fn echoed_names(message: &str, start: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut depth = 0usize;
+    let mut name = String::new();
+    for c in message[start..].chars() {
+        match c {
+            '{' | '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '}' if depth == 0 => break,
+            '}' => depth -= 1,
+            '=' if depth == 0 && !name.is_empty() => names.push(std::mem::take(&mut name)),
+            ',' if depth == 0 => name.clear(),
+            ' ' if depth == 0 => {}
+            _ if depth == 0 => name.push(c),
+            _ => {}
+        }
+    }
+    names
+}
+
+/// An echoed map is a Java `HashMap` sized to its entries (`new HashMap<>(n)`),
+/// so its names come out in the buckets of a table of 2, 4, 8, 16, 32, 64 or
+/// 128 as the count grows, never a default table of sixteen. Each `sent` list
+/// is the capture's request, in the order it was sent, and each `listed` list
+/// is DynamoDB's echo of it (us-east-1 and eu-west-2, 2026-10-10), except
+/// that names sharing a bucket are listed here in name order: DynamoDB keeps
+/// them in the order they were sent, which a decoded request no longer holds.
+#[test]
+fn an_echoed_map_is_sized_to_its_entries() {
+    let cases: [(&[&str], &[&str]); 11] = [
+        (&["bkem", "pk"], &["bkem", "pk"]),
+        (&["a001", "a000", "pk"], &["a001", "a000", "pk"]),
+        (
+            &["bcsb", "bdrw", "bugl", "pk"],
+            &["bdrw", "pk", "bcsb", "bugl"],
+        ),
+        (
+            &["bsol", "byko", "bvrn", "btgp", "pk"],
+            &["bsol", "pk", "btgp", "byko", "bvrn"],
+        ),
+        (
+            &["bkxo", "bjqp", "bhcs", "bfwy", "bjhz", "pk"],
+            &["bfwy", "bhcs", "bjqp", "pk", "bjhz", "bkxo"],
+        ),
+        (
+            &[
+                "a010", "a009", "a008", "a007", "a006", "a005", "a004", "a003", "a002", "a001",
+                "a000", "pk",
+            ],
+            &[
+                "a010", "a000", "a009", "a005", "a006", "a007", "a008", "pk", "a001", "a002",
+                "a003", "a004",
+            ],
+        ),
+        (
+            &[
+                "a011", "a010", "a009", "a008", "a007", "a006", "a005", "a004", "a003", "a002",
+                "a001", "a000", "pk",
+            ],
+            &[
+                "a010", "a000", "a011", "a009", "a005", "a006", "a007", "a008", "pk", "a001",
+                "a002", "a003", "a004",
+            ],
+        ),
+        (
+            &[
+                "a022", "a021", "a020", "a019", "a018", "a017", "a016", "a015", "a014", "a013",
+                "a012", "a011", "a010", "a009", "a008", "a007", "a006", "a005", "a004", "a003",
+                "a002", "a001", "a000", "pk",
+            ],
+            &[
+                "a020", "a010", "a021", "a000", "a011", "a022", "a009", "a005", "a016", "a006",
+                "a017", "a007", "a018", "a008", "a019", "pk", "a001", "a012", "a002", "a013",
+                "a003", "a014", "a004", "a015",
+            ],
+        ),
+        (
+            &[
+                "a023", "a022", "a021", "a020", "a019", "a018", "a017", "a016", "a015", "a014",
+                "a013", "a012", "a011", "a010", "a009", "a008", "a007", "a006", "a005", "a004",
+                "a003", "a002", "a001", "a000", "pk",
+            ],
+            &[
+                "a020", "a021", "a000", "a022", "a009", "a005", "a006", "a007", "a008", "a001",
+                "a023", "a002", "a003", "a004", "a010", "a011", "a016", "a017", "a018", "a019",
+                "pk", "a012", "a013", "a014", "a015",
+            ],
+        ),
+        (
+            &[
+                "a046", "a045", "a044", "a043", "a042", "a041", "a040", "a039", "a038", "a037",
+                "a036", "a035", "a034", "a033", "a032", "a031", "a030", "a029", "a028", "a027",
+                "a026", "a025", "a024", "a023", "a022", "a021", "a020", "a019", "a018", "a017",
+                "a016", "a015", "a014", "a013", "a012", "a011", "a010", "a009", "a008", "a007",
+                "a006", "a005", "a004", "a003", "a002", "a001", "a000", "pk",
+            ],
+            &[
+                "a041", "a020", "a042", "a021", "a043", "a000", "a022", "a044", "a040", "a009",
+                "a005", "a027", "a006", "a028", "a007", "a029", "a008", "a001", "a023", "a045",
+                "a002", "a024", "a046", "a003", "a025", "a004", "a026", "a030", "a031", "a010",
+                "a032", "a011", "a033", "a016", "a038", "a017", "a039", "a018", "a019", "pk",
+                "a012", "a034", "a013", "a035", "a014", "a036", "a015", "a037",
+            ],
+        ),
+        (
+            &[
+                "a047", "a046", "a045", "a044", "a043", "a042", "a041", "a040", "a039", "a038",
+                "a037", "a036", "a035", "a034", "a033", "a032", "a031", "a030", "a029", "a028",
+                "a027", "a026", "a025", "a024", "a023", "a022", "a021", "a020", "a019", "a018",
+                "a017", "a016", "a015", "a014", "a013", "a012", "a011", "a010", "a009", "a008",
+                "a007", "a006", "a005", "a004", "a003", "a002", "a001", "a000", "pk",
+            ],
+            &[
+                "a041", "a042", "a043", "a000", "a044", "a040", "a009", "a005", "a006", "a007",
+                "a008", "a001", "a045", "a002", "a046", "a003", "a047", "a004", "a030", "a031",
+                "a032", "a033", "a038", "a039", "a034", "a035", "a036", "a037", "a020", "a021",
+                "a022", "a027", "a028", "a029", "a023", "a024", "a025", "a026", "a010", "a011",
+                "a016", "a017", "a018", "a019", "pk", "a012", "a013", "a014", "a015",
+            ],
+        ),
+    ];
+    let db = Database::memory().unwrap();
+    for (sent, listed) in cases {
+        let item: serde_json::Map<String, Value> = sent
+            .iter()
+            .map(|name| {
+                let value = if *name == "pk" {
+                    json!({"S": "k"})
+                } else {
+                    json!({"N": "1"})
+                };
+                (name.to_string(), value)
+            })
+            .collect();
+
+        let mut puts = vec![json!({"PutRequest": {"Item": item}})];
+        puts.extend(
+            (0..25).map(|i| json!({"PutRequest": {"Item": {"pk": {"S": format!("s{i}")}}}})),
+        );
+        let message = db
+            .batch_write_item(serde_json::from_value(json!({"RequestItems": {"t": puts}})).unwrap())
+            .unwrap_err()
+            .to_string();
+        let start = message.find("item={").unwrap() + "item={".len();
+        assert_eq!(
+            echoed_names(&message, start),
+            listed,
+            "batch, {} names",
+            sent.len()
+        );
+
+        let mut actions = vec![json!({"Put": {"TableName": "t", "Item": item}})];
+        actions.extend(
+            (0..100).map(
+                |i| json!({"Put": {"TableName": "t", "Item": {"pk": {"S": format!("s{i}")}}}}),
+            ),
+        );
+        let message = db
+            .transact_write_items(
+                serde_json::from_value::<TransactWriteItemsRequest>(
+                    json!({"TransactItems": actions}),
+                )
+                .unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
+        let start = message.find("item={").unwrap() + "item={".len();
+        assert_eq!(
+            echoed_names(&message, start),
+            listed,
+            "transaction, {} names",
+            sent.len()
+        );
+    }
+
+    // A nested map, and ExpressionAttributeNames, are sized the same way.
+    let sent = ["bsol", "byko", "bvrn", "btgp", "pk"];
+    let nested: serde_json::Map<String, Value> = sent
+        .iter()
+        .map(|name| (name.to_string(), json!({"N": "1"})))
+        .collect();
+    let mut puts = vec![json!({"PutRequest": {"Item": {
+        "pk": {"S": "nest"},
+        "m": {"M": nested}
+    }}})];
+    puts.extend((0..25).map(|i| json!({"PutRequest": {"Item": {"pk": {"S": format!("s{i}")}}}})));
+    let message = db
+        .batch_write_item(serde_json::from_value(json!({"RequestItems": {"t": puts}})).unwrap())
+        .unwrap_err()
+        .to_string();
+    let start = message.find(", m={").unwrap() + ", m={".len();
+    assert_eq!(
+        echoed_names(&message, start),
+        ["bsol", "pk", "btgp", "byko", "bvrn"]
+    );
+
+    let names: serde_json::Map<String, Value> = sent
+        .iter()
+        .map(|name| (format!("#{name}"), json!(name)))
+        .collect();
+    let condition = sent
+        .iter()
+        .map(|name| format!("attribute_not_exists(#{name})"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut actions = vec![json!({"Put": {
+        "TableName": "t",
+        "Item": {"pk": {"S": "n"}},
+        "ConditionExpression": condition,
+        "ExpressionAttributeNames": names
+    }})];
+    actions.extend(
+        (0..100)
+            .map(|i| json!({"Put": {"TableName": "t", "Item": {"pk": {"S": format!("s{i}")}}}})),
+    );
+    let message = db
+        .transact_write_items(
+            serde_json::from_value::<TransactWriteItemsRequest>(json!({"TransactItems": actions}))
+                .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+    let start =
+        message.find("expressionAttributeNames={").unwrap() + "expressionAttributeNames={".len();
+    assert_eq!(
+        echoed_names(&message, start),
+        ["#bvrn", "#bsol", "#btgp", "#byko", "#pk"]
+    );
+}

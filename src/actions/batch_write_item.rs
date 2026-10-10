@@ -678,17 +678,18 @@ fn write_write_request(out: &mut dyn std::fmt::Write, request: &WriteRequest) ->
     out.write_str(")")
 }
 
-/// A map's names in the order the Java model prints them: a hash map's
-/// iteration order, sixteen buckets doubling whenever more than three quarters
-/// full (captured us-east-1, eu-west-1 and us-west-2, 2026-10-10, on a
-/// transaction's item). Names sharing a bucket would keep the order they were
-/// sent in, which a decoded map no longer holds; they are taken in order of
-/// name.
+/// A map's names in the order the Java model prints them: the iteration order
+/// of a hash map sized to its entries (`new HashMap<>(n)`), so 1 name gives
+/// two buckets, 2 or 3 give four, 4 to 6 give eight, and so on up, doubling
+/// whenever more than three quarters full (captured us-east-1 and eu-west-2,
+/// 2026-10-10, for an item's attributes, a nested map and
+/// ExpressionAttributeNames, of 1 to 49 names). Names sharing a bucket keep the
+/// order they were sent in on DynamoDB, which a decoded map no longer holds;
+/// they are taken in order of name.
 fn java_map_order<'a, I: Iterator<Item = &'a String>>(names: I) -> Vec<&'a str> {
     let mut names: Vec<&str> = names.map(String::as_str).collect();
-    let capacity = crate::validation::java_table_capacity(16, names.len());
-    names.sort_by_cached_key(|name| (crate::validation::java_hash_bucket(name, capacity), *name));
-    names
+    names.sort_unstable();
+    crate::validation::java_hash_order(&names, true)
 }
 
 /// An attribute map, `{name=AttributeValue(...), ...}`, in the Java model's
