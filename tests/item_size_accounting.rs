@@ -399,8 +399,20 @@ fn an_update_can_never_store_an_item_over_the_hard_limit() {
 
 /// Run a PartiQL statement, returning the error text if it was refused.
 fn partiql(db: &Database, statement: String) -> Result<(), String> {
+    partiql_with(db, statement, Vec::new())
+}
+
+/// Run a PartiQL statement with `?` parameters. A value near 400KB has to
+/// travel as a parameter: DynamoDB refuses a statement over 8,192 characters
+/// before it reads it, so a literal that size never reaches the size check.
+fn partiql_with(
+    db: &Database,
+    statement: String,
+    parameters: Vec<AttributeValue>,
+) -> Result<(), String> {
     db.execute_statement(ExecuteStatementRequest {
         statement,
+        parameters: (!parameters.is_empty()).then_some(parameters),
         ..Default::default()
     })
     .map(|_| ())
@@ -415,17 +427,19 @@ fn the_partiql_write_paths_hold_the_item_size_limit() {
     let db = make_db();
     let over = "x".repeat(MAX_ITEM_SIZE + 1);
 
-    let err = partiql(
+    let err = partiql_with(
         &db,
-        format!("INSERT INTO \"Items\" VALUE {{'pk': 'k1', 'b': '{over}'}}"),
+        "INSERT INTO \"Items\" VALUE {'pk': 'k1', 'b': ?}".to_string(),
+        vec![AttributeValue::S(over.clone())],
     )
     .expect_err("INSERT over the limit");
     assert_eq!(err, "Item size has exceeded the maximum allowed size");
 
     partiql(&db, "INSERT INTO \"Items\" VALUE {'pk': 'k2'}".to_string()).unwrap();
-    let err = partiql(
+    let err = partiql_with(
         &db,
-        format!("UPDATE \"Items\" SET b = '{over}' WHERE pk = 'k2'"),
+        "UPDATE \"Items\" SET b = ? WHERE pk = 'k2'".to_string(),
+        vec![AttributeValue::S(over)],
     )
     .expect_err("UPDATE over the limit");
     assert_eq!(
@@ -452,9 +466,10 @@ fn a_partiql_update_is_measured_flat_like_an_insert() {
 
     // resulting item = pk (2 + 1) + "b" (1) + blob, landing exactly on the limit
     let blob = "x".repeat(MAX_ITEM_SIZE - 4);
-    partiql(
+    partiql_with(
         &db,
-        format!("UPDATE \"Items\" SET b = '{blob}' WHERE pk = 'k'"),
+        "UPDATE \"Items\" SET b = ? WHERE pk = 'k'".to_string(),
+        vec![AttributeValue::S(blob)],
     )
     .expect("PartiQL UPDATE accepts an item at the flat limit");
 
