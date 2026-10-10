@@ -617,6 +617,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of more than 100 statements, listed with the token and the statements rather
   than answering after them. The MCP `batch_execute_partiql` and
   `execute_transaction_partiql` tools list a bad mode the same way.
+- A PartiQL WHERE clause's alternatives are held to 16,384 condition slots
+  between them, where each alternative was already held to 4,096. Every slot is
+  evaluated against every item read, and a clause of a few hundred operators
+  could flatten to tens of thousands. The limit is Dynoxide's own, as DynamoDB
+  does not flatten a clause; a clause past it is refused as too complex.
 - A refused member echoed in a constraint message (`BatchWriteItem`'s and
   `BatchGetItem`'s request items, `BatchExecuteStatement`'s statements) stops
   at 1 MiB and ends `...`. The Java form these echoes take runs to about

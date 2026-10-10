@@ -3302,15 +3302,26 @@ const MAX_OR_GROUPS: usize = 256;
 /// are read in loops and don't spend depth.
 const MAX_EXPR_DEPTH: usize = 64;
 
-/// How many conditions a flattened clause may hold in total.
+/// How many conditions an AND product may hold.
 ///
 /// `MAX_OR_GROUPS` bounds the number of groups, not the conditions inside them,
 /// and a single group can be wide: `NOT a IN [...]` is one group of up to
 /// `MAX_IN_OPERANDS` leaves under De Morgan. A handful of negated conjunctions
 /// then repeats that group up to `MAX_OR_GROUPS` times, and every slot is a
-/// condition evaluated against every item read. Budgeting the total, before
-/// each step builds it, keeps that a rejection.
+/// condition evaluated against every item read. Each AND budgets its product
+/// before building it, which keeps that a rejection. It is per product, not
+/// per clause: an alternation of products is held to `MAX_OR_SLOTS` instead.
 const MAX_TOTAL_CONDITIONS: usize = 4096;
+
+/// How many conditions an alternation's arms may hold between them.
+///
+/// Each arm is already held to `MAX_TOTAL_CONDITIONS`, and alternatives side by
+/// side are no reason to refuse a statement DynamoDB runs, so the alternation
+/// gets four times that. It is still a bound: every slot is evaluated against
+/// every item read, and without one a clause of a few hundred operators could
+/// hold tens of thousands of slots. The limit is Dynoxide's own; DynamoDB
+/// evaluates the clause without flattening it and has no such limit.
+const MAX_OR_SLOTS: usize = 4 * MAX_TOTAL_CONDITIONS;
 
 /// The rejection every clause-complexity budget shares.
 const TOO_COMPLEX: &str = "WHERE clause is too complex to evaluate";
@@ -3395,24 +3406,31 @@ fn slots(groups: &Groups) -> usize {
 /// An AND works out how many groups and condition slots its product will hold
 /// before building it, and refuses a clause past `MAX_OR_GROUPS` or
 /// `MAX_TOTAL_CONDITIONS` then, so no product larger than the budget is ever
-/// built only to be thrown away. An OR caps only its groups: its arms are
-/// already within the slot budget each. The conditions themselves are shared,
-/// so a slot costs a pointer however long the path or literal it names.
+/// built only to be thrown away. An OR caps its groups and holds its arms'
+/// slots to `MAX_OR_SLOTS` between them, checking each arm before adding it.
+/// The conditions themselves are shared, so a slot costs a pointer however
+/// long the path or literal it names.
 fn to_dnf(tree: &ConditionTree) -> Result<Groups, String> {
     let too_complex = || Err(TOO_COMPLEX.to_string());
     match tree {
         ConditionTree::Leaf(cond) => Ok(vec![vec![Arc::clone(cond)]]),
         ConditionTree::Or(terms) => {
-            // Only the groups are capped here. Each arm has already held its
-            // own slots to the budget, and alternatives side by side are no
-            // reason to refuse: DynamoDB runs far wider alternations (captured
-            // eu-west-2, 2026-10-10).
+            // Each arm has already held its own slots to the per-product
+            // budget, and alternatives side by side are no reason to refuse:
+            // DynamoDB runs far wider alternations (captured eu-west-2,
+            // 2026-10-10). Together they are held to the looser `MAX_OR_SLOTS`,
+            // checked before each arm is added.
             let mut out: Groups = Vec::new();
+            let mut held = 0usize;
             for term in terms {
                 let term_groups = to_dnf(term)?;
-                if out.len().saturating_add(term_groups.len()) > MAX_OR_GROUPS {
+                let term_slots = slots(&term_groups);
+                if out.len().saturating_add(term_groups.len()) > MAX_OR_GROUPS
+                    || held.saturating_add(term_slots) > MAX_OR_SLOTS
+                {
                     return too_complex();
                 }
+                held += term_slots;
                 out.extend(term_groups);
             }
             Ok(out)
@@ -5170,11 +5188,17 @@ mod tests {
     /// 2026-10-10), and a bag handed to a condition function costs nothing
     /// beyond the call. The function's operand is read once, so its bag isn't
     /// charged twice either.
+    ///
+    /// Only the first two rows are captured. The function row follows from
+    /// the captured function-call count, and the IN row is inferred: it
+    /// asserts that IN itself costs nothing, and whether DynamoDB counts IN,
+    /// BETWEEN or IS toward the limit has not been captured.
     #[test]
     fn a_bag_literal_counts_no_operators() {
         assert_eq!(operators_in("pk = 'a' AND s = <<'x'>>"), 3);
         assert_eq!(operators_in("pk = 'a' AND s = <<'x', 'y'>>"), 3);
         assert_eq!(operators_in("pk = 'a' AND attribute_exists(<<'x'>>)"), 3);
+        // Inferred: IN uncounted (uncaptured).
         assert_eq!(operators_in("pk = 'a' AND s IN [<<'x'>>, <<'y'>>]"), 2);
     }
 
@@ -5324,6 +5348,21 @@ mod tests {
         terms.push(wide);
         terms.push(pair());
         assert_eq!(to_dnf(&ConditionTree::And(terms)).unwrap_err(), TOO_COMPLEX);
+    }
+
+    /// An alternation's arms are each held to the per-product slot budget, and
+    /// side by side they are held to four times it: four arms of 4,096
+    /// conditions are accepted, one leaf more is refused.
+    #[test]
+    fn an_alternation_is_held_to_four_times_the_slot_budget() {
+        let conjunction = |n| ConditionTree::And((0..n).map(|_| leaf("a")).collect());
+        let mut arms = vec![conjunction(MAX_TOTAL_CONDITIONS); 4];
+        assert_eq!(
+            slots(&to_dnf(&ConditionTree::Or(arms.clone())).unwrap()),
+            4 * MAX_TOTAL_CONDITIONS
+        );
+        arms.push(leaf("b"));
+        assert_eq!(to_dnf(&ConditionTree::Or(arms)).unwrap_err(), TOO_COMPLEX);
     }
 
     /// Flattening shares conditions: a group repeats the same condition, not a
