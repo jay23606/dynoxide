@@ -3824,6 +3824,37 @@ fn test_count_is_rejected_at_the_top_level_on_execute_transaction() {
 }
 
 #[test]
+fn test_count_star_is_rejected_with_the_statement_index_in_a_transaction() {
+    // The captured form (eu-west-2 and us-east-1, 2026-10-10): `COUNT(*)` as
+    // statement 0 and as statement 1 carries that index in front.
+    let db = Database::memory().unwrap();
+    create_test_table(&db, "Users");
+    let select = || ParameterizedStatement {
+        statement: "SELECT * FROM \"Users\" WHERE pk = 'a'".to_string(),
+        parameters: None,
+    };
+    let count = || ParameterizedStatement {
+        statement: "SELECT COUNT(*) FROM \"Users\"".to_string(),
+        parameters: None,
+    };
+    for (statements, index) in [(vec![count(), select()], 0), (vec![select(), count()], 1)] {
+        let err = db
+            .execute_transaction(ExecuteTransactionRequest {
+                transact_statements: statements,
+                ..Default::default()
+            })
+            .unwrap_err();
+        let expected = format!(
+            "Validation failed in TransactStatements[{index}]: Unexpected path component at 1:8:5"
+        );
+        assert!(
+            matches!(err, DynoxideError::ValidationException(ref m) if *m == expected),
+            "unexpected error for index {index}: {err:?}"
+        );
+    }
+}
+
+#[test]
 fn test_next_token_is_rejected_when_replayed_with_different_parameters() {
     // The same statement text with different Parameters walks a different row
     // set, so the token must not carry across.
