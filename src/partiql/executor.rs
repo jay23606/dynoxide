@@ -13,6 +13,7 @@ use crate::partiql::parser::{
 use crate::storage_backend::StorageBackend;
 use crate::types::{AttributeValue, Item, ScalarAttributeType};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Execute a parsed PartiQL statement.
 ///
@@ -205,7 +206,7 @@ impl PartialEq for KeyCondition {
 /// `BETWEEN` and `begins_with`. `None` when a value can't be resolved, which is
 /// reported elsewhere.
 fn key_conditions(
-    group: &[WhereCondition],
+    group: &[Arc<WhereCondition>],
     key: &str,
     sort_key: bool,
     parameters: &[AttributeValue],
@@ -218,7 +219,7 @@ fn key_conditions(
     };
     let mut found: Vec<KeyCondition> = Vec::new();
     for cond in group {
-        let (op, values): (&'static str, Vec<&PartiqlValue>) = match cond {
+        let (op, values): (&'static str, Vec<&PartiqlValue>) = match &**cond {
             WhereCondition::Comparison(c) if c.path == key => match c.op {
                 CompOp::Eq => ("=", vec![&c.value]),
                 CompOp::Lt if sort_key => ("<", vec![&c.value]),
@@ -407,7 +408,7 @@ pub(crate) fn keyed_select(
     // attribute; the same one written twice is still one (captured eu-west-2
     // and us-east-1, 2026-10-09).
     let names_a_key = |path: &str| keys.iter().any(|(name, _)| *name == path);
-    let single = group.iter().all(|cond| match cond {
+    let single = group.iter().all(|cond| match &**cond {
         WhereCondition::Comparison(c) => c.op == CompOp::Eq && names_a_key(&c.path),
         WhereCondition::In(path, values) => values.len() == 1 && names_a_key(path),
         _ => false,
@@ -609,7 +610,7 @@ fn reject_overlapping_key_conditions(
             }
         };
         for cond in group {
-            match cond {
+            match &**cond {
                 WhereCondition::Comparison(c) if c.path == read_pk && c.op == CompOp::Eq => {
                     narrow(key(&c.value).into_iter().collect());
                 }
@@ -692,7 +693,11 @@ fn reject_overlapping_key_conditions(
 /// (x = 1 OR x = 2)` is one range, and runs; `pk = 'a' AND (sk = 1 OR x = 2)`
 /// is two that meet, and is refused (captured eu-west-2 and us-east-1,
 /// 2026-10-09).
-fn key_groups(wc: &WhereClause, read_pk: &str, read_sk: Option<&str>) -> Vec<Vec<WhereCondition>> {
+fn key_groups(
+    wc: &WhereClause,
+    read_pk: &str,
+    read_sk: Option<&str>,
+) -> Vec<Vec<Arc<WhereCondition>>> {
     use crate::partiql::parser::ConditionTree;
     let is_key = |cond: &WhereCondition| {
         condition_path(cond).is_some_and(|path| {
@@ -711,7 +716,7 @@ fn key_groups(wc: &WhereClause, read_pk: &str, read_sk: Option<&str>) -> Vec<Vec
     fn flatten(
         tree: &ConditionTree,
         is_key: &dyn Fn(&WhereCondition) -> bool,
-    ) -> Vec<Vec<WhereCondition>> {
+    ) -> Vec<Vec<Arc<WhereCondition>>> {
         match tree {
             ConditionTree::Leaf(cond) => vec![vec![cond.clone()]],
             // A filter: it narrows no key range, so it contributes nothing.
@@ -725,7 +730,7 @@ fn key_groups(wc: &WhereClause, read_pk: &str, read_sk: Option<&str>) -> Vec<Vec
                     let term_groups = flatten(term, is_key);
                     out = out
                         .iter()
-                        .flat_map(|held: &Vec<WhereCondition>| {
+                        .flat_map(|held: &Vec<Arc<WhereCondition>>| {
                             term_groups.iter().map(move |group| {
                                 let mut joined = held.clone();
                                 joined.extend(group.iter().cloned());
@@ -928,7 +933,7 @@ fn plan_order(
     for group in &wc.groups {
         let pinned: Vec<Vec<&PartiqlValue>> = group
             .iter()
-            .filter_map(|cond| match cond {
+            .filter_map(|cond| match &**cond {
                 WhereCondition::Comparison(c) if c.path == read_pk && c.op == CompOp::Eq => {
                     Some(vec![&c.value])
                 }
@@ -1148,7 +1153,7 @@ fn validate_operand_types(
     };
     for group in &wc.groups {
         for condition in group {
-            match condition {
+            match &**condition {
                 // A negated comparison is checked too: `NOT a < ?` reads the
                 // same operand and DynamoDB rejects it on the same terms.
                 WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => {
@@ -2265,13 +2270,13 @@ fn decode_next_token(token: &str, table_name: &str, fingerprint: u64) -> Result<
 /// on every row. Conditions on other attributes are ignored here and keep
 /// filtering post-read.
 fn translate_sk_conditions(
-    group: &[WhereCondition],
+    group: &[Arc<WhereCondition>],
     sk_name: &str,
     parameters: &[AttributeValue],
 ) -> Option<Vec<ResolvedSortKeyCondition>> {
     let mut resolved = Vec::new();
     for cond in group {
-        match cond {
+        match &**cond {
             WhereCondition::Comparison(c) if c.path == sk_name => {
                 let value = resolve_value(&c.value, parameters).ok()?;
                 value.to_key_string()?;
@@ -2355,7 +2360,7 @@ fn keys_index(where_clause: Option<&WhereClause>, pk_name: &str) -> bool {
     if wc.groups.len() != 1 {
         return false;
     }
-    wc.groups[0].iter().any(|c| match c {
+    wc.groups[0].iter().any(|c| match &**c {
         WhereCondition::Comparison(cond) => cond.path == pk_name && cond.op == CompOp::Eq,
         WhereCondition::In(path, _) => path == pk_name,
         _ => false,
@@ -2374,7 +2379,7 @@ fn find_pk_condition<'a>(
     let [group] = wc.groups.as_slice() else {
         return None;
     };
-    let mut pinning = group.iter().filter_map(|c| match c {
+    let mut pinning = group.iter().filter_map(|c| match &**c {
         WhereCondition::Comparison(cond) if cond.path == pk_name && cond.op == CompOp::Eq => {
             Some((Some(cond), std::slice::from_ref(&cond.value)))
         }
@@ -3108,7 +3113,7 @@ fn mandatory_key_equality() -> DynoxideError {
 /// Find a comparison condition matching a given path with Eq operator,
 /// searching across all OR groups.
 fn find_comparison_in_groups<'a>(
-    groups: &'a [Vec<WhereCondition>],
+    groups: &'a [Vec<Arc<WhereCondition>>],
     path: &str,
 ) -> Option<&'a crate::partiql::parser::Condition> {
     for group in groups {
@@ -3121,10 +3126,10 @@ fn find_comparison_in_groups<'a>(
 
 /// Find a comparison condition matching a given path with Eq operator.
 fn find_comparison<'a>(
-    conditions: &'a [WhereCondition],
+    conditions: &'a [Arc<WhereCondition>],
     path: &str,
 ) -> Option<&'a crate::partiql::parser::Condition> {
-    conditions.iter().find_map(|c| match c {
+    conditions.iter().find_map(|c| match &**c {
         WhereCondition::Comparison(cond) if cond.path == path && cond.op == CompOp::Eq => {
             Some(cond)
         }
@@ -3550,13 +3555,13 @@ fn has_unbound_parameter(condition: &WhereCondition, bound: usize) -> bool {
 }
 
 /// Check if an item matches all conditions in a group (AND semantics).
-fn matches_conditions(
+fn matches_conditions<C: std::borrow::Borrow<WhereCondition>>(
     item: &Item,
-    conditions: &[WhereCondition],
+    conditions: &[C],
     parameters: &[AttributeValue],
 ) -> bool {
     for cond in conditions {
-        match cond {
+        match cond.borrow() {
             WhereCondition::Comparison(c) => {
                 // A missing attribute is unequal to anything, and neither less
                 // nor greater (captured eu-west-2 and us-east-1, 2026-10-09).

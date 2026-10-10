@@ -8,6 +8,7 @@
 
 use crate::types::AttributeValue;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Why a statement did not parse.
 ///
@@ -342,7 +343,12 @@ pub enum SetValue {
 #[non_exhaustive]
 pub struct WhereClause {
     /// OR-groups: outer = OR, inner = AND.
-    pub groups: Vec<Vec<WhereCondition>>,
+    ///
+    /// Each condition is shared rather than owned. Distributing an AND over
+    /// ORs repeats a condition in every group it lands in, so a long literal
+    /// or path written once would otherwise be held once per group; shared, it
+    /// is held once however many groups name it.
+    pub groups: Vec<Vec<Arc<WhereCondition>>>,
     /// Whether the clause as written joined anything with `OR`.
     ///
     /// More than one group no longer means the author wrote an `OR`. A `NOT`
@@ -367,25 +373,42 @@ pub struct WhereClause {
 }
 
 /// A WHERE clause as written, with every `NOT` pushed down to a condition.
+///
+/// Its leaves are the conditions `groups` shares, so the tree costs the clause
+/// nothing beyond its own shape.
 #[derive(Debug, Clone)]
 pub(crate) enum ConditionTree {
-    Leaf(WhereCondition),
+    Leaf(Arc<WhereCondition>),
     And(Vec<ConditionTree>),
     Or(Vec<ConditionTree>),
 }
 
 impl ConditionTree {
     /// The tree of an expression `push_not_down` has already run over.
-    fn of(expr: &BoolExpr) -> Self {
+    fn of(expr: BoolExpr) -> Self {
         match expr {
-            BoolExpr::Leaf(cond) => ConditionTree::Leaf(cond.clone()),
-            BoolExpr::And(terms) => ConditionTree::And(terms.iter().map(Self::of).collect()),
-            BoolExpr::Or(terms) => ConditionTree::Or(terms.iter().map(Self::of).collect()),
+            BoolExpr::Leaf(cond) => ConditionTree::Leaf(Arc::new(cond)),
+            BoolExpr::And(terms) => ConditionTree::And(terms.into_iter().map(Self::of).collect()),
+            BoolExpr::Or(terms) => ConditionTree::Or(terms.into_iter().map(Self::of).collect()),
             BoolExpr::Not(_) => {
                 unreachable!("push_not_down removes every Not before the tree is kept")
             }
             // push_not_down replaces it with a refused condition.
-            BoolExpr::NonBoolean(_) => ConditionTree::Leaf(WhereCondition::Exists(String::new())),
+            BoolExpr::NonBoolean(_) => {
+                ConditionTree::Leaf(Arc::new(WhereCondition::Exists(String::new())))
+            }
+        }
+    }
+
+    /// The bytes the tree's conditions hold in paths and literal values, each
+    /// counted once: every leaf is its own condition, and flattening only
+    /// shares them. Saturates rather than overflowing.
+    fn bytes(&self) -> usize {
+        match self {
+            ConditionTree::Leaf(cond) => condition_bytes(cond),
+            ConditionTree::And(terms) | ConditionTree::Or(terms) => terms
+                .iter()
+                .fold(0usize, |total, term| total.saturating_add(term.bytes())),
         }
     }
 }
@@ -401,6 +424,21 @@ impl WhereClause {
     /// it, and flattens `pk='x' AND NOT (a=1 OR b=2)` from a clause that has one
     /// into groups that all name the same item.
     pub fn from_groups_written(groups: Vec<Vec<WhereCondition>>, wrote_or: bool) -> Self {
+        Self::from_shared_groups(
+            groups
+                .into_iter()
+                .map(|group| group.into_iter().map(Arc::new).collect())
+                .collect(),
+            wrote_or,
+        )
+    }
+
+    /// As [`WhereClause::from_groups_written`], for groups whose conditions
+    /// are already shared.
+    pub(crate) fn from_shared_groups(
+        groups: Vec<Vec<Arc<WhereCondition>>>,
+        wrote_or: bool,
+    ) -> Self {
         Self {
             groups,
             wrote_or,
@@ -2300,7 +2338,7 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
             t.next_token()?; // consume WHERE
             t.clause = LiteralClause::Where;
             let parsed = parse_conditions_with_or(t)?;
-            let mut clause = WhereClause::from_groups_written(parsed.groups, parsed.wrote_or);
+            let mut clause = WhereClause::from_shared_groups(parsed.groups, parsed.wrote_or);
             clause.top_level_equalities = parsed.top_level_equalities;
             clause.tree = Some(parsed.tree);
             Ok(Some(clause))
@@ -2330,10 +2368,30 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
     let wrote_or = contains_or(&expr);
     let mut top_level_equalities = Vec::new();
     collect_top_level_equalities(&expr, &mut top_level_equalities);
-    let expr = push_not_down(expr, false)?;
-    let tree = ConditionTree::of(&expr);
+    // A statement already holding a refusal is refused with it, so its clause
+    // isn't flattened at all: the flattening's own budget would otherwise
+    // answer first, in words DynamoDB never uses, for a statement DynamoDB
+    // refuses for another reason (too many operators, too many IN operands).
+    let refused = || ParsedConditions {
+        groups: Vec::new(),
+        wrote_or,
+        top_level_equalities: Vec::new(),
+        tree: ConditionTree::And(Vec::new()),
+    };
+    if t.holds_refusal() {
+        return Ok(refused());
+    }
+    let flattened = push_not_down(expr, false).and_then(|expr| {
+        let tree = ConditionTree::of(expr);
+        if tree.bytes() > MAX_CLAUSE_BYTES {
+            return Err(TOO_COMPLEX.to_string());
+        }
+        let groups = to_dnf(&tree)?;
+        Ok((tree, groups))
+    });
+    let (tree, groups) = flattened?;
     Ok(ParsedConditions {
-        groups: to_dnf(expr)?,
+        groups,
         wrote_or,
         top_level_equalities,
         tree,
@@ -2343,7 +2401,7 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
 /// A WHERE clause as parsed: its OR-groups, whether it was written with an
 /// `OR`, the equalities among its top-level conditions, and its tree.
 struct ParsedConditions {
-    groups: Vec<Vec<WhereCondition>>,
+    groups: Vec<Vec<Arc<WhereCondition>>>,
     wrote_or: bool,
     top_level_equalities: Vec<Condition>,
     tree: ConditionTree,
@@ -2954,7 +3012,9 @@ fn expect_between_and(t: &mut Tokenizer) -> Result<(), String> {
     }
 }
 
-/// An IN list, `[...]` or `(...)`, its members read as values.
+/// An IN list, `[...]` or `(...)`, its members read as values. The closing
+/// token must match the opener. More than `MAX_IN_OPERANDS` members are
+/// refused in DynamoDB's words once the statement has parsed.
 fn parse_in_list(t: &mut Tokenizer, depth: usize) -> Result<Vec<PartiqlValue>, String> {
     let open = t.next_token()?.ok_or("Expected '(' or '[' after IN")?;
     let close = match open.as_str() {
@@ -2967,6 +3027,12 @@ fn parse_in_list(t: &mut Tokenizer, depth: usize) -> Result<Vec<PartiqlValue>, S
         let peek = t.peek_token()?.ok_or("Unexpected end of IN list")?;
         if peek == close {
             t.next_token()?;
+            if values.len() > MAX_IN_OPERANDS {
+                t.note_term(format!(
+                    "The IN operator is provided with too many operands; number of operands: {}",
+                    values.len()
+                ));
+            }
             return Ok(values);
         }
         if peek == "," {
@@ -3234,26 +3300,34 @@ const MAX_EXPR_DEPTH: usize = 64;
 /// How many conditions a flattened clause may hold in total.
 ///
 /// `MAX_OR_GROUPS` bounds the number of groups, not the conditions inside them,
-/// and a single group can be very wide: `NOT a IN [8000 items]` is one group of
-/// 8000 leaves under De Morgan. A handful of negated conjunctions then clones
-/// that group up to `MAX_OR_GROUPS` times, so a statement of a few tens of
-/// kilobytes turns into tens of millions of cloned conditions and burns minutes
-/// of CPU before the group cap ever trips. Budgeting the total keeps that a
-/// rejection.
+/// and a single group can be wide: `NOT a IN [...]` is one group of up to
+/// `MAX_IN_OPERANDS` leaves under De Morgan. A handful of negated conjunctions
+/// then repeats that group up to `MAX_OR_GROUPS` times, and every slot is a
+/// condition evaluated against every item read. Budgeting the total, before
+/// each step builds it, keeps that a rejection.
 const MAX_TOTAL_CONDITIONS: usize = 4096;
 
 /// The rejection every clause-complexity budget shares.
 const TOO_COMPLEX: &str = "WHERE clause is too complex to evaluate";
 
-/// How many bytes of paths and literal values a flattened clause may hold.
+/// How many bytes of paths and literal values a clause's conditions may hold.
 ///
-/// `MAX_TOTAL_CONDITIONS` counts conditions, not their size, and a condition
-/// can carry a long path: De Morgan copies a negated `IN`'s path once per
-/// value, and every cross product copies whole groups again, so a statement
-/// within the 8,192-character limit could still hold tens of megabytes, and a
-/// transaction of a hundred such statements gigabytes, before the count cap
-/// tripped. No clause written for a real table comes near this budget.
-const MAX_CLAUSE_BYTES: usize = 1024 * 1024;
+/// Flattening shares conditions rather than copying them, so a condition
+/// repeated across groups costs its bytes once, and the budget counts each
+/// condition once. The one place a clause holds more than it was written with
+/// is De Morgan on a negated `IN`, which copies the path once per operand; an
+/// `IN` takes at most `MAX_IN_OPERANDS`, and a statement over 8,192
+/// characters (up to 32 KiB of UTF-8) is refused before it is parsed, so a
+/// statement DynamoDB accepts holds at most about 100 x 32 KiB, a little over
+/// 3 MiB. The budget sits above that and so refuses nothing DynamoDB would
+/// run; it bounds what a caller of the parser itself, without the length
+/// limit, can make a clause hold.
+const MAX_CLAUSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many operands an `IN` may take: DynamoDB refuses the 101st, negated or
+/// not, as `The IN operator is provided with too many operands; number of
+/// operands: 101` (captured eu-west-2, 2026-10-10).
+const MAX_IN_OPERANDS: usize = 100;
 
 /// The bytes a condition holds in paths and literal values, for
 /// `MAX_CLAUSE_BYTES`. Parameters are referred to by index, so they cost
@@ -3292,19 +3366,6 @@ fn condition_bytes(condition: &WhereCondition) -> usize {
     }
 }
 
-/// Whether a flattened clause is past `MAX_CLAUSE_BYTES`.
-fn over_byte_budget(groups: &[Vec<WhereCondition>]) -> bool {
-    groups
-        .iter()
-        .flatten()
-        .map(condition_bytes)
-        .try_fold(0usize, |total, bytes| {
-            let total = total.saturating_add(bytes);
-            (total <= MAX_CLAUSE_BYTES).then_some(total)
-        })
-        .is_none()
-}
-
 /// The rejection every descent shares when it runs past `MAX_EXPR_DEPTH`.
 const TOO_DEEP: &str = "Statement is nested too deeply to parse";
 
@@ -3314,72 +3375,80 @@ const TOO_DEEP: &str = "Statement is nested too deeply to parse";
 /// function counts as well wasn't captured.
 const MAX_OPERATORS: usize = 300;
 
+/// The OR-of-ANDs a clause flattens to: shared conditions, grouped.
+type Groups = Vec<Vec<Arc<WhereCondition>>>;
+
+/// How many condition slots a set of groups holds.
+fn slots(groups: &Groups) -> usize {
+    groups.iter().map(Vec::len).sum()
+}
+
 /// Flatten an AND/OR tree into the OR-of-ANDs the rest of the engine reads.
-fn to_dnf(expr: BoolExpr) -> Result<Vec<Vec<WhereCondition>>, String> {
-    let groups = match expr {
-        BoolExpr::Leaf(cond) => vec![vec![cond]],
-        BoolExpr::Not(_) => {
-            unreachable!("push_not_down removes every Not before to_dnf sees the tree")
-        }
-        // push_not_down replaces it with a refused condition.
-        BoolExpr::NonBoolean(_) => vec![vec![WhereCondition::Exists(String::new())]],
-        BoolExpr::Or(terms) => {
-            let mut out = Vec::new();
-            for term in terms {
-                out.extend(to_dnf(term)?);
-                // Checked inside the loop, not after it. `out` only ever grows
-                // here, so a clause rejected at the end was already over the cap
-                // at the term that crossed it; testing as we go rejects exactly
-                // the same statements without first building the whole thing.
-                // A wide alternation is otherwise gigabytes of groups before the
-                // rejection it was always going to get.
-                if out.len() > MAX_OR_GROUPS {
-                    return Err(TOO_COMPLEX.to_string());
-                }
-            }
-            out
-        }
-        BoolExpr::And(terms) => {
-            let mut out: Vec<Vec<WhereCondition>> = vec![Vec::new()];
+///
+/// Every step works out how many groups and condition slots its result will
+/// hold before building it, and refuses a clause past `MAX_OR_GROUPS` or
+/// `MAX_TOTAL_CONDITIONS` then, so nothing larger than the budget is ever
+/// built only to be thrown away. The conditions themselves are shared, so a
+/// slot costs a pointer however long the path or literal it names.
+fn to_dnf(tree: &ConditionTree) -> Result<Groups, String> {
+    let too_complex = || Err(TOO_COMPLEX.to_string());
+    match tree {
+        ConditionTree::Leaf(cond) => Ok(vec![vec![Arc::clone(cond)]]),
+        ConditionTree::Or(terms) => {
+            let mut out: Groups = Vec::new();
+            let mut held = 0usize;
             for term in terms {
                 let term_groups = to_dnf(term)?;
+                let term_slots = slots(&term_groups);
+                if out.len().saturating_add(term_groups.len()) > MAX_OR_GROUPS
+                    || held.saturating_add(term_slots) > MAX_TOTAL_CONDITIONS
+                {
+                    return too_complex();
+                }
+                held += term_slots;
+                out.extend(term_groups);
+            }
+            Ok(out)
+        }
+        ConditionTree::And(terms) => {
+            let mut out: Groups = vec![Vec::new()];
+            let mut held = 0usize;
+            for term in terms {
+                let term_groups = to_dnf(term)?;
+                let term_slots = slots(&term_groups);
+                // Every group in hand meets every group of the term, so the
+                // product holds each held slot once per term group and each
+                // term slot once per group in hand.
+                let next_groups = out.len().saturating_mul(term_groups.len());
+                let next_slots = held
+                    .saturating_mul(term_groups.len())
+                    .saturating_add(term_slots.saturating_mul(out.len()));
+                if next_groups > MAX_OR_GROUPS || next_slots > MAX_TOTAL_CONDITIONS {
+                    return too_complex();
+                }
                 // The common shape: the term is a single conjunction, so the
-                // cross product is just an append onto every group in hand. Take
-                // it without cloning every group we already have.
-                if term_groups.len() == 1 {
+                // cross product is just an append onto every group in hand.
+                if let [only] = term_groups.as_slice() {
                     for group in out.iter_mut() {
-                        group.extend(term_groups[0].iter().cloned());
+                        group.extend(only.iter().cloned());
                     }
                 } else {
-                    if out.len().saturating_mul(term_groups.len()) > MAX_OR_GROUPS {
-                        return Err(TOO_COMPLEX.to_string());
-                    }
-                    let mut next = Vec::with_capacity(out.len() * term_groups.len());
+                    let mut next = Vec::with_capacity(next_groups);
                     for existing in &out {
                         for group in &term_groups {
-                            let mut combined = existing.clone();
+                            let mut combined = Vec::with_capacity(existing.len() + group.len());
+                            combined.extend(existing.iter().cloned());
                             combined.extend(group.iter().cloned());
                             next.push(combined);
                         }
                     }
                     out = next;
                 }
-                // Group count alone does not bound the work: one group can be
-                // thousands of conditions wide, and the cross product copies
-                // every one of them per term. Budget the conditions too.
-                if out.iter().map(Vec::len).sum::<usize>() > MAX_TOTAL_CONDITIONS
-                    || over_byte_budget(&out)
-                {
-                    return Err(TOO_COMPLEX.to_string());
-                }
+                held = next_slots;
             }
-            out
+            Ok(out)
         }
-    };
-    if groups.len() > MAX_OR_GROUPS || over_byte_budget(&groups) {
-        return Err(TOO_COMPLEX.to_string());
     }
-    Ok(groups)
 }
 
 /// Parse a single condition (comparison, function call, etc.).
@@ -3474,31 +3543,7 @@ fn parse_single_condition(t: &mut Tokenizer, depth: usize) -> Result<WhereCondit
                 }
                 "IN" => {
                     t.next_token()?; // consume IN
-                    // Accept both the parenthesised form `IN (...)` (DynamoDB
-                    // FilterExpression style) and the bracket form `IN [...]`
-                    // (PartiQL style); the closing token must match the opener.
-                    let open = t.next_token()?.ok_or("Expected '(' or '[' after IN")?;
-                    let close_char = match open.as_str() {
-                        "(" => ")",
-                        "[" => "]",
-                        other => {
-                            return Err(format!("Expected '(' or '[' after IN, got '{other}'"));
-                        }
-                    };
-                    let mut values = Vec::new();
-                    loop {
-                        let peek = t.peek_token()?.ok_or("Unexpected end of IN list")?;
-                        if peek == close_char {
-                            t.next_token()?; // consume closing bracket
-                            break;
-                        }
-                        if peek == "," {
-                            t.next_token()?; // consume comma
-                            continue;
-                        }
-                        values.push(parse_bound(t, depth)?);
-                    }
-                    Ok(WhereCondition::In(path, values))
+                    Ok(WhereCondition::In(path, parse_in_list(t, depth)?))
                 }
                 "IS" => {
                     t.next_token()?; // consume IS
@@ -4542,6 +4587,12 @@ impl Tokenizer {
         self.refusals.iter().any(|r| r.clause == self.clause)
     }
 
+    /// Whether the statement already holds any refusal, in any clause, so
+    /// that it will be refused whatever else is read.
+    fn holds_refusal(&self) -> bool {
+        !self.refusals.is_empty() || self.operand_refusal.is_some()
+    }
+
     /// Count an operator in the WHERE clause, refusing the one past
     /// [`MAX_OPERATORS`] in DynamoDB's words once the statement has parsed.
     fn count_operator(&mut self) {
@@ -5076,7 +5127,7 @@ mod tests {
             else {
                 panic!("expected a SELECT with WHERE");
             };
-            let is_negated = match &wc.groups[0][0] {
+            let is_negated = match &*wc.groups[0][0] {
                 WhereCondition::Comparison(_) => false,
                 WhereCondition::NotComparison(_) => true,
                 other => panic!("{nots} NOTs: {other:?}"),
@@ -5092,7 +5143,7 @@ mod tests {
     /// guards the cap behind it.
     #[test]
     fn a_clause_too_wide_to_flatten_is_rejected_rather_than_grinding() {
-        let values = (0..4_000)
+        let values = (0..MAX_IN_OPERANDS)
             .map(|i| format!("'v{i}'"))
             .collect::<Vec<_>>()
             .join(",");
@@ -5106,43 +5157,157 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
-    /// A negated `IN` under a long path is copied once per value by De Morgan
-    /// and again by every cross product, so the number of conditions alone
-    /// doesn't bound the bytes held: this statement fits the 8,192-character
-    /// limit and holds 4,002 conditions, within that cap, while copying a
-    /// 4,000-character path for each.
+    /// A negated `IN` past 100 operands is refused for its operands in
+    /// DynamoDB's words, under a long path or a short one (captured eu-west-2,
+    /// 2026-10-10).
     #[test]
-    fn a_negated_in_under_a_long_path_is_too_complex() {
-        let path = "a".repeat(4_000);
-        let values = vec!["1"; 1_900].join(",");
-        let statement =
-            format!(r#"SELECT * FROM "t" WHERE NOT {path} IN [{values}] AND (x = 1 OR x = 2)"#);
-        assert!(statement.chars().count() <= 8_192, "{}", statement.len());
-        let err = parse(&statement).unwrap_err();
+    fn a_negated_in_past_100_operands_is_refused_for_them() {
+        for path in ["a".repeat(4_000), "a".to_string()] {
+            let values = vec!["1"; 1_900].join(",");
+            let statement =
+                format!(r#"SELECT * FROM "t" WHERE NOT {path} IN [{values}] AND (x = 1 OR x = 2)"#);
+            assert!(statement.chars().count() <= 8_192, "{}", statement.len());
+            let err = parse(&statement).unwrap_err().to_string();
+            assert!(
+                err.contains(
+                    "The IN operator is provided with too many operands; number of operands: 1900"
+                ),
+                "got {err}"
+            );
+        }
+    }
+
+    /// A negated `IN` of 100 operands is an ordinary clause, under a long
+    /// path too: De Morgan's copies of the path are within the budget.
+    #[test]
+    fn a_negated_in_of_100_operands_is_evaluated() {
+        for path in ["a".repeat(4_000), "a".to_string()] {
+            let values = vec!["1"; MAX_IN_OPERANDS].join(",");
+            let statement =
+                format!(r#"SELECT * FROM "t" WHERE NOT {path} IN [{values}] AND (x = 1 OR x = 2)"#);
+            assert!(parse(&statement).is_ok(), "{} path", path.len());
+        }
+    }
+
+    /// The parser itself takes statements of any length, so a negated `IN`
+    /// whose path, copied once per operand, would hold more than the budget
+    /// is refused before De Morgan copies it.
+    #[test]
+    fn a_negated_in_whose_copies_would_pass_the_budget_is_too_complex() {
+        let path = "a".repeat(MAX_CLAUSE_BYTES / MAX_IN_OPERANDS + 1);
+        let values = vec!["1"; MAX_IN_OPERANDS].join(",");
+        let err = parse(&format!(
+            r#"SELECT * FROM "t" WHERE NOT {path} IN [{values}]"#
+        ))
+        .unwrap_err();
         assert!(err.to_string().contains("too complex"), "got {err}");
     }
 
-    /// The same shape under a short path is an ordinary clause.
+    /// A wide alternation is refused for its operators, as DynamoDB refuses
+    /// it, rather than flattened first.
     #[test]
-    fn a_negated_in_under_a_short_path_is_evaluated() {
-        let values = vec!["1"; 1_900].join(",");
-        let statement =
-            format!(r#"SELECT * FROM "t" WHERE NOT a IN [{values}] AND (x = 1 OR x = 2)"#);
-        assert!(parse(&statement).is_ok());
-    }
-
-    /// The group cap trips while an alternation is flattened, not after every
-    /// arm has been built.
-    #[test]
-    fn a_wide_alternation_is_rejected_without_building_it_first() {
+    fn a_wide_alternation_is_refused_without_flattening_it() {
         let clause = (0..40_000)
             .map(|i| format!("a='v{i}'"))
             .collect::<Vec<_>>()
             .join(" OR ");
         let start = std::time::Instant::now();
         let err = parse(&format!(r#"SELECT * FROM "t" WHERE {clause}"#)).unwrap_err();
-        assert!(err.to_string().contains("too complex"), "got {err}");
+        assert!(err.to_string().contains("too many operators"), "got {err}");
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A condition leaf for the flattening tests.
+    fn leaf(name: &str) -> ConditionTree {
+        ConditionTree::Leaf(Arc::new(WhereCondition::Exists(name.to_string())))
+    }
+
+    /// Flattening refuses a product, an alternation or a conjunction past its
+    /// caps before it builds the result, and accepts one exactly at them.
+    #[test]
+    fn flattening_refuses_past_its_caps_before_building() {
+        let pair = || ConditionTree::Or(vec![leaf("a"), leaf("b")]);
+        // 2^8 = 256 groups is the cap; 2^9 is past it.
+        assert_eq!(
+            to_dnf(&ConditionTree::And(vec![pair(); 8])).unwrap().len(),
+            256
+        );
+        assert_eq!(
+            to_dnf(&ConditionTree::And(vec![pair(); 9])).unwrap_err(),
+            TOO_COMPLEX
+        );
+        let alternation = |n| ConditionTree::Or((0..n).map(|_| leaf("a")).collect());
+        assert_eq!(
+            to_dnf(&alternation(MAX_OR_GROUPS)).unwrap().len(),
+            MAX_OR_GROUPS
+        );
+        assert_eq!(
+            to_dnf(&alternation(MAX_OR_GROUPS + 1)).unwrap_err(),
+            TOO_COMPLEX
+        );
+        let conjunction = |n| ConditionTree::And((0..n).map(|_| leaf("a")).collect());
+        assert_eq!(
+            slots(&to_dnf(&conjunction(MAX_TOTAL_CONDITIONS)).unwrap()),
+            MAX_TOTAL_CONDITIONS
+        );
+        assert_eq!(
+            to_dnf(&conjunction(MAX_TOTAL_CONDITIONS + 1)).unwrap_err(),
+            TOO_COMPLEX
+        );
+        // Four pairs hold 16 groups of 4 slots; joining a 300-wide conjunction
+        // would make 64 + 300 x 16 = 4,864 slots, past the cap at that step.
+        let wide = ConditionTree::And((0..300).map(|_| leaf("w")).collect());
+        let mut terms = vec![pair(); 4];
+        terms.push(wide);
+        terms.push(pair());
+        assert_eq!(to_dnf(&ConditionTree::And(terms)).unwrap_err(), TOO_COMPLEX);
+    }
+
+    /// Flattening shares conditions: a group repeats the same condition, not a
+    /// copy of it.
+    #[test]
+    fn flattening_shares_each_condition_across_groups() {
+        let shared = leaf("s");
+        let pair = ConditionTree::Or(vec![leaf("a"), leaf("b")]);
+        let groups = to_dnf(&ConditionTree::And(vec![pair, shared])).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(Arc::ptr_eq(&groups[0][1], &groups[1][1]));
+    }
+
+    /// The byte budget counts each condition once, however many groups repeat
+    /// it, and refuses a clause one byte past it (the parser itself has no
+    /// length limit, so the boundary can be reached directly).
+    #[test]
+    fn the_byte_budget_counts_each_condition_once() {
+        let repeated = format!(
+            r#"SELECT * FROM "t" WHERE pk = 'k' AND {} AND s = '{}'"#,
+            ["(a = 1 OR a = 2)"; 8].join(" AND "),
+            "x".repeat(4_070)
+        );
+        let Statement::Select {
+            where_clause: Some(wc),
+            ..
+        } = parse(&repeated).unwrap()
+        else {
+            panic!("expected a SELECT with WHERE");
+        };
+        let per_copy: usize = wc.groups.iter().flatten().map(|c| condition_bytes(c)).sum();
+        let held = wc.tree.as_ref().unwrap().bytes();
+        assert!(per_copy > 1024 * 1024, "{per_copy}");
+        assert!(held < 8_192, "{held}");
+
+        // `s` is one byte of path; the literal is the rest.
+        let at_budget = format!(
+            r#"SELECT * FROM "t" WHERE s = '{}'"#,
+            "x".repeat(MAX_CLAUSE_BYTES - 1)
+        );
+        assert!(parse(&at_budget).is_ok());
+        let over = format!(
+            r#"SELECT * FROM "t" WHERE s = '{}'"#,
+            "x".repeat(MAX_CLAUSE_BYTES)
+        );
+        let err = parse(&over).unwrap_err();
+        assert!(err.to_string().contains("too complex"), "got {err}");
     }
 
     /// Only the first refusal in a clause is ever reported, so later ones in
@@ -5202,7 +5367,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(wc.groups[0].len(), 1);
-                match &wc.groups[0][0] {
+                match &*wc.groups[0][0] {
                     WhereCondition::Comparison(c) => {
                         assert_eq!(c.path, "pk");
                         assert_eq!(c.op, CompOp::Eq);
@@ -5393,7 +5558,7 @@ mod tests {
             Statement::Select {
                 where_clause: Some(wc),
                 ..
-            } => match &wc.groups[0][0] {
+            } => match &*wc.groups[0][0] {
                 WhereCondition::Comparison(c) => match &c.value {
                     PartiqlValue::Parameter(0) => {}
                     other => panic!("Expected Parameter(0), got {other:?}"),
@@ -5411,7 +5576,7 @@ mod tests {
             Statement::Select {
                 where_clause: Some(wc),
                 ..
-            } => match &wc.groups[0][0] {
+            } => match &*wc.groups[0][0] {
                 WhereCondition::Comparison(c) => {
                     assert_eq!(c.op, CompOp::Gt);
                     match &c.value {
@@ -5460,7 +5625,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(wc.groups[0].len(), 1);
-                match &wc.groups[0][0] {
+                match &*wc.groups[0][0] {
                     WhereCondition::Between(path, low, high) => {
                         assert_eq!(path, "age");
                         match low {
@@ -5488,8 +5653,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(wc.groups[0].len(), 2);
-                assert!(matches!(&wc.groups[0][0], WhereCondition::Between(..)));
-                assert!(matches!(&wc.groups[0][1], WhereCondition::Comparison(..)));
+                assert!(matches!(&*wc.groups[0][0], WhereCondition::Between(..)));
+                assert!(matches!(&*wc.groups[0][1], WhereCondition::Comparison(..)));
             }
             _ => panic!("Expected SELECT with WHERE"),
         }
@@ -5504,7 +5669,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(wc.groups[0].len(), 1);
-                match &wc.groups[0][0] {
+                match &*wc.groups[0][0] {
                     WhereCondition::In(path, values) => {
                         assert_eq!(path, "status");
                         assert_eq!(values.len(), 2);
@@ -5525,7 +5690,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(wc.groups[0].len(), 1);
-                match &wc.groups[0][0] {
+                match &*wc.groups[0][0] {
                     WhereCondition::Contains(path, val) => {
                         assert_eq!(path, "name");
                         match val {
@@ -5551,7 +5716,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(wc.groups[0].len(), 1);
-                match &wc.groups[0][0] {
+                match &*wc.groups[0][0] {
                     WhereCondition::IsMissing(path) => assert_eq!(path, "email"),
                     other => panic!("Expected IsMissing, got {other:?}"),
                 }
@@ -5569,7 +5734,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(wc.groups[0].len(), 1);
-                match &wc.groups[0][0] {
+                match &*wc.groups[0][0] {
                     WhereCondition::IsNotMissing(path) => assert_eq!(path, "email"),
                     other => panic!("Expected IsNotMissing, got {other:?}"),
                 }
@@ -5782,7 +5947,7 @@ mod tests {
             Statement::Select {
                 where_clause: Some(wc),
                 ..
-            } => match &wc.groups[0][0] {
+            } => match &*wc.groups[0][0] {
                 WhereCondition::BeginsWith(path, _) => {
                     assert_eq!(path, "address.city");
                 }
@@ -6085,7 +6250,7 @@ mod tests {
             Statement::Select {
                 where_clause: Some(wc),
                 ..
-            } => match &wc.groups[0][0] {
+            } => match &*wc.groups[0][0] {
                 WhereCondition::Comparison(c) => c.value.clone(),
                 other => panic!("expected a comparison, got {other:?}"),
             },
