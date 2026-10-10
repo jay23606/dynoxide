@@ -2225,14 +2225,10 @@ const BACKUP_LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(
 
 /// How long a backup keeps retrying a busy or locked database before giving
 /// up, by the clock: the same patience as an open connection's busy timeout,
-/// [`REQUEST_BUSY_TIMEOUT`], and shorter under test so a test of the limit
-/// runs quickly.
+/// [`REQUEST_BUSY_TIMEOUT`]. Tests use it unchanged, so a test that waits out
+/// a brief lock has a wide margin on a slow machine.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
-const BACKUP_LOCK_PATIENCE: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_millis(200)
-} else {
-    REQUEST_BUSY_TIMEOUT
-};
+const BACKUP_LOCK_PATIENCE: std::time::Duration = REQUEST_BUSY_TIMEOUT;
 
 /// How many times a backup starts over, because another connection changed
 /// the database being copied, before it gives up.
@@ -3301,9 +3297,9 @@ mod tests {
             let _ = done.send(result.map_err(|e| e.to_string()));
         });
 
-        // The first busy step waits out SQLite's busy timeout (5 s), which is
-        // already past the patience under test, so the copy gives up after
-        // about five seconds.
+        // The first busy step waits out SQLite's busy timeout (5 s), which
+        // uses up the whole patience, so the copy gives up after about five
+        // seconds.
         let result = outcome
             .recv_timeout(std::time::Duration::from_secs(15))
             .expect("a backup of a locked source must give up within its patience");
