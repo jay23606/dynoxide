@@ -1895,7 +1895,22 @@ async fn evaluate_window<S: StorageBackend>(
             }
             Some(value.to_key_string())
         }
-        None => None,
+        None => {
+            // An OR beside the key condition leaves the key in every group the
+            // clause expands to, so the statement still reads one partition
+            // and an oversized key is refused as it is without the OR
+            // (captured eu-west-2 and us-east-1, 2026-10-10:
+            // `pk = <2,049 bytes> AND (x = 1 OR x = 2)` on a table; an index's
+            // key is inferred to follow suit, as its key reads do). The read
+            // itself stays a scan here.
+            if let Some(value) = where_clause.and_then(|wc| pk_in_every_group(wc, read_pk)) {
+                let value = resolve_value(value, parameters)?;
+                if let Some(refusal) = crate::actions::helpers::key_size_refusal(&value, false) {
+                    return Err(refusal);
+                }
+            }
+            None
+        }
     };
 
     let rows: Vec<(String, String, String)> = if let Some(plan) = order {
@@ -2667,6 +2682,23 @@ fn find_pk_condition<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a Parti
     let [group] = wc.groups.as_slice() else {
         return None;
     };
+    group_pk_value(group, pk_name)
+}
+
+/// The one value every group of a clause pins the partition key to, when
+/// they all pin the same one: `pk = 'a' AND (x = 1 OR x = 2)` flattens to two
+/// groups that both name partition `a`.
+fn pk_in_every_group<'a>(wc: &'a WhereClause, pk_name: &str) -> Option<&'a PartiqlValue> {
+    let (first, rest) = wc.groups.split_first()?;
+    let value = group_pk_value(first, pk_name)?;
+    rest.iter()
+        .all(|group| group_pk_value(group, pk_name) == Some(value))
+        .then_some(value)
+}
+
+/// The one value a group pins the partition key to, as `find_pk_condition`
+/// reads it.
+fn group_pk_value<'a>(group: &'a [Arc<WhereCondition>], pk_name: &str) -> Option<&'a PartiqlValue> {
     let mut pinning = group.iter().filter_map(|c| match &**c {
         WhereCondition::Comparison(cond) if cond.path == pk_name && cond.op == CompOp::Eq => {
             Some(std::slice::from_ref(&cond.value))

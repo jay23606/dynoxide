@@ -5,9 +5,10 @@
 //!
 //! A statement that reads or writes by key is refused once its key is pinned:
 //! on the table, on either kind of index, and for a sort key under any key
-//! condition. A statement that isn't a key read (an OR, or an IN with several
-//! values) runs as a scan. In a batch the refusal echoes the table and is
-//! charged nothing.
+//! condition, and beside an OR that leaves the partition key in every
+//! alternative. A statement that names several partitions (an OR between
+//! them, or an IN with several values) runs as a scan. In a batch the refusal
+//! echoes the table and is charged nothing.
 
 use dynoxide::Database;
 use dynoxide::actions::batch_execute_statement::BatchExecuteStatementRequest;
@@ -341,6 +342,49 @@ fn a_statement_that_does_not_pin_the_key_is_not_refused_for_its_size() {
     // k15: an UPDATE missing its sort key is refused for that first.
     let text = format!(r#"UPDATE "{TK}" SET x = 1 WHERE pk = '{}'"#, k(2049));
     assert_eq!(single(&db, statement(text)), Err(refused(MANDATORY)));
+}
+
+/// An OR under a key condition leaves the statement reading one partition,
+/// so an oversized partition key there is refused as it is without the OR,
+/// written as a literal or as a parameter (captured eu-west-2 and us-east-1,
+/// 2026-10-10, cases 8a, 8b, 8c, 8e, 8f and 8h).
+#[test]
+fn a_partition_key_beside_an_or_is_still_measured() {
+    let db = setup();
+    let big = k(2049);
+    for (table, alternatives) in [
+        (TH, "(x = 1 OR x = 2)"),
+        (TH, "(x = 1 OR y = 2)"),
+        (TK, "(sk = 'a' OR sk = 'b')"),
+    ] {
+        let text = format!(r#"SELECT * FROM "{table}" WHERE pk = '{big}' AND {alternatives}"#);
+        assert_eq!(
+            single(&db, statement(text)),
+            Err(refused(HASH)),
+            "{table}: {alternatives}"
+        );
+    }
+    let request = json!({
+        "Statement": format!(r#"SELECT * FROM "{TH}" WHERE pk = ? AND (x = 1 OR x = 2)"#),
+        "Parameters": [{"S": big}]
+    });
+    assert_eq!(single(&db, request), Err(refused(HASH)));
+    // At the limit, it runs.
+    let text = format!(
+        r#"SELECT * FROM "{TH}" WHERE pk = '{}' AND (x = 1 OR x = 2)"#,
+        k(2048)
+    );
+    assert_eq!(single(&db, statement(text)), Ok(vec![]));
+    // The key named in two alternatives is refused as overlapping first.
+    let text = format!(
+        r#"SELECT * FROM "{TH}" WHERE (pk = '{big}' AND x = 1) OR (pk = '{big}' AND x = 2)"#
+    );
+    assert_eq!(
+        single(&db, statement(text)),
+        Err(refused(
+            "Overlapping conditions with range keys are not supported in where clause"
+        ))
+    );
 }
 
 #[test]

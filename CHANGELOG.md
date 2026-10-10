@@ -705,8 +705,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Aggregated size of all range keys has exceeded the size limit of 1024
   bytes`. That covers a SELECT on the table or on either kind of index, a
   sort key under any key condition (`=`, a comparison, `BETWEEN` or
-  `begins_with`), and the key of an `UPDATE` or a `DELETE`; a statement that
-  doesn't read by key, such as an `OR` of keys, still runs. The refusal stands
+  `begins_with`), a partition key beside an `OR` that every alternative
+  shares (`pk = <key> AND (x = 1 OR x = 2)`), and the key of an `UPDATE` or a
+  `DELETE`; a statement that names several partitions, such as an `OR` of
+  keys, still runs. The refusal stands
   on its own on `ExecuteStatement`, against that statement (with its table)
   in a `BatchExecuteStatement`, where it is now charged nothing, and as a
   `ValidationError` cancellation in an `ExecuteTransaction`. Captured against
