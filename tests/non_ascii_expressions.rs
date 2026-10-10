@@ -13,6 +13,11 @@
 //! us-east-1 gave the same answers apart from the emoji on Scan and in
 //! transactions, which its older validation layer reports as two UTF-16 halves
 //! (`token: "?"`); the fixture keeps both regions' answers.
+//!
+//! All 140 captured cases are replayed. In a placeholder's own name the
+//! character is refused as an invalid key of its map, before the expression is
+//! read. In a PartiQL statement it is refused as not well formed with nothing
+//! after the colon, and inside a string literal the statement runs.
 
 #![cfg(feature = "http-server")]
 
@@ -131,6 +136,35 @@ async fn non_ascii_characters_in_expressions_answer_as_dynamodb_does() {
     })
     .await;
     assert_eq!(ran, 112);
+    assert!(
+        failures.is_empty(),
+        "{} of {ran} cases differ from DynamoDB:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// The character in a PartiQL statement: outside a string DynamoDB refuses the
+/// statement as not well formed, with nothing after the colon; inside a string
+/// it runs.
+#[tokio::test]
+async fn non_ascii_characters_in_partiql_statements_answer_as_dynamodb_does() {
+    let (ran, failures) = replay(|surface, _| surface == "partiql").await;
+    assert_eq!(ran, 20);
+    assert!(
+        failures.is_empty(),
+        "{} of {ran} cases differ from DynamoDB:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// The character in a placeholder's own name: the name map's key is refused
+/// as a syntax error before the expression is read.
+#[tokio::test]
+async fn non_ascii_characters_in_placeholder_names_answer_as_dynamodb_does() {
+    let (ran, failures) = replay(|_, position| matches!(position, "value-key" | "name-key")).await;
+    assert_eq!(ran, 8);
     assert!(
         failures.is_empty(),
         "{} of {ran} cases differ from DynamoDB:\n{}",

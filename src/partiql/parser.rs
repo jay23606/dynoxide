@@ -4942,7 +4942,13 @@ fn tokenize(input: &str) -> Result<(Vec<String>, Vec<Span>), String> {
             continue;
         }
 
-        // Unknown character: report an error rather than silently skipping
+        // Unknown character: report an error rather than silently skipping.
+        // DynamoDB says nothing after "can't be processed: " for a character
+        // outside ASCII, the no-break space included (captured eu-west-2 and
+        // us-east-1, 2026-10-09); an unexpected ASCII character wasn't captured.
+        if !chars[i].is_ascii() {
+            return Err(String::new());
+        }
         return Err(format!("Unexpected character: '{}'", chars[i]));
     }
 

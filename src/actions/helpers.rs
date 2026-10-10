@@ -667,6 +667,24 @@ pub struct ExpressionParamContext<'a> {
 /// This performs the pre-checks that DynamoDB runs before table existence and
 /// key schema validation.
 ///
+/// Refuse a placeholder whose name holds a character outside ASCII before the
+/// expression is read: DynamoDB reports the map's key, not the expression
+/// (`:vé`, `#n€`, an emoji or a no-break space; captured on UpdateItem in
+/// eu-west-2 and us-east-1, 2026-10-09, inside the request-validation
+/// envelope). The family is enveloped like the others here, so operations that
+/// don't wrap it propagate the plain message.
+fn reject_non_ascii_placeholder(
+    map: &str,
+    key: &str,
+) -> std::result::Result<(), ClassifiedValidationError> {
+    if key.is_ascii() {
+        return Ok(());
+    }
+    Err(ClassifiedValidationError::enveloped(format!(
+        "{map} contains invalid key: Syntax error; key: \"{key}\""
+    )))
+}
+
 /// Returns the parsed `ExpressionAttributeValues` if raw JSON was provided
 /// and successfully parsed, so the caller can store it on the request.
 ///
@@ -735,6 +753,7 @@ pub fn validate_expression_params(
                     "ExpressionAttributeNames contains invalid key: Syntax error; key: \"{key}\""
                 )));
             }
+            reject_non_ascii_placeholder("ExpressionAttributeNames", key)?;
         }
     }
 
@@ -753,6 +772,7 @@ pub fn validate_expression_params(
                         "ExpressionAttributeValues contains invalid key: Syntax error; key: \"{key}\""
                     )));
                 }
+                reject_non_ascii_placeholder("ExpressionAttributeValues", key)?;
             }
             // Parse and validate values with key context
             let parsed =
@@ -781,6 +801,7 @@ pub fn validate_expression_params(
                     "ExpressionAttributeValues contains invalid key: Syntax error; key: \"{key}\""
                 )));
             }
+            reject_non_ascii_placeholder("ExpressionAttributeValues", key)?;
         }
         for (key, value) in values {
             validate_expression_attribute_value(key, value, ctx.layer)?;
