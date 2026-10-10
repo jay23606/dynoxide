@@ -1,11 +1,21 @@
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
 };
+use dynoxide_benchmarks::containers::{
+    ContainerTarget, DYNAMODB_LOCAL, MULTI_SERVICE_EMULATORS, docker_available, image_available,
+    remove_container, report_not_ready, wait_for_list_tables,
+};
 use dynoxide_benchmarks::http::make_sdk_client;
 use dynoxide_benchmarks::stats::{mean, stddev};
 use serde::Serialize;
-use std::process::Command;
 use std::time::{Duration, Instant};
+
+/// How long a container gets to answer its first ListTables.
+const CONTAINER_READY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// LocalStack has always been timed over at most five starts, because each
+/// one is slow. The other multi-service emulators are timed the same way.
+const MULTI_SERVICE_MAX_REPS: usize = 5;
 
 #[derive(Debug, Serialize)]
 struct StartupResult {
@@ -16,9 +26,18 @@ struct StartupResult {
     stddev_ms: f64,
 }
 
+/// A target that was attempted and produced no measurement.
+#[derive(Debug, Serialize)]
+struct Failure {
+    target: String,
+    reason: String,
+}
+
 #[derive(Debug, Serialize)]
 struct AllResults {
     results: Vec<StartupResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    failures: Vec<Failure>,
 }
 
 #[tokio::main]
@@ -39,6 +58,7 @@ async fn main() {
     eprintln!("=== Startup Benchmark ({repetitions} repetitions) ===\n");
 
     let mut all_results = Vec::new();
+    let mut failures = Vec::new();
 
     // --- Dynoxide Embedded (cold start) ---
     {
@@ -64,131 +84,81 @@ async fn main() {
             s,
             m * 1000.0
         );
-        all_results.push(StartupResult {
-            target: "dynoxide_embedded".to_string(),
-            mode: "cold".to_string(),
-            samples: samples.clone(),
-            mean_ms: m,
-            stddev_ms: s,
-        });
+        all_results.push(cold("dynoxide_embedded", samples));
     }
 
     // --- Dynoxide HTTP (cold start) ---
     {
         eprintln!("\nDynoxide HTTP (cold start):");
-        let mut samples = Vec::new();
-        for _ in 0..repetitions {
-            let ms = measure_dynoxide_http_startup().await;
-            samples.push(ms);
+        match measure_dynoxide_http_startups(repetitions).await {
+            Ok(samples) => {
+                eprintln!(
+                    "  mean: {:.1}ms  stddev: {:.1}ms",
+                    mean(&samples),
+                    stddev(&samples)
+                );
+                all_results.push(cold("dynoxide_http", samples));
+            }
+            Err(reason) => fail(&mut failures, "dynoxide_http", reason),
         }
-        let m = mean(&samples);
-        let s = stddev(&samples);
-        eprintln!("  mean: {:.1}ms  stddev: {:.1}ms", m, s);
-        all_results.push(StartupResult {
-            target: "dynoxide_http".to_string(),
-            mode: "cold".to_string(),
-            samples,
-            mean_ms: m,
-            stddev_ms: s,
-        });
     }
 
-    // --- DynamoDB Local (cold start) ---
     if docker_available() {
-        eprintln!("\nDynamoDB Local (cold start):");
-        let mut samples = Vec::new();
-        for i in 0..repetitions {
-            eprintln!("  rep {}/{repetitions}...", i + 1);
-            match measure_docker_startup(
-                "amazon/dynamodb-local:latest",
-                "dynoxide-bench-ddb",
-                8002,
-                8000,
-                &["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"],
-            )
-            .await
-            {
-                Some(ms) => samples.push(ms),
-                None => {
-                    eprintln!("  (skipped -- Docker image not available)");
-                    break;
+        // --- DynamoDB Local (cold start, then warm start) ---
+        if image_available(DYNAMODB_LOCAL.image) {
+            eprintln!("\nDynamoDB Local (cold start):");
+            match measure_container_startups(&DYNAMODB_LOCAL, repetitions).await {
+                Ok(samples) => {
+                    print_container_summary(&samples);
+                    all_results.push(cold(DYNAMODB_LOCAL.key, samples));
                 }
+                Err(reason) => fail(&mut failures, DYNAMODB_LOCAL.key, reason),
             }
-        }
-        if !samples.is_empty() {
-            let m = mean(&samples);
-            let s = stddev(&samples);
-            eprintln!("  mean: {:.0}ms  stddev: {:.0}ms", m, s);
-            all_results.push(StartupResult {
-                target: "dynamodb_local".to_string(),
-                mode: "cold".to_string(),
-                samples,
-                mean_ms: m,
-                stddev_ms: s,
-            });
+
+            eprintln!("\nDynamoDB Local (warm start):");
+            match measure_warm_start().await {
+                Ok(ms) => {
+                    // One measurement: it is the same container throughout.
+                    eprintln!("  time after warmup: {ms:.1}ms");
+                    all_results.push(StartupResult {
+                        target: DYNAMODB_LOCAL.key.to_string(),
+                        mode: "warm".to_string(),
+                        samples: vec![ms],
+                        mean_ms: ms,
+                        stddev_ms: 0.0,
+                    });
+                }
+                Err(reason) => fail(&mut failures, DYNAMODB_LOCAL.key, reason),
+            }
+        } else {
+            skip_missing_image(&DYNAMODB_LOCAL);
         }
 
-        // --- DynamoDB Local (warm start) ---
-        eprintln!("\nDynamoDB Local (warm start):");
-        let mut samples = Vec::new();
-        // Start once, warm up, then measure
-        if let Some(ms) = measure_warm_start("amazon/dynamodb-local:latest", 8002, 8000).await {
-            samples.push(ms);
-            // Only one measurement for warm start (it's the same container)
-            let m = mean(&samples);
-            eprintln!("  time after warmup: {:.1}ms", m);
-            all_results.push(StartupResult {
-                target: "dynamodb_local".to_string(),
-                mode: "warm".to_string(),
-                samples,
-                mean_ms: m,
-                stddev_ms: 0.0,
-            });
+        // --- LocalStack, Floci, MiniStack (cold start) ---
+        for target in MULTI_SERVICE_EMULATORS {
+            if !image_available(target.image) {
+                skip_missing_image(target);
+                continue;
+            }
+            eprintln!("\n{} (cold start):", target.label);
+            let reps = repetitions.min(MULTI_SERVICE_MAX_REPS);
+            match measure_container_startups(target, reps).await {
+                Ok(samples) => {
+                    print_container_summary(&samples);
+                    all_results.push(cold(target.key, samples));
+                }
+                Err(reason) => fail(&mut failures, target.key, reason),
+            }
         }
     } else {
-        eprintln!("\nDocker not available -- skipping DynamoDB Local and LocalStack");
-    }
-
-    // --- LocalStack (cold start) ---
-    if docker_available() && image_available("localstack/localstack:latest") {
-        eprintln!("\nLocalStack (cold start):");
-        let mut samples = Vec::new();
-        for i in 0..repetitions.min(5) {
-            // Fewer reps -- LocalStack is slow to start
-            eprintln!("  rep {}/{}...", i + 1, repetitions.min(5));
-            match measure_docker_startup(
-                "localstack/localstack:latest",
-                "dynoxide-bench-ls",
-                4566,
-                4566,
-                &[],
-            )
-            .await
-            {
-                Some(ms) => samples.push(ms),
-                None => {
-                    eprintln!("  (skipped -- Docker image not available)");
-                    break;
-                }
-            }
-        }
-        if !samples.is_empty() {
-            let m = mean(&samples);
-            let s = stddev(&samples);
-            eprintln!("  mean: {:.0}ms  stddev: {:.0}ms", m, s);
-            all_results.push(StartupResult {
-                target: "localstack".to_string(),
-                mode: "cold".to_string(),
-                samples,
-                mean_ms: m,
-                stddev_ms: s,
-            });
-        }
+        eprintln!("\nDocker not available -- skipping the container targets");
     }
 
     // Output
+    let failed = !failures.is_empty();
     let output = AllResults {
         results: all_results,
+        failures,
     };
     let json = serde_json::to_string_pretty(&output).unwrap();
 
@@ -198,141 +168,145 @@ async fn main() {
     } else {
         println!("{json}");
     }
+
+    // A target that was attempted and never answered is a failed run, not a
+    // shorter results list: a README refresh would otherwise keep that
+    // target's old number beside a new commit link.
+    if failed {
+        eprintln!("\nFAILED: no startup time for:");
+        for failure in &output.failures {
+            eprintln!("  {}: {}", failure.target, failure.reason);
+        }
+        std::process::exit(1);
+    }
 }
 
-async fn measure_dynoxide_http_startup() -> f64 {
+fn cold(target: &str, samples: Vec<f64>) -> StartupResult {
+    StartupResult {
+        target: target.to_string(),
+        mode: "cold".to_string(),
+        mean_ms: mean(&samples),
+        stddev_ms: stddev(&samples),
+        samples,
+    }
+}
+
+fn fail(failures: &mut Vec<Failure>, target: &str, reason: String) {
+    eprintln!("  FAILED: {reason}");
+    failures.push(Failure {
+        target: target.to_string(),
+        reason,
+    });
+}
+
+fn skip_missing_image(target: &ContainerTarget) {
+    eprintln!(
+        "\n{}: image {} not pulled -- skipping (docker pull it to include it)",
+        target.label, target.image
+    );
+}
+
+fn print_container_summary(samples: &[f64]) {
+    eprintln!(
+        "  mean: {:.0}ms  stddev: {:.0}ms",
+        mean(samples),
+        stddev(samples)
+    );
+}
+
+async fn measure_dynoxide_http_startups(reps: usize) -> Result<Vec<f64>, String> {
+    let mut samples = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        samples.push(measure_dynoxide_http_startup().await?);
+    }
+    Ok(samples)
+}
+
+async fn measure_dynoxide_http_startup() -> Result<f64, String> {
     let t = Instant::now();
 
     let db = dynoxide::Database::memory().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         dynoxide::server::serve_on(listener, db).await;
     });
 
-    // Poll until ListTables succeeds
-    let client = make_sdk_client(&format!("http://{addr}"));
-    poll_until_ready(&client, Duration::from_secs(10)).await;
+    let ready = wait_for_list_tables(&format!("http://{addr}"), Duration::from_secs(10)).await;
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    server.abort();
 
-    t.elapsed().as_secs_f64() * 1000.0
+    if ready {
+        Ok(ms)
+    } else {
+        Err(format!(
+            "in-process server at {addr} did not answer ListTables within 10s"
+        ))
+    }
 }
 
-async fn measure_docker_startup(
-    image: &str,
-    container_name: &str,
-    host_port: u16,
-    container_port: u16,
-    extra_args: &[&str],
-) -> Option<f64> {
-    // Remove any existing container
-    let _ = Command::new("docker")
-        .args(["rm", "-f", container_name])
-        .output();
+/// Time `reps` starts of `target`, from `docker run` to the first successful
+/// ListTables. Any start that fails fails the target: an average over the
+/// starts that happened to work would read as a full measurement.
+async fn measure_container_startups(
+    target: &ContainerTarget,
+    reps: usize,
+) -> Result<Vec<f64>, String> {
+    let mut samples = Vec::with_capacity(reps);
+    for i in 0..reps {
+        eprintln!("  rep {}/{reps}...", i + 1);
+        let ms = measure_container_startup(target)
+            .await
+            .map_err(|e| format!("rep {}/{reps}: {e}", i + 1))?;
+        samples.push(ms);
+    }
+    Ok(samples)
+}
 
+async fn measure_container_startup(target: &ContainerTarget) -> Result<f64, String> {
+    let container_name = target.container_name("dynoxide-bench-");
+    remove_container(&container_name);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let t = Instant::now();
-
-    let port_mapping = format!("{host_port}:{container_port}");
-    let mut cmd_args = vec![
-        "run",
-        "--rm",
-        "-d",
-        "-p",
-        &port_mapping,
-        "--name",
-        container_name,
-    ];
-
-    // Forward LocalStack auth token if available
-    let ls_token;
-    if image.contains("localstack")
-        && let Ok(token) = std::env::var("LOCALSTACK_AUTH_TOKEN")
-    {
-        ls_token = format!("LOCALSTACK_AUTH_TOKEN={token}");
-        cmd_args.extend_from_slice(&["-e", &ls_token]);
-    }
-
-    cmd_args.push(image);
-    cmd_args.extend_from_slice(extra_args);
-
-    let output = Command::new("docker").args(&cmd_args).output().ok()?;
-
-    if !output.status.success() {
-        eprintln!(
-            "  Failed to start {image}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return None;
-    }
-
-    let endpoint = format!("http://localhost:{host_port}");
-
-    let client = make_sdk_client(&endpoint);
-    let ready = poll_until_ready(&client, Duration::from_secs(300)).await;
-
+    target.run(&container_name)?;
+    let ready = wait_for_list_tables(&target.endpoint(), CONTAINER_READY_TIMEOUT).await;
     let ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    // Clean up
-    let _ = Command::new("docker")
-        .args(["rm", "-f", container_name])
-        .output();
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    if ready {
-        Some(ms)
+    let result = if ready {
+        Ok(ms)
     } else {
-        eprintln!("  Timed out waiting for {image}");
-        None
-    }
+        Err(report_not_ready(
+            target,
+            &container_name,
+            CONTAINER_READY_TIMEOUT,
+        ))
+    };
+    remove_container(&container_name);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    result
 }
 
-async fn measure_warm_start(image: &str, host_port: u16, container_port: u16) -> Option<f64> {
+/// Start DynamoDB Local, warm the JVM up with 500 PutItem and 100 GetItem
+/// calls, then time one ListTables.
+async fn measure_warm_start() -> Result<f64, String> {
+    let target = &DYNAMODB_LOCAL;
     let container_name = "dynoxide-bench-warm";
+    let timeout = Duration::from_secs(60);
 
-    // Remove any existing
-    let _ = Command::new("docker")
-        .args(["rm", "-f", container_name])
-        .output();
+    remove_container(container_name);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Start container
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-d",
-            "-p",
-            &format!("{host_port}:{container_port}"),
-            "--name",
-            container_name,
-            image,
-            "-jar",
-            "DynamoDBLocal.jar",
-            "-inMemory",
-            "-sharedDb",
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
+    target.run(container_name)?;
+    if !wait_for_list_tables(&target.endpoint(), timeout).await {
+        let reason = report_not_ready(target, container_name, timeout);
+        remove_container(container_name);
+        return Err(reason);
     }
 
-    let endpoint = format!("http://localhost:{host_port}");
-    let client = make_sdk_client(&endpoint);
+    let client = make_sdk_client(&target.endpoint());
 
-    // Wait for container to be ready
-    if !poll_until_ready(&client, Duration::from_secs(60)).await {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", container_name])
-            .output();
-        return None;
-    }
-
-    // Run warmup: 500 Put + 100 Get
     let _ = client
         .create_table()
         .table_name("_warmup")
@@ -373,42 +347,13 @@ async fn measure_warm_start(image: &str, host_port: u16, container_port: u16) ->
 
     // Now measure first operation after warmup
     let t = Instant::now();
-    let _ = client.list_tables().send().await;
+    let listed = client.list_tables().send().await;
     let ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    // Clean up
-    let _ = Command::new("docker")
-        .args(["rm", "-f", container_name])
-        .output();
+    remove_container(container_name);
 
-    Some(ms)
-}
-
-async fn poll_until_ready(client: &aws_sdk_dynamodb::Client, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if Instant::now() > deadline {
-            return false;
-        }
-        match client.list_tables().send().await {
-            Ok(_) => return true,
-            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
+    match listed {
+        Ok(_) => Ok(ms),
+        Err(e) => Err(format!("ListTables after the warm-up failed: {e}")),
     }
-}
-
-fn docker_available() -> bool {
-    Command::new("docker")
-        .args(["info"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn image_available(image: &str) -> bool {
-    Command::new("docker")
-        .args(["image", "inspect", image])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }

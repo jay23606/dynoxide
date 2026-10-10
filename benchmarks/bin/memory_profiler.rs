@@ -5,6 +5,10 @@ use dynoxide::actions::query::QueryRequest;
 use dynoxide::actions::scan::ScanRequest;
 use dynoxide::actions::update_item::UpdateItemRequest;
 use dynoxide::types::AttributeValue;
+use dynoxide_benchmarks::containers::{
+    self, ContainerState, ContainerTarget, container_state, docker_available, image_available,
+    remove_container, report_not_ready, report_stopped, wait_for_list_tables,
+};
 use dynoxide_benchmarks::memory_measurement::{current_rss_bytes, disk_usage_bytes, format_bytes};
 use dynoxide_benchmarks::stats;
 use dynoxide_benchmarks::{BENCH_TABLE, ItemSize, create_table_request, generate_items, make_key};
@@ -12,6 +16,9 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+/// How long a container gets to answer its first ListTables.
+const CONTAINER_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct CsvWriter {
     rows: Vec<String>,
@@ -71,56 +78,46 @@ fn main() {
     run_workload_file(&mut csv_file);
 
     // Docker container idle RSS
-    // Methodology: 30s settle after first successful health check,
+    // Methodology: 30s settle after the first successful ListTables,
     // then 3 samples taken 10s apart. Reports mean and range.
     let mut docker_rows: Vec<String> = Vec::new();
+    let mut failures: Vec<(&str, String)> = Vec::new();
     if docker_available() {
         eprintln!("\n--- Docker Container Idle RSS (30s settle, 3 samples @ 10s intervals) ---");
 
-        if let Some(samples) = measure_container_idle_rss(
-            "amazon/dynamodb-local:latest",
-            "dynoxide-bench-mem-ddb",
-            8002,
-            8000,
-            &["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"],
-            None,
-        ) {
-            let mean = stats::mean(&samples) as u64;
-            let min = *samples.iter().min_by(|a, b| a.total_cmp(b)).unwrap() as u64;
-            let max = *samples.iter().max_by(|a, b| a.total_cmp(b)).unwrap() as u64;
-            eprintln!(
-                "  DynamoDB Local idle RSS: {} (range: {}–{})",
-                format_bytes(mean),
-                format_bytes(min),
-                format_bytes(max)
-            );
-            docker_rows.push(format!("docker_idle,dynamodb_local,{mean},0,0,0"));
-        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-        if image_available("localstack/localstack:latest") {
-            let ls_token = std::env::var("LOCALSTACK_AUTH_TOKEN").ok();
-            let ls_env = ls_token.as_deref().map(|t| ("LOCALSTACK_AUTH_TOKEN", t));
-            if let Some(samples) = measure_container_idle_rss(
-                "localstack/localstack:latest",
-                "dynoxide-bench-mem-ls",
-                4566,
-                4566,
-                &[],
-                ls_env,
-            ) {
-                let mean = stats::mean(&samples) as u64;
-                let min = *samples.iter().min_by(|a, b| a.total_cmp(b)).unwrap() as u64;
-                let max = *samples.iter().max_by(|a, b| a.total_cmp(b)).unwrap() as u64;
+        for target in containers::ALL {
+            if !image_available(target.image) {
                 eprintln!(
-                    "  LocalStack idle RSS:    {} (range: {}–{})",
-                    format_bytes(mean),
-                    format_bytes(min),
-                    format_bytes(max)
+                    "  {}: image {} not pulled -- skipping (docker pull it to include it)",
+                    target.label, target.image
                 );
-                docker_rows.push(format!("docker_idle,localstack,{mean},0,0,0"));
+                continue;
             }
-        } else {
-            eprintln!("  LocalStack image not available -- skipping");
+            eprintln!("  {}:", target.label);
+            match measure_container_idle_rss(&runtime, target) {
+                Ok(samples) => {
+                    let mean = stats::mean(&samples) as u64;
+                    let min = *samples.iter().min_by(|a, b| a.total_cmp(b)).unwrap() as u64;
+                    let max = *samples.iter().max_by(|a, b| a.total_cmp(b)).unwrap() as u64;
+                    eprintln!(
+                        "  {} idle RSS: {} (range: {} to {})",
+                        target.label,
+                        format_bytes(mean),
+                        format_bytes(min),
+                        format_bytes(max)
+                    );
+                    docker_rows.push(format!("docker_idle,{},{mean},0,0,0", target.key));
+                }
+                Err(reason) => {
+                    eprintln!("  FAILED: {reason}");
+                    failures.push((target.key, reason));
+                }
+            }
         }
     } else {
         eprintln!("\nDocker not available -- skipping container idle RSS");
@@ -135,6 +132,17 @@ fn main() {
         .chain(docker_rows.iter())
     {
         println!("{row}");
+    }
+
+    // A target that was attempted and never answered is a failed run, not a
+    // shorter CSV: a README refresh would otherwise keep that target's old
+    // number beside a new commit link.
+    if !failures.is_empty() {
+        eprintln!("\nFAILED: no idle RSS for:");
+        for (target, reason) in &failures {
+            eprintln!("  {target}: {reason}");
+        }
+        std::process::exit(1);
     }
 }
 
@@ -376,85 +384,35 @@ fn delete_items(db: &Database, count: usize) {
 
 // --- Docker container idle RSS helpers ---
 
-fn docker_available() -> bool {
-    Command::new("docker")
-        .args(["info"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn image_available(image: &str) -> bool {
-    Command::new("docker")
-        .args(["image", "inspect", image])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Start a Docker container, wait for it to accept DynamoDB API calls,
-/// settle for 30 seconds (no requests served), then take 3 RSS samples
-/// 10 seconds apart via `docker stats`. Returns all samples as f64 bytes.
+/// Start a container, wait for its first successful ListTables, settle for
+/// 30 seconds (no requests served), then take 3 RSS samples 10 seconds apart
+/// via `docker stats`. Returns all samples as f64 bytes.
 fn measure_container_idle_rss(
-    image: &str,
-    container_name: &str,
-    host_port: u16,
-    container_port: u16,
-    extra_args: &[&str],
-    env: Option<(&str, &str)>,
-) -> Option<Vec<f64>> {
+    runtime: &tokio::runtime::Runtime,
+    target: &ContainerTarget,
+) -> Result<Vec<f64>, String> {
     const SETTLE_SECS: u64 = 30;
     const SAMPLE_COUNT: usize = 3;
     const SAMPLE_INTERVAL_SECS: u64 = 10;
 
-    // Clean up any previous container
-    let _ = Command::new("docker")
-        .args(["rm", "-f", container_name])
-        .output();
+    let container_name = target.container_name("dynoxide-bench-mem-");
+    remove_container(&container_name);
     std::thread::sleep(Duration::from_millis(500));
 
-    // Start container
-    let port_mapping = format!("{host_port}:{container_port}");
-    let mut cmd_args = vec![
-        "run",
-        "--rm",
-        "-d",
-        "-p",
-        &port_mapping,
-        "--name",
-        container_name,
-    ];
+    target.run(&container_name)?;
 
-    let env_str;
-    if let Some((key, val)) = env {
-        env_str = format!("{key}={val}");
-        cmd_args.extend_from_slice(&["-e", &env_str]);
-    }
-
-    cmd_args.push(image);
-    cmd_args.extend_from_slice(extra_args);
-
-    let output = Command::new("docker").args(&cmd_args).output().ok()?;
-    if !output.status.success() {
-        eprintln!(
-            "  Failed to start {image}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return None;
-    }
-
-    // Poll until the DynamoDB endpoint responds
-    let endpoint = format!("http://localhost:{host_port}");
-    if !poll_endpoint_ready(&endpoint, Duration::from_secs(300)) {
-        eprintln!("  Timed out waiting for {image}");
-        let _ = Command::new("docker")
-            .args(["rm", "-f", container_name])
-            .output();
-        return None;
+    // The same readiness check as the startup benchmark.
+    if !runtime.block_on(wait_for_list_tables(
+        &target.endpoint(),
+        CONTAINER_READY_TIMEOUT,
+    )) {
+        let reason = report_not_ready(target, &container_name, CONTAINER_READY_TIMEOUT);
+        remove_container(&container_name);
+        return Err(reason);
     }
 
     // Settle: no requests, just wait
-    eprintln!("    settling {SETTLE_SECS}s after health check...");
+    eprintln!("    settling {SETTLE_SECS}s after the first ListTables...");
     std::thread::sleep(Duration::from_secs(SETTLE_SECS));
 
     // Take multiple samples
@@ -463,60 +421,34 @@ fn measure_container_idle_rss(
         if i > 0 {
             std::thread::sleep(Duration::from_secs(SAMPLE_INTERVAL_SECS));
         }
-        if let Some(rss) = read_container_rss(container_name) {
+        if let Some(rss) = read_container_rss(&container_name) {
             eprintln!("    sample {}: {}", i + 1, format_bytes(rss));
             samples.push(rss as f64);
         }
     }
 
+    // Containers run without `--rm`, so one that died during the settle is
+    // still there for `docker stats` to read, and whatever it reports is not
+    // idle memory. A container running now was
+    // running for every sample.
+    let state = container_state(&container_name);
+    let stopped =
+        (state != ContainerState::Running).then(|| report_stopped(target, &container_name, &state));
+
     // Clean up
-    let _ = Command::new("docker")
-        .args(["rm", "-f", container_name])
-        .output();
+    remove_container(&container_name);
     std::thread::sleep(Duration::from_millis(500));
 
-    if samples.is_empty() {
-        None
+    if let Some(reason) = stopped {
+        Err(reason)
+    } else if samples.is_empty() {
+        Err(format!(
+            "{}: docker stats returned no memory reading for {container_name}",
+            target.label
+        ))
     } else {
-        Some(samples)
+        Ok(samples)
     }
-}
-
-/// Poll a DynamoDB-compatible endpoint until it responds to HTTP requests.
-/// Accepts any HTTP response (including 400) — a response means the server is up.
-fn poll_endpoint_ready(endpoint: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let result = Command::new("curl")
-            .args([
-                "-s",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                "-X",
-                "POST",
-                "-H",
-                "Content-Type: application/x-amz-json-1.0",
-                "-H",
-                "X-Amz-Target: DynamoDB_20120810.ListTables",
-                "-d",
-                "{}",
-                endpoint,
-            ])
-            .output();
-
-        if let Ok(out) = result {
-            let code = String::from_utf8_lossy(&out.stdout);
-            if let Ok(status) = code.trim().parse::<u16>()
-                && status > 0
-            {
-                return true;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    false
 }
 
 /// Read a container's current memory usage from `docker stats`.

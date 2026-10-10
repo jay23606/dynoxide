@@ -30,15 +30,15 @@ For Rust projects, there's also an **embedded mode** - direct API calls via `Dat
 
 Numbers from `ubuntu-latest` (<!-- prose:ci_runner_hardware -->4-core Intel(R) Xeon(R) 6973P-C, 16GB RAM<!-- /bench -->). Commit <!-- bench:ci_commit_link_root -->[`49c6338`](../../commit/49c6338adf3ea2efea9991033183ffaaefe1b08a)<!-- /bench -->.
 
-| Metric | Dynoxide (embedded) | Dynoxide (HTTP) | DynamoDB Local | LocalStack (all services) |
-|---|---|---|---|---|
-| Cold startup | <!-- bench:ci_startup_embedded -->**<1ms**<!-- /bench --> | <!-- bench:ci_startup_http -->**~2ms**<!-- /bench --> | <!-- bench:ci_startup_ddb_local -->~2,831ms<!-- /bench --> | <!-- bench:ci_startup_localstack -->~13,473ms<!-- /bench --> |
-| GetItem (p50) | <!-- bench:ci_getitem_embedded -->10µs<!-- /bench --> | <!-- bench:ci_getitem_http -->0.2ms<!-- /bench --> | <!-- bench:ci_getitem_ddb_local -->0.7ms<!-- /bench --> | - |
-| 50-test CI suite | <!-- bench:ci_suite_embedded_seq -->573ms<!-- /bench --> | <!-- bench:ci_suite_http_seq -->533ms<!-- /bench --> | <!-- bench:ci_suite_ddb_local_seq -->1,871ms<!-- /bench --> | - |
-| Full workload (10K items) | - | <!-- bench:ci_workload_http -->**2.1s**<!-- /bench --> | <!-- bench:ci_workload_ddb_local -->8.2s<!-- /bench --> | - |
-| Binary / image (download) | <!-- prose:ci_binary_download -->~3 MB<!-- /bench --> | <!-- prose:ci_binary_download_http -->~3 MB<!-- /bench --> | <!-- prose:ci_image_ddb_local_download -->225 MB<!-- /bench --> | <!-- prose:ci_image_localstack_download -->1.1 GB<!-- /bench --> |
-| Binary / image (on disk) | <!-- bench:ci_binary_size -->7 MB<!-- /bench --> | <!-- bench:ci_binary_size_http -->7 MB<!-- /bench --> | <!-- bench:ci_image_ddb_local -->473 MB<!-- /bench --> | <!-- bench:ci_image_localstack -->1.2 GB<!-- /bench --> |
-| Idle memory (RSS) | <!-- bench:ci_memory_embedded_idle -->~5.3 MB<!-- /bench --> | <!-- bench:ci_memory_http_idle -->~8 MB<!-- /bench --> | <!-- bench:ci_memory_ddb_local_idle -->~205 MB<!-- /bench --> | <!-- bench:ci_memory_localstack_idle -->~388 MB<!-- /bench --> |
+| Metric | Dynoxide (embedded) | Dynoxide (HTTP) | DynamoDB Local | LocalStack (all services) | Floci | MiniStack |
+|---|---|---|---|---|---|---|
+| Cold startup | <!-- bench:ci_startup_embedded -->**<1ms**<!-- /bench --> | <!-- bench:ci_startup_http -->**~2ms**<!-- /bench --> | <!-- bench:ci_startup_ddb_local -->~2,831ms<!-- /bench --> | <!-- bench:ci_startup_localstack -->~13,473ms<!-- /bench --> | <!-- bench:ci_startup_floci -->pending<!-- /bench --> | <!-- bench:ci_startup_ministack -->pending<!-- /bench --> |
+| GetItem (p50) | <!-- bench:ci_getitem_embedded -->10µs<!-- /bench --> | <!-- bench:ci_getitem_http -->0.2ms<!-- /bench --> | <!-- bench:ci_getitem_ddb_local -->0.7ms<!-- /bench --> | - | - | - |
+| 50-test CI suite | <!-- bench:ci_suite_embedded_seq -->573ms<!-- /bench --> | <!-- bench:ci_suite_http_seq -->533ms<!-- /bench --> | <!-- bench:ci_suite_ddb_local_seq -->1,871ms<!-- /bench --> | - | - | - |
+| Full workload (10K items) | - | <!-- bench:ci_workload_http -->**2.1s**<!-- /bench --> | <!-- bench:ci_workload_ddb_local -->8.2s<!-- /bench --> | - | - | - |
+| Binary / image (download) | <!-- prose:ci_binary_download -->~3 MB<!-- /bench --> | <!-- prose:ci_binary_download_http -->~3 MB<!-- /bench --> | <!-- prose:ci_image_ddb_local_download -->225 MB<!-- /bench --> | <!-- prose:ci_image_localstack_download -->1.1 GB<!-- /bench --> | - | - |
+| Binary / image (on disk) | <!-- bench:ci_binary_size -->7 MB<!-- /bench --> | <!-- bench:ci_binary_size_http -->7 MB<!-- /bench --> | <!-- bench:ci_image_ddb_local -->473 MB<!-- /bench --> | <!-- bench:ci_image_localstack -->1.2 GB<!-- /bench --> | <!-- bench:ci_image_floci -->pending<!-- /bench --> | <!-- bench:ci_image_ministack -->pending<!-- /bench --> |
+| Idle memory (RSS) | <!-- bench:ci_memory_embedded_idle -->~5.3 MB<!-- /bench --> | <!-- bench:ci_memory_http_idle -->~8 MB<!-- /bench --> | <!-- bench:ci_memory_ddb_local_idle -->~205 MB<!-- /bench --> | <!-- bench:ci_memory_localstack_idle -->~388 MB<!-- /bench --> | <!-- bench:ci_memory_floci_idle -->pending<!-- /bench --> | <!-- bench:ci_memory_ministack_idle -->pending<!-- /bench --> |
 
 > The gap is wider on Apple Silicon because the faster CPU amplifies the difference between native code and JVM overhead. Both are real measurements of the same benchmark suite. [Full methodology and per-operation breakdowns →](benchmarks/README.md)
 
@@ -55,15 +55,15 @@ This covers the native build. The [WebAssembly](https://github.com/nubo-db/dynox
 
 ### How It Compares
 
-| | Dynoxide | DynamoDB Local | LocalStack (all services) | dynalite |
-|---|---|---|---|---|
-| Language | Rust | Java | Python + Java | Node.js |
-| Storage | SQLite | SQLite | SQLite (via DDB Local) | LevelDB |
-| Runtime dependency | - | JVM | Docker + LocalStack | Node.js |
-| Embeddable (Rust / iOS) | ✓ | - | - | - |
-| MCP server for agents | ✓ | - | - | - |
+| | Dynoxide | DynamoDB Local | LocalStack (all services) | Floci | MiniStack | dynalite |
+|---|---|---|---|---|---|---|
+| Language | Rust | Java | Python + Java | Java (GraalVM native image) | Python | Node.js |
+| Storage | SQLite | SQLite | SQLite (via DDB Local) | Its own (in-memory, persistent or WAL) | Its own (in-memory, optional on-disk state) | LevelDB |
+| Runtime dependency | - | JVM | Docker + a LocalStack account (auth token) | Docker | Docker or Python | Node.js |
+| Embeddable (Rust / iOS) | ✓ | - | - | - | - | - |
+| MCP server for agents | ✓ | - | - | - | - | - |
 
-LocalStack uses DynamoDB Local internally as its DynamoDB engine, so its startup and memory overhead includes DynamoDB Local's JVM plus LocalStack's own Python routing layer.
+LocalStack uses DynamoDB Local internally as its DynamoDB engine, so its startup and memory overhead includes DynamoDB Local's JVM plus LocalStack's own Python routing layer. Since March 2026 its image needs a LocalStack account and `LOCALSTACK_AUTH_TOKEN` to start, even for the services that used to be free. Floci and MiniStack are general AWS emulators like LocalStack, each with its own DynamoDB engine rather than DynamoDB Local.
 
 
 ## Quick Start

@@ -1,12 +1,15 @@
+use dynoxide_benchmarks::containers;
 use dynoxide_benchmarks::memory_measurement::format_bytes;
 use std::process::Command;
 
 fn main() {
-    println!("=== Dynoxide vs DynamoDB Local vs LocalStack: Size Comparison ===\n");
+    println!("=== Dynoxide vs container emulators: Size Comparison ===\n");
 
     let dynoxide_size = measure_dynoxide_binary();
-    let ddb_local_size = measure_docker_image("amazon/dynamodb-local:latest");
-    let localstack_size = measure_docker_image("localstack/localstack:latest");
+    let images: Vec<_> = containers::ALL
+        .iter()
+        .map(|target| (target, measure_docker_image(target.image)))
+        .collect();
 
     println!("{:<25} {:>15}", "Target", "Install Size");
     println!("{:-<25} {:-<15}", "", "");
@@ -20,52 +23,42 @@ fn main() {
         );
     }
 
-    if let Some(size) = ddb_local_size {
-        println!(
-            "{:<25} {:>15}",
-            "DynamoDB Local (Docker)",
-            format_bytes(size)
-        );
-    } else {
-        println!(
-            "{:<25} {:>15}",
-            "DynamoDB Local (Docker)", "(docker pull first)"
-        );
-    }
-
-    if let Some(size) = localstack_size {
-        println!("{:<25} {:>15}", "LocalStack (Docker)", format_bytes(size));
-    } else {
-        println!(
-            "{:<25} {:>15}",
-            "LocalStack (Docker)", "(docker pull first)"
-        );
+    for (target, size) in &images {
+        let name = format!("{} (Docker)", target.label);
+        match size {
+            Some(size) => println!("{:<25} {:>15}", name, format_bytes(*size)),
+            None => println!("{:<25} {:>15}", name, "(docker pull first)"),
+        }
     }
 
     // Print ratios
-    if let (Some(dyn_size), Some(ddb_size)) = (dynoxide_size, ddb_local_size) {
-        println!(
-            "\nDynamoDB Local is {:.0}x larger than Dynoxide",
-            ddb_size as f64 / dyn_size as f64
-        );
-    }
-    if let (Some(dyn_size), Some(ls_size)) = (dynoxide_size, localstack_size) {
-        println!(
-            "LocalStack is {:.0}x larger than Dynoxide",
-            ls_size as f64 / dyn_size as f64
-        );
+    if let Some(dyn_size) = dynoxide_size {
+        println!();
+        for (target, size) in &images {
+            if let Some(size) = size {
+                println!(
+                    "{} is {:.0}x larger than Dynoxide",
+                    target.label,
+                    *size as f64 / dyn_size as f64
+                );
+            }
+        }
     }
 
     // Output JSON for report generation
-    println!("\n--- JSON Output ---");
-    println!(
-        "{}",
-        serde_json::json!({
-            "dynoxide_binary_bytes": dynoxide_size,
-            "dynamodb_local_docker_bytes": ddb_local_size,
-            "localstack_docker_bytes": localstack_size,
-        })
+    let mut json = serde_json::Map::new();
+    json.insert(
+        "dynoxide_binary_bytes".to_string(),
+        serde_json::json!(dynoxide_size),
     );
+    for (target, size) in &images {
+        json.insert(
+            format!("{}_docker_bytes", target.key),
+            serde_json::json!(size),
+        );
+    }
+    println!("\n--- JSON Output ---");
+    println!("{}", serde_json::Value::Object(json));
 }
 
 fn measure_dynoxide_binary() -> Option<u64> {

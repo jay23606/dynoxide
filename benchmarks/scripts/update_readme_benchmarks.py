@@ -151,6 +151,59 @@ def fmt_size_gb(bytes_val):
     return "{:.1f} GB".format(gb)
 
 
+def fmt_image_size(bytes_val):
+    """Format an image size in GB from 1 GiB up, MB below that."""
+    if bytes_val >= 1024 * 1024 * 1024:
+        return fmt_size_gb(bytes_val)
+    return fmt_size_mb(bytes_val)
+
+
+def fmt_ratio_vs_ddb_local(target_ms, ddb_ms):
+    """Compare a container emulator's startup with DynamoDB Local's.
+
+    Not bold: bold is kept for Dynoxide's own rows.
+    """
+    if target_ms < ddb_ms:
+        return fmt_ratio_faster(ddb_ms / target_ms, bold=False)
+    return fmt_ratio_slower(target_ms / ddb_ms)
+
+
+# Container emulators measured for startup, idle memory and image size only,
+# in the order the tables list them. Maps the key used in the result files to
+# the display name.
+CONTAINER_EMULATORS = [
+    ("localstack", "LocalStack"),
+    ("floci", "Floci"),
+    ("ministack", "MiniStack"),
+]
+
+IMAGE_NAMES = [("dynamodb_local", "DynamoDB Local")] + CONTAINER_EMULATORS
+
+
+def fmt_image_versions(system_info):
+    """Name the image each emulator was measured from, like
+    'DynamoDB Local `ff89bd48ff32`, Floci 2.2.0'.
+
+    The version comes from the image's own OCI label. An image without one is
+    identified by the first 12 hex digits of its registry digest, or of its ID
+    when it was never pulled from a registry.
+    """
+    images = system_info.get("images") or {}
+    parts = []
+    for key, name in IMAGE_NAMES:
+        info = images.get(key)
+        if not info:
+            continue
+        if info.get("version"):
+            parts.append("{} {}".format(name, info["version"]))
+            continue
+        sha = info.get("digest") or info.get("id") or ""
+        sha = sha.split(":", 1)[-1][:12]
+        if sha:
+            parts.append("{} `{}`".format(name, sha))
+    return ", ".join(parts) if parts else None
+
+
 def fmt_criterion_ns(ns):
     """Format criterion benchmark results (ns/iter) as human-readable latency."""
     us = ns / 1000
@@ -291,7 +344,6 @@ def build_value_mapping(run_summary, memory_rows):
     emb = find_startup(results, "dynoxide_embedded")
     http = find_startup(results, "dynoxide_http")
     ddb = find_startup(results, "dynamodb_local")
-    ls = find_startup(results, "localstack")
 
     if emb and ddb:
         # Main README (simplified)
@@ -314,13 +366,17 @@ def build_value_mapping(run_summary, memory_rows):
         values["ci_startup_ddb_local_mean"] = "{:,.0f}ms".format(ddb["mean_ms"])
         values["ci_startup_ddb_local_stddev"] = "\u00b1{:,.0f}ms".format(ddb["stddev_ms"])
 
-    if ls:
-        values["ci_startup_localstack"] = fmt_startup_ms(ls["mean_ms"])
-        values["ci_startup_localstack_mean"] = "{:,.0f}ms".format(ls["mean_ms"])
-        values["ci_startup_localstack_stddev"] = "\u00b1{:,.0f}ms".format(ls["stddev_ms"])
-        if ddb:
-            ratio = ls["mean_ms"] / ddb["mean_ms"]
-            values["ci_startup_localstack_ratio"] = fmt_ratio_slower(ratio)
+    for key, _ in CONTAINER_EMULATORS:
+        target = find_startup(results, key)
+        if not target:
+            continue
+        values["ci_startup_{}".format(key)] = fmt_startup_ms(target["mean_ms"])
+        values["ci_startup_{}_mean".format(key)] = "{:,.0f}ms".format(target["mean_ms"])
+        values["ci_startup_{}_stddev".format(key)] = "\u00b1{:,.0f}ms".format(
+            target["stddev_ms"])
+        if ddb and target["mean_ms"] > 0:
+            values["ci_startup_{}_ratio".format(key)] = fmt_ratio_vs_ddb_local(
+                target["mean_ms"], ddb["mean_ms"])
 
     # --- Per-operation comparison ---
     # Maps marker key suffix -> JSON step name
@@ -433,7 +489,6 @@ def build_value_mapping(run_summary, memory_rows):
     file_loaded = find_memory_row(memory_rows, "file", "loaded_10k")
     file_empty_table = find_memory_row(memory_rows, "file", "table_created")
     ddb_idle = find_memory_row(memory_rows, "docker_idle", "dynamodb_local")
-    ls_idle = find_memory_row(memory_rows, "docker_idle", "localstack")
 
     if mem_idle:
         values["ci_mem_memory_idle"] = fmt_memory_mb_exact(int(mem_idle["rss_bytes"]))
@@ -454,9 +509,11 @@ def build_value_mapping(run_summary, memory_rows):
     if ddb_idle:
         values["ci_mem_ddb_local_idle"] = fmt_memory_mb_exact(int(ddb_idle["rss_bytes"]))
         values["ci_memory_ddb_local_idle"] = fmt_memory_mb(int(ddb_idle["rss_bytes"]))
-    if ls_idle:
-        values["ci_mem_localstack_idle"] = fmt_memory_mb_exact(int(ls_idle["rss_bytes"]))
-        values["ci_memory_localstack_idle"] = fmt_memory_mb(int(ls_idle["rss_bytes"]))
+    for key, _ in CONTAINER_EMULATORS:
+        idle = find_memory_row(memory_rows, "docker_idle", key)
+        if idle:
+            values["ci_mem_{}_idle".format(key)] = fmt_memory_mb_exact(int(idle["rss_bytes"]))
+            values["ci_memory_{}_idle".format(key)] = fmt_memory_mb(int(idle["rss_bytes"]))
 
     # --- Binary / Docker image sizes ---
     binary_bytes = system_info.get("dynoxide_binary_bytes")
@@ -468,12 +525,14 @@ def build_value_mapping(run_summary, memory_rows):
     if ddb_image_bytes:
         values["ci_image_ddb_local"] = fmt_size_mb(ddb_image_bytes)
 
-    ls_image_bytes = system_info.get("localstack_image_bytes")
-    if ls_image_bytes:
-        if ls_image_bytes >= 1024 * 1024 * 1024:
-            values["ci_image_localstack"] = fmt_size_gb(ls_image_bytes)
-        else:
-            values["ci_image_localstack"] = fmt_size_mb(ls_image_bytes)
+    for key, _ in CONTAINER_EMULATORS:
+        image_bytes = system_info.get("{}_image_bytes".format(key))
+        if image_bytes:
+            values["ci_image_{}".format(key)] = fmt_image_size(image_bytes)
+
+    image_versions = fmt_image_versions(system_info)
+    if image_versions:
+        values["ci_image_versions"] = image_versions
 
     # --- Prose values (derived from CI data) ---
     if ddb:
@@ -687,7 +746,7 @@ def classify_key(key):
 
     Returns: 'ratio', 'latency', 'memory', or 'skip'.
     """
-    if key.startswith("ci_commit") or key == "ci_runner_hardware":
+    if key.startswith("ci_commit") or key in ("ci_runner_hardware", "ci_image_versions"):
         return "skip"
     if "_ratio" in key or key.endswith("_ratio"):
         return "ratio"
