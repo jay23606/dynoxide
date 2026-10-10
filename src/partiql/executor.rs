@@ -3325,37 +3325,18 @@ fn resolve_set_call(
             "An operand in the update expression has an incorrect data type".to_string(),
         )
     };
-    fn combine<T: Clone, K: PartialEq>(
-        held: &[T],
-        change: &[T],
-        delete: bool,
-        key: impl Fn(&T) -> K,
-    ) -> Vec<T> {
-        let in_change = |m: &T| change.iter().any(|c| key(c) == key(m));
-        if delete {
-            held.iter().filter(|m| !in_change(m)).cloned().collect()
-        } else {
-            let mut out = held.to_vec();
-            for m in change {
-                if !out.iter().any(|h| key(h) == key(m)) {
-                    out.push(m.clone());
-                }
-            }
-            out
-        }
-    }
     let result = match (resolve_nested_path(item, path), &members) {
         (None, _) => return Ok((!delete).then_some(members)),
         (Some(AttributeValue::SS(held)), AttributeValue::SS(change)) => {
-            AttributeValue::SS(combine(held, change, delete, String::clone))
+            AttributeValue::SS(combine_set_members(held, change, delete, String::clone))
         }
         (Some(AttributeValue::NS(held)), AttributeValue::NS(change)) => {
-            AttributeValue::NS(combine(held, change, delete, |n: &String| {
+            AttributeValue::NS(combine_set_members(held, change, delete, |n: &String| {
                 crate::types::normalize_dynamo_number(n)
             }))
         }
         (Some(AttributeValue::BS(held)), AttributeValue::BS(change)) => {
-            AttributeValue::BS(combine(held, change, delete, Vec::clone))
+            AttributeValue::BS(combine_set_members(held, change, delete, Vec::clone))
         }
         _ => return Err(wrong_type()),
     };
@@ -3365,6 +3346,36 @@ fn resolve_set_call(
         _ => false,
     };
     Ok((!empty).then_some(result))
+}
+
+/// `set_delete` takes the held members `change` names; `set_add` appends the
+/// members of `change` the set doesn't hold, in the order written. Members are
+/// matched by `key`, which for a number set is its normalised value. Each
+/// member's key is worked out once and looked up in a hash set, so the work
+/// grows with the sets' sizes rather than their product.
+fn combine_set_members<T: Clone, K: Eq + std::hash::Hash>(
+    held: &[T],
+    change: &[T],
+    delete: bool,
+    key: impl Fn(&T) -> K,
+) -> Vec<T> {
+    use std::collections::HashSet;
+    if delete {
+        let named: HashSet<K> = change.iter().map(&key).collect();
+        held.iter()
+            .filter(|m| !named.contains(&key(m)))
+            .cloned()
+            .collect()
+    } else {
+        let mut seen: HashSet<K> = held.iter().map(&key).collect();
+        let mut out = held.to_vec();
+        for m in change {
+            if seen.insert(key(m)) {
+                out.push(m.clone());
+            }
+        }
+        out
+    }
 }
 
 /// Resolve a SetValue other than a set call to a concrete AttributeValue,
@@ -4040,6 +4051,53 @@ fn format_bigdecimal(n: &bigdecimal::BigDecimal) -> String {
 mod tests {
     use super::*;
     use crate::partiql::parser::parse;
+
+    /// `set_add` appends the members it doesn't hold, in the order written,
+    /// once each; `set_delete` keeps the held members it doesn't name. A
+    /// number set matches by value. Each member's key is worked out once, so a
+    /// large set costs in proportion to its size rather than its square.
+    #[test]
+    fn set_members_combine_once_per_member() {
+        let s = |v: &[&str]| v.iter().map(|m| m.to_string()).collect::<Vec<_>>();
+        let held = s(&["a", "b", "c"]);
+        assert_eq!(
+            combine_set_members(&held, &s(&["c", "d", "d", "e"]), false, String::clone),
+            s(&["a", "b", "c", "d", "e"])
+        );
+        assert_eq!(
+            combine_set_members(&held, &s(&["c", "a", "z"]), true, String::clone),
+            s(&["b"])
+        );
+        let numbers = s(&["1", "2.0", "30"]);
+        let by_value = |n: &String| crate::types::normalize_dynamo_number(n);
+        assert_eq!(
+            combine_set_members(&numbers, &s(&["2", "3e1", "4"]), false, by_value),
+            s(&["1", "2.0", "30", "4"])
+        );
+        assert_eq!(
+            combine_set_members(&numbers, &s(&["1.00", "30"]), true, by_value),
+            s(&["2.0"])
+        );
+
+        let held: Vec<String> = (0..2_000).map(|i| format!("h{i}")).collect();
+        let change: Vec<String> = (0..2_000).map(|i| format!("c{i}")).collect();
+        for delete in [false, true] {
+            let calls = std::cell::Cell::new(0usize);
+            let counted = |m: &String| {
+                calls.set(calls.get() + 1);
+                m.clone()
+            };
+            combine_set_members(&held, &change, delete, counted);
+            assert_eq!(
+                calls.get(),
+                held.len() + change.len(),
+                "set_{} worked out {} keys for {} members",
+                if delete { "delete" } else { "add" },
+                calls.get(),
+                held.len() + change.len()
+            );
+        }
+    }
 
     fn where_of(statement: &str) -> WhereClause {
         match parse(statement).unwrap() {
