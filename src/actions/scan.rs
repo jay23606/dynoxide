@@ -87,6 +87,13 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
         let raw = ScanRequestRaw::deserialize(deserializer)?;
         use crate::validation::format_validation_errors;
 
+        // A BOOL or NULL in a legacy condition, or its `Exists`, that doesn't
+        // read as a boolean makes the whole request malformed, ahead of
+        // everything else.
+        if let Some(message) = crate::types::malformed_condition_boolean(raw.scan_filter.as_ref()) {
+            return Err(serde::de::Error::custom(message));
+        }
+
         // Scan still runs on the older validation layer in most regions (six
         // of seven, 2026-10-09). Its member errors come back together in the
         // order Select, ReturnConsumedCapacity, ConditionalOperator, Limit,
@@ -338,10 +345,14 @@ pub async fn execute<S: StorageBackend>(
     crate::value_nesting::check_scan_start_key(exclusive_start_key.as_ref())?;
 
     // Convert legacy ScanFilter to FilterExpression if no expression is set
-    if request.filter_expression.is_none()
-        && let Some(ref sf_val) = request.scan_filter
-        && let Ok(sf) =
-            serde_json::from_value::<HashMap<String, helpers::FilterCondition>>(sf_val.clone())
+    let scan_filter: Option<HashMap<String, helpers::FilterCondition>> =
+        match request.scan_filter.as_ref() {
+            Some(sf_val) if request.filter_expression.is_none() && !sf_val.is_null() => Some(
+                helpers::read_legacy_conditions(sf_val, crate::validation::ValueLayer::Older)?,
+            ),
+            _ => None,
+        };
+    if let Some(sf) = scan_filter
         && !sf.is_empty()
     {
         let converted =

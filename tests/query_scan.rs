@@ -1758,11 +1758,11 @@ fn test_query_esk_null_false_starting_key_invalid() {
 }
 
 #[test]
-fn test_scan_filter_null_false_no_marker_leak() {
-    // A {"NULL": false} inside a ScanFilter AttributeValueList fails to
-    // deserialise; the raw filter validation lets it fall through and the
-    // unparseable filter is dropped, so the scan succeeds. What matters here
-    // is that the internal marker on the serde message never surfaces.
+fn test_scan_filter_null_false_is_refused() {
+    // A {"NULL": false} inside a ScanFilter AttributeValueList is refused, bare
+    // and with no internal marker, ahead of the condition's operator checks
+    // (captured eu-west-2 and us-east-1, 2026-10-10). It used to fail to read
+    // and be dropped, so the scan ran unfiltered and returned every item.
     let db = setup_db();
     create_hash_only_table(&db, "Items");
 
@@ -1776,10 +1776,12 @@ fn test_scan_filter_null_false_no_marker_leak() {
     }))
     .unwrap();
 
-    match db.scan(req) {
-        Ok(resp) => assert_eq!(resp.count, 1),
-        Err(err) => panic!("scan unexpectedly failed: {err}"),
-    }
+    let err = db.scan(req).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "One or more parameter values were invalid: \
+         Null attribute value types must have the value of true"
+    );
 }
 
 /// A table keyed on a string partition key and a number sort key.

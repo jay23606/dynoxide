@@ -103,6 +103,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A legacy `QueryFilter` or `ScanFilter` condition whose value didn't read,
+  such as `{"NULL": false}` or `{"BOOL": "maybe"}`, was dropped, so the Query
+  or Scan ran without that condition and returned items it should have
+  filtered out. This was in 1.2.1. Such a condition is now refused as
+  DynamoDB refuses it, in `QueryFilter`, `ScanFilter`, `KeyConditions` and
+  `Expected` alike: a `NULL` that reads as false (`false`, `"no"`, `"false"`)
+  with `Null attribute value types must have the value of true`, ahead of the
+  operator's own checks, and a `BOOL` or `NULL` that doesn't read as a
+  boolean by failing the whole request with `Unexpected token received from
+  parser`. A `KeyConditions` that didn't read no longer leaves the Query
+  asking for a key condition. A legacy `IN` checks the type of every value in
+  its list, where it looked at the first, and a value whose other member is
+  `null` takes the type of the member it has; `Expected` refuses an `IN` of a
+  `BOOL` or `NULL` too, as the filters do. A condition's `Exists` reads a
+  string as a `BOOL` member does, and one read from a string makes the
+  request's refusals bare, as a `BOOL` or `NULL` read from a string does.
+  Captured against eu-west-2 and us-east-1.
 - `ExecuteTransaction` lists a reason for every statement that failed, as
   DynamoDB does, where it stopped at the first and reported `None` for the
   rest. A key of the wrong type on any statement is reported alone, with

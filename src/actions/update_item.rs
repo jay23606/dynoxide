@@ -113,6 +113,13 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
         let raw = UpdateItemRequestRaw::deserialize(deserializer)?;
         use crate::validation::format_validation_errors;
 
+        // A BOOL or NULL in a legacy condition, or its `Exists`, that doesn't
+        // read as a boolean makes the whole request malformed, ahead of
+        // everything else.
+        if let Some(message) = crate::types::malformed_condition_boolean(raw.expected.as_ref()) {
+            return Err(serde::de::Error::custom(message));
+        }
+
         // Without its key, UpdateItem falls back to the older layer in all seven
         // regions captured on 2026-10-09: every enum error in the older
         // per-value wording, then the key, and no table name error beside

@@ -1493,7 +1493,11 @@ pub fn expected_attr_names(
 pub struct ExpectedCondition {
     #[serde(rename = "Value", default)]
     pub value: Option<crate::types::AttributeValue>,
-    #[serde(rename = "Exists", default)]
+    #[serde(
+        rename = "Exists",
+        default,
+        deserialize_with = "crate::types::deserialize_lenient_flag"
+    )]
     pub exists: Option<bool>,
     #[serde(rename = "ComparisonOperator", default)]
     pub comparison_operator: Option<String>,
@@ -1605,6 +1609,17 @@ pub fn validate_expected_conditions(expected: &HashMap<String, ExpectedCondition
                         "One or more parameter values were invalid: Invalid comparison operator"
                             .to_string(),
                     ));
+                }
+            }
+
+            // IN takes only a string, number or binary value, and names the
+            // first value in its list of any other type, ahead of the list's
+            // types disagreeing (captured eu-west-2 and us-east-1, 2026-10-10).
+            if op == "IN"
+                && let Some(ref avl) = cond.attribute_value_list
+            {
+                for value in avl {
+                    validate_comparison_type_compat(op, value.type_name())?;
                 }
             }
 
@@ -2292,13 +2307,17 @@ pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Resu
             )));
         }
 
-        // Type compatibility validation
+        // Type compatibility validation. IN checks every value in its list,
+        // naming the first whose type it can't take (captured eu-west-2 and
+        // us-east-1, 2026-10-10); the other operators check their first.
         if let Some(arr) = avl
             && !arr.is_empty()
         {
-            let first_type = attr_value_type_name_from_json(&arr[0]);
-            if let Some(type_name) = first_type {
-                validate_comparison_type_compat(comp_op, type_name)?;
+            let checked = if comp_op == "IN" { &arr[..] } else { &arr[..1] };
+            for value in checked {
+                if let Some(type_name) = attr_value_type_name_from_json(value) {
+                    validate_comparison_type_compat(comp_op, type_name)?;
+                }
             }
         }
     }
@@ -2307,15 +2326,13 @@ pub fn validate_filter_condition_args(value: Option<&serde_json::Value>) -> Resu
 }
 
 /// Extract the DynamoDB type name (S, N, B, BOOL, NULL, SS, NS, BS, M, L)
-/// from a raw JSON AttributeValue object.
+/// from a raw JSON AttributeValue object. A member set to JSON null counts as
+/// absent, as it does when the value is read.
 fn attr_value_type_name_from_json(val: &serde_json::Value) -> Option<&str> {
     val.as_object().and_then(|obj| {
-        for key in &["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS", "M", "L"] {
-            if obj.contains_key(*key) {
-                return Some(*key);
-            }
-        }
-        None
+        ["S", "N", "B", "BOOL", "NULL", "SS", "NS", "BS", "M", "L"]
+            .into_iter()
+            .find(|key| obj.get(*key).is_some_and(|member| !member.is_null()))
     })
 }
 
@@ -2373,33 +2390,10 @@ pub fn validate_filter_conditions_raw(
                 match crate::types::with_value_layer(layer, || {
                     serde_json::from_value::<AttributeValue>(av_val.clone())
                 }) {
-                    Err(e) => {
-                        let msg = e.to_string();
-                        // Strip the serde position suffix and any internal marker
-                        let inner = crate::serde_errors::clean_serde_message(&msg);
-
-                        if inner.contains("empty AttributeValue")
-                            || (inner.contains("Supplied AttributeValue")
-                                && inner.contains("empty"))
-                        {
-                            return Err(DynoxideError::ValidationException(
-                                    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes".to_string()
-                                ));
-                        } else if inner.contains("more than one datatypes") {
-                            return Err(DynoxideError::ValidationException(
-                                "Supplied AttributeValue has more than one datatypes set, \
-                                     must contain exactly one of the supported datatypes"
-                                    .to_string(),
-                            ));
-                        } else if inner.contains("cannot be converted to a numeric value")
-                            || inner.contains("significant digits")
-                            || inner.contains("Number overflow")
-                            || inner.contains("Number underflow")
-                        {
-                            return Err(DynoxideError::ValidationException(inner.to_string()));
-                        }
-                        // Let other errors pass through for now
-                    }
+                    // A value that doesn't read is refused, never skipped:
+                    // skipping it dropped the condition and ran the read
+                    // without it.
+                    Err(e) => return Err(legacy_value_refusal(&e.to_string(), av_val, layer)),
                     Ok(av) => {
                         // Validate parsed value (NULL:false, empty sets, duplicates, numbers)
                         validate_filter_attribute_value(&av, layer)?;
@@ -2410,6 +2404,58 @@ pub fn validate_filter_conditions_raw(
     }
 
     Ok(())
+}
+
+/// The error a value in a legacy condition that doesn't read is refused with,
+/// bare, as DynamoDB refuses it in a QueryFilter, ScanFilter or KeyConditions:
+/// a BOOL or NULL that doesn't read as a boolean fails the whole request as
+/// malformed, and a NULL that reads as false is refused ahead of the
+/// condition's operator checks (captured eu-west-2 and us-east-1, 2026-10-10).
+/// Anything else is classified as the request body's own values are.
+fn legacy_value_refusal(
+    msg: &str,
+    value: &serde_json::Value,
+    layer: crate::validation::ValueLayer,
+) -> DynoxideError {
+    use crate::serde_errors::{EMPTY_VALUE, MORE_THAN_ONE_TYPE, ValueRefusal, value_refusal};
+    if let Some(error) = crate::serde_errors::marked_serialization_error(msg) {
+        return error;
+    }
+    let refusal = |message: &str| DynoxideError::ValidationException(message.to_string());
+    match value_refusal(msg) {
+        ValueRefusal::Empty => refusal(EMPTY_VALUE),
+        ValueRefusal::MoreThanOneType => refusal(MORE_THAN_ONE_TYPE),
+        ValueRefusal::EmptySet(inner)
+        | ValueRefusal::Number(inner)
+        | ValueRefusal::ParsedNull(inner)
+        | ValueRefusal::RequestNull(inner) => refusal(inner),
+        ValueRefusal::Other => match crate::types::with_value_layer(layer, || {
+            crate::serde_errors::deserialize::<AttributeValue>(&value.to_string())
+        }) {
+            Err(DynoxideError::EnvelopedValidation(message)) => {
+                DynoxideError::ValidationException(message)
+            }
+            Err(error) => error,
+            Ok(_) => refusal(crate::serde_errors::clean_serde_message(msg)),
+        },
+    }
+}
+
+/// Read a legacy condition map (`QueryFilter`, `ScanFilter`, `KeyConditions`)
+/// into its conditions, refusing one that doesn't read in the words the
+/// request body's own errors take. It is never dropped: dropping it ran the
+/// read with no condition at all.
+pub(crate) fn read_legacy_conditions<T: serde::de::DeserializeOwned>(
+    conditions: &serde_json::Value,
+    layer: crate::validation::ValueLayer,
+) -> Result<T> {
+    crate::types::with_value_layer(layer, || {
+        crate::serde_errors::deserialize::<T>(&conditions.to_string())
+    })
+    .map_err(|e| match e {
+        DynoxideError::EnvelopedValidation(message) => DynoxideError::ValidationException(message),
+        other => other,
+    })
 }
 
 /// Validate a single attribute value inside a filter condition (QueryFilter,

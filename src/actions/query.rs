@@ -93,6 +93,15 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         let raw = QueryRequestRaw::deserialize(deserializer)?;
         use crate::validation::format_validation_errors;
 
+        // A BOOL or NULL in a legacy condition that doesn't read as a boolean
+        // makes the whole request malformed, ahead of everything else.
+        if let Some(message) =
+            crate::types::malformed_condition_boolean(raw.key_conditions.as_ref())
+                .or_else(|| crate::types::malformed_condition_boolean(raw.query_filter.as_ref()))
+        {
+            return Err(serde::de::Error::custom(message));
+        }
+
         // An empty name and a Limit of 0 are the newer validation layer's own
         // checks, each reported on its own ahead of everything else. A name
         // error and ReturnConsumedCapacity follow, together; Select waits
@@ -441,10 +450,16 @@ pub async fn execute<S: StorageBackend>(
     };
 
     // Convert legacy KeyConditions to KeyConditionExpression if no expression is set
-    if request.key_condition_expression.is_none()
-        && let Some(ref kc_val) = request.key_conditions
-        && let Ok(kc) =
-            serde_json::from_value::<HashMap<String, helpers::KeyCondition>>(kc_val.clone())
+    let key_conditions: Option<HashMap<String, helpers::KeyCondition>> = match request
+        .key_conditions
+        .as_ref()
+    {
+        Some(kc_val) if request.key_condition_expression.is_none() && !kc_val.is_null() => Some(
+            helpers::read_legacy_conditions(kc_val, crate::validation::ValueLayer::Current)?,
+        ),
+        _ => None,
+    };
+    if let Some(kc) = key_conditions
         && !kc.is_empty()
     {
         check_legacy_key_condition_types(&kc, &meta)?;
@@ -461,10 +476,14 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // Convert legacy QueryFilter to FilterExpression if no expression is set
-    if request.filter_expression.is_none()
-        && let Some(ref qf_val) = request.query_filter
-        && let Ok(qf) =
-            serde_json::from_value::<HashMap<String, helpers::FilterCondition>>(qf_val.clone())
+    let query_filter: Option<HashMap<String, helpers::FilterCondition>> =
+        match request.query_filter.as_ref() {
+            Some(qf_val) if request.filter_expression.is_none() && !qf_val.is_null() => Some(
+                helpers::read_legacy_conditions(qf_val, crate::validation::ValueLayer::Current)?,
+            ),
+            _ => None,
+        };
+    if let Some(qf) = query_filter
         && !qf.is_empty()
     {
         let converted =

@@ -56,6 +56,13 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
         let raw = DeleteItemRequestRaw::deserialize(deserializer)?;
         use crate::validation::format_validation_errors;
 
+        // A BOOL or NULL in a legacy condition, or its `Exists`, that doesn't
+        // read as a boolean makes the whole request malformed, ahead of
+        // everything else.
+        if let Some(message) = crate::types::malformed_condition_boolean(raw.expected.as_ref()) {
+            return Err(serde::de::Error::custom(message));
+        }
+
         // An empty name is the newer validation layer's own check and is
         // reported on its own; any other name error leads the member errors,
         // one per name (captured 2026-10-09, five of seven regions).

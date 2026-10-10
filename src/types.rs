@@ -493,6 +493,49 @@ pub(crate) fn deserialize_lenient_flag<'de, D: serde::Deserializer<'de>>(
     }
 }
 
+/// The malformed-request error, marked for a `SerializationException`, for the
+/// first `BOOL` or `NULL` member, or `Exists`, in a legacy condition map
+/// (`QueryFilter`, `ScanFilter`, `KeyConditions`, `Expected`) that doesn't read
+/// as a boolean; `None` when every one reads. DynamoDB fails the whole request
+/// as it is read (captured eu-west-2 and us-east-1, 2026-10-10), and the map's
+/// values are read later than the request's own members, so the request
+/// decoders look here first.
+pub(crate) fn malformed_condition_boolean(
+    conditions: Option<&serde_json::Value>,
+) -> Option<String> {
+    let malformed = |message: String| {
+        message
+            .starts_with(crate::serde_errors::SERIALIZATION_MARKER)
+            .then_some(message)
+    };
+    for condition in conditions?.as_object()?.values() {
+        let Some(condition) = condition.as_object() else {
+            continue;
+        };
+        if let Some(exists) = condition.get("Exists")
+            && let Err(e) = deserialize_lenient_flag(exists.clone())
+            && let Some(message) = malformed(e.to_string())
+        {
+            return Some(message);
+        }
+        let values = condition.get("Value").into_iter().chain(
+            condition
+                .get("AttributeValueList")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten(),
+        );
+        for value in values {
+            if let Err(e) = serde_json::from_value::<AttributeValue>(value.clone())
+                && let Some(message) = malformed(e.to_string())
+            {
+                return Some(message);
+            }
+        }
+    }
+    None
+}
+
 /// Whether a request's own boolean member written as a string reads as a
 /// boolean, by the rule [`deserialize_lenient_flag`] follows.
 #[cfg(any(feature = "http-server", feature = "wasm-sqlite", test))]

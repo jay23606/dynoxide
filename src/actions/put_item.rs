@@ -53,6 +53,13 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
     ) -> std::result::Result<Self, D::Error> {
         let raw = PutItemRequestRaw::deserialize(deserializer)?;
 
+        // A BOOL or NULL in a legacy condition, or its `Exists`, that doesn't
+        // read as a boolean makes the whole request malformed, ahead of
+        // everything else.
+        if let Some(message) = crate::types::malformed_condition_boolean(raw.expected.as_ref()) {
+            return Err(serde::de::Error::custom(message));
+        }
+
         use crate::validation::format_validation_errors;
 
         // An empty name is the newer validation layer's own check and is

@@ -794,3 +794,390 @@ async fn a_number_for_a_boolean_is_named_by_how_it_is_written() {
         }
     }
 }
+
+/// Put the four items the legacy-condition captures read: `e1` with `a` 1 and
+/// `b` true, `e2` with `b` false, `e3` with `b` the string `x`, `e4` with `a` 2.
+async fn put_legacy_items(url: &str) {
+    for item in [
+        json!({"pk": {"S": "e1"}, "a": {"N": "1"}, "b": {"BOOL": true}}),
+        json!({"pk": {"S": "e2"}, "b": {"BOOL": false}}),
+        json!({"pk": {"S": "e3"}, "b": {"S": "x"}}),
+        json!({"pk": {"S": "e4"}, "a": {"N": "2"}}),
+    ] {
+        let (status, body) = send(url, "PutItem", json!({"TableName": TABLE, "Item": item})).await;
+        assert_eq!(status, 200, "{body}");
+    }
+}
+
+/// The four places a legacy condition is written, each holding `condition`
+/// on attribute `b` (or the partition key, for KeyConditions).
+fn legacy_requests(condition: &Value) -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        (
+            "QueryFilter",
+            "Query",
+            json!({
+                "TableName": TABLE,
+                "KeyConditions": {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "e1"}]}},
+                "QueryFilter": {"b": condition}
+            }),
+        ),
+        (
+            "ScanFilter",
+            "Scan",
+            json!({"TableName": TABLE, "ScanFilter": {"b": condition}}),
+        ),
+        (
+            "KeyConditions",
+            "Query",
+            json!({"TableName": TABLE, "KeyConditions": {"pk": condition}}),
+        ),
+        (
+            "Expected",
+            "PutItem",
+            json!({"TableName": TABLE, "Item": {"pk": {"S": "e9"}}, "Expected": {"b": condition}}),
+        ),
+    ]
+}
+
+/// A legacy condition whose value is a NULL that reads as false is refused,
+/// whatever its operator and wherever it is written, ahead of the operator's
+/// own checks. It used to be dropped from a QueryFilter or ScanFilter, so the
+/// read ran unfiltered, and to leave a Query with no key condition. The
+/// refusal is bare, except JSON `false` in `Expected`, which keeps the
+/// envelope. Captured against eu-west-2 and us-east-1, 2026-10-10.
+#[tokio::test]
+async fn a_legacy_condition_refuses_a_null_that_reads_as_false() {
+    let url = start().await;
+    put_legacy_items(&url).await;
+    for flag in [json!(false), json!("no"), json!("false")] {
+        for operator in ["EQ", "NE", "IN", "CONTAINS", "NULL", "NOT_NULL"] {
+            let condition = json!({
+                "ComparisonOperator": operator,
+                "AttributeValueList": [{"NULL": flag}]
+            });
+            for (place, operation, request) in legacy_requests(&condition) {
+                let refusal = if place == "Expected" && flag == json!(false) {
+                    enveloped(NULL_FALSE)
+                } else {
+                    validation(NULL_FALSE)
+                };
+                assert_eq!(
+                    send(&url, operation, request).await,
+                    (400, refusal),
+                    "{place} {operator} {flag}"
+                );
+            }
+        }
+    }
+    // The Value form of Expected too.
+    for (flag, refusal) in [
+        (json!(false), enveloped(NULL_FALSE)),
+        (json!("no"), validation(NULL_FALSE)),
+    ] {
+        assert_eq!(
+            send(
+                &url,
+                "PutItem",
+                json!({"TableName": TABLE, "Item": {"pk": {"S": "e9"}},
+                    "Expected": {"b": {"Value": {"NULL": flag}}}})
+            )
+            .await,
+            (400, refusal),
+            "Value {flag}"
+        );
+    }
+}
+
+/// A BOOL or NULL in a legacy condition that doesn't read as a boolean makes
+/// the whole request malformed, whatever its operator and wherever it is
+/// written. Captured against eu-west-2 and us-east-1, 2026-10-10. That it is
+/// refused ahead of the request's other checks, a `Limit` of 0 here, is
+/// inferred: DynamoDB fails the request as it is read.
+#[tokio::test]
+async fn a_legacy_condition_with_a_malformed_boolean_fails_the_request() {
+    let url = start().await;
+    put_legacy_items(&url).await;
+    for operator in ["EQ", "NE", "IN", "CONTAINS", "NULL", "NOT_NULL"] {
+        let condition = json!({
+            "ComparisonOperator": operator,
+            "AttributeValueList": [{"BOOL": "maybe"}]
+        });
+        for (place, operation, request) in legacy_requests(&condition) {
+            assert_eq!(
+                send(&url, operation, request).await,
+                (400, serialization(Some(UNEXPECTED))),
+                "{place} {operator}"
+            );
+        }
+    }
+    assert_eq!(
+        send(
+            &url,
+            "PutItem",
+            json!({"TableName": TABLE, "Item": {"pk": {"S": "e9"}},
+                "Expected": {"b": {"Value": {"BOOL": "maybe"}}}})
+        )
+        .await,
+        (400, serialization(Some(UNEXPECTED)))
+    );
+    for (operation, request) in [
+        (
+            "Query",
+            json!({
+                "TableName": TABLE, "Limit": 0,
+                "KeyConditions": {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "e1"}]}},
+                "QueryFilter": {"b": {"ComparisonOperator": "EQ", "AttributeValueList": [{"BOOL": "maybe"}]}}
+            }),
+        ),
+        (
+            "Scan",
+            json!({
+                "TableName": TABLE, "Limit": 0,
+                "ScanFilter": {"b": {"ComparisonOperator": "EQ", "AttributeValueList": [{"NULL": "maybe"}]}}
+            }),
+        ),
+    ] {
+        assert_eq!(
+            send(&url, operation, request).await,
+            (400, serialization(Some(UNEXPECTED))),
+            "{operation}"
+        );
+    }
+    // A BOOL that does read filters as the boolean it spells.
+    let (status, body) = send(
+        &url,
+        "Scan",
+        json!({"TableName": TABLE, "ScanFilter": {"b": {
+            "ComparisonOperator": "EQ", "AttributeValueList": [{"BOOL": "no"}]
+        }}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["Items"],
+        json!([{"pk": {"S": "e2"}, "b": {"BOOL": false}}])
+    );
+}
+
+/// A legacy `IN` names the type of every value in its list, and a value whose
+/// other member is JSON `null` is the type of the member it has. Captured
+/// against eu-west-2 and us-east-1, 2026-10-10.
+#[tokio::test]
+async fn a_legacy_in_checks_the_type_of_every_value() {
+    let url = start().await;
+    put_legacy_items(&url).await;
+    let in_bool = "One or more parameter values were invalid: ComparisonOperator IN is not valid for BOOL AttributeValue type";
+    let scan = |operator: &str, values: Value| {
+        json!({"TableName": TABLE, "ScanFilter": {"b": {
+            "ComparisonOperator": operator, "AttributeValueList": values
+        }}})
+    };
+    for values in [
+        json!([{"BOOL": true, "S": null}]),
+        json!([{"S": null, "BOOL": true}]),
+        json!([{"S": "x"}, {"BOOL": true, "S": null}]),
+        json!([{"S": "x"}, {"S": null, "BOOL": true}]),
+        json!([{"BOOL": true}]),
+    ] {
+        assert_eq!(
+            send(&url, "Scan", scan("IN", values.clone())).await,
+            (400, validation(in_bool)),
+            "{values}"
+        );
+    }
+    let (status, body) = send(&url, "Scan", scan("EQ", json!([{"BOOL": true, "S": null}]))).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["Count"], json!(1));
+    assert_eq!(body["Items"][0]["pk"], json!({"S": "e1"}));
+
+    // Expected checks the same, in the envelope unless the request reads a
+    // boolean from a string.
+    for operation in ["PutItem", "DeleteItem"] {
+        let request = |expected: Value| {
+            let mut request = if operation == "PutItem" {
+                json!({"TableName": TABLE, "Item": {"pk": {"S": "e1"}, "a": {"N": "1"}, "b": {"BOOL": true}}})
+            } else {
+                json!({"TableName": TABLE, "Key": {"pk": {"S": "e5"}}})
+            };
+            request["Expected"] = expected;
+            request
+        };
+        let in_list = |values: Value| json!({"b": {"ComparisonOperator": "IN", "AttributeValueList": values}});
+        for (expected, refusal) in [
+            (in_list(json!([{"BOOL": true}])), enveloped(in_bool)),
+            (in_list(json!([{"BOOL": "true"}])), validation(in_bool)),
+            (
+                in_list(json!([{"S": "x"}, {"BOOL": "true"}])),
+                validation(in_bool),
+            ),
+            (
+                in_list(json!([{"NULL": true}])),
+                enveloped(
+                    "One or more parameter values were invalid: ComparisonOperator IN is not valid for NULL AttributeValue type",
+                ),
+            ),
+        ] {
+            assert_eq!(
+                send(&url, operation, request(expected.clone())).await,
+                (400, refusal),
+                "{operation} {expected}"
+            );
+        }
+    }
+}
+
+/// Every refusal of a legacy `Expected` comes back bare once the request reads
+/// a boolean from a string, even one in another condition, and in the
+/// envelope otherwise. Captured on PutItem and DeleteItem against eu-west-2
+/// and us-east-1, 2026-10-10.
+#[tokio::test]
+async fn an_expected_reading_a_string_boolean_refuses_bare() {
+    let url = start().await;
+    put_legacy_items(&url).await;
+    let null_count = "One or more parameter values were invalid: Invalid number of argument(s) for the NULL ComparisonOperator";
+    let exists_false = "One or more parameter values were invalid: Value cannot be used when Exists is false for Attribute: b";
+    for operation in ["PutItem", "DeleteItem"] {
+        let request = |expected: Value| {
+            let mut request = if operation == "PutItem" {
+                json!({"TableName": TABLE, "Item": {"pk": {"S": "e1"}, "a": {"N": "1"}, "b": {"BOOL": true}}})
+            } else {
+                json!({"TableName": TABLE, "Key": {"pk": {"S": "e5"}}})
+            };
+            request["Expected"] = expected;
+            request
+        };
+        for (expected, refusal) in [
+            (
+                json!({"b": {"ComparisonOperator": "NULL", "AttributeValueList": [{"S": "x"}]}}),
+                enveloped(null_count),
+            ),
+            (
+                json!({
+                    "b": {"ComparisonOperator": "EQ", "AttributeValueList": [{"BOOL": "no"}]},
+                    "nl": {"ComparisonOperator": "NULL", "AttributeValueList": [{"NULL": true}]}
+                }),
+                validation(null_count),
+            ),
+            (
+                json!({"b": {"Exists": false, "Value": {"BOOL": "no"}}}),
+                validation(exists_false),
+            ),
+            (
+                json!({"b": {"Exists": false, "Value": {"BOOL": true}}}),
+                enveloped(exists_false),
+            ),
+        ] {
+            assert_eq!(
+                send(&url, operation, request(expected.clone())).await,
+                (400, refusal),
+                "{operation} {expected}"
+            );
+        }
+    }
+}
+
+/// A legacy condition's `Exists` reads a string as a `BOOL` member does, and
+/// one read from a string makes the request's refusals bare. Captured on
+/// PutItem against eu-west-2 and us-east-1, 2026-10-10.
+#[tokio::test]
+async fn exists_reads_the_strings_a_bool_reads() {
+    let url = start().await;
+    put_legacy_items(&url).await;
+    let ccf = json!({
+        "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
+        "message": "The conditional request failed"
+    });
+    let must = |when: &str| {
+        format!(
+            "One or more parameter values were invalid: Value must be provided when Exists is {when} for Attribute: a"
+        )
+    };
+    let cannot = "One or more parameter values were invalid: Value cannot be used when Exists is false for Attribute: a";
+    // e1 has `a`, e2 doesn't. Each write puts the item back as it was.
+    let write = |pk: &str, exists: Value, value: bool| {
+        let item = if pk == "e1" {
+            json!({"pk": {"S": "e1"}, "a": {"N": "1"}, "b": {"BOOL": true}})
+        } else {
+            json!({"pk": {"S": "e2"}, "b": {"BOOL": false}})
+        };
+        let mut condition = json!({"Exists": exists});
+        if value {
+            condition["Value"] = json!({"N": "1"});
+        }
+        json!({"TableName": TABLE, "Item": item, "Expected": {"a": condition}})
+    };
+    let ok = (200, json!({}));
+    for text in ["false", "no", "0", "f"] {
+        let exists = json!(text);
+        assert_eq!(
+            send(&url, "PutItem", write("e1", exists.clone(), false)).await,
+            (400, ccf.clone()),
+            "{text}"
+        );
+        assert_eq!(
+            send(&url, "PutItem", write("e2", exists.clone(), false)).await,
+            ok,
+            "{text}"
+        );
+        for pk in ["e1", "e2"] {
+            assert_eq!(
+                send(&url, "PutItem", write(pk, exists.clone(), true)).await,
+                (400, validation(cannot)),
+                "{text} {pk}"
+            );
+        }
+    }
+    for text in ["true", "TRUE", "yes"] {
+        let exists = json!(text);
+        for pk in ["e1", "e2"] {
+            assert_eq!(
+                send(&url, "PutItem", write(pk, exists.clone(), false)).await,
+                (400, validation(&must("true"))),
+                "{text} {pk}"
+            );
+        }
+        assert_eq!(
+            send(&url, "PutItem", write("e1", exists.clone(), true)).await,
+            ok,
+            "{text}"
+        );
+        assert_eq!(
+            send(&url, "PutItem", write("e2", exists.clone(), true)).await,
+            (400, ccf.clone()),
+            "{text}"
+        );
+    }
+    // JSON booleans and null keep the envelope.
+    assert_eq!(
+        send(&url, "PutItem", write("e1", json!(false), true)).await,
+        (400, enveloped(cannot))
+    );
+    assert_eq!(
+        send(&url, "PutItem", write("e2", json!(true), false)).await,
+        (400, enveloped(&must("true")))
+    );
+    assert_eq!(
+        send(&url, "PutItem", write("e2", Value::Null, false)).await,
+        (400, enveloped(&must("null")))
+    );
+    assert_eq!(
+        send(&url, "PutItem", write("e1", Value::Null, true)).await,
+        ok
+    );
+    // Anything else is a malformed request.
+    for pk in ["e1", "e2"] {
+        for value in [false, true] {
+            assert_eq!(
+                send(&url, "PutItem", write(pk, json!("maybe"), value)).await,
+                (400, serialization(Some(UNEXPECTED))),
+                "maybe {pk} {value}"
+            );
+            assert_eq!(
+                send(&url, "PutItem", write(pk, json!(1), value)).await,
+                (400, serialization(Some(NUMBER_VALUE))),
+                "1 {pk} {value}"
+            );
+        }
+    }
+}
