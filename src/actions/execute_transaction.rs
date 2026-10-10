@@ -152,15 +152,18 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         // refuses, is reported with its index in front, as the RETURNING and
         // index-read refusals below are (captured eu-west-2 and us-east-1,
         // 2026-10-09).
-        let ast = partiql::parser::parse_statement(&stmt.statement).map_err(|failure| {
-            let message = match failure {
-                partiql::parser::ParseFailure::Statement(e) => e.into_message(),
-                partiql::parser::ParseFailure::Literal(message) => message,
-            };
-            DynoxideError::ValidationException(format!(
-                "Validation failed in TransactStatements[{index}]: {message}"
-            ))
-        })?;
+        let supplied = stmt.parameters.as_ref().map_or(0, Vec::len);
+        let ast = partiql::parser::parse_with_parameters(&stmt.statement, supplied).map_err(
+            |failure| {
+                let message = match failure {
+                    partiql::parser::ParseFailure::Statement(e) => e.into_message(),
+                    partiql::parser::ParseFailure::Literal(message) => message,
+                };
+                DynoxideError::ValidationException(format!(
+                    "Validation failed in TransactStatements[{index}]: {message}"
+                ))
+            },
+        )?;
         // DynamoDB rejects a RETURNING clause on any member of a transaction with
         // a top-level ValidationException, before applying any write. This is a
         // plain validation failure, not a TransactionCanceledException.

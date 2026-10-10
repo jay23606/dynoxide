@@ -487,7 +487,15 @@ async fn prepare<S: StorageBackend>(
     let mut tables: HashMap<String, ResolvedTable> = HashMap::new();
 
     for stmt_req in statements {
-        let parsed = partiql::parser::parse(&stmt_req.statement);
+        let supplied = stmt_req.parameters.as_ref().map_or(0, Vec::len);
+        let parsed = partiql::parser::parse_with_parameters(&stmt_req.statement, supplied).map_err(
+            |failure| match failure {
+                partiql::parser::ParseFailure::Statement(e) => e,
+                partiql::parser::ParseFailure::Literal(message) => {
+                    partiql::parser::ParseError::Validation(message)
+                }
+            },
+        );
         let mut target = None;
         if let Ok(ref stmt) = parsed
             && let Some(name) = partiql::parser::table_name(stmt)

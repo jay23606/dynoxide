@@ -251,13 +251,13 @@ fn equality_accepts_every_operand_type() {
 
 /// The error a statement gets, or a panic naming what came back instead.
 fn statement_error(db: &Database, statement: String, parameters: serde_json::Value) -> String {
-    match db.execute_statement(
-        serde_json::from_value(serde_json::json!({
-            "Statement": statement,
-            "Parameters": parameters
-        }))
-        .unwrap(),
-    ) {
+    // No parameters means no Parameters member: an empty list is a request
+    // member error on DynamoDB.
+    let mut request = serde_json::json!({ "Statement": statement });
+    if parameters.as_array().is_none_or(|list| !list.is_empty()) {
+        request["Parameters"] = parameters;
+    }
+    match db.execute_statement(serde_json::from_value(request).unwrap()) {
         Ok(_) => panic!("{statement} must be rejected"),
         Err(e) => e.to_string(),
     }

@@ -72,6 +72,17 @@ pub async fn execute<S: StorageBackend>(
         return Err(e);
     }
 
+    // An empty Parameters list is a request member error (captured eu-west-2
+    // and us-east-1, 2026-10-10).
+    if request.parameters.as_ref().is_some_and(Vec::is_empty) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(
+                "Value '[]' at 'parameters' failed to satisfy constraint: Member must have \
+                 length greater than or equal to 1",
+            ),
+        ));
+    }
+
     // A parameter holding an empty attribute name is refused bare, before the
     // statement is parsed or its table looked up (captured in ten regions).
     if crate::empty_names::parameters_have_empty_name(request.parameters.as_deref()) {
@@ -110,8 +121,15 @@ pub async fn execute<S: StorageBackend>(
     // The parser says which envelope its rejection takes: a malformed statement
     // gets DynamoDB's "wasn't well formed" wrapper, while a rejection DynamoDB
     // reports on its own terms is passed through bare.
-    let stmt = partiql::parser::parse(&request.statement)
-        .map_err(|e| DynoxideError::ValidationException(e.into_message()))?;
+    let supplied = request.parameters.as_ref().map_or(0, Vec::len);
+    let stmt = partiql::parser::parse_with_parameters(&request.statement, supplied).map_err(
+        |failure| {
+            DynoxideError::ValidationException(match failure {
+                partiql::parser::ParseFailure::Statement(e) => e.into_message(),
+                partiql::parser::ParseFailure::Literal(message) => message,
+            })
+        },
+    )?;
 
     let params = request.parameters.unwrap_or_default();
     let run = partiql::executor::execute_page(

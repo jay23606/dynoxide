@@ -563,8 +563,37 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
     })
 }
 
+/// DynamoDB's refusal of a statement with more `?` than the request has
+/// parameters.
+pub(crate) const PARAMETER_COUNT_MISMATCH: &str =
+    "Number of parameters in request and statement don't match.";
+
+/// [`parse_statement`] for a request carrying `supplied` parameters. A
+/// statement with more placeholders than that is refused once it has parsed;
+/// more parameters than placeholders are accepted and the extra ignored
+/// (captured eu-west-2 and us-east-1, 2026-10-10). Refused as a statement
+/// failure, so in a batch only that statement fails and it takes no part in
+/// the mixed read and write or duplicate checks, as on DynamoDB.
+pub(crate) fn parse_with_parameters(
+    input: &str,
+    supplied: usize,
+) -> Result<Statement, ParseFailure> {
+    let (statement, placeholders) = parse_counting_placeholders(input)?;
+    if placeholders > supplied {
+        return Err(ParseFailure::Statement(ParseError::Validation(
+            PARAMETER_COUNT_MISMATCH.to_string(),
+        )));
+    }
+    Ok(statement)
+}
+
 /// [`parse`], saying whether a failure came from a literal DynamoDB refuses.
 pub(crate) fn parse_statement(input: &str) -> Result<Statement, ParseFailure> {
+    parse_counting_placeholders(input).map(|(statement, _)| statement)
+}
+
+/// [`parse_statement`] with the number of `?` placeholders the statement holds.
+fn parse_counting_placeholders(input: &str) -> Result<(Statement, usize), ParseFailure> {
     let mut tokenizer = Tokenizer::new(input)?;
     let first = tokenizer
         .next_token()?
@@ -623,7 +652,7 @@ pub(crate) fn parse_statement(input: &str) -> Result<Statement, ParseFailure> {
         return Err(failure);
     }
 
-    Ok(statement)
+    Ok((statement, tokenizer.param_counter))
 }
 
 /// Check that the statement has ended: nothing left, or one semicolon and

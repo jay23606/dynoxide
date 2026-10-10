@@ -2169,9 +2169,11 @@ fn with_parameters(
     statement: &str,
     parameters: Vec<AttributeValue>,
 ) -> Result<ExecuteStatementResponse, DynoxideError> {
+    // No parameters means no Parameters member: an empty list is a request
+    // member error on DynamoDB.
     db.execute_statement(ExecuteStatementRequest {
         statement: statement.to_string(),
-        parameters: Some(parameters),
+        parameters: (!parameters.is_empty()).then_some(parameters),
         ..Default::default()
     })
 }

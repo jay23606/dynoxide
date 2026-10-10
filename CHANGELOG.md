@@ -576,6 +576,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matches an item. `flag <> ?` with no parameters used to hold for every item
   without `flag`, so a `DELETE` or `UPDATE` short of its parameters could
   delete or change it.
+- A PartiQL statement with more `?` placeholders than the request has
+  parameters is refused with DynamoDB's "Number of parameters in request and
+  statement don't match." message: on its own on `ExecuteStatement`, against
+  that statement alone in `BatchExecuteStatement` (where it no longer counts
+  towards the mixed read and write check), and with the statement's index on
+  `ExecuteTransaction`. More parameters than placeholders are still accepted.
+  An empty `Parameters` list is refused as a request member. Captured against
+  eu-west-2 and us-east-1.
 
 ## [1.2.1] - 2026-09-20
 
