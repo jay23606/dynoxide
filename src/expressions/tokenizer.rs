@@ -314,20 +314,6 @@ impl TokenStream {
         self.tokens.get(self.pos).map(|(t, _)| t)
     }
 
-    /// Span of the token currently at `pos` (the next call to `peek`/`next` would return it).
-    pub fn peek_span(&self) -> Option<TokenSpan> {
-        self.tokens.get(self.pos).map(|(_, s)| *s)
-    }
-
-    /// Span of the token most recently returned by `next` (i.e. at `pos - 1`).
-    pub fn current_span(&self) -> Option<TokenSpan> {
-        if self.pos == 0 {
-            None
-        } else {
-            self.tokens.get(self.pos - 1).map(|(_, s)| *s)
-        }
-    }
-
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<&Token> {
         let token = self.tokens.get(self.pos).map(|(t, _)| t);
@@ -367,11 +353,7 @@ impl TokenStream {
         self.pos >= self.tokens.len()
     }
 
-    pub fn position(&self) -> usize {
-        self.pos
-    }
-
-    /// Get the current position (alias for `position`).
+    /// The index of the token the next call to `peek` or `next` returns.
     pub fn pos(&self) -> usize {
         self.pos
     }

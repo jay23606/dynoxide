@@ -566,28 +566,6 @@ fn reserved_word_case_insensitive() {
 // --------------------------------------------------------------------------
 
 #[test]
-fn update_expression_syntax_error_includes_quoted_token_and_near_window() {
-    // The conformance suite pins the AWS string for "INVALID SYNTAX HERE":
-    //   Invalid UpdateExpression: Syntax error; token: "INVALID", near: "INVALID SYNTAX"
-    let err = dynoxide::expressions::update::parse("INVALID SYNTAX HERE").unwrap_err();
-    assert_eq!(
-        err,
-        r#"Invalid UpdateExpression: Syntax error; token: "INVALID", near: "INVALID SYNTAX""#
-    );
-}
-
-#[test]
-fn projection_expression_tokenizer_error_includes_near_window() {
-    // The conformance suite pins the AWS string for "!!! INVALID !!!":
-    //   Invalid ProjectionExpression: Syntax error; token: "!", near: "!!"
-    let err = dynoxide::expressions::projection::parse("!!! INVALID !!!").unwrap_err();
-    assert_eq!(
-        err,
-        r#"Invalid ProjectionExpression: Syntax error; token: "!", near: "!!""#
-    );
-}
-
-#[test]
 fn update_expression_missing_eav_carries_invalid_update_expression_prefix() {
     // R7: UpdateItem with `SET attr1 = :v` and no ExpressionAttributeValues should
     // carry the `Invalid UpdateExpression:` prefix on the missing-EAV message.

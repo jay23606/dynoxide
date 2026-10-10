@@ -177,15 +177,3 @@ fn nested_size_calls_and_size_arithmetic_are_refused_on_every_partiql_operation(
         );
     }
 }
-
-/// The parser itself holds nested `size(` calls to its depth limit, so a
-/// caller that skips the request's length limit can't overflow the stack.
-#[test]
-fn the_parser_refuses_nested_size_calls_without_the_length_limit() {
-    let statement = format!(
-        r#"SELECT * FROM "Tbl" WHERE {}a{} = 1"#,
-        "size(".repeat(10_000),
-        ")".repeat(10_000)
-    );
-    assert!(dynoxide::partiql::parser::parse(&statement).is_err());
-}

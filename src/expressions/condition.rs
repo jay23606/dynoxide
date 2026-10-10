@@ -1073,6 +1073,8 @@ fn check_path_non_scalar(
 
 /// Extract the `:name` value references in a condition expression, sorted and
 /// deduplicated, so a caller can check them against the values it holds.
+/// The import rules are the only caller outside tests.
+#[cfg(any(feature = "import", test))]
 pub fn extract_value_refs(expr: &ConditionExpr) -> Vec<String> {
     let mut refs = Vec::new();
     collect_value_refs(expr, &mut refs);
@@ -1081,6 +1083,7 @@ pub fn extract_value_refs(expr: &ConditionExpr) -> Vec<String> {
     refs
 }
 
+#[cfg(any(feature = "import", test))]
 fn collect_value_refs(expr: &ConditionExpr, out: &mut Vec<String>) {
     match expr {
         ConditionExpr::Comparison { left, right, .. } => {
@@ -1112,6 +1115,7 @@ fn collect_value_refs(expr: &ConditionExpr, out: &mut Vec<String>) {
     }
 }
 
+#[cfg(any(feature = "import", test))]
 fn collect_operand_value_ref(operand: &Operand, out: &mut Vec<String>) {
     if let Operand::ValueRef(name) = operand {
         out.push(name.clone());
@@ -1219,7 +1223,8 @@ fn resolve_top_level_path(
 }
 
 /// Extract the `#alias` name references in a condition expression, sorted
-/// and deduplicated.
+/// and deduplicated. The import rules are the only caller outside tests.
+#[cfg(any(feature = "import", test))]
 pub fn extract_name_refs(expr: &ConditionExpr) -> Vec<String> {
     let mut refs = Vec::new();
     collect_undefined_name_refs(expr, &None, &mut refs);

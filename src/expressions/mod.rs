@@ -73,23 +73,6 @@ pub fn resolve_name(
     }
 }
 
-/// Resolve an attribute value reference `:name`.
-pub fn resolve_value<'a>(
-    name: &str,
-    attr_values: &'a Option<HashMap<String, AttributeValue>>,
-) -> Result<&'a AttributeValue, String> {
-    match attr_values {
-        Some(map) => map.get(name).ok_or_else(|| {
-            format!(
-                "Value provided in ExpressionAttributeValues unused in expressions: keys: {{{name}}}"
-            )
-        }),
-        None => Err(format!(
-            "An expression attribute value used in expression is not defined; attribute value: {name}"
-        )),
-    }
-}
-
 /// Wrapper around expression attribute names/values that tracks which entries are used.
 ///
 /// Use `RefCell` for interior mutability so it can be passed as `&TrackedExpressionAttributes`
@@ -297,17 +280,6 @@ impl<'a> TrackedExpressionAttributes<'a> {
         }
     }
 
-    /// Pre-register all `#name` and `:value` references in a parsed key condition.
-    /// Note: key_condition::parse already resolves names, so we track the original
-    /// value refs that will be resolved later via key_condition::bind.
-    pub fn track_key_condition(&self, cond: &key_condition::KeyCondition) {
-        for clause in &cond.clauses {
-            for value_ref in clause.value_refs() {
-                self.used_values.borrow_mut().insert(value_ref.to_string());
-            }
-        }
-    }
-
     /// Check for unused names/values. Returns an error listing all unused keys.
     pub fn check_unused(&self) -> Result<(), DynoxideError> {
         let used_names = self.used_names.borrow();
@@ -369,6 +341,7 @@ pub fn resolve_path_elements(
 ///
 /// This is a convenience wrapper for callers (e.g., import filters) that don't need
 /// unused-attribute validation. Uses the no-tracking variant to avoid RefCell/HashSet overhead.
+#[cfg(any(feature = "import", test))]
 pub fn evaluate_without_tracking(
     expr: &condition::ConditionExpr,
     item: &HashMap<String, AttributeValue>,

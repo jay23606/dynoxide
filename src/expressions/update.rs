@@ -1568,4 +1568,15 @@ mod tests {
         apply(&mut item, &expr, &tracker).unwrap();
         assert_eq!(item["c"], AttributeValue::N("100000000000000000001".into()));
     }
+
+    #[test]
+    fn update_expression_syntax_error_includes_quoted_token_and_near_window() {
+        // The conformance suite pins the AWS string for "INVALID SYNTAX HERE":
+        //   Invalid UpdateExpression: Syntax error; token: "INVALID", near: "INVALID SYNTAX"
+        let err = parse("INVALID SYNTAX HERE").unwrap_err();
+        assert_eq!(
+            err,
+            r#"Invalid UpdateExpression: Syntax error; token: "INVALID", near: "INVALID SYNTAX""#
+        );
+    }
 }

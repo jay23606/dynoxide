@@ -349,15 +349,6 @@ pub struct WhereClause {
     /// or path written once would otherwise be held once per group; shared, it
     /// is held once however many groups name it.
     pub groups: Vec<Vec<Arc<WhereCondition>>>,
-    /// Whether the clause as written joined anything with `OR`.
-    ///
-    /// More than one group no longer means the author wrote an `OR`. A `NOT`
-    /// over a conjunction becomes a disjunction under De Morgan, so
-    /// `NOT (a=1 AND b=2)` flattens to two groups from a clause with no `OR` in
-    /// it at all. UPDATE and DELETE refuse an `OR`, and the refusal has to name
-    /// what the author actually wrote, so it is recorded here before the
-    /// flattening rather than inferred from the result of it.
-    pub wrote_or: bool,
     /// The equalities among the clause's top-level conditions: those joined to
     /// the rest by `AND` alone, outside any `OR` or `NOT`, parentheses aside.
     /// An UPDATE or DELETE takes its key from these and only these, as
@@ -409,41 +400,6 @@ impl ConditionTree {
             ConditionTree::And(terms) | ConditionTree::Or(terms) => terms
                 .iter()
                 .fold(0usize, |total, term| total.saturating_add(term.bytes())),
-        }
-    }
-}
-
-impl WhereClause {
-    /// Create a WhereClause from flattened OR-groups, saying separately whether
-    /// the clause was written with an `OR`.
-    ///
-    /// The only constructor, because `wrote_or` cannot be worked out from the
-    /// groups. The two that tried, by taking more than one group to mean an `OR`
-    /// and one group to mean none, were wrong in both directions: De Morgan
-    /// turns `NOT (a=1 AND b=2)` into two groups from a clause with no `OR` in
-    /// it, and flattens `pk='x' AND NOT (a=1 OR b=2)` from a clause that has one
-    /// into groups that all name the same item.
-    pub fn from_groups_written(groups: Vec<Vec<WhereCondition>>, wrote_or: bool) -> Self {
-        Self::from_shared_groups(
-            groups
-                .into_iter()
-                .map(|group| group.into_iter().map(Arc::new).collect())
-                .collect(),
-            wrote_or,
-        )
-    }
-
-    /// As [`WhereClause::from_groups_written`], for groups whose conditions
-    /// are already shared.
-    pub(crate) fn from_shared_groups(
-        groups: Vec<Vec<Arc<WhereCondition>>>,
-        wrote_or: bool,
-    ) -> Self {
-        Self {
-            groups,
-            wrote_or,
-            top_level_equalities: Vec::new(),
-            tree: None,
         }
     }
 }
@@ -596,12 +552,17 @@ impl From<&str> for ParseFailure {
     }
 }
 
-/// Parse a PartiQL statement string.
-pub fn parse(input: &str) -> Result<Statement, ParseError> {
-    parse_statement(input).map_err(|failure| match failure {
-        ParseFailure::Statement(error) => error,
-        ParseFailure::Literal(message) => ParseError::Validation(message),
-    })
+/// Parse a PartiQL statement string with no parameter count to check it
+/// against. A request parses through [`parse_with_parameters`]; this is for
+/// tests.
+#[cfg(test)]
+pub(crate) fn parse(input: &str) -> Result<Statement, ParseError> {
+    parse_counting_placeholders(input)
+        .map(|(statement, _)| statement)
+        .map_err(|failure| match failure {
+            ParseFailure::Statement(error) => error,
+            ParseFailure::Literal(message) => ParseError::Validation(message),
+        })
 }
 
 /// DynamoDB's refusal of a statement with more `?` than the request has
@@ -609,7 +570,8 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
 pub(crate) const PARAMETER_COUNT_MISMATCH: &str =
     "Number of parameters in request and statement don't match.";
 
-/// [`parse_statement`] for a request carrying `supplied` parameters. A
+/// Parse a PartiQL statement for a request carrying `supplied` parameters,
+/// saying whether a failure came from a literal DynamoDB refuses. A
 /// statement with more placeholders than that is refused once it has parsed;
 /// more parameters than placeholders are accepted and the extra ignored
 /// (captured eu-west-2 and us-east-1, 2026-10-10). Refused as a statement
@@ -628,12 +590,7 @@ pub(crate) fn parse_with_parameters(
     Ok(statement)
 }
 
-/// [`parse`], saying whether a failure came from a literal DynamoDB refuses.
-pub(crate) fn parse_statement(input: &str) -> Result<Statement, ParseFailure> {
-    parse_counting_placeholders(input).map(|(statement, _)| statement)
-}
-
-/// [`parse_statement`] with the number of `?` placeholders the statement holds.
+/// Parse a PartiQL statement, with the number of `?` placeholders it holds.
 fn parse_counting_placeholders(input: &str) -> Result<(Statement, usize), ParseFailure> {
     let mut tokenizer = Tokenizer::new(input)?;
     let first = tokenizer
@@ -2344,10 +2301,11 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
             t.next_token()?; // consume WHERE
             t.clause = LiteralClause::Where;
             let parsed = parse_conditions_with_or(t)?;
-            let mut clause = WhereClause::from_shared_groups(parsed.groups, parsed.wrote_or);
-            clause.top_level_equalities = parsed.top_level_equalities;
-            clause.tree = Some(parsed.tree);
-            Ok(Some(clause))
+            Ok(Some(WhereClause {
+                groups: parsed.groups,
+                top_level_equalities: parsed.top_level_equalities,
+                tree: Some(parsed.tree),
+            }))
         }
         _ => Ok(None),
     }
@@ -2356,10 +2314,7 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
 /// Parse conditions supporting both AND and OR.
 ///
 /// Returns a list of OR-groups, where each group is a list of AND-joined
-/// conditions, alongside whether the clause as written joined anything with
-/// `OR`. That has to be read off the tree before `push_not_down` runs: De Morgan
-/// turns a negated conjunction into a disjunction, so counting groups afterwards
-/// reports an `OR` in a clause that never had one.
+/// conditions.
 fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, String> {
     t.reading_where = true;
     let expr = parse_or_expr(t, 0);
@@ -2374,7 +2329,6 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
             None => "WHERE clause must contain an expression that resolves to a boolean".into(),
         });
     }
-    let wrote_or = contains_or(&expr);
     let mut top_level_equalities = Vec::new();
     collect_top_level_equalities(&expr, &mut top_level_equalities);
     // A statement already holding a refusal is refused with it, so its clause
@@ -2383,7 +2337,6 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
     // refuses for another reason (too many operators, too many IN operands).
     let refused = || ParsedConditions {
         groups: Vec::new(),
-        wrote_or,
         top_level_equalities: Vec::new(),
         tree: ConditionTree::And(Vec::new()),
     };
@@ -2401,17 +2354,15 @@ fn parse_conditions_with_or(t: &mut Tokenizer) -> Result<ParsedConditions, Strin
     let (tree, groups) = flattened?;
     Ok(ParsedConditions {
         groups,
-        wrote_or,
         top_level_equalities,
         tree,
     })
 }
 
-/// A WHERE clause as parsed: its OR-groups, whether it was written with an
-/// `OR`, the equalities among its top-level conditions, and its tree.
+/// A WHERE clause as parsed: its OR-groups, the equalities among its
+/// top-level conditions, and its tree.
 struct ParsedConditions {
     groups: Vec<Vec<Arc<WhereCondition>>>,
-    wrote_or: bool,
     top_level_equalities: Vec<Condition>,
     tree: ConditionTree,
 }
@@ -2443,16 +2394,6 @@ fn non_boolean(
         BoolExpr::Or(terms) => terms.iter().find_map(|e| non_boolean(e, Some("OR"))),
         BoolExpr::Not(inner) => non_boolean(inner, Some("NOT")),
         BoolExpr::Leaf(_) => None,
-    }
-}
-
-/// Whether an expression as parsed holds an `OR` anywhere.
-fn contains_or(expr: &BoolExpr) -> bool {
-    match expr {
-        BoolExpr::Or(_) => true,
-        BoolExpr::And(terms) => terms.iter().any(contains_or),
-        BoolExpr::Not(inner) => contains_or(inner),
-        BoolExpr::Leaf(_) | BoolExpr::NonBoolean(_) => false,
     }
 }
 
@@ -6762,5 +6703,17 @@ mod tests {
         ] {
             assert!(parse(input).is_ok(), "{input}");
         }
+    }
+
+    /// The parser itself holds nested `size(` calls to its depth limit, so a
+    /// caller that skips the request's length limit can't overflow the stack.
+    #[test]
+    fn the_parser_refuses_nested_size_calls_without_the_length_limit() {
+        let statement = format!(
+            r#"SELECT * FROM "Tbl" WHERE {}a{} = 1"#,
+            "size(".repeat(10_000),
+            ")".repeat(10_000)
+        );
+        assert!(parse(&statement).is_err());
     }
 }

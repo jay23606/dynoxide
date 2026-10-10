@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Breaking (Rust API)
 
+- The `expressions` and `partiql` modules are no longer public. They hold the
+  parsers for DynamoDB's expression syntax and for PartiQL, whose shape changes
+  as compatibility work lands, and this release changed both substantially.
+  Expressions and PartiQL statements are still sent through `Database` and the
+  `actions` request types, which this does not change.
 - `ParameterizedStatement` and `ExecuteStatementRequest` gain
   `return_values_on_condition_check_failure`, and `BatchStatementError` gains
   `item`, so struct literals of them need the field adding, or
@@ -827,10 +832,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `a[0]` unquoted, a step into `a`, and `SET "x[0]"` was refused as an
   invalid document path. `"a"."b"` and `"a"[0]` still step into `a`. A key
   attribute whose name holds a `.` or a `[` is named by quoting it, so such
-  a table is read by its key and its items can be updated and deleted. For
-  Rust users of the crate, a parsed statement's path holds such a name in
-  double quotes, its own quotes doubled, so `"a.b"` is the path text for the
-  attribute `a.b`. Captured against eu-west-2 and us-east-1.
+  a table is read by its key and its items can be updated and deleted.
+  Captured against eu-west-2 and us-east-1.
 - PartiQL `size()` calls nested inside one another, and arithmetic after a
   `size()`, are held to the same depth as nested brackets.
 - A PartiQL `IN` with more than 100 operands, negated or not, written as

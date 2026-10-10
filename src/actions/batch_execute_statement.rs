@@ -381,9 +381,9 @@ pub async fn execute<S: StorageBackend>(
                 // DELETE against a table that does not exist reports
                 // ResourceNotFound with the table echoed, and a SELECT must say
                 // the same rather than claim the key is missing when it is
-                // there. Letting it through to `execute_page` is what produces
-                // that, because table resolution is the first thing a SELECT
-                // does.
+                // there. Letting it through to `execute_written_page` is what
+                // produces that, because table resolution is the first thing a
+                // SELECT does.
                 //
                 // Overlapping key conditions are refused first, and a key of the
                 // wrong type is reported in ExecuteStatement's words (captured
@@ -433,7 +433,7 @@ pub async fn execute<S: StorageBackend>(
                 }
                 let run = partiql::executor::execute_written_page(
                     storage,
-                    None,
+                    &stmt_req.statement,
                     &stmt,
                     params,
                     None,

@@ -396,22 +396,15 @@ pub(crate) async fn execute_cached<S: StorageBackend>(
         }
     }
 
-    // Which statements asked for the item a failed condition was evaluated
-    // against.
-    let old_on_failure: Vec<bool> = statements
-        .iter()
-        .map(|s| s.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD"))
-        .collect();
-
     // All statements run inside one SQLite transaction (all-or-nothing).
     let (responses, charges) = helpers::with_write_transaction(
         storage,
         execute_within_transaction(
             storage,
+            statements,
             &parsed,
             &tables,
             request.return_consumed_capacity.as_deref(),
-            &old_on_failure,
         ),
     )
     .await?;
@@ -578,10 +571,10 @@ pub(crate) fn replay_response(
 /// run after that would commit on its own.
 async fn execute_within_transaction<S: StorageBackend>(
     storage: &S,
+    statements: &[ParameterizedStatement],
     parsed: &[(partiql::parser::Statement, Vec<AttributeValue>)],
     tables: &HashMap<String, ResolvedTable>,
     capacity_mode: Option<&str>,
-    old_on_failure: &[bool],
 ) -> Result<(Vec<ItemResponse>, Vec<StatementCharge>)> {
     let resolved_for = |stmt: &partiql::parser::Statement| {
         partiql::parser::table_name(stmt).and_then(|t| tables.get(t))
@@ -632,8 +625,13 @@ async fn execute_within_transaction<S: StorageBackend>(
     let mut cancellation_reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
     let mut failed = false;
 
-    for ((stmt, params), &old_on_failure) in parsed.iter().zip(old_on_failure) {
+    // `parsed` holds each statement of `statements`, in order.
+    for ((stmt, params), written) in parsed.iter().zip(statements) {
         let resolved = resolved_for(stmt);
+        // Whether the statement asked for the item a failed condition was
+        // evaluated against.
+        let old_on_failure =
+            written.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
         // An INSERT key of the wrong type cancels the transaction with
         // PutItem's reason (captured eu-west-2 and us-east-1, 2026-10-09).
         let insert_keys = match resolved {
@@ -647,7 +645,7 @@ async fn execute_within_transaction<S: StorageBackend>(
             Ok(()) => {
                 partiql::executor::execute_written_page(
                     storage,
-                    None,
+                    &written.statement,
                     stmt,
                     params,
                     None,

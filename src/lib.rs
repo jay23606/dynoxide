@@ -63,7 +63,7 @@ pub mod bench_counters;
 // Where DynamoDB refuses an empty attribute name, and how it words it.
 pub(crate) mod empty_names;
 pub mod errors;
-pub mod expressions;
+pub(crate) mod expressions;
 #[cfg(feature = "import")]
 pub mod import;
 #[doc(hidden)]
@@ -72,7 +72,7 @@ pub mod macros;
 pub mod mcp;
 #[cfg(any(feature = "http-server", feature = "mcp-server"))]
 pub(crate) mod net;
-pub mod partiql;
+pub(crate) mod partiql;
 pub mod schema;
 // The order DynamoDB returns set members in, per operation.
 pub(crate) mod set_order;

@@ -137,7 +137,7 @@ pub async fn execute<S: StorageBackend>(
     // the statement as written, as DynamoDB binds it.
     let run = partiql::executor::execute_written_page(
         storage,
-        Some(&request.statement),
+        &request.statement,
         &stmt,
         &params,
         request.limit,

@@ -16,42 +16,6 @@ use crate::types::{AttributeValue, Item, ScalarAttributeType};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Execute a parsed PartiQL statement.
-///
-/// Returns `Some(items)` for SELECT (may be empty) and for a DELETE or UPDATE
-/// carrying a `RETURNING` clause (the deleted item or the requested projection);
-/// `None` for a write with no `RETURNING` clause. An optional `limit` bounds how
-/// many rows a SELECT evaluates (reads), not how many it returns, matching
-/// DynamoDB's `Limit` and the Query/Scan semantics.
-pub async fn execute<S: StorageBackend>(
-    storage: &S,
-    stmt: &Statement,
-    parameters: &[AttributeValue],
-    limit: Option<usize>,
-) -> Result<Option<Vec<Item>>> {
-    Ok(execute_measured(storage, stmt, parameters, limit).await?.0)
-}
-
-/// Like [`execute`], but also returns the total item byte size the statement
-/// touched. SELECT reports the summed size of the rows it walked, which is
-/// before its WHERE clause and its projection narrow them;
-/// INSERT/UPDATE/DELETE report the affected item's size (0 when the statement
-/// was a no-op, e.g. a missing DELETE target).
-///
-/// This size alone no longer describes what the statement costs. A write is
-/// charged on the larger of the images either side of it plus a per-index arm,
-/// which [`execute_page`] carries on `StatementPage::capacity`. Prefer that for
-/// capacity; this remains for callers that only want the byte count.
-pub async fn execute_measured<S: StorageBackend>(
-    storage: &S,
-    stmt: &Statement,
-    parameters: &[AttributeValue],
-    limit: Option<usize>,
-) -> Result<(Option<Vec<Item>>, usize)> {
-    let page = execute_page(storage, stmt, parameters, limit, None, false, None, None).await?;
-    Ok((page.items, page.size))
-}
-
 /// One page of a statement's result.
 ///
 /// Only a `SELECT` paginates. Every other statement returns the whole result
@@ -59,8 +23,9 @@ pub async fn execute_measured<S: StorageBackend>(
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct StatementPage {
-    /// The rows this page carries, with the same `Some`/`None` meaning as
-    /// [`execute`].
+    /// The rows this page carries: `Some` for a SELECT (possibly empty) and
+    /// for an UPDATE or DELETE with a `RETURNING` clause (the deleted item or
+    /// the requested projection), `None` for a write without one.
     pub items: Option<Vec<Item>>,
     /// Total item bytes touched, for `ConsumedCapacity`.
     pub size: usize,
@@ -92,11 +57,6 @@ pub struct ReadIndex {
     pub is_lsi: bool,
 }
 
-/// Like [`execute_measured`], but resumable.
-///
-/// `next_token` continues a previous page; the returned token, when present,
-/// continues this one. A statement without a `Limit` returns every matching row
-/// and no token.
 /// The WHERE clause a statement carries, if any. `INSERT` never has one.
 fn statement_where_clause(stmt: &Statement) -> Option<&WhereClause> {
     match stmt {
@@ -1346,37 +1306,13 @@ fn validate_operand_types(
     Ok(())
 }
 
-/// Run one page of a parsed statement. A continuation token is bound to the
-/// statement as parsed, since its text isn't at hand here; `ExecuteStatement`
-/// binds it to the text as written instead, as DynamoDB does.
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_page<S: StorageBackend>(
-    storage: &S,
-    stmt: &Statement,
-    parameters: &[AttributeValue],
-    limit: Option<usize>,
-    next_token: Option<&str>,
-    consistent_read: bool,
-    capacity_mode: Option<&str>,
-    resolved: Option<&ResolvedTable>,
-) -> Result<StatementPage> {
-    execute_written_page(
-        storage,
-        None,
-        stmt,
-        parameters,
-        limit,
-        next_token,
-        consistent_read,
-        capacity_mode,
-        resolved,
-        false,
-    )
-    .await
-}
-
-/// [`execute_page`] for a statement whose text, `written`, is at hand: a
-/// continuation token is then bound to that text exactly as written.
+/// Run one page of a parsed statement, `written` being its text as the
+/// request carried it. A continuation token is bound to that text exactly as
+/// written, as DynamoDB binds it.
+///
+/// `next_token` continues a previous page; the returned token, when present,
+/// continues this one. A statement without a `limit` returns every matching
+/// row and no token.
 ///
 /// `old_on_condition_failure` is `ReturnValuesOnConditionCheckFailure` set to
 /// `ALL_OLD`: an UPDATE or DELETE whose WHERE clause is false on an item that
@@ -1386,7 +1322,7 @@ pub async fn execute_page<S: StorageBackend>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_written_page<S: StorageBackend>(
     storage: &S,
-    written: Option<&str>,
+    written: &str,
     stmt: &Statement,
     parameters: &[AttributeValue],
     limit: Option<usize>,
@@ -1643,7 +1579,7 @@ fn projection_key(path: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn execute_select<S: StorageBackend>(
     storage: &S,
-    written: Option<&str>,
+    written: &str,
     table_name: &str,
     index_name: Option<&str>,
     projections: &[String],
@@ -1776,8 +1712,7 @@ async fn execute_select<S: StorageBackend>(
         }
     }
 
-    let fingerprint =
-        statement_fingerprint(written, where_clause, parameters, index_name, order_by);
+    let fingerprint = statement_fingerprint(written, parameters);
     let cursor = next_token
         .map(|token| decode_next_token(token, table_name, fingerprint))
         .transpose()?;
@@ -2401,67 +2336,18 @@ fn resolve_index(meta: &crate::storage::TableMetadata, index_name: &str) -> Resu
 }
 
 /// A digest binding a continuation token to its statement and parameters.
-/// DynamoDB binds it to the statement exactly as written, so with the text at
-/// hand (`written`) that is what is hashed, beside the parameters by value
-/// (see `hash_parameters`): a space, a keyword's case, the projection or a map
-/// literal's key order changed between pages is a different statement, and
-/// `0` and `0.0` are different parameters (captured eu-west-2 and us-east-1,
-/// 2026-10-10).
-///
-/// Without the text, the digest is of the parts of the SELECT that determine
-/// its row walk: the WHERE clause as parsed (see `write_clause_shape`), the
-/// parameters, the index and any ORDER BY. Projections are left out there,
-/// because they run after the read and do not move the cursor. Tokens are
-/// ephemeral and in-process, so the hash does not need to be stable across
-/// builds.
-///
-/// Whatever is hashed here is part of the continuation token's contract, so the
-/// fields are named one at a time rather than taken off a whole value's `Debug`.
-/// Hashing `WhereClause` wholesale made every field it might ever gain part of
-/// that contract, and adding one that has no bearing on the walk then
-/// invalidated every token already in flight with nothing to say it had.
-fn statement_fingerprint(
-    written: Option<&str>,
-    where_clause: Option<&WhereClause>,
-    parameters: &[AttributeValue],
-    index_name: Option<&str>,
-    order_by: &[OrderByTerm],
-) -> u64 {
+/// DynamoDB binds it to the statement exactly as written, so that is what is
+/// hashed, beside the parameters by value (see `hash_parameters`): a space, a
+/// keyword's case, the projection or a map literal's key order changed between
+/// pages is a different statement, and `0` and `0.0` are different parameters
+/// (captured eu-west-2 and us-east-1, 2026-10-10). Tokens are ephemeral and
+/// in-process, so the hash does not need to be stable across builds.
+fn statement_fingerprint(written: &str, parameters: &[AttributeValue]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    match written {
-        Some(text) => {
-            text.hash(&mut hasher);
-            hash_parameters(parameters, &mut hasher);
-        }
-        None => fingerprint_into(&mut hasher, where_clause, parameters, index_name, order_by),
-    }
+    written.hash(&mut hasher);
+    hash_parameters(parameters, &mut hasher);
     hasher.finish()
-}
-
-/// Feed a statement's fingerprint into any hasher, so a test can measure what
-/// a fingerprint costs by counting the bytes it writes.
-fn fingerprint_into<H: std::hash::Hasher>(
-    hasher: &mut H,
-    where_clause: Option<&WhereClause>,
-    parameters: &[AttributeValue],
-    index_name: Option<&str>,
-    order_by: &[OrderByTerm],
-) {
-    use std::hash::Hash;
-    // Writing into a hasher can't fail.
-    let _ = write_clause_shape(&mut HashWriter(&mut *hasher), where_clause);
-    // The index is part of the walk, not just of the filter: a token minted
-    // against one index would otherwise resume against another at a position
-    // that means nothing there.
-    index_name.hash(hasher);
-    hash_parameters(parameters, hasher);
-    // So is the order: a position in an ascending read resumed in a
-    // descending one would start from the wrong end. Mixed in only when there
-    // is an ORDER BY, so a statement without one hashes as it always did.
-    if !order_by.is_empty() {
-        format!("{order_by:?}").hash(hasher);
-    }
 }
 
 /// Feed a statement's parameters into a hasher as DynamoDB matches them when
@@ -2542,35 +2428,6 @@ fn decimal_identity(n: &str) -> (bool, String, i64) {
         .unwrap_or(i64::MAX)
         .saturating_sub(exponent);
     (negative && !digits.is_empty(), digits, scale)
-}
-
-/// A `fmt::Write` that feeds a hasher, so a clause is hashed as it is written
-/// out rather than formatted into a string first.
-struct HashWriter<'a, H>(&'a mut H);
-
-impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.0.write(s.as_bytes());
-        Ok(())
-    }
-}
-
-/// The WHERE clause as a fingerprint reads it: the clause as parsed, which
-/// holds each condition once and decides the groups, rather than the groups
-/// themselves, which repeat every condition outside an alternation once per
-/// group. A clause built from groups alone has no tree and is read off its
-/// groups. A clause with no groups at all is not the same as no clause.
-fn write_clause_shape(
-    out: &mut impl std::fmt::Write,
-    where_clause: Option<&WhereClause>,
-) -> std::fmt::Result {
-    match where_clause {
-        Some(wc) => match wc.tree {
-            Some(ref tree) => write!(out, "tree {tree:?}"),
-            None => write!(out, "groups {:?}", wc.groups),
-        },
-        None => out.write_str("no-where"),
-    }
 }
 
 /// Callers should treat this as opaque, but it is only base64 and anyone can
@@ -2816,8 +2673,8 @@ pub struct ResolvedTable {
     pub meta: crate::storage::TableMetadata,
     pub key_schema: crate::actions::helpers::KeySchema,
     /// The table this was resolved from, so a caller handing it to
-    /// [`execute_page`] alongside a statement against another table can be
-    /// spotted rather than obeyed.
+    /// [`execute_written_page`] alongside a statement against another table
+    /// can be spotted rather than obeyed.
     pub table_name: String,
 }
 
@@ -4438,111 +4295,30 @@ mod tests {
         }
     }
 
-    /// A NextToken's fingerprint is read off the clause as written, which
-    /// holds each condition once, not off the flattened groups, which repeat
-    /// every condition outside an alternation in each group. Here the 100
-    /// conditions De Morgan makes of a negated IN, each naming a
-    /// 7,700-character path, sit beside five alternations: the tree holds them
-    /// once (about 770 KB), the 32 groups hold them 32 times (about 25 MB).
+    /// The fingerprint gives the same answer for the same statement and
+    /// parameters, and tells apart any change to the text as written or to a
+    /// parameter, so a NextToken resumes only the read it was minted for.
     #[test]
-    fn a_clause_is_fingerprinted_once_per_condition() {
-        /// A hasher that only counts the bytes written into it.
-        struct Count(usize);
-        impl std::hash::Hasher for Count {
-            fn write(&mut self, bytes: &[u8]) {
-                self.0 += bytes.len();
-            }
-            fn finish(&self) -> u64 {
-                self.0 as u64
-            }
-        }
-        let operands = (0..100)
-            .map(|i| (i % 10).to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let statement = format!(
-            r#"SELECT * FROM "t" WHERE pk = 'k' AND {} AND NOT "{}" IN [{operands}]"#,
-            ["(a = 1 OR a = 2)"; 5].join(" AND "),
-            "a".repeat(7_700),
-        );
-        assert!(statement.chars().count() <= 8_192);
-        let wc = where_of(&statement);
-        assert_eq!(wc.groups.len(), 32);
-        // Through the fingerprint itself, so a fingerprint that went back to
-        // the groups would be caught here, not only a clause writer that did.
-        let mut written = Count(0);
-        fingerprint_into(&mut written, Some(&wc), &[], None, &[]);
-        assert!(
-            written.0 < 2_000_000,
-            "fingerprinting wrote {} bytes",
-            written.0
-        );
-    }
-
-    /// The fingerprint still tells statements apart, and gives the same
-    /// answer for the same statement, so a NextToken resumes only the read
-    /// it was minted for.
-    #[test]
-    fn a_fingerprint_follows_the_clause() {
-        let fingerprint = |statement: &str| {
-            statement_fingerprint(None, Some(&where_of(statement)), &[], None, &[])
-        };
+    fn a_fingerprint_follows_the_text_as_written() {
+        let fingerprint = |statement: &str| statement_fingerprint(statement, &[]);
         let a = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#;
         let b = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 3)"#;
         let c = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 AND b = 2)"#;
+        let spaced = r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR  b = 2)"#;
+        let lower = r#"select * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#;
         assert_eq!(fingerprint(a), fingerprint(a));
-        assert_ne!(fingerprint(a), fingerprint(b));
-        assert_ne!(fingerprint(a), fingerprint(c));
-        assert_ne!(
-            fingerprint(a),
-            statement_fingerprint(None, None, &[], None, &[])
-        );
+        for other in [b, c, spaced, lower] {
+            assert_ne!(fingerprint(a), fingerprint(other), "{other}");
+        }
 
-        // Parameters, the index and the order each still count.
-        let wc = where_of(r#"SELECT * FROM "t" WHERE pk = ?"#);
-        let with = |p: &[AttributeValue], index: Option<&str>, order: &[OrderByTerm]| {
-            statement_fingerprint(None, Some(&wc), p, index, order)
-        };
+        // Parameters count by value.
+        let with =
+            |p: &[AttributeValue]| statement_fingerprint(r#"SELECT * FROM "t" WHERE pk = ?"#, p);
         let one = [AttributeValue::S("1".to_string())];
         let two = [AttributeValue::S("2".to_string())];
-        assert_ne!(with(&one, None, &[]), with(&two, None, &[]));
-        assert_ne!(with(&one, None, &[]), with(&one, Some("byName"), &[]));
-        let ordered = match parse(r#"SELECT * FROM "t" WHERE pk = ? ORDER BY sk DESC"#).unwrap() {
-            Statement::Select { order_by, .. } => order_by,
-            other => panic!("expected a SELECT: {other:?}"),
-        };
-        assert!(!ordered.is_empty());
-        assert_ne!(with(&one, None, &[]), with(&one, None, &ordered));
-    }
-
-    /// A clause built from groups alone carries no tree, and is read off its
-    /// groups: it still digests alike for an equal clause and apart for a
-    /// different one, and apart from no clause at all.
-    #[test]
-    fn a_clause_without_a_tree_is_fingerprinted_from_its_groups() {
-        let groups_only = |statement: &str| {
-            let mut wc = where_of(statement);
-            wc.tree = None;
-            wc
-        };
-        let a = groups_only(r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#);
-        let b = groups_only(r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 3)"#);
-        let a_again = groups_only(r#"SELECT * FROM "t" WHERE pk = 'k' AND (a = 1 OR b = 2)"#);
-        let digest = |wc: &WhereClause| statement_fingerprint(None, Some(wc), &[], None, &[]);
-        assert_eq!(digest(&a), digest(&a_again));
-        assert_ne!(digest(&a), digest(&b));
-        assert_ne!(
-            digest(&a),
-            statement_fingerprint(None, None, &[], None, &[])
-        );
-        // A map in a groups-only clause is written in key order too.
-        let m1 = groups_only(
-            r#"SELECT * FROM "t" WHERE m = {'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5, 'f': 6}"#,
-        );
-        let m2 = groups_only(
-            r#"SELECT * FROM "t" WHERE m = {'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5, 'f': 6}"#,
-        );
-        assert_eq!(digest(&m1), digest(&m2));
+        assert_eq!(with(&one), with(&one));
+        assert_ne!(with(&one), with(&two));
+        assert_ne!(with(&one), with(&[]));
     }
 
     /// A placeholder with no parameter to fill it decides nothing, whatever

@@ -61,8 +61,7 @@ pub fn parse(expr: &str) -> Result<ProjectionExpr, String> {
 /// Wrap a parser-level ProjectionExpression error in the standard envelope.
 /// For now this is a passthrough through the existing message shape; if the
 /// conformance suite later pins a `near:` window for parser-level projection
-/// errors, the offending span is available via `stream.current_span()` and
-/// the next span via `stream.peek_span()`.
+/// errors, the stream's position says where the parse stopped.
 fn projection_parser_error(_expr: &str, _stream: &mut TokenStream, msg: String) -> String {
     format!("Invalid ProjectionExpression: {msg}")
 }
@@ -755,5 +754,16 @@ mod tests {
         let n1 = expect_map(&n[1]);
         assert_eq!(n1.get("q"), Some(&AttributeValue::S("q01".into())));
         assert!(!n1.contains_key("p"));
+    }
+
+    #[test]
+    fn projection_expression_tokenizer_error_includes_near_window() {
+        // The conformance suite pins the AWS string for "!!! INVALID !!!":
+        //   Invalid ProjectionExpression: Syntax error; token: "!", near: "!!"
+        let err = parse("!!! INVALID !!!").unwrap_err();
+        assert_eq!(
+            err,
+            r#"Invalid ProjectionExpression: Syntax error; token: "!", near: "!!""#
+        );
     }
 }

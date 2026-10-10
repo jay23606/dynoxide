@@ -46,19 +46,6 @@ impl SortKeyCondition {
             | Self::BeginsWith(n, _) => n,
         }
     }
-
-    /// The value references this clause reads, in the order written.
-    pub fn value_refs(&self) -> Vec<&str> {
-        match self {
-            Self::Eq(_, v)
-            | Self::Lt(_, v)
-            | Self::Le(_, v)
-            | Self::Gt(_, v)
-            | Self::Ge(_, v)
-            | Self::BeginsWith(_, v) => vec![v],
-            Self::Between(_, lo, hi) => vec![lo, hi],
-        }
-    }
 }
 
 /// Parse a KeyConditionExpression string, tracking attribute name usage.
