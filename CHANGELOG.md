@@ -737,8 +737,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Where a WHERE clause holds more than one refusal, `MISSING` compared
   without `IS` now outranks a refused operand whichever is written first, and
   an `IN` with too many operands is reported in the order written against a
-  refused operand rather than ahead of it. Captured against eu-west-2 and
-  us-east-1.
+  refused operand rather than ahead of it. An `IN` with too many operands
+  that also holds its own path is refused for the path, wherever it stands
+  in the list, where the operand count used to be reported. Captured against
+  eu-west-2 and us-east-1.
 - PartiQL `size()` calls nested inside one another, and arithmetic after a
   `size()`, are held to the same depth as nested brackets.
 - A PartiQL `IN` with more than 100 operands, negated or not, written as

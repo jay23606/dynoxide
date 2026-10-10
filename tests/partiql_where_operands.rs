@@ -672,6 +672,26 @@ fn in_and_between_refuse_the_path_among_their_own_operands() {
     }
 }
 
+/// An IN with more than 100 members that also holds the path it tests is
+/// refused as not distinct, not for its operand count, whether the path comes
+/// first or last (captured eu-west-2 and us-east-1, 2026-10-10).
+#[test]
+fn an_in_list_names_its_own_path_before_its_operand_count() {
+    let db = db();
+    let hundred = (1..=100)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let distinct = "The first operand must be distinct from the remaining operands for this \
+                    operator or function; operator: IN, first operand: [n]";
+    for condition in [
+        format!("n IN [n, {hundred}]"),
+        format!("n IN [{hundred}, n]"),
+    ] {
+        assert_eq!(where_refusal(&db, &condition), distinct, "{condition}");
+    }
+}
+
 /// Which refusal DynamoDB reports when a WHERE clause holds two. A function
 /// it doesn't recognise, a number it can't store and `MISSING` compared
 /// without IS outrank the rest, the first written of them winning. Below them,

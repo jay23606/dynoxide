@@ -2894,6 +2894,7 @@ fn condition_function_tail(
     if is_keyword(&next, "IN") {
         t.next_token()?;
         let members = parse_in_list(t, depth, parse_bound_operand)?;
+        note_in_operand_count(t, members.len());
         let listed = function.listed(&members)?;
         return Ok(if negated {
             BoolExpr::Not(Box::new(listed))
@@ -3122,8 +3123,9 @@ fn expect_between_and(t: &mut Tokenizer) -> Result<(), String> {
 }
 
 /// An IN list, `[...]` or `(...)`, each member read by `member`. The closing
-/// token must match the opener. More than `MAX_IN_OPERANDS` members are
-/// refused in DynamoDB's words once the statement has parsed.
+/// token must match the opener. Its operand count is the caller's to check,
+/// with `note_in_operand_count`, once it has checked anything DynamoDB
+/// reports first.
 fn parse_in_list<T>(
     t: &mut Tokenizer,
     depth: usize,
@@ -3140,15 +3142,6 @@ fn parse_in_list<T>(
         let peek = t.peek_token()?.ok_or("Unexpected end of IN list")?;
         if peek == close {
             t.next_token()?;
-            // Reported in the order written against a refused operand,
-            // below a refused term or literal (captured eu-west-2 and
-            // us-east-1, 2026-10-10).
-            if values.len() > MAX_IN_OPERANDS {
-                t.note_operand_refusal(format!(
-                    "The IN operator is provided with too many operands; number of operands: {}",
-                    values.len()
-                ));
-            }
             return Ok(values);
         }
         if peek == "," {
@@ -3156,6 +3149,18 @@ fn parse_in_list<T>(
             continue;
         }
         values.push(member(t, depth)?);
+    }
+}
+
+/// Refuse an IN list of more than `MAX_IN_OPERANDS` members in DynamoDB's
+/// words once the statement has parsed. Reported in the order written against
+/// a refused operand, below a refused term or literal, and after the list's
+/// own path among its members (captured eu-west-2 and us-east-1, 2026-10-10).
+fn note_in_operand_count(t: &mut Tokenizer, count: usize) {
+    if count > MAX_IN_OPERANDS {
+        t.note_operand_refusal(format!(
+            "The IN operator is provided with too many operands; number of operands: {count}"
+        ));
     }
 }
 
@@ -3224,6 +3229,7 @@ fn finish_comparison(t: &mut Tokenizer, depth: usize, left: Operand) -> Result<B
         Some(tok) if is_keyword(tok, "IN") => {
             t.next_token()?;
             let members = parse_in_list(t, depth, parse_bound_operand)?;
+            note_in_operand_count(t, members.len());
             Ok(BoolExpr::Leaf(WhereCondition::CompareIn(left, members)))
         }
         Some(tok) if is_keyword(tok, "IS") && matches!(left, Operand::Size(_)) => {
@@ -3800,6 +3806,7 @@ fn path_in(t: &mut Tokenizer, path: String, members: Vec<Operand>) -> WhereCondi
         t.note_operand_refusal(not_distinct("IN", &path));
         return WhereCondition::Exists(String::new());
     }
+    note_in_operand_count(t, members.len());
     match all_values(&members) {
         Some(values) => WhereCondition::In(path, values),
         None => WhereCondition::CompareIn(Operand::Path(path), members),
