@@ -1,8 +1,8 @@
 //! DynamoDB's request member errors on the PartiQL operations: every
 //! violation in a request is listed, numbered, in member order, and one on a
 //! batch or transaction member refuses the whole request, writing nothing.
-//! Captured in eu-west-2 and us-east-1, 2026-10-10; the regions agree on
-//! every case here.
+//! Captured in eu-west-2 and us-east-1, 2026-10-10, except where a test says
+//! its case is inferred; the regions agree on every captured case here.
 
 use dynoxide::Database;
 use dynoxide::actions::batch_execute_statement::BatchExecuteStatementRequest;

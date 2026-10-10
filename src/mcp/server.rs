@@ -1820,9 +1820,8 @@ impl McpServer {
                 ));
             }
         }
-        if let Some(err) = refuse_bad_capacity_mode(params.return_consumed_capacity.as_deref()) {
-            return Ok(err);
-        }
+        // The action lists a bad ReturnConsumedCapacity with the statement's
+        // other member errors, so it isn't refused on its own here.
         let parameters: Option<Vec<AttributeValue>> = match params.parameters {
             Some(val) => match serde_json::from_value(val) {
                 Ok(v) => Some(v),
@@ -3527,13 +3526,30 @@ mod capacity_tests {
         .check();
     }
 
-    /// The PartiQL batch and transaction tools list a bad mode with the other
-    /// member errors, as the wire and library do, rather than refusing it on
-    /// its own first (both orders captured eu-west-2 and us-east-1,
-    /// 2026-10-10).
+    /// The PartiQL tools list a bad mode with the other member errors, as the
+    /// wire and library do, rather than refusing it on its own first (the
+    /// orders captured eu-west-2 and us-east-1, 2026-10-10: on ExecuteStatement
+    /// the statement before the mode).
     #[test]
     fn partiql_tools_list_the_mode_with_the_other_member_errors() {
         let server = server();
+        let long = format!("SELECT * FROM \"Cap\" WHERE pk = '{}'", "x".repeat(9_000));
+        let (is_error, body) = reply(server.execute_partiql(Parameters(wire(json!({
+            "statement": long,
+            "return_consumed_capacity": "BOGUS"
+        })))));
+        assert!(is_error, "the statement was accepted: {body}");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("2 validation errors detected: Value '"),
+            "the statement listed {message}"
+        );
+        assert!(message.contains("' at 'statement' failed to satisfy constraint"));
+        assert!(message.ends_with(
+            "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: \
+             Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
+        ));
+
         let statements: Vec<Value> = (0..26)
             .map(|_| json!({"Statement": "SELECT * FROM \"Cap\" WHERE pk = 'p'"}))
             .collect();

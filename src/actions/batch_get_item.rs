@@ -401,13 +401,13 @@ fn request_items_echo(request_items: &HashMap<String, KeysAndAttributes>) -> Str
         if let Some(ref names) = ka.expression_attribute_names {
             members.insert(
                 "ExpressionAttributeNames".to_string(),
-                sorted_json(serde_json::json!(names)),
+                crate::sorted_json(serde_json::json!(names)),
             );
         }
         let keys = ka
             .keys
             .iter()
-            .map(|key| sorted_json(serde_json::to_value(key).unwrap_or_default()))
+            .map(|key| crate::sorted_json(serde_json::to_value(key).unwrap_or_default()))
             .collect();
         members.insert("Keys".to_string(), serde_json::Value::Array(keys));
         if let Some(ref projection) = ka.projection_expression {
@@ -418,26 +418,9 @@ fn request_items_echo(request_items: &HashMap<String, KeysAndAttributes>) -> Str
         }
         echo.insert(table_name.clone(), serde_json::Value::Object(members));
     }
-    crate::actions::batch_write_item::bound_echo(serde_json::Value::Object(echo).to_string())
-}
-
-/// Rebuild every JSON object with its keys in order of name, so the echo does
-/// not depend on hash-map iteration order.
-fn sorted_json(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            serde_json::Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(k, v)| (k, sorted_json(v)))
-                    .collect(),
-            )
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(sorted_json).collect())
-        }
-        other => other,
-    }
+    // Sorted as a whole too: the tables arrive in hash-map order, which
+    // serde_json keeps when its `preserve_order` feature is on.
+    crate::actions::batch_write_item::bound_echo(
+        crate::sorted_json(serde_json::Value::Object(echo)).to_string(),
+    )
 }

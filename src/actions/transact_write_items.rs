@@ -232,9 +232,10 @@ pub(crate) fn check_request(request: &TransactWriteItemsRequest) -> Result<()> {
     // anchors a regex on the envelope and constraint phrase but leaves the
     // dump body unconstrained.
     if items.len() > 100 {
-        let dump = format!("{items:?}");
+        // Bounded like the other echoes of a refused member.
+        let dump = crate::actions::batch_write_item::bounded_listing(items);
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '[{dump}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
+            "1 validation error detected: Value '{dump}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
         )));
     }
 

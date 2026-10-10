@@ -2206,13 +2206,10 @@ fn fingerprint_into<H: std::hash::Hasher>(
     // against one index would otherwise resume against another at a position
     // that means nothing there.
     index_name.hash(hasher);
-    // Through a `serde_json::Value`, whose maps keep their keys in order: a map
-    // parameter is a `HashMap`, decoded afresh for every page, so writing it
-    // straight out would order its keys differently on each page.
-    serde_json::to_value(parameters)
-        .and_then(|v| serde_json::to_vec(&v))
-        .unwrap_or_default()
-        .hash(hasher);
+    // With every map's keys sorted: a map parameter is a `HashMap`, decoded
+    // afresh for every page, so writing it straight out would order its keys
+    // differently on each page.
+    crate::canonical_json(parameters).hash(hasher);
     // So is the order: a position in an ascending read resumed in a
     // descending one would start from the wrong end. Mixed in only when there
     // is an ORDER BY, so a statement without one hashes as it always did.
@@ -4050,6 +4047,30 @@ mod tests {
         };
         assert!(!ordered.is_empty());
         assert_ne!(with(&one, None, &[]), with(&one, None, &ordered));
+    }
+
+    /// A map parameter fingerprints by its contents, not by the order its keys
+    /// come out in. Two `HashMap`s holding the same entries iterate in
+    /// different orders, and serde_json keeps that order when a crate in the
+    /// build turns on its `preserve_order` feature, so the fingerprint sorts
+    /// keys itself, at every depth.
+    #[test]
+    fn a_map_parameter_fingerprints_alike_whatever_its_key_order() {
+        let map = |n: &str| -> AttributeValue {
+            let inner: HashMap<String, AttributeValue> = (0..16)
+                .map(|i| (format!("i{i}"), AttributeValue::N(n.to_string())))
+                .collect();
+            AttributeValue::M(
+                (0..16)
+                    .map(|i| (format!("k{i}"), AttributeValue::M(inner.clone())))
+                    .collect(),
+            )
+        };
+        let fingerprint = |p: &[AttributeValue]| statement_fingerprint(None, p, None, &[]);
+        for _ in 0..8 {
+            assert_eq!(fingerprint(&[map("1")]), fingerprint(&[map("1")]));
+        }
+        assert_ne!(fingerprint(&[map("1")]), fingerprint(&[map("2")]));
     }
 
     /// A clause built from groups alone carries no tree, and is read off its

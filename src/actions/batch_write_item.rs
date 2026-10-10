@@ -554,7 +554,9 @@ fn require_key_attributes(item: &Item, schema: &helpers::KeySchema) -> Result<()
     Ok(())
 }
 
-/// The most a constraint message's echo of a member may run to, in bytes.
+/// The most of a member a constraint message echoes, in bytes, before the echo
+/// is cut. A cut echo is this many bytes (less any partial character at the
+/// cut) followed by the three-character `...`.
 ///
 /// DynamoDB echoes the refused member in its Java model's `toString`, which
 /// names all sixteen of a value's fields and so runs to about twenty times the
@@ -608,6 +610,15 @@ impl std::fmt::Write for BoundedEcho {
         self.full = true;
         Err(std::fmt::Error)
     }
+}
+
+/// A list's `Debug` form wrapped in brackets, as the transaction operations
+/// echo an action list longer than 100, bounded by [`ECHO_LIMIT`] like the
+/// other echoes. Under the limit it is the text `format!("[{value:?}]")` gives.
+pub(crate) fn bounded_listing<T: std::fmt::Debug + ?Sized>(value: &T) -> String {
+    let mut out = BoundedEcho::new();
+    let _ = std::fmt::Write::write_fmt(&mut out, format_args!("[{value:?}]"));
+    out.finish()
 }
 
 /// Cut an echo already built to [`ECHO_LIMIT`], for an echo that is no larger
@@ -795,9 +806,48 @@ fn write_java_shown(out: &mut dyn std::fmt::Write, value: &AttributeValue) -> st
 
 #[cfg(test)]
 mod tests {
+    use super::{BoundedEcho, ECHO_LIMIT, bound_echo};
     use crate::actions::{batch_write_item, create_table};
     use crate::storage::Storage;
     use crate::storage_backend::StorageBackend;
+    use std::fmt::Write;
+
+    /// An echo that fits is returned untouched, with no `...`, right up to the
+    /// limit itself.
+    #[test]
+    fn an_echo_of_exactly_the_limit_is_untouched() {
+        let echo = "a".repeat(ECHO_LIMIT);
+        assert_eq!(bound_echo(echo.clone()), echo);
+        assert_eq!(bound_echo("short".to_string()), "short");
+    }
+
+    /// One byte over the limit is cut at the limit and ends `...`.
+    #[test]
+    fn an_echo_one_byte_over_the_limit_is_cut_and_marked() {
+        let cut = bound_echo("a".repeat(ECHO_LIMIT + 1));
+        assert_eq!(cut.len(), ECHO_LIMIT + 3);
+        assert!(cut.ends_with("a..."));
+    }
+
+    /// A character that straddles the limit is left out whole rather than
+    /// split, for two- and four-byte characters and for an echo written in
+    /// many small pieces as well as one large one.
+    #[test]
+    fn an_echo_is_never_cut_inside_a_character() {
+        for (filler, ch) in [(ECHO_LIMIT - 1, "é"), (ECHO_LIMIT - 2, "😀")] {
+            let echo = format!("{}{ch}tail", "a".repeat(filler));
+            let cut = bound_echo(echo);
+            assert_eq!(cut, format!("{}...", "a".repeat(filler)), "cut at {ch}");
+
+            let mut pieces = BoundedEcho::new();
+            for _ in 0..filler {
+                let _ = pieces.write_str("a");
+            }
+            assert!(pieces.write_str(ch).is_err(), "{ch} did not fill the echo");
+            assert!(pieces.write_str("more").is_err(), "a full echo took more");
+            assert_eq!(pieces.finish(), format!("{}...", "a".repeat(filler)));
+        }
+    }
 
     /// Each batch put is atomic with its own GSI fan-out: a mid-fan-out failure
     /// rolls that item's base write back rather than leaving a torn index.

@@ -127,9 +127,10 @@ pub async fn execute<S: StorageBackend>(
     // anchors a regex on the envelope and constraint phrase but leaves the
     // dump body unconstrained.
     if request.transact_items.len() > 100 {
-        let dump = format!("{:?}", request.transact_items);
+        // Bounded like the other echoes of a refused member.
+        let dump = crate::actions::batch_write_item::bounded_listing(&request.transact_items);
         return Err(DynoxideError::ValidationException(format!(
-            "1 validation error detected: Value '[{dump}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
+            "1 validation error detected: Value '{dump}' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100"
         )));
     }
 

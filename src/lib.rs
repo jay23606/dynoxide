@@ -258,16 +258,50 @@ pub(crate) fn token_constraint_error(token: Option<&str>) -> Option<String> {
 ///
 /// The input is the items or statements only, never `ReturnConsumedCapacity`,
 /// so a same-token call differing only in the capacity mode replays rather than
-/// mismatching. Normalised through `serde_json::Value` first so the digest does
-/// not depend on map iteration order.
+/// mismatching. Hashed through [`canonical_json`], so the digest does not depend
+/// on map iteration order.
 fn request_hash<H: serde::Serialize>(input: &H) -> u64 {
     use std::hash::{Hash, Hasher};
-    let normalised = serde_json::to_value(input)
-        .and_then(|v| serde_json::to_vec(&v))
-        .unwrap_or_default();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    normalised.hash(&mut hasher);
+    canonical_json(input).hash(&mut hasher);
     hasher.finish()
+}
+
+/// `value` serialised to JSON with every object's keys in sorted order, at any
+/// depth, for hashing or comparing by content.
+///
+/// A `serde_json::Value` keeps an object's keys sorted only while serde_json's
+/// `preserve_order` feature is off. A crate that depends on Dynoxide can turn
+/// that feature on for the whole build, and then a `HashMap`'s keys come out in
+/// its iteration order, which differs between two maps holding the same
+/// entries. So the keys are sorted here rather than left to serde_json.
+pub(crate) fn canonical_json<T: serde::Serialize + ?Sized>(value: &T) -> Vec<u8> {
+    serde_json::to_value(value)
+        .map(sorted_json)
+        .and_then(|v| serde_json::to_vec(&v))
+        .unwrap_or_default()
+}
+
+/// A JSON value with every object's keys sorted, at any depth. Building the
+/// object from sorted entries gives sorted keys whether serde_json keeps
+/// objects in key order or in insertion order.
+pub(crate) fn sorted_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, sorted_json(v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted_json).collect())
+        }
+        other => other,
+    }
 }
 
 fn lock_cache<T>(cache: &Mutex<TokenCache<T>>) -> Result<std::sync::MutexGuard<'_, TokenCache<T>>> {
@@ -1655,6 +1689,35 @@ mod idempotency_tests {
             lookup_or_claim(&cache, TOKEN, hash()).unwrap(),
             TokenClaim::Hit(2)
         ));
+    }
+
+    /// A map in the request hashes by its contents, not by the order its keys
+    /// come out in. Two `HashMap`s holding the same entries iterate in
+    /// different orders, and serde_json keeps that order when a crate in the
+    /// build turns on its `preserve_order` feature, so the digest sorts keys
+    /// itself, at every depth. Otherwise a same-token retry of an identical
+    /// request could be refused as a mismatch.
+    #[test]
+    fn a_request_hash_ignores_map_key_order() {
+        use crate::types::AttributeValue;
+        let item = |n: &str| -> HashMap<String, AttributeValue> {
+            let inner: HashMap<String, AttributeValue> = (0..16)
+                .map(|i| (format!("i{i}"), AttributeValue::N(n.to_string())))
+                .collect();
+            (0..16)
+                .map(|i| (format!("k{i}"), AttributeValue::M(inner.clone())))
+                .collect()
+        };
+        for _ in 0..8 {
+            assert_eq!(
+                request_hash(&vec![item("1")]),
+                request_hash(&vec![item("1")])
+            );
+        }
+        assert_ne!(
+            request_hash(&vec![item("1")]),
+            request_hash(&vec![item("2")])
+        );
     }
 
     #[test]

@@ -12,13 +12,44 @@ use dynoxide::actions::batch_execute_statement::{
 };
 use dynoxide::actions::batch_get_item::{BatchGetItemRequest, KeysAndAttributes};
 use dynoxide::actions::batch_write_item::{BatchWriteItemRequest, PutRequest, WriteRequest};
+use dynoxide::actions::transact_get_items::{
+    TransactGet, TransactGetItem, TransactGetItemsRequest,
+};
+use dynoxide::actions::transact_write_items::{
+    TransactPut, TransactWriteItem, TransactWriteItemsRequest,
+};
 use dynoxide::errors::DynoxideError;
 use dynoxide::types::AttributeValue;
 use std::collections::HashMap;
 
 /// A little over the bound, so a test can tell a capped echo from an uncapped
-/// one: the uncapped echoes below run to tens of megabytes.
+/// one: the uncapped echoes below run to megabytes or tens of megabytes.
 const BOUNDED: usize = 1_200_000;
+
+/// The bound itself (Dynoxide's `ECHO_LIMIT`, 1 MiB). A cut echo runs to it and
+/// then ends `...`, so the message is longer than this.
+const LIMIT: usize = 1024 * 1024;
+
+/// A capped echo reached the limit and was cut there: the message is longer
+/// than the limit, shorter than [`BOUNDED`], and the echo ends `...` just
+/// before the member it names.
+fn assert_cut(message: &str) {
+    assert!(
+        message.len() > LIMIT,
+        "the echo was cut short: {} bytes",
+        message.len()
+    );
+    assert!(
+        message.len() < BOUNDED,
+        "the echo ran to {} bytes",
+        message.len()
+    );
+    assert!(
+        message.contains("...' at '"),
+        "the cut echo doesn't end with ...: {}",
+        &message[message.len().saturating_sub(200)..]
+    );
+}
 
 fn message(err: DynoxideError) -> String {
     match err {
@@ -56,11 +87,7 @@ fn a_batch_write_echo_is_bounded() {
         "unexpected message start: {}",
         &message[..message.len().min(200)]
     );
-    assert!(
-        message.len() < BOUNDED,
-        "the echo ran to {} bytes",
-        message.len()
-    );
+    assert_cut(&message);
 }
 
 /// BatchExecuteStatement echoes the statement list when it holds more than 25.
@@ -93,16 +120,12 @@ fn a_batch_statement_echo_is_bounded() {
         "unexpected message start: {}",
         &message[..message.len().min(200)]
     );
-    assert!(
-        message.len() < BOUNDED,
-        "the echo ran to {} bytes",
-        message.len()
-    );
+    assert_cut(&message);
 }
 
 /// BatchGetItem echoes its RequestItems map as JSON when a table name breaks
 /// its constraints. That echo is no larger than the request, but it is cut at
-/// the same bound: 100 keys of 12,000-character strings are about 1.2 MB.
+/// the same bound: 100 keys of 20,000-character strings are about 2 MB.
 #[test]
 fn a_batch_get_echo_is_bounded() {
     let db = Database::memory().unwrap();
@@ -110,7 +133,7 @@ fn a_batch_get_echo_is_bounded() {
         .map(|i| {
             HashMap::from([(
                 "pk".to_string(),
-                AttributeValue::S(format!("{i}{}", "x".repeat(12_000))),
+                AttributeValue::S(format!("{i}{}", "x".repeat(20_000))),
             )])
         })
         .collect();
@@ -134,9 +157,72 @@ fn a_batch_get_echo_is_bounded() {
         "unexpected message start: {}",
         &message[..message.len().min(200)]
     );
+    assert_cut(&message);
+}
+
+/// A key 20,000 characters long, distinct for each `i`.
+fn long_key(i: usize) -> HashMap<String, AttributeValue> {
+    HashMap::from([(
+        "pk".to_string(),
+        AttributeValue::S(format!("{i}{}", "x".repeat(20_000))),
+    )])
+}
+
+/// TransactWriteItems lists its actions when it holds more than 100. A hundred
+/// and one puts of a 20,000-character attribute are about 2 MB of request.
+#[test]
+fn a_transaction_write_listing_is_bounded() {
+    let db = Database::memory().unwrap();
+    let transact_items = (0..101)
+        .map(|i| TransactWriteItem {
+            put: Some(TransactPut {
+                table_name: "T".to_string(),
+                item: long_key(i),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .collect();
+    let err = db
+        .transact_write_items(TransactWriteItemsRequest {
+            transact_items,
+            ..Default::default()
+        })
+        .unwrap_err();
+    let message = message(err);
     assert!(
-        message.len() < BOUNDED,
-        "the echo ran to {} bytes",
-        message.len()
+        message.starts_with("1 validation error detected: Value '[["),
+        "unexpected message start: {}",
+        &message[..message.len().min(200)]
     );
+    assert_cut(&message);
+}
+
+/// TransactGetItems lists its gets when it holds more than 100, in the same
+/// form.
+#[test]
+fn a_transaction_get_listing_is_bounded() {
+    let db = Database::memory().unwrap();
+    let transact_items = (0..101)
+        .map(|i| TransactGetItem {
+            get: TransactGet {
+                table_name: "T".to_string(),
+                key: long_key(i),
+                ..Default::default()
+            },
+        })
+        .collect();
+    let err = db
+        .transact_get_items(TransactGetItemsRequest {
+            transact_items,
+            ..Default::default()
+        })
+        .unwrap_err();
+    let message = message(err);
+    assert!(
+        message.starts_with("1 validation error detected: Value '[["),
+        "unexpected message start: {}",
+        &message[..message.len().min(200)]
+    );
+    assert_cut(&message);
 }

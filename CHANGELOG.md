@@ -615,7 +615,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can't be reproduced. Inferred rather than captured: a batch member's own
   errors following `ReturnConsumedCapacity`, and an empty transaction, or one
   of more than 100 statements, listed with the token and the statements rather
-  than answering after them. The MCP `batch_execute_partiql` and
+  than answering after them, the over-100 error now worded in the same
+  `Value at 'transactStatements' ...` form as the empty one rather than as a
+  bare constraint. The MCP `execute_partiql`, `batch_execute_partiql` and
   `execute_transaction_partiql` tools list a bad mode the same way.
 - A PartiQL WHERE clause's alternatives are held to 16,384 condition slots
   between them, where each alternative was already held to 4,096. Every slot is
@@ -623,8 +625,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could flatten to tens of thousands. The limit is Dynoxide's own, as DynamoDB
   does not flatten a clause; a clause past it is refused as too complex.
 - A refused member echoed in a constraint message (`BatchWriteItem`'s and
-  `BatchGetItem`'s request items, `BatchExecuteStatement`'s statements) stops
-  at 1 MiB and ends `...`. The Java form these echoes take runs to about
+  `BatchGetItem`'s request items, `BatchExecuteStatement`'s statements, and the
+  action list `TransactWriteItems` and `TransactGetItems` echo when it holds
+  more than 100) stops at 1 MiB and ends `...`. The Java form these echoes take runs to about
   twenty times the request, so a rejected request near the body limit built
   an error message of hundreds of megabytes. The limit is Dynoxide's own;
   what DynamoDB does with an echo that size has not been captured.
@@ -638,6 +641,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   afresh for every request, so the token stopped matching its own statement on
   the next page and was refused with `NextToken does not match request`. The
   `Debug` form of a map `AttributeValue` now writes its entries in key order.
+  The `NextToken` check and the idempotency check on transactions sort a map's
+  keys themselves rather than rely on serde_json to, so a build in which
+  another crate turns on serde_json's `preserve_order` feature still resumes
+  the page and still replays a same-token retry of an identical request.
 
 ## [1.2.1] - 2026-09-20
 

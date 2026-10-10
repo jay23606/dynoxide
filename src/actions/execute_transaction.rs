@@ -89,7 +89,10 @@ pub async fn execute<S: StorageBackend>(
 /// them, after the token and ahead of the statements. That is inferred, not
 /// captured: the batch lists its list-length error with its other members
 /// (captured), and the transaction's statements member sits between the token
-/// and the mode. The wording is the one this action used before, uncaptured.
+/// and the mode. The empty-list wording is the one this action used before;
+/// the over-100 wording is new (it used to be the bare "Member must have length
+/// less than or equal to 100"), written in the same form. Neither is captured,
+/// and DynamoDB may echo the list where these don't.
 fn member_violations(request: &ExecuteTransactionRequest) -> Vec<String> {
     let mut violations = Vec::new();
     violations.extend(crate::token_constraint_error(
