@@ -699,3 +699,56 @@ fn a_comparison_with_nothing_after_its_operator_is_unfinished() {
         "Statement wasn't well formed, can't be processed: Expected expression after AND"
     );
 }
+
+/// A size is a number, so it takes the type checks a number does: a boolean
+/// under an ordering operator is refused, and BETWEEN's bounds must be in
+/// order. A string or a boolean compared with it by `=` is simply false, and
+/// by `<>` true. Captured eu-west-2 and us-east-1, 2026-10-10, against an item
+/// whose `s` holds three characters, as `rich`'s does.
+#[test]
+fn size_takes_a_numbers_type_checks() {
+    let db = db();
+    let operand = |op: &str| {
+        format!(
+            "Incorrect operand type for operator or function; operator or function: {op}, \
+             operand type: BOOL"
+        )
+    };
+    assert_eq!(where_refusal(&db, "size(s) < true"), operand("<"));
+    assert_eq!(where_refusal(&db, "size(s) > true"), operand(">"));
+    assert_eq!(
+        refusal_with(
+            &db,
+            r#"SELECT pk FROM "Things" WHERE pk = 'it1' AND size(s) < ?"#,
+            Some(vec![AttributeValue::BOOL(true)]),
+        ),
+        operand("<")
+    );
+    assert_eq!(
+        where_refusal(&db, "size(s) BETWEEN 'b' AND 'a'"),
+        "The BETWEEN operator requires upper bound to be greater than or equal to lower \
+         bound; lower bound operand: AttributeValue: {S:b}, upper bound operand: \
+         AttributeValue: {S:a}"
+    );
+    assert_eq!(
+        where_refusal(&db, "size(s) BETWEEN 10 AND 1"),
+        "The BETWEEN operator requires upper bound to be greater than or equal to lower \
+         bound; lower bound operand: AttributeValue: {N:10}, upper bound operand: \
+         AttributeValue: {N:1}"
+    );
+
+    assert_eq!(keys_where(&db, "size(s) = true"), NONE);
+    assert_eq!(keys_where(&db, "size(s) < 'x'"), NONE);
+    assert_eq!(keys_where(&db, "size(s) <> 'x'"), IT1);
+    assert_eq!(keys_where(&db, "size(s) IN ['3']"), NONE);
+    assert_eq!(
+        keys(
+            &db,
+            r#"SELECT pk FROM "Things" WHERE pk = 'it1' AND size(s) = ?"#,
+            Some(vec![s("3")]),
+        ),
+        NONE
+    );
+    assert_eq!(keys_where(&db, "size(s) = 3"), IT1);
+    assert_eq!(keys_where(&db, "size(s) BETWEEN 1 AND 10"), IT1);
+}

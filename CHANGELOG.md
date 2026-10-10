@@ -368,7 +368,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   condition function and a size standing alone as a condition are each refused
   with DynamoDB's message before the table is looked up, and a comparison with
   nothing after its operator is `Missing right-hand side expression of infix
-  operator`.
+  operator`. A size takes a number's type checks: a boolean under an ordering
+  operator is refused, BETWEEN refuses bounds that are out of order, and a
+  string compared with a size is simply unequal (captured against eu-west-2
+  and us-east-1). BETWEEN also refuses bounds of different types, as it does
+  for a path.
 - PartiQL refuses a bag it can't store with DynamoDB's messages and positions:
   one that starts with a string at its first member that isn't one, one that
   starts with a number without a position, and a parameter, `null` or Ion

@@ -1148,82 +1148,128 @@ fn validate_operand_types(
         ))
     }
 
+    fn ordering_op(op: &CompOp) -> Option<&'static str> {
+        match op {
+            CompOp::Lt => Some("<"),
+            CompOp::Le => Some("<="),
+            CompOp::Gt => Some(">"),
+            CompOp::Ge => Some(">="),
+            CompOp::Eq | CompOp::Ne => None,
+        }
+    }
+    // Bounds of one type, the lower first (captured eu-west-2 and us-east-1,
+    // 2026-10-09 for a path, and 2026-10-10 for `size()`).
+    fn check_bounds(low: &AttributeValue, high: &AttributeValue) -> Result<()> {
+        for value in [low, high] {
+            if !orderable(value) {
+                return Err(reject("BETWEEN", value));
+            }
+        }
+        let bounds = |rule: &str| {
+            DynoxideError::ValidationException(format!(
+                "The BETWEEN operator requires {rule}; lower bound operand: \
+                 AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+                bound_operand(low),
+                bound_operand(high)
+            ))
+        };
+        if std::mem::discriminant(low) != std::mem::discriminant(high) {
+            return Err(bounds("same data type for lower and upper bounds"));
+        }
+        if compare_values(low, &CompOp::Gt, high) {
+            return Err(bounds(
+                "upper bound to be greater than or equal to lower bound",
+            ));
+        }
+        Ok(())
+    }
+    fn check(condition: &WhereCondition, parameters: &[AttributeValue]) -> Result<()> {
+        match condition {
+            // A negated comparison is checked too: `NOT a < ?` reads the
+            // same operand and DynamoDB rejects it on the same terms.
+            WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => {
+                let Some(op) = ordering_op(&c.op) else {
+                    return Ok(());
+                };
+                let value = resolve_value(&c.value, parameters)?;
+                if !orderable(&value) {
+                    return Err(reject(op, &value));
+                }
+            }
+            WhereCondition::Between(_, low, high) | WhereCondition::NotBetween(_, low, high) => {
+                check_bounds(
+                    &resolve_value(low, parameters)?,
+                    &resolve_value(high, parameters)?,
+                )?;
+            }
+            // A comparison between operands that aren't a path and a value,
+            // `size(s) < true` among them: each side that is a value takes the
+            // check the value of a `path op value` comparison does (captured
+            // eu-west-2 and us-east-1, 2026-10-10, for `size()`). A size is a
+            // number, so a string or boolean against it under `=` or `<>` is
+            // simply unequal rather than refused.
+            WhereCondition::Compare(left, op, right) => {
+                let Some(op) = ordering_op(op) else {
+                    return Ok(());
+                };
+                for side in [left, right] {
+                    if let Operand::Value(value) = side {
+                        let value = resolve_value(value, parameters)?;
+                        if !orderable(&value) {
+                            return Err(reject(op, &value));
+                        }
+                    }
+                }
+            }
+            // BETWEEN on an operand that isn't a path checks its bounds as
+            // BETWEEN on a path does, when both are values (captured for
+            // `size()`, 2026-10-10). A bound that isn't a value, such as a path,
+            // can't be checked until an item is read; a value beside it is still
+            // held to the orderable types (inferred, not captured).
+            WhereCondition::CompareBetween(_, low, high) => match (low, high) {
+                (Operand::Value(low), Operand::Value(high)) => check_bounds(
+                    &resolve_value(low, parameters)?,
+                    &resolve_value(high, parameters)?,
+                )?,
+                _ => {
+                    for bound in [low, high] {
+                        if let Operand::Value(value) = bound {
+                            let value = resolve_value(value, parameters)?;
+                            if !orderable(&value) {
+                                return Err(reject("BETWEEN", &value));
+                            }
+                        }
+                    }
+                }
+            },
+            // A type given to `attribute_type` as a parameter is checked
+            // once it is bound, negated or not (captured eu-west-2 and
+            // us-east-1, 2026-10-09).
+            WhereCondition::AttributeType(_, kind @ PartiqlValue::Parameter(_)) => {
+                check_attribute_type_parameter(kind, parameters, reject)?;
+            }
+            // A condition with no negated form of its own is checked as it
+            // would be without the NOT.
+            WhereCondition::Not(inner) => check(inner, parameters)?,
+            // `begins_with` takes a string or binary operand (captured
+            // eu-west-2 and us-east-1, 2026-10-09).
+            WhereCondition::BeginsWith(_, prefix) | WhereCondition::NotBeginsWith(_, prefix) => {
+                let value = resolve_value(prefix, parameters)?;
+                if !matches!(value, AttributeValue::S(_) | AttributeValue::B(_)) {
+                    return Err(reject("begins_with", &value));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     let Some(wc) = where_clause else {
         return Ok(());
     };
     for group in &wc.groups {
         for condition in group {
-            match &**condition {
-                // A negated comparison is checked too: `NOT a < ?` reads the
-                // same operand and DynamoDB rejects it on the same terms.
-                WhereCondition::Comparison(c) | WhereCondition::NotComparison(c) => {
-                    let op = match c.op {
-                        CompOp::Lt => "<",
-                        CompOp::Le => "<=",
-                        CompOp::Gt => ">",
-                        CompOp::Ge => ">=",
-                        CompOp::Eq | CompOp::Ne => continue,
-                    };
-                    let value = resolve_value(&c.value, parameters)?;
-                    if !orderable(&value) {
-                        return Err(reject(op, &value));
-                    }
-                }
-                // Bounds of one type, the lower first, negated or not
-                // (captured eu-west-2 and us-east-1, 2026-10-09).
-                WhereCondition::Between(_, low, high)
-                | WhereCondition::NotBetween(_, low, high) => {
-                    let low = resolve_value(low, parameters)?;
-                    let high = resolve_value(high, parameters)?;
-                    for value in [&low, &high] {
-                        if !orderable(value) {
-                            return Err(reject("BETWEEN", value));
-                        }
-                    }
-                    let bounds = |rule: &str| {
-                        DynoxideError::ValidationException(format!(
-                            "The BETWEEN operator requires {rule}; lower bound operand: \
-                             AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
-                            bound_operand(&low),
-                            bound_operand(&high)
-                        ))
-                    };
-                    if std::mem::discriminant(&low) != std::mem::discriminant(&high) {
-                        return Err(bounds("same data type for lower and upper bounds"));
-                    }
-                    if compare_values(&low, &CompOp::Gt, &high) {
-                        return Err(bounds(
-                            "upper bound to be greater than or equal to lower bound",
-                        ));
-                    }
-                }
-                // A type given to `attribute_type` as a parameter is checked
-                // once it is bound, negated or not (captured eu-west-2 and
-                // us-east-1, 2026-10-09).
-                WhereCondition::AttributeType(_, kind @ PartiqlValue::Parameter(_)) => {
-                    check_attribute_type_parameter(kind, parameters, reject)?;
-                }
-                WhereCondition::Not(inner)
-                    if matches!(
-                        **inner,
-                        WhereCondition::AttributeType(_, PartiqlValue::Parameter(_))
-                    ) =>
-                {
-                    if let WhereCondition::AttributeType(_, kind) = &**inner {
-                        check_attribute_type_parameter(kind, parameters, reject)?;
-                    }
-                }
-                // `begins_with` takes a string or binary operand (captured
-                // eu-west-2 and us-east-1, 2026-10-09).
-                WhereCondition::BeginsWith(_, prefix)
-                | WhereCondition::NotBeginsWith(_, prefix) => {
-                    let value = resolve_value(prefix, parameters)?;
-                    if !matches!(value, AttributeValue::S(_) | AttributeValue::B(_)) {
-                        return Err(reject("begins_with", &value));
-                    }
-                }
-                _ => {}
-            }
+            check(condition, parameters)?;
         }
     }
     Ok(())
