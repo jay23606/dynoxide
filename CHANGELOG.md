@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `dynoxide import` reads JSON Lines files named `.jsonl` and `.jsonl.gz`, in a DynamoDB Export directory (`<dir>/<TableName>/data/`) or a flat directory of those files, alongside the `.json` and `.json.gz` parts it already accepted.
+
 ## [1.3.0] - 2026-10-10
 
 The crate moves to `dynoxide-rs` 3.0.0: the `expressions` and `partiql`
