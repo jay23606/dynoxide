@@ -162,22 +162,16 @@ mod tests {
         let output = tmp.path().join("output.db");
         let schema_file = tmp.path().join("schema.json");
 
+        let alice =
+            r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "name": {"S": "Alice"}}}"#;
         let mut plain = std::fs::File::create(data_dir.join("00000000.jsonl")).unwrap();
-        writeln!(
-            plain,
-            "{}",
-            r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "name": {"S": "Alice"}}}"#
-        )
-        .unwrap();
+        writeln!(plain, "{alice}").unwrap();
 
+        let bob =
+            r#"{"Item": {"pk": {"S": "USER#2"}, "sk": {"S": "PROFILE"}, "name": {"S": "Bob"}}}"#;
         let gz = std::fs::File::create(data_dir.join("00000001.jsonl.gz")).unwrap();
         let mut encoder = GzEncoder::new(gz, Compression::default());
-        writeln!(
-            encoder,
-            "{}",
-            r#"{"Item": {"pk": {"S": "USER#2"}, "sk": {"S": "PROFILE"}, "name": {"S": "Bob"}}}"#
-        )
-        .unwrap();
+        writeln!(encoder, "{bob}").unwrap();
         encoder.finish().unwrap();
 
         create_schema_file(&schema_file, &[simple_table_schema("Users")]);
