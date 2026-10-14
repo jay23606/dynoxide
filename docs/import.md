@@ -16,7 +16,7 @@ dynoxide import \
   --output snapshot.db
 ```
 
-The `--source` directory should follow DynamoDB Export structure:
+The `--source` directory should follow DynamoDB Export structure. Each part is JSON Lines, named `.json` or `.jsonl`, plain or gzipped:
 
 ```
 export-data/

@@ -151,6 +151,56 @@ mod tests {
     }
 
     #[test]
+    fn test_import_jsonl_files() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("export");
+        let data_dir = source.join("Users").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let output = tmp.path().join("output.db");
+        let schema_file = tmp.path().join("schema.json");
+
+        let mut plain = std::fs::File::create(data_dir.join("00000000.jsonl")).unwrap();
+        writeln!(
+            plain,
+            "{}",
+            r#"{"Item": {"pk": {"S": "USER#1"}, "sk": {"S": "PROFILE"}, "name": {"S": "Alice"}}}"#
+        )
+        .unwrap();
+
+        let gz = std::fs::File::create(data_dir.join("00000001.jsonl.gz")).unwrap();
+        let mut encoder = GzEncoder::new(gz, Compression::default());
+        writeln!(
+            encoder,
+            "{}",
+            r#"{"Item": {"pk": {"S": "USER#2"}, "sk": {"S": "PROFILE"}, "name": {"S": "Bob"}}}"#
+        )
+        .unwrap();
+        encoder.finish().unwrap();
+
+        create_schema_file(&schema_file, &[simple_table_schema("Users")]);
+
+        let summary = import::run(ImportCommand {
+            source,
+            output: Some(output),
+            schema: schema_file,
+            rules: None,
+            tables: None,
+            compress: false,
+            force: false,
+            continue_on_error: false,
+            data_model: None,
+        })
+        .unwrap();
+
+        assert_eq!(summary.total_items, 2);
+        assert_eq!(summary.total_skipped, 0);
+        assert_eq!(summary.tables[0].table_name, "Users");
+    }
+
+    #[test]
     fn test_import_with_table_filter() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("export");
