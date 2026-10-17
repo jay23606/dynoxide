@@ -17,6 +17,15 @@ use std::time::{Duration, Instant};
 /// measured for it.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// How long a container is left alone before its state is first read while
+/// waiting for it. A target that answers within this is never touched by the
+/// check; one that takes longer pays a `docker inspect` on a separate thread
+/// every [`EXIT_CHECK_INTERVAL`] until it does.
+pub const EXIT_CHECK_GRACE: Duration = Duration::from_secs(3);
+
+/// How often the container's state is read once the grace period has passed.
+pub const EXIT_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
 /// How many of a failed container's last log lines are printed.
 const LOG_TAIL_LINES: &str = "20";
 
@@ -249,6 +258,64 @@ pub async fn wait_for_list_tables(endpoint: &str, timeout: Duration) -> bool {
             Ok(Err(_)) => tokio::time::sleep(POLL_INTERVAL).await,
             Err(_) => return false,
         }
+    }
+}
+
+/// [`wait_for_list_tables`] for a container, which also gives up as soon as the
+/// container is seen to have exited, rather than polling a port nothing will
+/// ever answer on until `timeout` runs out. LocalStack without its auth token
+/// exits with code 55 within seconds, and the 300s wait made every run pay five
+/// minutes to say so.
+///
+/// The container's state is first read after [`EXIT_CHECK_GRACE`] and then
+/// every [`EXIT_CHECK_INTERVAL`], on a blocking thread, alongside the polling
+/// rather than between its calls, so a probe that is stuck waiting on a dead
+/// container's port does not hold the check up. Returns whether a call
+/// succeeded; call [`report_not_ready`] for the reason when it did not.
+pub async fn wait_for_container_list_tables(
+    endpoint: &str,
+    container_name: &str,
+    timeout: Duration,
+) -> bool {
+    let name = container_name.to_string();
+    wait_for_list_tables_unless_exited(
+        endpoint,
+        timeout,
+        EXIT_CHECK_GRACE,
+        EXIT_CHECK_INTERVAL,
+        move || container_state(&name),
+    )
+    .await
+}
+
+async fn wait_for_list_tables_unless_exited<F>(
+    endpoint: &str,
+    timeout: Duration,
+    grace: Duration,
+    interval: Duration,
+    state: F,
+) -> bool
+where
+    F: Fn() -> ContainerState + Clone + Send + 'static,
+{
+    tokio::select! {
+        ready = wait_for_list_tables(endpoint, timeout) => ready,
+        () = watch_for_exit(grace, interval, state) => false,
+    }
+}
+
+/// Resolves once `state` reports the container has exited. Reads it first
+/// after `grace`, then every `interval`.
+async fn watch_for_exit<F>(grace: Duration, interval: Duration, state: F)
+where
+    F: Fn() -> ContainerState + Clone + Send + 'static,
+{
+    tokio::time::sleep(grace).await;
+    loop {
+        if let Ok(ContainerState::Exited(_)) = tokio::task::spawn_blocking(state.clone()).await {
+            return;
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -555,6 +622,115 @@ mod tests {
             wait_for_list_tables(&format!("http://{addr}"), Duration::from_millis(300)).await;
         assert!(!ready);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A port nothing is listening on.
+    fn refused_endpoint() -> String {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn a_container_that_has_exited_ends_the_wait_early() {
+        let started = Instant::now();
+        let ready = wait_for_list_tables_unless_exited(
+            &refused_endpoint(),
+            Duration::from_secs(300),
+            Duration::ZERO,
+            Duration::from_millis(10),
+            || ContainerState::Exited(3),
+        )
+        .await;
+        assert!(!ready);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "gave up after {:?}, nowhere near the 300s timeout",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exit_ends_the_wait_even_while_a_probe_is_stuck() {
+        // A proxy that still accepts connections on a dead container's port:
+        // the probe is waiting on an answer that never comes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let started = Instant::now();
+        let ready = wait_for_list_tables_unless_exited(
+            &format!("http://{addr}"),
+            Duration::from_secs(300),
+            Duration::ZERO,
+            Duration::from_millis(10),
+            || ContainerState::Exited(55),
+        )
+        .await;
+        assert!(!ready);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "gave up after {:?}, nowhere near the 300s timeout",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_container_still_running_is_waited_for_until_the_timeout() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let started = Instant::now();
+        let ready = wait_for_list_tables_unless_exited(
+            &refused_endpoint(),
+            Duration::from_millis(400),
+            Duration::ZERO,
+            Duration::from_millis(10),
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                ContainerState::Running
+            },
+        )
+        .await;
+        assert!(!ready);
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "a running container ends the wait at the timeout, not before"
+        );
+        assert!(
+            reads.load(Ordering::SeqCst) > 0,
+            "the state was read while waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_state_is_not_read_inside_the_grace_period() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let ready = wait_for_list_tables_unless_exited(
+            &refused_endpoint(),
+            Duration::from_millis(300),
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                ContainerState::Exited(1)
+            },
+        )
+        .await;
+        assert!(!ready);
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "no read inside the grace");
     }
 
     #[tokio::test]

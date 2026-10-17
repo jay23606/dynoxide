@@ -3,7 +3,7 @@ use aws_sdk_dynamodb::types::{
 };
 use dynoxide_benchmarks::containers::{
     ContainerTarget, DYNAMODB_LOCAL, MULTI_SERVICE_EMULATORS, docker_available, image_available,
-    remove_container, report_not_ready, wait_for_list_tables,
+    remove_container, report_not_ready, wait_for_container_list_tables, wait_for_list_tables,
 };
 use dynoxide_benchmarks::http::make_sdk_client;
 use dynoxide_benchmarks::stats::{mean, stddev};
@@ -271,7 +271,12 @@ async fn measure_container_startup(target: &ContainerTarget) -> Result<f64, Stri
 
     let t = Instant::now();
     target.run(&container_name)?;
-    let ready = wait_for_list_tables(&target.endpoint(), CONTAINER_READY_TIMEOUT).await;
+    let ready = wait_for_container_list_tables(
+        &target.endpoint(),
+        &container_name,
+        CONTAINER_READY_TIMEOUT,
+    )
+    .await;
     let ms = t.elapsed().as_secs_f64() * 1000.0;
 
     let result = if ready {
@@ -299,7 +304,7 @@ async fn measure_warm_start() -> Result<f64, String> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     target.run(container_name)?;
-    if !wait_for_list_tables(&target.endpoint(), timeout).await {
+    if !wait_for_container_list_tables(&target.endpoint(), container_name, timeout).await {
         let reason = report_not_ready(target, container_name, timeout);
         remove_container(container_name);
         return Err(reason);
