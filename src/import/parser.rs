@@ -1,7 +1,8 @@
 //! DynamoDB Export JSON Lines parser.
 //!
-//! Parses gzipped `.json.gz` files from DynamoDB Export format.
-//! Each line is a JSON object with an `Item` field containing a DynamoDB-typed item.
+//! Parses JSON Lines files from DynamoDB Export format, plain (`.json`,
+//! `.jsonl`) or gzipped (`.json.gz`, `.jsonl.gz`). Each line is a JSON object
+//! with an `Item` field containing a DynamoDB-typed item.
 
 use crate::types::{AttributeValue, Item};
 use flate2::read::GzDecoder;
@@ -427,8 +428,8 @@ fn parse_attribute_value_with_depth(
 /// Discover export files in a DynamoDB Export directory structure.
 ///
 /// Supports two layouts:
-/// 1. DynamoDB Export structure: `<dir>/<TableName>/data/*.json.gz`
-/// 2. Flat directory: `<dir>/*.json.gz` or `<dir>/*.json`
+/// 1. DynamoDB Export structure: `<dir>/<TableName>/data/*.{json,jsonl}[.gz]`
+/// 2. Flat directory: `<dir>/*.{json,jsonl}[.gz]`
 ///
 /// Returns: `Vec<(table_name, Vec<file_paths>)>`
 pub fn discover_export_files(
@@ -530,7 +531,10 @@ pub fn discover_export_files(
     Ok(tables)
 }
 
-/// Collect `.json.gz` and `.json` files from a directory.
+/// Collect JSON Lines export files from a directory.
+///
+/// AWS names the parts `.json.gz`. A file written by hand is often `.jsonl`,
+/// gzipped or not, and it is the same lines.
 fn collect_data_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     let mut files = Vec::new();
 
@@ -543,7 +547,7 @@ fn collect_data_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
 
         if path.is_file() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.ends_with(".json.gz") || name.ends_with(".json") {
+            if is_export_file(name) {
                 files.push(path);
             }
         }
@@ -551,6 +555,12 @@ fn collect_data_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
 
     files.sort();
     Ok(files)
+}
+
+/// `.json` or `.jsonl`, optionally gzipped.
+fn is_export_file(name: &str) -> bool {
+    let plain = name.strip_suffix(".gz").unwrap_or(name);
+    plain.ends_with(".jsonl") || plain.ends_with(".json")
 }
 
 #[cfg(test)]

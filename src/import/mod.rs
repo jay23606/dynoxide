@@ -234,7 +234,8 @@ pub fn run_into(db: &Database, cmd: ImportCommand) -> Result<ImportSummary, Impo
     if export_files.is_empty() {
         return Err(ImportError::Config(format!(
             "No export files found in {}. Expected DynamoDB Export directory structure \
-             (<dir>/<TableName>/data/*.json.gz) or flat directory (<dir>/*.json[.gz]).",
+             (<dir>/<TableName>/data/*.json[.gz] or *.jsonl[.gz]) or a flat directory \
+             of the same files.",
             cmd.source.display()
         )));
     }
