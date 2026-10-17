@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a file-backed database's files stayed open (and could not be deleted on
   Windows). `start` now runs on it too, with its Ctrl-C and SIGTERM handling
   unchanged.
+- `dynoxide import` reads JSON Lines files named `.jsonl` and `.jsonl.gz`, in a DynamoDB Export directory (`<dir>/<TableName>/data/`) or a flat directory of those files, alongside the `.json` and `.json.gz` parts it already accepted.
 
 ## [1.3.0] - 2026-10-10
 
