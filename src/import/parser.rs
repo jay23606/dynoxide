@@ -778,6 +778,28 @@ mod tests {
     }
 
     #[test]
+    fn a_flat_directory_picks_up_exactly_the_json_and_jsonl_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = dir.path().join("Users");
+        std::fs::create_dir(&flat).unwrap();
+        let taken = ["a.json", "b.json.gz", "c.jsonl", "d.jsonl.gz"];
+        let left = [".gz", "e.txt.gz", "f.jsonl.bak", "g.jsonlx", "h.csv"];
+        for name in taken.iter().chain(left.iter()) {
+            std::fs::write(flat.join(name), "{}\n").unwrap();
+        }
+
+        let found = discover_export_files(&flat, None).unwrap();
+        assert_eq!(found.len(), 1, "one table in a flat directory: {found:?}");
+        let mut names: Vec<String> = found[0]
+            .1
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, taken, "exactly the accepted names, nothing else");
+    }
+
+    #[test]
     fn a_filter_naming_a_table_the_export_lacks_is_an_error() {
         // The run used to import the tables it found and say nothing about
         // the one it did not, so a misspelt name left a table out in silence.
