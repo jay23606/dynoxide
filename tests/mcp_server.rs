@@ -3456,15 +3456,19 @@ fn wait_ready_or_exit(child: &mut std::process::Child, addr: &str) -> Startup {
 /// between. The child then exits with "Address already in use". That is a lost
 /// race, not a failure, so it is started again on a fresh port.
 fn spawn_on_free_port(host: &str, build: impl Fn(u16) -> Command) -> (u16, std::process::Child) {
+    let mut exits = Vec::new();
     for _ in 0..5 {
         let port = free_port();
         let mut child = build(port).spawn().expect("failed to spawn dynoxide");
         if let Startup::Ready = wait_ready_or_exit(&mut child, &format!("{host}:{port}")) {
             return (port, child);
         }
-        let _ = child.wait();
+        exits.push(format!("port {port}: {:?}", child.wait()));
     }
-    panic!("the server exited before it accepted a connection on {host} on five different ports");
+    panic!(
+        "the server exited before it accepted a connection on {host} on five different ports \
+         (a real startup failure looks like this too, so run it by hand): {exits:?}"
+    );
 }
 
 /// Spawn `dynoxide mcp --http` on 127.0.0.1 with a fixed token via env, waiting
