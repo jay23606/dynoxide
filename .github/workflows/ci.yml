@@ -87,6 +87,11 @@ jobs:
       - name: Test
         run: cargo test --lib
 
+      # Windows refuses to delete a file a connection task still has open,
+      # which is what serve_with_shutdown exists to prevent.
+      - name: Test the embedded server's shutdown
+        run: cargo test --test graceful_shutdown
+
   # `rust-version` is part of the published Rust API contract in
   # docs/versioning.md, so it is a promise rather than a description. Every
   # other job runs on stable, which cannot see a language feature that raises

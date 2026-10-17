@@ -84,22 +84,62 @@ pub async fn start_with_options(
     let listener = tokio::net::TcpListener::from_std(std_listener)
         .map_err(|e| format!("failed to create async listener: {e}"))?;
 
-    let app = build_router(db);
-
     if !options.suppresses_informational_messages() {
         eprintln!("Dynoxide listening on http://{addr}");
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(options.suppresses_informational_messages()))
-        .await
-        .map_err(|e| format!("server failed: {e}"))
+    serve_with_shutdown(
+        listener,
+        db,
+        shutdown_signal(options.suppresses_informational_messages()),
+    )
+    .await
 }
 
 /// Start on a specific listener (for tests).
 pub async fn serve_on(listener: tokio::net::TcpListener, db: Database) {
     let app = build_router(db);
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Serve on `listener` until `shutdown` resolves, for an application that
+/// embeds the server and has to stop it.
+///
+/// On shutdown the server stops accepting connections, closes the idle
+/// keep-alive ones, lets any request already running finish, and returns once
+/// every connection has finished serving. [`start`] is this with a Ctrl-C and
+/// SIGTERM handler as the shutdown signal.
+///
+/// What an embedder should know before relying on it to free a file-backed
+/// database (Windows refuses to delete a file that is still open):
+///
+/// - The return is not an exact "every handle is closed" signal. A connection
+///   task lets the server know it has finished a moment before it drops its
+///   own clone of `db`, so on a multi-threaded runtime the last clone can
+///   outlive the return by an instant. Delete the files with a short retry,
+///   and drop your own handle to the database first.
+/// - A request that never finishes holds the shutdown for as long as it runs,
+///   and so does a client that has sent only part of a request. Wrapping the
+///   returned future in a timeout does not free the database, because the
+///   connection tasks are detached and keep their clones until they end.
+/// - Dropping the last clone closes SQLite, which may checkpoint the
+///   write-ahead log, on the runtime thread that drops it.
+///
+/// Unlike [`start`], this installs no signal handler: `shutdown` is the only
+/// thing that stops it. A `shutdown` future that panics, or is dropped, stops
+/// the server like any other and the call still returns `Ok(())`, so check your
+/// own signal before you go on to delete anything. It has to run inside a Tokio
+/// runtime.
+pub async fn serve_with_shutdown(
+    listener: tokio::net::TcpListener,
+    db: Database,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
+    let app = build_router(db);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(|e| format!("server failed: {e}"))
 }
 
 /// DynamoDB accepts bodies up to 16 MB.
