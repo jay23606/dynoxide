@@ -137,3 +137,47 @@ fn search_vectors_names_a_short_table_as_the_wire_does() {
         |r| db.search_vectors(r),
     );
 }
+
+/// A DeleteItem built in Rust is refused for a `ReturnValues` it does not
+/// honour before the table is looked up, and before its expressions are read.
+#[test]
+fn delete_item_refuses_return_values_it_does_not_honour_in_process() {
+    let db = Database::memory().unwrap();
+    let build = |return_values: &str, condition: Option<&str>| {
+        let mut body = json!({
+            "TableName": "Missing",
+            "Key": {"pk": {"S": "a"}},
+            "ReturnValues": "NONE"
+        });
+        if let Some(condition) = condition {
+            body["ConditionExpression"] = json!(condition);
+        }
+        let mut request: dynoxide::actions::delete_item::DeleteItemRequest =
+            serde_json::from_value(body).unwrap();
+        request.return_values = Some(return_values.to_string());
+        request
+    };
+    for value in ["ALL_NEW", "UPDATED_NEW", "UPDATED_OLD", "all_new"] {
+        let err = db.delete_item(build(value, None)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ReturnValues can only be ALL_OLD or NONE"),
+            "{value}: {err}"
+        );
+        // Ahead of an expression that would otherwise be refused.
+        let err = db.delete_item(build(value, Some(""))).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ReturnValues can only be ALL_OLD or NONE"),
+            "{value} with an empty condition: {err}"
+        );
+    }
+    // The values it does honour go on to the table lookup.
+    for value in ["NONE", "ALL_OLD"] {
+        let err = db.delete_item(build(value, None)).unwrap_err();
+        assert!(
+            !err.to_string().contains("ReturnValues can only be"),
+            "{value}: {err}"
+        );
+    }
+}

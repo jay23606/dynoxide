@@ -49,10 +49,7 @@ pub struct DeleteItemRequest {
     pub expression_attribute_values_raw: Option<serde_json::Value>,
 }
 
-/// DeleteItem's refusal of a `ReturnValues` the enum allows but it does not
-/// honour (captured eu-west-2 and us-east-1, 2026-10-09, for ALL_NEW,
-/// UPDATED_NEW and UPDATED_OLD).
-const RETURN_VALUES_NOT_HONOURED: &str = "ReturnValues can only be ALL_OLD or NONE";
+use crate::validation::RETURN_VALUES_NOT_HONOURED;
 
 /// Whether `return_values` is one DeleteItem refuses, for a request built in
 /// Rust: anything but NONE and ALL_OLD, compared without regard to case, as
@@ -109,7 +106,7 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
 
         // ReturnValues enum
         if let Some(ref rv) = raw.return_values
-            && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv.as_str())
+            && !crate::validation::RETURN_VALUES.contains(&rv.as_str())
         {
             errors.push(crate::validation::RETURN_VALUES_REJECTION.to_string());
         }

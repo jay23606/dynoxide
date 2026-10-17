@@ -83,7 +83,7 @@ fn first_invalid_member_enum(
     return_consumed_capacity: Option<&str>,
 ) -> Option<(String, bool)> {
     if let Some(rv) = return_values
-        && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv)
+        && !crate::validation::RETURN_VALUES.contains(&rv)
     {
         return Some((crate::validation::RETURN_VALUES_REJECTION.to_string(), true));
     }
@@ -140,7 +140,7 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
                 errors.extend(crate::validation::update_item_table_name_errors(None));
             }
             if let Some(rv) = raw.return_values.as_deref()
-                && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv)
+                && !crate::validation::RETURN_VALUES.contains(&rv)
             {
                 errors.push(crate::validation::return_values_value_rejection(rv));
             }
@@ -169,7 +169,7 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
         // The other enums beside a missing name are uncaptured.
         if raw.table_name.is_none()
             && let Some(rv) = raw.return_values.as_deref()
-            && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv)
+            && !crate::validation::RETURN_VALUES.contains(&rv)
         {
             let mut errors = crate::validation::update_item_table_name_errors(None);
             errors.push(crate::validation::return_values_value_rejection(rv));

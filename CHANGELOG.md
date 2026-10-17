@@ -26,7 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   characters, an empty `SearchVector` or a `TopK` below 1 used to get past
   `Database::search_vectors` and fail later with whatever came next. They now
   get the same validation message as the same request sent over HTTP, in the
-  same order.
+  same order. A `TopK` below 1 now gets the `1 validation error detected:`
+  form it has over HTTP rather than the bare out-of-range message; `TopK` above
+  100 keeps the bare message.
 - **Five request-validation messages now match DynamoDB when more than one
   thing is wrong.** UpdateItem with no `TableName` keeps that error beside a
   bad `ReturnValues`, and, when the key is missing too, beside a bad
@@ -38,7 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member: it is joined after the other member errors and reported ahead of any
   expression error. UpdateItem puts an empty `UpdateExpression` in the
   `1 validation error detected:` envelope and reports an empty
-  `ConditionExpression` before it.
+  `ConditionExpression` before it. For a request built in Rust, that empty
+  `UpdateExpression` now comes back as `DynoxideError::EnvelopedValidation`
+  rather than `ValidationException`; the message is unchanged.
 
 ## [1.3.0] - 2026-10-10
 

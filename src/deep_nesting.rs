@@ -30,7 +30,7 @@
 //! makes first, such as `Limit`, in its place.
 
 use crate::errors::DynoxideError;
-use crate::validation::NESTING_LIMIT_MESSAGE;
+use crate::validation::{NESTING_LIMIT_MESSAGE, RETURN_VALUES_NOT_HONOURED};
 
 /// How far a value may nest inside its attribute: DynamoDB accepts a leaf
 /// wrapped in 31 maps or lists and refuses one wrapped in 32.
@@ -135,17 +135,13 @@ fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) 
     // ahead of the nesting error (captured eu-west-2 and us-east-1,
     // 2026-10-09, for ALL_NEW and UPDATED_NEW).
     if operation == "DeleteItem" {
-        let enveloped =
-            crate::validation::envelope_message("ReturnValues can only be ALL_OLD or NONE");
+        let enveloped = crate::validation::envelope_message(RETURN_VALUES_NOT_HONOURED);
         return match err {
             DynoxideError::ValidationException(message)
             | DynoxideError::EnvelopedValidation(message)
-                if message == enveloped
-                    || message == "ReturnValues can only be ALL_OLD or NONE" =>
+                if message == enveloped || message == RETURN_VALUES_NOT_HONOURED =>
             {
-                DynoxideError::ValidationException(
-                    "ReturnValues can only be ALL_OLD or NONE".to_string(),
-                )
+                DynoxideError::ValidationException(RETURN_VALUES_NOT_HONOURED.to_string())
             }
             other => other,
         };

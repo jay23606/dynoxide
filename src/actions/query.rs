@@ -145,9 +145,8 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
                  Member must have value greater than or equal to 1"
                     .to_string(),
             );
-            if let Some(msg) = format_validation_errors(&errors) {
-                return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
-            }
+            let msg = format_validation_errors(&errors).expect("the missing name is an error");
+            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
         }
         let mut first_pass = Vec::new();
         if raw.limit == Some(0) {

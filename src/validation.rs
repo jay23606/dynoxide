@@ -367,6 +367,14 @@ pub(crate) fn reject_bad_capacity_mode(mode: Option<&str>) -> Result<()> {
 /// eu-south-2 and me-central-1 still give the older per-value wording. Which
 /// values are accepted is unchanged: `UPDATED_NEW` is valid, `UPDATE_NEW` is
 /// only the message's spelling.
+/// The values `ReturnValues` accepts on a write.
+pub(crate) const RETURN_VALUES: [&str; 5] =
+    ["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"];
+
+/// DeleteItem's refusal of a `ReturnValues` the enum allows but it does not
+/// honour.
+pub(crate) const RETURN_VALUES_NOT_HONOURED: &str = "ReturnValues can only be ALL_OLD or NONE";
+
 pub(crate) const RETURN_VALUES_REJECTION: &str = "Failed to satisfy constraint: Member must \
      satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]";
 

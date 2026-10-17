@@ -92,7 +92,7 @@ impl<'de> serde::Deserialize<'de> for PutItemRequest {
 
         // ReturnValues enum validation
         if let Some(ref rv) = raw.return_values
-            && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv.as_str())
+            && !crate::validation::RETURN_VALUES.contains(&rv.as_str())
         {
             errors.push(crate::validation::RETURN_VALUES_REJECTION.to_string());
         }
@@ -277,7 +277,7 @@ async fn execute_inner<S: StorageBackend>(
         let rv_upper = rv.to_uppercase();
         if rv_upper != "NONE" && rv_upper != "ALL_OLD" {
             return Err(DynoxideError::EnvelopedValidation(
-                "ReturnValues can only be ALL_OLD or NONE".to_string(),
+                crate::validation::RETURN_VALUES_NOT_HONOURED.to_string(),
             ));
         }
     }

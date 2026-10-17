@@ -225,7 +225,7 @@ async fn batch_get_item_still_reports_over_100_keys_in_one_valid_entry() {
 #[tokio::test]
 async fn delete_item_joins_an_unsupported_return_values_after_the_other_member_errors() {
     let url = start().await;
-    for rv in ["ALL_NEW", "UPDATED_NEW"] {
+    for rv in ["ALL_NEW", "UPDATED_NEW", "UPDATED_OLD"] {
         // Short table name.
         let message = refusal(
             &url,
@@ -271,7 +271,7 @@ async fn delete_item_reports_an_unsupported_return_values_ahead_of_the_expressio
         }),
     ];
     for extra in bad_expressions {
-        for rv in ["ALL_NEW", "UPDATED_NEW"] {
+        for rv in ["ALL_NEW", "UPDATED_NEW", "UPDATED_OLD"] {
             let mut body =
                 json!({"TableName": "Env", "Key": {"pk": {"S": "a"}}, "ReturnValues": rv});
             for (k, v) in extra.as_object().unwrap() {
