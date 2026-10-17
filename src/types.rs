@@ -2428,6 +2428,75 @@ impl TryFrom<AttributeValue> for Vec<String> {
 mod tests {
     use super::*;
 
+    /// A future that reports the layer in force at each of its polls, and
+    /// waits once between them.
+    struct SeesLayer {
+        seen: Vec<crate::validation::ValueLayer>,
+        waited: bool,
+    }
+
+    impl std::future::Future for SeesLayer {
+        type Output = Vec<crate::validation::ValueLayer>;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.seen.push(current_value_layer());
+            if self.waited {
+                std::task::Poll::Ready(std::mem::take(&mut self.seen))
+            } else {
+                self.waited = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    fn sees_layer() -> SeesLayer {
+        SeesLayer {
+            seen: Vec::new(),
+            waited: false,
+        }
+    }
+
+    /// The layer holds across a future's awaits without reaching anything
+    /// polled in between: on the wasm engine another request runs between two
+    /// polls of this one, on the same thread.
+    #[test]
+    fn the_value_layer_follows_a_future_across_its_polls_and_no_further() {
+        use crate::validation::ValueLayer::{Current, Older};
+        use std::future::Future;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut older = Box::pin(with_value_layer_async(Older, sees_layer()));
+        let mut current = Box::pin(with_value_layer_async(Current, sees_layer()));
+
+        assert_eq!(current_value_layer(), Current);
+        assert!(older.as_mut().poll(&mut cx).is_pending());
+        // Out of its poll the layer is back to what the thread had.
+        assert_eq!(current_value_layer(), Current);
+        // A neighbour polled between the two reads its own layer, not the
+        // one left by the poll before it.
+        assert!(current.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(current_value_layer(), Current);
+        assert_eq!(
+            with_value_layer(Older, || {
+                let mut neighbour = Box::pin(sees_layer());
+                let _ = neighbour.as_mut().poll(&mut cx);
+                current_value_layer()
+            }),
+            Older
+        );
+        match older.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(seen) => assert_eq!(seen, vec![Older, Older]),
+            std::task::Poll::Pending => panic!("the future was ready on its second poll"),
+        }
+        match current.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(seen) => assert_eq!(seen, vec![Current, Current]),
+            std::task::Poll::Pending => panic!("the future was ready on its second poll"),
+        }
+        assert_eq!(current_value_layer(), Current);
+    }
+
     #[test]
     fn test_serialize_string() {
         let val = AttributeValue::S("hello".to_string());

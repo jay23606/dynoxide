@@ -55,15 +55,8 @@ impl From<&str> for ParseError {
 }
 
 /// A parsed PartiQL statement.
-///
-/// Every variant is `#[non_exhaustive]`: they carry a growing set of clauses (a
-/// `RETURNING` variant was added in 0.12.0, an index qualifier after that), so
-/// downstream code must match them with `..` and cannot build them by struct
-/// literal. This keeps later clause additions non-breaking, matching the
-/// precedent set by `DynoxideError`.
 #[derive(Debug, Clone)]
 pub enum Statement {
-    #[non_exhaustive]
     Select {
         table_name: String,
         /// The index named by a `"table"."index"` qualifier, if any.
@@ -74,13 +67,11 @@ pub enum Statement {
         /// clause.
         order_by: Vec<OrderByTerm>,
     },
-    #[non_exhaustive]
     Insert {
         table_name: String,
         item: HashMap<String, PartiqlValue>,
         if_not_exists: bool,
     },
-    #[non_exhaustive]
     Update {
         table_name: String,
         /// The index named by a `"table"."index"` qualifier, if any. DynamoDB
@@ -94,7 +85,6 @@ pub enum Statement {
         /// clause. All four variants are valid on `UPDATE`. `None` when absent.
         returning: Option<ReturningVariant>,
     },
-    #[non_exhaustive]
     Delete {
         table_name: String,
         /// The index named by a `"table"."index"` qualifier, if any. Carried
@@ -110,7 +100,6 @@ pub enum Statement {
 
 /// One term of a SELECT's `ORDER BY` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct OrderByTerm {
     /// The attribute path the term names, unquoted.
     pub path: String,
@@ -340,7 +329,6 @@ pub enum SetValue {
 /// Groups are OR-joined; conditions within each group are AND-joined.
 /// `WHERE a = 1 AND b = 2 OR c = 3` parses as `[[a=1, b=2], [c=3]]`.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct WhereClause {
     /// OR-groups: outer = OR, inner = AND.
     ///
@@ -360,7 +348,7 @@ pub struct WhereClause {
     /// conditions, before it is flattened into `groups`. The overlap check
     /// reads it, because DynamoDB splits a read only on an OR with a key
     /// condition under it (captured eu-west-2 and us-east-1, 2026-10-09).
-    pub(crate) tree: Option<ConditionTree>,
+    pub(crate) tree: ConditionTree,
 }
 
 /// A WHERE clause as written, with every `NOT` pushed down to a condition.
@@ -405,12 +393,7 @@ impl ConditionTree {
 }
 
 /// A single condition in a WHERE clause: either a comparison or a function call.
-///
-/// Non-exhaustive, like `WhereClause` and `Statement`. The parser gains variants
-/// as it learns predicates, and each one it gained used to break every
-/// downstream `match` on it.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
 pub enum WhereCondition {
     Comparison(Condition),
     /// `NOT` of a comparison, in the same shape as `NotBeginsWith` and
@@ -458,7 +441,6 @@ pub enum WhereCondition {
 
 /// One side of a comparison that isn't `path op value`.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
 pub enum Operand {
     Path(String),
     Value(PartiqlValue),
@@ -475,7 +457,6 @@ pub enum Operand {
 /// other than MISSING, which has its own condition (captured eu-west-2 and
 /// us-east-1, 2026-10-09).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum TypeTest {
     Null,
     Boolean,
@@ -2304,7 +2285,7 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
             Ok(Some(WhereClause {
                 groups: parsed.groups,
                 top_level_equalities: parsed.top_level_equalities,
-                tree: Some(parsed.tree),
+                tree: parsed.tree,
             }))
         }
         _ => Ok(None),
@@ -5588,7 +5569,7 @@ mod tests {
             panic!("expected a SELECT with WHERE");
         };
         let per_copy: usize = wc.groups.iter().flatten().map(|c| condition_bytes(c)).sum();
-        let held = wc.tree.as_ref().unwrap().bytes();
+        let held = wc.tree.bytes();
         assert!(per_copy > 1024 * 1024, "{per_copy}");
         assert!(held < 8_192, "{held}");
 

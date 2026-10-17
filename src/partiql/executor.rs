@@ -21,7 +21,6 @@ use std::sync::Arc;
 /// Only a `SELECT` paginates. Every other statement returns the whole result
 /// and no continuation token.
 #[derive(Debug, Default)]
-#[non_exhaustive]
 pub struct StatementPage {
     /// The rows this page carries: `Some` for a SELECT (possibly empty) and
     /// for an UPDATE or DELETE with a `RETURNING` clause (the deleted item or
@@ -50,7 +49,6 @@ pub struct StatementPage {
 
 /// The index a `SELECT` was served from.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct ReadIndex {
     pub name: String,
     /// LSIs and GSIs land on different arms of `ConsumedCapacity`.
@@ -753,10 +751,7 @@ fn key_groups(
             }
         }
     }
-    match &wc.tree {
-        Some(tree) => flatten(tree, &is_key),
-        None => wc.groups.clone(),
-    }
+    flatten(&wc.tree, &is_key)
 }
 
 /// The atoms of one sort key condition as bytes, equal exactly when the atoms
@@ -2668,7 +2663,6 @@ fn group_pk_value<'a>(group: &'a [Arc<WhereCondition>], pk_name: &str) -> Option
 /// snapshot taken at the start of it. The window is one request wide and
 /// DynamoDB promises nothing across the members of a batch, so this is recorded
 /// rather than closed.
-#[non_exhaustive]
 pub struct ResolvedTable {
     pub meta: crate::storage::TableMetadata,
     pub key_schema: crate::actions::helpers::KeySchema,
@@ -4339,6 +4333,33 @@ mod tests {
             ("In", "tag IN [?, 'x']"),
             ("Compare", "size(tag) <> ?"),
             ("Compare, parameter first", "? <> size(tag)"),
+            // A condition function is an operand too: the call itself is
+            // fine, and it is the placeholder beside it that is unfilled.
+            ("Condition operand", "attribute_exists(flag) <> ?"),
+            (
+                "Condition operand holding the parameter",
+                "attribute_type(flag, ?) <> tag",
+            ),
+            (
+                "Condition operand holding the parameter, on a present path",
+                "attribute_type(tag, ?) <> flag",
+            ),
+            (
+                "Condition operand, parameter first",
+                "? <> attribute_exists(flag)",
+            ),
+            (
+                "Condition operand under NOT",
+                "NOT attribute_exists(flag) = ?",
+            ),
+            (
+                "Condition operand in an IN list",
+                "attribute_exists(flag) IN [?, false]",
+            ),
+            (
+                "Condition operand in an IN list under NOT",
+                "NOT attribute_exists(flag) IN [?, true]",
+            ),
         ]
         .into_iter()
         .filter(|(_, clause)| {
@@ -4358,5 +4379,24 @@ mod tests {
             Some(&wc),
             &[AttributeValue::S("y".to_string())]
         ));
+        // And so are the condition function forms: with the parameter
+        // supplied, each of them holds of this item, so it is the missing
+        // parameter and nothing else that stops them above.
+        let supplied = AttributeValue::BOOL(true);
+        for clause in [
+            "attribute_exists(flag) <> ?",
+            "? <> attribute_exists(flag)",
+            "attribute_type(flag, ?) <> tag",
+            "attribute_type(tag, ?) <> flag",
+            "NOT attribute_exists(flag) = ?",
+            "attribute_exists(flag) IN [?, false]",
+            "NOT attribute_exists(flag) IN [?, true]",
+        ] {
+            let wc = where_of(&format!(r#"SELECT * FROM "t" WHERE {clause}"#));
+            assert!(
+                matches_where(&item, Some(&wc), std::slice::from_ref(&supplied)),
+                "{clause}"
+            );
+        }
     }
 }

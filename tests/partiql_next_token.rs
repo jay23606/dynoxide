@@ -316,3 +316,86 @@ fn a_set_parameter_resumes_as_the_same_set() {
         );
     }
 }
+
+/// The same rule at the edges: a negative exponent is a scale, so `1E-2` is
+/// `0.01` and `10E-3` is `0.010` but neither is the other; a mantissa as long
+/// as DynamoDB takes (38 digits) matches itself under a leading `+` or
+/// zeros, and not at another scale. No capture backs these rows: they follow
+/// the rule the captured rows above show (same value and same scale).
+#[test]
+fn a_number_parameter_resumes_by_value_and_scale_at_the_edges() {
+    let statement = r#"SELECT pk FROM "Tok" WHERE z = ?"#;
+    let page = |first: &str, second: &str| {
+        second_page(
+            (statement, json!([{"N": first}])),
+            (statement, json!([{"N": second}])),
+            1,
+        )
+    };
+    let long = "12345678901234567890123456789012345678";
+    let long_plus = format!("+{long}");
+    let long_zeros = format!("000{long}");
+    let long_scaled = "1234567890123456789012345678901234567.8";
+    // 37 decimal places and an exponent of 37 leave the mantissa unscaled.
+    let long_exponent = "1.2345678901234567890123456789012345678E37";
+    let long_exponent_up = "1.2345678901234567890123456789012345678E38";
+    let same = [
+        ("1E-2", "0.01"),
+        ("0.01", "1E-2"),
+        ("10E-3", "0.010"),
+        ("+1.5E+1", "15"),
+        ("-1E-2", "-0.01"),
+        (long, long_plus.as_str()),
+        (long, long_zeros.as_str()),
+        (long, long_exponent),
+        (long_scaled, long_scaled),
+        (long_exponent, "1.2345678901234567890123456789012345678e+37"),
+    ];
+    for (first, second) in same {
+        assert_eq!(page(first, second), Ok(()), "{first} then {second}");
+    }
+    let different = [
+        ("1E-2", "0.010"),
+        ("10E-3", "0.01"),
+        ("1E-2", "-1E-2"),
+        (long, long_scaled),
+        (long, long_exponent_up),
+        (long_scaled, long_exponent),
+        (long, "12345678901234567890123456789012345679"),
+    ];
+    for (first, second) in different {
+        assert_eq!(
+            page(first, second),
+            Err(MISMATCH.to_string()),
+            "{first} then {second}"
+        );
+    }
+    // A set's members are respelt and reordered together.
+    let set = |first: Value, second: Value| {
+        second_page((statement, json!([first])), (statement, json!([second])), 1)
+    };
+    assert_eq!(
+        set(
+            json!({"NS": ["1e2", "+7", "1E-2"]}),
+            json!({"NS": ["0.01", "7", "1E+2"]})
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        set(
+            json!({"NS": [long, "7"]}),
+            json!({"NS": ["7", long_plus.as_str()]})
+        ),
+        Ok(())
+    );
+    // A set compares its members by value, so a scale doesn't tell them
+    // apart there, but a different value does.
+    assert_eq!(
+        set(json!({"NS": ["1E-2", "7"]}), json!({"NS": ["7", "0.010"]})),
+        Ok(())
+    );
+    assert_eq!(
+        set(json!({"NS": ["1E-2", "7"]}), json!({"NS": ["7", "0.02"]})),
+        Err(MISMATCH.to_string())
+    );
+}

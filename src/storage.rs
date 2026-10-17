@@ -3723,6 +3723,36 @@ mod tests {
         );
     }
 
+    /// The newer build's stamp may still be in the `-wal` file, not folded
+    /// into the main file, when another connection holds the database open.
+    /// It is read from there, and the refusal leaves both files as they were.
+    #[test]
+    fn a_newer_stamp_still_in_the_wal_is_refused_and_both_files_are_left_as_they_were() {
+        let (_dir, path) = v9_snapshot_path();
+        drop(crate::Database::new(&path).unwrap());
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA wal_autocheckpoint = 0")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE _config SET value = ?1 WHERE key = 'schema_version'",
+                [(SCHEMA_VERSION + 1).to_string()],
+            )
+            .unwrap();
+        let wal = format!("{path}-wal");
+        let main_before = std::fs::read(&path).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+        assert!(!wal_before.is_empty(), "the stamp is in the WAL");
+
+        assert_refused_as_newer(Storage::new(&path).map(drop).unwrap_err());
+        assert_refused_as_newer(crate::Database::new(&path).map(drop).unwrap_err());
+
+        assert_eq!(std::fs::read(&path).unwrap(), main_before);
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        assert_eq!(recorded_version(&writer), (SCHEMA_VERSION + 1).to_string());
+    }
+
     #[cfg(feature = "_has-encryption")]
     #[test]
     fn an_encrypted_database_a_newer_build_wrote_is_refused_and_left_as_it_was() {
