@@ -52,22 +52,71 @@ fn answers_http(port: u16, path: &str) -> bool {
     stream.read_exact(&mut head).is_ok() && head.starts_with(b"HTTP/1.")
 }
 
-/// Poll until `port` answers an HTTP request for `path`, or `timeout`
-/// elapses.
+/// How a freshly spawned server got on.
+enum HttpStartup {
+    /// It answers HTTP and is still running.
+    Ready,
+    /// It exited first, which is what a child that lost the race for its port
+    /// does: the port was free when it was chosen and taken before the child
+    /// bound it.
+    Exited,
+    /// It neither answered nor exited in time.
+    TimedOut,
+}
+
+/// Poll until `port` answers an HTTP request for `path`, `child` exits, or
+/// `timeout` elapses.
 ///
 /// A bare TCP connect is not enough. Both servers bind before they print
 /// their listening line and before they start serving, so a connect can
 /// succeed while the line is still unprinted. An HTTP answer means the serve
 /// loop is running, which comes after the line.
-fn wait_until_http_ready(port: u16, path: &str, timeout: Duration) -> bool {
+fn wait_until_http_ready(
+    child: &mut Child,
+    port: u16,
+    path: &str,
+    timeout: Duration,
+) -> HttpStartup {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        if child.try_wait().expect("poll dynoxide").is_some() {
+            return HttpStartup::Exited;
+        }
         if answers_http(port, path) {
-            return true;
+            // Something answers. A child that lost the race for the port is
+            // still on its way to exiting, and the answer is another
+            // process's, so watch it for a moment before believing it.
+            for _ in 0..12 {
+                if child.try_wait().expect("poll dynoxide").is_some() {
+                    return HttpStartup::Exited;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            return HttpStartup::Ready;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    false
+    HttpStartup::TimedOut
+}
+
+#[test]
+fn a_child_that_loses_its_port_is_reported_as_exited_not_as_slow() {
+    // Something else already holds the port, so the child cannot bind it and
+    // exits. That has to read as a lost race, which the callers start again,
+    // and not as a server that never came up.
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = holder.local_addr().unwrap().port();
+    let mut child = spawn(
+        &args(&["mcp", "--http", "--port", &taken.to_string()]),
+        &[("DYNOXIDE_MCP_AUTH_TOKEN", "log-quiet-token")],
+    );
+    let startup = wait_until_http_ready(&mut child, taken, "/mcp", Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        matches!(startup, HttpStartup::Exited),
+        "a child that cannot bind its port exits"
+    );
 }
 
 /// Wait for `child` to exit on its own, killing it after `timeout`.
@@ -419,22 +468,31 @@ fn quiet_mode_still_reports_an_mcp_auth_configuration_error() {
 #[test]
 fn mcp_http_quiet_suppresses_the_listener_line() {
     let envs = [("DYNOXIDE_MCP_AUTH_TOKEN", "log-quiet-token")];
+    // `free_ports` releases the port before the child binds it, so another
+    // process can take it in between and the child exits. That is a lost race,
+    // not a regression, and is tried again on a fresh port.
     let run = |quiet: bool| {
-        let [port] = free_ports();
-        let mut a = args(&["mcp", "--http", "--port", &port.to_string()]);
-        if quiet {
-            a = with_quiet(a);
+        let mut lost = Vec::new();
+        for _ in 0..5 {
+            let [port] = free_ports();
+            let mut a = args(&["mcp", "--http", "--port", &port.to_string()]);
+            if quiet {
+                a = with_quiet(a);
+            }
+            let mut child = spawn(&a, &envs);
+            let startup = wait_until_http_ready(&mut child, port, "/mcp", Duration::from_secs(30));
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("collect dynoxide output");
+            match startup {
+                HttpStartup::Ready => return stderr_of(&output),
+                HttpStartup::Exited => lost.push(stderr_of(&output)),
+                HttpStartup::TimedOut => panic!(
+                    "mcp --http did not listen with args {a:?}; stderr:\n{}",
+                    stderr_of(&output)
+                ),
+            }
         }
-        let mut child = spawn(&a, &envs);
-        let ready = wait_until_http_ready(port, "/mcp", Duration::from_secs(30));
-        let _ = child.kill();
-        let output = child.wait_with_output().expect("collect dynoxide output");
-        assert!(
-            ready,
-            "mcp --http did not listen with args {a:?}; stderr:\n{}",
-            stderr_of(&output)
-        );
-        stderr_of(&output)
+        panic!("mcp --http exited before it listened on five different ports: {lost:?}");
     };
 
     let needles = ["MCP HTTP server listening"];
