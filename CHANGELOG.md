@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`server::serve_with_shutdown` stops an embedded HTTP server cleanly.** It
+  serves on a listener you bind until a future you supply resolves, then stops
+  accepting, closes idle keep-alive connections, lets running requests finish
+  and returns. Stopping a server you had started yourself used to mean
+  aborting its task, which left the connection tasks holding the database, so
+  a file-backed database's files stayed open (and could not be deleted on
+  Windows). `start` now runs on it too, with its Ctrl-C and SIGTERM handling
+  unchanged.
+
 ## [1.3.0] - 2026-10-10
 
 The crate moves to `dynoxide-rs` 3.0.0: the `expressions` and `partiql`
