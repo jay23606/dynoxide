@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Database::search_vectors` and fail later with whatever came next. They now
   get the same validation message as the same request sent over HTTP, in the
   same order.
+- **Five request-validation messages now match DynamoDB when more than one
+  thing is wrong.** UpdateItem with no `TableName` keeps that error beside a
+  bad `ReturnValues`, and, when the key is missing too, beside a bad
+  `ReturnConsumedCapacity` or `ReturnItemCollectionMetrics`, in the order
+  DynamoDB lists them. Query with
+  no `TableName` and a `Limit` of 0 reports both, with a bad `Select` first.
+  BatchGetItem reports a malformed table name ahead of the total key count.
+  DeleteItem treats a `ReturnValues` of `ALL_NEW` or `UPDATED_NEW` as a request
+  member: it is joined after the other member errors and reported ahead of any
+  expression error. UpdateItem puts an empty `UpdateExpression` in the
+  `1 validation error detected:` envelope and reports an empty
+  `ConditionExpression` before it.
 
 ## [1.3.0] - 2026-10-10
 

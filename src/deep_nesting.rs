@@ -130,6 +130,26 @@ pub(crate) fn resolve(operation: &str, body: &str) -> DeepBody {
 /// UpdateItem with a value nested 100 levels, eu-west-2 and us-east-1,
 /// 2026-10-09.
 fn older_return_values_wording(operation: &str, body: &str, err: DynoxideError) -> DynoxideError {
+    // DeleteItem refuses ALL_NEW, UPDATED_NEW and UPDATED_OLD as a request
+    // member, in the envelope, where the older layer gives the bare sentence
+    // ahead of the nesting error (captured eu-west-2 and us-east-1,
+    // 2026-10-09, for ALL_NEW and UPDATED_NEW).
+    if operation == "DeleteItem" {
+        let enveloped =
+            crate::validation::envelope_message("ReturnValues can only be ALL_OLD or NONE");
+        return match err {
+            DynoxideError::ValidationException(message)
+            | DynoxideError::EnvelopedValidation(message)
+                if message == enveloped
+                    || message == "ReturnValues can only be ALL_OLD or NONE" =>
+            {
+                DynoxideError::ValidationException(
+                    "ReturnValues can only be ALL_OLD or NONE".to_string(),
+                )
+            }
+            other => other,
+        };
+    }
     if !matches!(operation, "PutItem" | "UpdateItem") {
         return err;
     }

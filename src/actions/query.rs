@@ -86,6 +86,25 @@ pub struct QueryRequest {
     pub exclusive_start_key_raw: Option<serde_json::Value>,
 }
 
+/// The rejection for a `Select` outside the enum, or `None` when it is one
+/// DynamoDB accepts. The one copy of the set and the wording.
+fn select_rejection(select: &str) -> Option<String> {
+    if [
+        "ALL_ATTRIBUTES",
+        "ALL_PROJECTED_ATTRIBUTES",
+        "COUNT",
+        "SPECIFIC_ATTRIBUTES",
+    ]
+    .contains(&select)
+    {
+        return None;
+    }
+    Some(format!(
+        "Value '{select}' at 'select' failed to satisfy constraint: Member must satisfy \
+         enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]"
+    ))
+}
+
 impl<'de> serde::Deserialize<'de> for QueryRequest {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -112,6 +131,24 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         // lowercases 'limit'. Do not collapse these into a shared helper. The two
         // come back together, Limit first (captured 2026-10-09, six of seven
         // regions).
+        //
+        // With no TableName at all, a Limit of 0 is joined with the missing
+        // name's error, and with a Select outside the enum, which leads. This
+        // form echoes the value and spells the member 'limit' (captured
+        // eu-west-2 and us-east-1, 2026-10-09).
+        if raw.table_name.is_none() && raw.limit == Some(0) {
+            let mut errors = Vec::new();
+            errors.extend(raw.select.as_deref().and_then(select_rejection));
+            errors.extend(crate::validation::item_table_name_errors(None));
+            errors.push(
+                "Value '0' at 'limit' failed to satisfy constraint: \
+                 Member must have value greater than or equal to 1"
+                    .to_string(),
+            );
+            if let Some(msg) = format_validation_errors(&errors) {
+                return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+            }
+        }
         let mut first_pass = Vec::new();
         if raw.limit == Some(0) {
             first_pass.push(
@@ -271,21 +308,9 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // ---- Select, after the mixing check (captured 2026-10-09) ----
-    if let Some(ref sel) = request.select
-        && ![
-            "ALL_ATTRIBUTES",
-            "ALL_PROJECTED_ATTRIBUTES",
-            "COUNT",
-            "SPECIFIC_ATTRIBUTES",
-        ]
-        .contains(&sel.as_str())
-    {
+    if let Some(msg) = request.select.as_deref().and_then(select_rejection) {
         return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&format!(
-                "Value '{sel}' at 'select' failed to satisfy constraint: Member must satisfy \
-                 enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, \
-                 ALL_PROJECTED_ATTRIBUTES]"
-            )),
+            crate::validation::envelope_message(&msg),
         ));
     }
 

@@ -79,8 +79,16 @@ pub async fn execute<S: StorageBackend>(
     // table with the largest Keys array (and, on ties, fall through to whichever
     // HashMap iteration yields first) so the field path lines up with the table
     // that pushed the total over.
+    //
+    // A table name that breaks its constraints is reported first, whatever the
+    // total: the map-key error wins over the key count (captured eu-west-2 and
+    // us-east-1, 2026-10-09), and is raised below.
     let total_keys: usize = request.request_items.values().map(|ka| ka.keys.len()).sum();
-    if total_keys > 100 {
+    let all_names_valid = request
+        .request_items
+        .keys()
+        .all(|name| crate::validation::member_table_name_is_valid(name));
+    if total_keys > 100 && all_names_valid {
         let table_name = request
             .request_items
             .iter()
@@ -98,11 +106,7 @@ pub async fn execute<S: StorageBackend>(
     // anything is read (captured us-east-1, eu-west-2 and ten more regions,
     // 2026-10-08 and 2026-10-09).
     let mut member_errors = Vec::new();
-    if !request
-        .request_items
-        .keys()
-        .all(|name| crate::validation::member_table_name_is_valid(name))
-    {
+    if !all_names_valid {
         member_errors.push(format!(
             "Value '{}' at 'requestItems' failed to satisfy constraint: {}",
             request_items_echo(&request.request_items),
