@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 - `dynoxide import` reads JSON Lines files named `.jsonl` and `.jsonl.gz`, in a DynamoDB Export directory (`<dir>/<TableName>/data/`) or a flat directory of those files, alongside the `.json` and `.json.gz` parts it already accepted.
 
+### Fixed
+
+- **A `SearchVectorsRequest` built in Rust now meets the `IndexName`,
+  `SearchVector` and `TopK` checks.** An `IndexName` shorter than three
+  characters, an empty `SearchVector` or a `TopK` below 1 used to get past
+  `Database::search_vectors` and fail later with whatever came next. They now
+  get the same validation message as the same request sent over HTTP, in the
+  same order.
+
 ## [1.3.0] - 2026-10-10
 
 The crate moves to `dynoxide-rs` 3.0.0: the `expressions` and `partiql`
