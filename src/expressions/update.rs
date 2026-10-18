@@ -5,9 +5,8 @@
 use crate::expressions::condition::parse_raw_path;
 use crate::expressions::tokenizer::{Token, TokenStream, tokenize, tokenizer_syntax_error};
 use crate::expressions::{
-    INVALID_UPDATE_PATH, MISSING_ATTRIBUTE, OPERAND_TYPE, PathElement, TrackedExpressionAttributes,
-    check_update_parent, format_path_for_error, remove_path, resolve_path, resolve_path_elements,
-    set_path,
+    MISSING_ATTRIBUTE, OPERAND_TYPE, PathElement, TrackedExpressionAttributes, check_update_parent,
+    format_path_for_error, remove_path, resolve_path, resolve_path_elements, set_path,
 };
 use crate::types::AttributeValue;
 use std::collections::HashMap;
@@ -707,13 +706,28 @@ pub fn apply(
     Ok(())
 }
 
-/// An ADD or DELETE failure as the caller sees it: a bad path says so, anything
-/// else is an operand that does not fit what is stored.
-fn operand_or_path_error(error: String) -> String {
-    if error == INVALID_UPDATE_PATH {
-        error
-    } else {
-        OPERAND_TYPE.to_string()
+/// Why an ADD or DELETE could not be applied. A path that cannot be stepped
+/// through is the document-path error; an operand that does not fit what is
+/// stored is the data-type error, whatever its own wording.
+enum UpdateFailure {
+    Path(String),
+    Operand(String),
+}
+
+impl UpdateFailure {
+    /// The failure's own message, for the legacy `AttributeUpdates` callers.
+    fn into_message(self) -> String {
+        match self {
+            UpdateFailure::Path(message) | UpdateFailure::Operand(message) => message,
+        }
+    }
+}
+
+/// An ADD or DELETE failure as an expression's caller sees it.
+fn operand_or_path_error(failure: UpdateFailure) -> String {
+    match failure {
+        UpdateFailure::Path(message) => message,
+        UpdateFailure::Operand(_) => OPERAND_TYPE.to_string(),
     }
 }
 
@@ -846,14 +860,14 @@ pub fn apply_add_public(
     path: &[PathElement],
     add_val: &AttributeValue,
 ) -> Result<(), String> {
-    apply_add(item, path, add_val)
+    apply_add(item, path, add_val).map_err(UpdateFailure::into_message)
 }
 
 fn apply_add(
     item: &mut HashMap<String, AttributeValue>,
     path: &[PathElement],
     add_val: &AttributeValue,
-) -> Result<(), String> {
+) -> Result<(), UpdateFailure> {
     let existing = resolve_path(item, path);
 
     match (existing, add_val) {
@@ -862,14 +876,16 @@ fn apply_add(
             use bigdecimal::BigDecimal;
             use std::str::FromStr;
             let de = BigDecimal::from_str(&existing_n)
-                .map_err(|_| format!("Invalid number: {existing_n}"))?;
-            let da = BigDecimal::from_str(add_n).map_err(|_| format!("Invalid number: {add_n}"))?;
+                .map_err(|_| UpdateFailure::Operand(format!("Invalid number: {existing_n}")))?;
+            let da = BigDecimal::from_str(add_n)
+                .map_err(|_| UpdateFailure::Operand(format!("Invalid number: {add_n}")))?;
             let result = &de + &da;
             set_path(item, path, AttributeValue::N(format_number(&result)))
+                .map_err(UpdateFailure::Path)
         }
         (None, AttributeValue::N(_)) => {
             // Create with the provided value
-            set_path(item, path, add_val.clone())
+            set_path(item, path, add_val.clone()).map_err(UpdateFailure::Path)
         }
 
         // String set: union
@@ -879,9 +895,11 @@ fn apply_add(
                     existing_set.push(s.clone());
                 }
             }
-            set_path(item, path, AttributeValue::SS(existing_set))
+            set_path(item, path, AttributeValue::SS(existing_set)).map_err(UpdateFailure::Path)
         }
-        (None, AttributeValue::SS(_)) => set_path(item, path, add_val.clone()),
+        (None, AttributeValue::SS(_)) => {
+            set_path(item, path, add_val.clone()).map_err(UpdateFailure::Path)
+        }
 
         // Number set: union
         (Some(AttributeValue::NS(mut existing_set)), AttributeValue::NS(add_set)) => {
@@ -890,9 +908,11 @@ fn apply_add(
                     existing_set.push(n.clone());
                 }
             }
-            set_path(item, path, AttributeValue::NS(existing_set))
+            set_path(item, path, AttributeValue::NS(existing_set)).map_err(UpdateFailure::Path)
         }
-        (None, AttributeValue::NS(_)) => set_path(item, path, add_val.clone()),
+        (None, AttributeValue::NS(_)) => {
+            set_path(item, path, add_val.clone()).map_err(UpdateFailure::Path)
+        }
 
         // Binary set: union
         (Some(AttributeValue::BS(mut existing_set)), AttributeValue::BS(add_set)) => {
@@ -901,18 +921,24 @@ fn apply_add(
                     existing_set.push(b.clone());
                 }
             }
-            set_path(item, path, AttributeValue::BS(existing_set))
+            set_path(item, path, AttributeValue::BS(existing_set)).map_err(UpdateFailure::Path)
         }
-        (None, AttributeValue::BS(_)) => set_path(item, path, add_val.clone()),
+        (None, AttributeValue::BS(_)) => {
+            set_path(item, path, add_val.clone()).map_err(UpdateFailure::Path)
+        }
 
         // List: append elements (legacy AttributeUpdates behaviour)
         (Some(AttributeValue::L(mut existing_list)), AttributeValue::L(add_list)) => {
             existing_list.extend(add_list.iter().cloned());
-            set_path(item, path, AttributeValue::L(existing_list))
+            set_path(item, path, AttributeValue::L(existing_list)).map_err(UpdateFailure::Path)
         }
-        (None, AttributeValue::L(_)) => set_path(item, path, add_val.clone()),
+        (None, AttributeValue::L(_)) => {
+            set_path(item, path, add_val.clone()).map_err(UpdateFailure::Path)
+        }
 
-        _ => Err("Type mismatch for attribute to update".to_string()),
+        _ => Err(UpdateFailure::Operand(
+            "Type mismatch for attribute to update".to_string(),
+        )),
     }
 }
 
@@ -926,15 +952,15 @@ pub fn apply_delete_public(
     path: &[PathElement],
     del_val: &AttributeValue,
 ) -> Result<(), String> {
-    apply_delete(item, path, del_val)
+    apply_delete(item, path, del_val).map_err(UpdateFailure::into_message)
 }
 
 fn apply_delete(
     item: &mut HashMap<String, AttributeValue>,
     path: &[PathElement],
     del_val: &AttributeValue,
-) -> Result<(), String> {
-    check_update_parent(item, path)?;
+) -> Result<(), UpdateFailure> {
+    check_update_parent(item, path).map_err(UpdateFailure::Path)?;
     let existing = resolve_path(item, path);
 
     match (existing, del_val) {
@@ -944,9 +970,9 @@ fn apply_delete(
                 .filter(|s| !del_set.contains(s))
                 .collect();
             if new_set.is_empty() {
-                remove_path(item, path)
+                remove_path(item, path).map_err(UpdateFailure::Path)
             } else {
-                set_path(item, path, AttributeValue::SS(new_set))
+                set_path(item, path, AttributeValue::SS(new_set)).map_err(UpdateFailure::Path)
             }
         }
         (Some(AttributeValue::NS(existing_set)), AttributeValue::NS(del_set)) => {
@@ -955,9 +981,9 @@ fn apply_delete(
                 .filter(|n| !del_set.contains(n))
                 .collect();
             if new_set.is_empty() {
-                remove_path(item, path)
+                remove_path(item, path).map_err(UpdateFailure::Path)
             } else {
-                set_path(item, path, AttributeValue::NS(new_set))
+                set_path(item, path, AttributeValue::NS(new_set)).map_err(UpdateFailure::Path)
             }
         }
         (Some(AttributeValue::BS(existing_set)), AttributeValue::BS(del_set)) => {
@@ -966,13 +992,15 @@ fn apply_delete(
                 .filter(|b| !del_set.contains(b))
                 .collect();
             if new_set.is_empty() {
-                remove_path(item, path)
+                remove_path(item, path).map_err(UpdateFailure::Path)
             } else {
-                set_path(item, path, AttributeValue::BS(new_set))
+                set_path(item, path, AttributeValue::BS(new_set)).map_err(UpdateFailure::Path)
             }
         }
         (None, _) => Ok(()), // Nothing to delete from
-        _ => Err("Type mismatch for attribute to update".to_string()),
+        _ => Err(UpdateFailure::Operand(
+            "Type mismatch for attribute to update".to_string(),
+        )),
     }
 }
 
@@ -1425,6 +1453,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A path failure keeps its own message whatever the wording, and an operand
+    /// failure is the data-type error whatever the wording.
+    #[test]
+    fn an_add_or_delete_failure_is_told_by_its_kind_not_its_text() {
+        let mut item = HashMap::new();
+        item.insert("s".to_string(), AttributeValue::S("x".into()));
+        let number = AttributeValue::N("1".into());
+        let top_level_index = [PathElement::Index(0)];
+        let failure = apply_add(&mut item, &top_level_index, &number).unwrap_err();
+        assert_eq!(
+            operand_or_path_error(failure),
+            "Cannot index into top-level item"
+        );
+        let failure = apply_delete(&mut item, &top_level_index, &number).unwrap_err();
+        assert_eq!(
+            operand_or_path_error(failure),
+            "Cannot index into top-level item"
+        );
+        let on_a_string = [PathElement::Attribute("s".into())];
+        let failure = apply_add(&mut item, &on_a_string, &number).unwrap_err();
+        assert_eq!(operand_or_path_error(failure), OPERAND_TYPE);
     }
 
     #[test]
