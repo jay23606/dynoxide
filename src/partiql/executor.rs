@@ -3013,6 +3013,10 @@ async fn execute_update<S: StorageBackend>(
         }
     }
 
+    // No two paths of one statement may overlap, the later clause being `path
+    // one`. Refused before the item is read, as UpdateItem refuses it.
+    reject_overlapping_paths(set_clauses, remove_paths)?;
+
     // Get existing item
     let existing_json = storage.get_item(table_name, &pk_str, &sk_str).await?;
     let mut item: Item = existing_json
@@ -3042,16 +3046,30 @@ async fn execute_update<S: StorageBackend>(
 
     let before_item = item.clone();
 
-    // Apply SET clauses with nested path support
+    // Every SET value is worked out from the item as it was, so `SET a = 1, b = a
+    // + 1` reads the old `a`, or finds none (eu-west-2, 18 October 2026).
+    let mut writes = Vec::with_capacity(set_clauses.len());
     for clause in set_clauses {
-        match resolve_set_value(&clause.value, &item, parameters)? {
-            Some(val) => set_nested_value(&mut item, &clause.path, val)?,
-            None => remove_nested_value(&mut item, &clause.path)?,
+        writes.push((
+            &clause.path,
+            resolve_set_value(&clause.value, &before_item, parameters)?,
+        ));
+    }
+    for (path, value) in writes {
+        match value {
+            Some(val) => set_nested_value(&mut item, path, val)?,
+            None => remove_nested_value(&mut item, path)?,
         }
     }
 
-    // Apply REMOVE clauses
-    for path in remove_paths {
+    // REMOVE goes last, highest path first, so that taking out `l[0]` does not
+    // move the element that `l[1]` names.
+    let mut removals: Vec<_> = remove_paths
+        .iter()
+        .map(|path| (element_path(path), path))
+        .collect();
+    removals.sort_by(|(a, _), (b, _)| crate::expressions::update::compare_paths(b, a));
+    for (_, path) in removals {
         remove_nested_value(&mut item, path)?;
     }
 
@@ -3686,11 +3704,11 @@ fn attribute_of(
     };
     match resolve_nested_path(item, path) {
         None => Err(DynoxideError::ValidationException(
-            crate::expressions::update::MISSING_ATTRIBUTE.to_string(),
+            crate::expressions::MISSING_ATTRIBUTE.to_string(),
         )),
         Some(value) if fits(value) => Ok(value.clone()),
         Some(_) => Err(DynoxideError::ValidationException(
-            crate::expressions::update::OPERAND_TYPE.to_string(),
+            crate::expressions::OPERAND_TYPE.to_string(),
         )),
     }
 }
@@ -3722,6 +3740,38 @@ fn arithmetic(
         left - right
     };
     Ok(AttributeValue::N(format_bigdecimal(&result)))
+}
+
+/// A statement's path as the elements an UpdateItem path is made of, for the
+/// checks the two share. A path that does not split names nothing and yields
+/// no elements.
+fn element_path(path: &str) -> Vec<crate::expressions::PathElement> {
+    use crate::expressions::PathElement;
+    split_path_segments(path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|segment| match segment {
+            PathSegment::Key(key) => PathElement::Attribute(key.into_owned()),
+            PathSegment::Index(i) => PathElement::Index(i),
+        })
+        .collect()
+}
+
+/// Refuse a statement with two paths that overlap, DynamoDB's check on the
+/// paths a statement writes and removes. The later clause is `path one`;
+/// the SET clauses are taken as written before the REMOVE paths.
+fn reject_overlapping_paths(
+    set_clauses: &[crate::partiql::parser::SetClause],
+    remove_paths: &[String],
+) -> Result<()> {
+    let mut paths: Vec<_> = set_clauses
+        .iter()
+        .map(|clause| element_path(&clause.path))
+        .chain(remove_paths.iter().map(|path| element_path(path)))
+        .collect();
+    paths.reverse();
+    crate::expressions::update::check_path_overlaps(&paths)
+        .map_err(DynoxideError::ValidationException)
 }
 
 /// The `ValidationException` DynamoDB raises for a document path that cannot be

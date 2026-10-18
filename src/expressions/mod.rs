@@ -358,6 +358,17 @@ pub fn evaluate_without_tracking(
 pub(crate) const INVALID_UPDATE_PATH: &str =
     "The document path provided in the update expression is invalid for update";
 
+/// What an arithmetic SET or `list_append` says of an operand that names an
+/// attribute the item does not have.
+pub(crate) const MISSING_ATTRIBUTE: &str =
+    "The provided expression refers to an attribute that does not exist in the item";
+
+/// What an update says of an operand whose type does not fit the operation: a
+/// stored value of the wrong type for `+`, `-` or `list_append`, or an ADD or
+/// DELETE operand that does not fit the stored value.
+pub(crate) const OPERAND_TYPE: &str =
+    "An operand in the update expression has an incorrect data type";
+
 /// Navigate a document path into an item, returning the attribute value at that path.
 pub fn resolve_path(
     item: &HashMap<String, AttributeValue>,

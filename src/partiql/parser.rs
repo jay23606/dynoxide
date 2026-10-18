@@ -3,7 +3,7 @@
 //! Parses a subset of PartiQL relevant to DynamoDB:
 //! - `SELECT [projections] FROM "table" [WHERE conditions]`
 //! - INSERT INTO "table" VALUE { ... } [IF NOT EXISTS]
-//! - UPDATE "table" SET path = value [REMOVE attr1, attr2] [WHERE conditions]
+//! - UPDATE "table" SET path = value [REMOVE attr1] [REMOVE attr2] [WHERE conditions]
 //! - DELETE FROM "table" [WHERE conditions]
 
 use crate::types::AttributeValue;
@@ -1925,8 +1925,10 @@ fn parse_update_clauses(t: &mut Tokenizer) -> Result<(Vec<SetClause>, Vec<String
                 let value = parse_set_value(t, &path)?;
                 set_clauses.push(SetClause { path, value });
             }
+            // SET takes a list of assignments; REMOVE takes one path, and a
+            // comma after it is a token left over (eu-west-2, 18 October 2026).
             match t.peek_token()? {
-                Some(ref s) if s == "," => {
+                Some(ref s) if s == "," && !remove => {
                     t.next_token()?;
                 }
                 _ => break,
@@ -6091,7 +6093,7 @@ mod tests {
     #[test]
     fn test_parse_update_with_remove() {
         let stmt =
-            parse("UPDATE \"T\" SET name = 'Bob' REMOVE age, email WHERE pk = 'k1'").unwrap();
+            parse("UPDATE \"T\" SET name = 'Bob' REMOVE age REMOVE email WHERE pk = 'k1'").unwrap();
         match stmt {
             Statement::Update {
                 set_clauses,

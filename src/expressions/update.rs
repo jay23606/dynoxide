@@ -5,8 +5,9 @@
 use crate::expressions::condition::parse_raw_path;
 use crate::expressions::tokenizer::{Token, TokenStream, tokenize, tokenizer_syntax_error};
 use crate::expressions::{
-    INVALID_UPDATE_PATH, PathElement, TrackedExpressionAttributes, check_update_parent,
-    format_path_for_error, remove_path, resolve_path, resolve_path_elements, set_path,
+    INVALID_UPDATE_PATH, MISSING_ATTRIBUTE, OPERAND_TYPE, PathElement, TrackedExpressionAttributes,
+    check_update_parent, format_path_for_error, remove_path, resolve_path, resolve_path_elements,
+    set_path,
 };
 use crate::types::AttributeValue;
 use std::collections::HashMap;
@@ -367,7 +368,7 @@ pub fn check_target_overlaps(
         .chain(expr.delete_actions.iter().map(|action| &action.path))
         .map(|path| resolve_tracked_path(path, tracker))
         .collect();
-    check_path_overlaps(&paths)
+    check_path_overlaps(&paths).map_err(|message| format!("Invalid UpdateExpression: {message}"))
 }
 
 /// Validate that an ADD operand has a compatible type.
@@ -526,7 +527,10 @@ fn resolve_tracked_path(
 /// Two paths overlap if one is a prefix of the other (e.g., `a.b` and `a.b.c`).
 /// Two paths conflict if they share elements but diverge in type at the same
 /// position (e.g., `a[3].c` and `a.c[3]`).
-fn check_path_overlaps(paths: &[Vec<PathElement>]) -> Result<(), String> {
+/// Two paths of one update that overlap, in DynamoDB's words without the
+/// `Invalid UpdateExpression: ` lead that UpdateItem puts in front. The earlier
+/// of the two in `paths` is `path one`.
+pub(crate) fn check_path_overlaps(paths: &[Vec<PathElement>]) -> Result<(), String> {
     for i in 0..paths.len() {
         for j in (i + 1)..paths.len() {
             let a = &paths[i];
@@ -550,7 +554,7 @@ fn check_path_overlaps(paths: &[Vec<PathElement>]) -> Result<(), String> {
             // If one path is a prefix of the other, they overlap
             if common == a.len() || common == b.len() {
                 return Err(format!(
-                    "Invalid UpdateExpression: Two document paths overlap with each other; \
+                    "Two document paths overlap with each other; \
                      must remove or rewrite one of these paths; \
                      path one: {}, path two: {}",
                     format_path_for_error(a),
@@ -561,7 +565,7 @@ fn check_path_overlaps(paths: &[Vec<PathElement>]) -> Result<(), String> {
             // If paths share a prefix but diverge, they conflict
             if common > 0 && common < min_len && a == b {
                 return Err(format!(
-                    "Invalid UpdateExpression: Two document paths conflict with each other; \
+                    "Two document paths conflict with each other; \
                      must remove or rewrite one of these paths; \
                      path one: {}, path two: {}",
                     format_path_for_error(a),
@@ -672,12 +676,6 @@ pub fn apply(
         set_path(item, &path, value)?;
     }
 
-    // Process REMOVE actions
-    for path in &expr.remove_actions {
-        let resolved_path = resolve_path_elements(path, tracker)?;
-        remove_path(item, &resolved_path)?;
-    }
-
     // Process ADD actions
     for action in &expr.add_actions {
         let resolved_path = resolve_path_elements(&action.path, tracker)?;
@@ -692,16 +690,22 @@ pub fn apply(
         apply_delete(item, &resolved_path, &del_val).map_err(operand_or_path_error)?;
     }
 
+    // REMOVE goes last, highest path first. Every path in an expression means
+    // what it meant in the item as it was, so taking out `l[0]` must not move
+    // the element that `l[1]` or `l[1].x` names, and an ADD or DELETE on
+    // either has already run against the original indexes (eu-west-2,
+    // 18 October 2026).
+    let mut removals = Vec::with_capacity(expr.remove_actions.len());
+    for path in &expr.remove_actions {
+        removals.push(resolve_path_elements(path, tracker)?);
+    }
+    removals.sort_by(|a, b| compare_paths(b, a));
+    for path in removals {
+        remove_path(item, &path)?;
+    }
+
     Ok(())
 }
-
-/// What an arithmetic SET says of an operand that names an attribute the item
-/// does not have.
-pub(crate) const MISSING_ATTRIBUTE: &str =
-    "The provided expression refers to an attribute that does not exist in the item";
-
-pub(crate) const OPERAND_TYPE: &str =
-    "An operand in the update expression has an incorrect data type";
 
 /// An ADD or DELETE failure as the caller sees it: a bad path says so, anything
 /// else is an operand that does not fit what is stored.
@@ -739,7 +743,7 @@ fn delete_fits(existing: Option<&AttributeValue>, del_val: &AttributeValue) -> b
 
 /// Order two resolved paths element by element, with list indexes compared as
 /// numbers.
-fn compare_paths(a: &[PathElement], b: &[PathElement]) -> std::cmp::Ordering {
+pub(crate) fn compare_paths(a: &[PathElement], b: &[PathElement]) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     for (x, y) in a.iter().zip(b) {
         let order = match (x, y) {
@@ -1383,6 +1387,65 @@ mod charge_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One value of every type, for crossing with every stored type.
+    fn every_type() -> Vec<AttributeValue> {
+        vec![
+            AttributeValue::S("x".into()),
+            AttributeValue::N("1".into()),
+            AttributeValue::B(vec![1]),
+            AttributeValue::BOOL(true),
+            AttributeValue::NULL(true),
+            AttributeValue::L(vec![AttributeValue::N("1".into())]),
+            AttributeValue::M(HashMap::new()),
+            AttributeValue::SS(vec!["a".into()]),
+            AttributeValue::NS(vec!["1".into()]),
+            AttributeValue::BS(vec![vec![1]]),
+        ]
+    }
+
+    /// The up-front type check and the applier read one table: whatever
+    /// `add_fits` lets through, `apply_add` applies, and the other way round,
+    /// for an absent attribute and for every stored type.
+    #[test]
+    fn the_add_type_check_agrees_with_the_applier() {
+        let path = [PathElement::Attribute("a".into())];
+        let mut stored = vec![None];
+        stored.extend(every_type().into_iter().map(Some));
+        for existing in &stored {
+            for operand in every_type() {
+                let mut item = HashMap::new();
+                if let Some(value) = existing {
+                    item.insert("a".to_string(), value.clone());
+                }
+                assert_eq!(
+                    add_fits(existing.as_ref(), &operand),
+                    apply_add(&mut item, &path, &operand).is_ok(),
+                    "ADD {operand:?} to {existing:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_delete_type_check_agrees_with_the_applier() {
+        let path = [PathElement::Attribute("a".into())];
+        let mut stored = vec![None];
+        stored.extend(every_type().into_iter().map(Some));
+        for existing in &stored {
+            for operand in every_type() {
+                let mut item = HashMap::new();
+                if let Some(value) = existing {
+                    item.insert("a".to_string(), value.clone());
+                }
+                assert_eq!(
+                    delete_fits(existing.as_ref(), &operand),
+                    apply_delete(&mut item, &path, &operand).is_ok(),
+                    "DELETE {operand:?} from {existing:?}"
+                );
+            }
+        }
+    }
 
     fn make_item(pairs: &[(&str, AttributeValue)]) -> HashMap<String, AttributeValue> {
         pairs

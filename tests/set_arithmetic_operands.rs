@@ -142,6 +142,8 @@ fn arithmetic_on_a_stored_number_still_works() {
 }
 
 const STATIC: &str = "Incorrect operand type for operator or function; operator or function";
+/// What UpdateItem puts in front of an expression's own refusal; PartiQL's has none.
+const LEAD: &str = "1 validation error detected: Invalid UpdateExpression: ";
 
 /// UpdateItem with a value of each type in the placeholder `:v`.
 fn update_with(expression: &str, value: Value) -> String {
@@ -175,6 +177,7 @@ fn a_value_of_the_wrong_type_names_the_operator_and_its_type() {
     for (code, value) in values {
         for op in ["+", "-"] {
             let message = update_with(&format!("SET n = n {op} :v"), value.clone());
+            assert!(message.starts_with(LEAD), "{op} {code}: {message}");
             assert!(
                 message.ends_with(&format!("{STATIC}: {op}, operand type: {code}")),
                 "{op} {code}: {message}"
@@ -211,6 +214,7 @@ fn add_and_delete_spell_the_type_out_and_name_the_type_set() {
     ] {
         for (expression, operator) in [("ADD fresh :v", "ADD"), ("DELETE ss :v", "DELETE")] {
             let message = update_with(expression, value.clone());
+            assert!(message.starts_with(LEAD), "{expression} {name}: {message}");
             let wanted = format!(
                 "operator: {operator}, operand type: {name}, typeSet: ALLOWED_FOR_ADD_OPERAND"
             );

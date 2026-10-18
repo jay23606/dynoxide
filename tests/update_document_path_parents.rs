@@ -173,6 +173,7 @@ fn add_and_delete_through_a_missing_or_mistyped_parent_name_the_path() {
         ("ADD zz.y :v", json!({":v": n(1)})),
         ("ADD m.nope.y :v", json!({":v": n(1)})),
         ("ADD s.y :v", json!({":v": n(1)})),
+        ("ADD lm[1].q :v", json!({":v": n(1)})),
         ("DELETE zz.y :v", json!({":v": {"SS": ["a"]}})),
         ("DELETE s.y :v", json!({":v": {"SS": ["a"]}})),
     ] {
