@@ -693,7 +693,13 @@ pub fn apply(
     Ok(())
 }
 
-const OPERAND_TYPE: &str = "An operand in the update expression has an incorrect data type";
+/// What an arithmetic SET says of an operand that names an attribute the item
+/// does not have.
+pub(crate) const MISSING_ATTRIBUTE: &str =
+    "The provided expression refers to an attribute that does not exist in the item";
+
+pub(crate) const OPERAND_TYPE: &str =
+    "An operand in the update expression has an incorrect data type";
 
 /// An ADD or DELETE failure as the caller sees it: a bad path says so, anything
 /// else is an operand that does not fit what is stored.
@@ -770,7 +776,7 @@ fn evaluate_set_value(
                     let result = &da + &db;
                     Ok(AttributeValue::N(format_number(&result)))
                 }
-                _ => Err("Operands for + must be numbers".to_string()),
+                _ => Err(OPERAND_TYPE.to_string()),
             }
         }
         SetValue::Minus(left, right) => {
@@ -785,7 +791,7 @@ fn evaluate_set_value(
                     let result = &da - &db;
                     Ok(AttributeValue::N(format_number(&result)))
                 }
-                _ => Err("Operands for - must be numbers".to_string()),
+                _ => Err(OPERAND_TYPE.to_string()),
             }
         }
     }
@@ -799,10 +805,7 @@ fn evaluate_set_operand(
     match operand {
         SetOperand::Path(path) => {
             let resolved = resolve_path_elements(path, tracker)?;
-            resolve_path(item, &resolved).ok_or_else(|| {
-                "The provided expression refers to an attribute that does not exist in the item"
-                    .to_string()
-            })
+            resolve_path(item, &resolved).ok_or_else(|| MISSING_ATTRIBUTE.to_string())
         }
         SetOperand::ValueRef(name) => Ok(tracker.resolve_value(name)?.clone()),
         SetOperand::IfNotExists(path, default) => {

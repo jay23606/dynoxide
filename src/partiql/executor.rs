@@ -3639,12 +3639,13 @@ fn resolve_set_operand(
                     let result = a + b;
                     Ok(AttributeValue::N(format_bigdecimal(&result)))
                 }
-                (None, AttributeValue::N(_)) => {
-                    // Attribute doesn't exist yet: use the operand value
-                    Ok(operand)
-                }
+                // An attribute that is not there is not read as zero: DynamoDB
+                // refuses the arithmetic (eu-west-2, 18 October 2026).
+                (None, AttributeValue::N(_)) => Err(DynoxideError::ValidationException(
+                    crate::expressions::update::MISSING_ATTRIBUTE.to_string(),
+                )),
                 _ => Err(DynoxideError::ValidationException(
-                    "SET expression add requires numeric attribute and operand".to_string(),
+                    crate::expressions::update::OPERAND_TYPE.to_string(),
                 )),
             }
         }
@@ -3664,18 +3665,11 @@ fn resolve_set_operand(
                     let result = a - b;
                     Ok(AttributeValue::N(format_bigdecimal(&result)))
                 }
-                (None, AttributeValue::N(sub)) => {
-                    // Attribute doesn't exist yet: treat as 0 - operand
-                    use bigdecimal::BigDecimal;
-                    use std::str::FromStr;
-                    let b = BigDecimal::from_str(sub).map_err(|e| {
-                        DynoxideError::ValidationException(format!("Invalid number: {e}"))
-                    })?;
-                    let result = -b;
-                    Ok(AttributeValue::N(format_bigdecimal(&result)))
-                }
+                (None, AttributeValue::N(_)) => Err(DynoxideError::ValidationException(
+                    crate::expressions::update::MISSING_ATTRIBUTE.to_string(),
+                )),
                 _ => Err(DynoxideError::ValidationException(
-                    "SET expression subtract requires numeric attribute and operand".to_string(),
+                    crate::expressions::update::OPERAND_TYPE.to_string(),
                 )),
             }
         }
