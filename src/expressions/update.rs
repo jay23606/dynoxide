@@ -5,8 +5,8 @@
 use crate::expressions::condition::parse_raw_path;
 use crate::expressions::tokenizer::{Token, TokenStream, tokenize, tokenizer_syntax_error};
 use crate::expressions::{
-    PathElement, TrackedExpressionAttributes, format_path_for_error, remove_path, resolve_path,
-    resolve_path_elements, set_path,
+    INVALID_UPDATE_PATH, PathElement, TrackedExpressionAttributes, check_update_parent,
+    format_path_for_error, remove_path, resolve_path, resolve_path_elements, set_path,
 };
 use crate::types::AttributeValue;
 use std::collections::HashMap;
@@ -635,6 +635,25 @@ pub fn apply(
     // reads see the original snapshot. (Overlapping target paths are rejected by
     // `check_path_overlaps`, so no SET can legitimately read another's output.)
     let snapshot = item.clone();
+
+    // An ADD or DELETE whose operand does not fit what is stored is refused
+    // before any path is applied, so it wins over a bad path in a SET or REMOVE
+    // of the same expression (eu-west-2, 18 October 2026).
+    for action in &expr.add_actions {
+        let path = resolve_path_elements(&action.path, tracker)?;
+        let add_val = tracker.resolve_value(&action.value_ref)?;
+        if !add_fits(resolve_path(&snapshot, &path).as_ref(), add_val) {
+            return Err(OPERAND_TYPE.to_string());
+        }
+    }
+    for action in &expr.delete_actions {
+        let path = resolve_path_elements(&action.path, tracker)?;
+        let del_val = tracker.resolve_value(&action.value_ref)?;
+        if !delete_fits(resolve_path(&snapshot, &path).as_ref(), del_val) {
+            return Err(OPERAND_TYPE.to_string());
+        }
+    }
+
     let mut writes = Vec::with_capacity(expr.set_actions.len());
     for action in &expr.set_actions {
         let resolved_path = resolve_path_elements(&action.path, tracker)?;
@@ -661,21 +680,53 @@ pub fn apply(
     for action in &expr.add_actions {
         let resolved_path = resolve_path_elements(&action.path, tracker)?;
         let add_val = tracker.resolve_value(&action.value_ref)?.clone();
-        apply_add(item, &resolved_path, &add_val).map_err(|_| {
-            "An operand in the update expression has an incorrect data type".to_string()
-        })?;
+        apply_add(item, &resolved_path, &add_val).map_err(operand_or_path_error)?;
     }
 
     // Process DELETE actions
     for action in &expr.delete_actions {
         let resolved_path = resolve_path_elements(&action.path, tracker)?;
         let del_val = tracker.resolve_value(&action.value_ref)?.clone();
-        apply_delete(item, &resolved_path, &del_val).map_err(|_| {
-            "An operand in the update expression has an incorrect data type".to_string()
-        })?;
+        apply_delete(item, &resolved_path, &del_val).map_err(operand_or_path_error)?;
     }
 
     Ok(())
+}
+
+const OPERAND_TYPE: &str = "An operand in the update expression has an incorrect data type";
+
+/// An ADD or DELETE failure as the caller sees it: a bad path says so, anything
+/// else is an operand that does not fit what is stored.
+fn operand_or_path_error(error: String) -> String {
+    if error == INVALID_UPDATE_PATH {
+        error
+    } else {
+        OPERAND_TYPE.to_string()
+    }
+}
+
+/// Whether ADD can apply `add_val` to `existing`: a number to a number, a set
+/// to a set of its kind, a list to a list, any of these to an absent attribute.
+fn add_fits(existing: Option<&AttributeValue>, add_val: &AttributeValue) -> bool {
+    use AttributeValue::{BS, L, N, NS, SS};
+    matches!(
+        (existing, add_val),
+        (Some(N(_)) | None, N(_))
+            | (Some(SS(_)) | None, SS(_))
+            | (Some(NS(_)) | None, NS(_))
+            | (Some(BS(_)) | None, BS(_))
+            | (Some(L(_)) | None, L(_))
+    )
+}
+
+/// Whether DELETE can apply `del_val` to `existing`: a set to a set of its
+/// kind, or anything to an absent attribute, which it leaves alone.
+fn delete_fits(existing: Option<&AttributeValue>, del_val: &AttributeValue) -> bool {
+    use AttributeValue::{BS, NS, SS};
+    matches!(
+        (existing, del_val),
+        (None, _) | (Some(SS(_)), SS(_)) | (Some(NS(_)), NS(_)) | (Some(BS(_)), BS(_))
+    )
 }
 
 /// Order two resolved paths element by element, with list indexes compared as
@@ -874,6 +925,7 @@ fn apply_delete(
     path: &[PathElement],
     del_val: &AttributeValue,
 ) -> Result<(), String> {
+    check_update_parent(item, path)?;
     let existing = resolve_path(item, path);
 
     match (existing, del_val) {

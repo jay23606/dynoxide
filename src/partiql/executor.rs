@@ -3046,13 +3046,13 @@ async fn execute_update<S: StorageBackend>(
     for clause in set_clauses {
         match resolve_set_value(&clause.value, &item, parameters)? {
             Some(val) => set_nested_value(&mut item, &clause.path, val)?,
-            None => remove_nested_value(&mut item, &clause.path),
+            None => remove_nested_value(&mut item, &clause.path)?,
         }
     }
 
     // Apply REMOVE clauses
     for path in remove_paths {
-        remove_nested_value(&mut item, path);
+        remove_nested_value(&mut item, path)?;
     }
 
     // Ensure keys are present
@@ -3712,16 +3712,14 @@ fn resolve_set_operand(
 /// The `ValidationException` DynamoDB raises for a document path that cannot be
 /// applied by an update (e.g. indexing a scalar, or a missing intermediate).
 fn invalid_update_path() -> DynoxideError {
-    DynoxideError::ValidationException(
-        "The document path provided in the update expression is invalid for update".to_string(),
-    )
+    DynoxideError::ValidationException(crate::expressions::INVALID_UPDATE_PATH.to_string())
 }
 
 /// Set a value at a document path, navigating both map keys and list indices,
 /// so `SET tags[0] = :v` writes the real list element rather than a literal
 /// `tags[0]` key. A list index at or beyond the end appends, matching DynamoDB.
-/// Intermediate map keys are created if absent, preserving the prior behaviour
-/// for dotted map paths.
+/// Every parent on the way must already exist: a missing map is refused, not
+/// created, the same as in an UpdateItem (eu-west-2, 18 October 2026).
 fn set_nested_value(item: &mut Item, path: &str, val: AttributeValue) -> Result<()> {
     let segments = split_path_segments(path).ok_or_else(invalid_update_path)?;
     let (first, rest) = segments.split_first().ok_or_else(invalid_update_path)?;
@@ -3734,9 +3732,7 @@ fn set_nested_value(item: &mut Item, path: &str, val: AttributeValue) -> Result<
         item.insert(key, val);
         return Ok(());
     }
-    let entry = item
-        .entry(key)
-        .or_insert_with(|| AttributeValue::M(HashMap::new()));
+    let entry = item.get_mut(&key).ok_or_else(invalid_update_path)?;
     set_into_value(entry, rest, val)
 }
 
@@ -3772,12 +3768,10 @@ fn set_into_value(
     }
     match seg {
         PathSegment::Key(k) => match current {
-            AttributeValue::M(map) => {
-                let next = map
-                    .entry((*k).to_string())
-                    .or_insert_with(|| AttributeValue::M(HashMap::new()));
-                set_into_value(next, rest, val)
-            }
+            AttributeValue::M(map) => match map.get_mut(k.as_ref()) {
+                Some(next) => set_into_value(next, rest, val),
+                None => Err(invalid_update_path()),
+            },
             _ => Err(invalid_update_path()),
         },
         PathSegment::Index(i) => match current {
@@ -3792,63 +3786,48 @@ fn set_into_value(
 
 /// Remove the value at a document path, navigating both map keys and list
 /// indices, so `REMOVE tags[0]` deletes the list element (shifting the rest)
-/// rather than a literal `tags[0]` key.
-fn remove_nested_value(item: &mut Item, path: &str) {
-    let Some(segments) = split_path_segments(path) else {
-        return;
-    };
-    let Some((first, rest)) = segments.split_first() else {
-        return;
-    };
+/// rather than a literal `tags[0]` key. A last step that is not there is left
+/// alone; a parent that is missing, or of the wrong type for the step taken
+/// through it, is refused as it is for SET (eu-west-2, 18 October 2026).
+fn remove_nested_value(item: &mut Item, path: &str) -> Result<()> {
+    let segments = split_path_segments(path).ok_or_else(invalid_update_path)?;
+    let (first, rest) = segments.split_first().ok_or_else(invalid_update_path)?;
+    // The top-level item is a map; it cannot be indexed.
     let PathSegment::Key(key) = first else {
-        return; // the top-level item cannot be indexed
+        return Err(invalid_update_path());
     };
     if rest.is_empty() {
         item.remove(key.as_ref());
-        return;
+        return Ok(());
     }
-    if let Some(current) = item.get_mut(key.as_ref()) {
-        remove_from_value(current, rest);
-    }
+    let current = item.get_mut(key.as_ref()).ok_or_else(invalid_update_path)?;
+    remove_from_value(current, rest)
 }
 
-/// Recursive helper for [`remove_nested_value`]. A path that does not exist or
-/// whose type does not match is a no-op, mirroring DynamoDB's tolerant REMOVE.
-fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) {
+/// Recursive helper for [`remove_nested_value`].
+fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) -> Result<()> {
     let (seg, rest) = segments.split_first().expect("segments is non-empty");
     if rest.is_empty() {
-        match seg {
-            PathSegment::Key(k) => {
-                if let AttributeValue::M(map) = current {
-                    map.remove(k.as_ref());
-                }
+        return match (seg, current) {
+            (PathSegment::Key(k), AttributeValue::M(map)) => {
+                map.remove(k.as_ref());
+                Ok(())
             }
-            PathSegment::Index(i) => {
-                if let AttributeValue::L(list) = current
-                    && *i < list.len()
-                {
+            (PathSegment::Index(i), AttributeValue::L(list)) => {
+                if *i < list.len() {
                     list.remove(*i);
                 }
+                Ok(())
             }
-        }
-        return;
+            _ => Err(invalid_update_path()),
+        };
     }
-    match seg {
-        PathSegment::Key(k) => {
-            if let AttributeValue::M(map) = current
-                && let Some(next) = map.get_mut(k.as_ref())
-            {
-                remove_from_value(next, rest);
-            }
-        }
-        PathSegment::Index(i) => {
-            if let AttributeValue::L(list) = current
-                && let Some(next) = list.get_mut(*i)
-            {
-                remove_from_value(next, rest);
-            }
-        }
-    }
+    let next = match (seg, current) {
+        (PathSegment::Key(k), AttributeValue::M(map)) => map.get_mut(k.as_ref()),
+        (PathSegment::Index(i), AttributeValue::L(list)) => list.get_mut(*i),
+        _ => None,
+    };
+    remove_from_value(next.ok_or_else(invalid_update_path)?, rest)
 }
 
 /// Check if an item matches a WHERE clause (with OR-group support).

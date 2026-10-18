@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 - `dynoxide import` reads JSON Lines files named `.jsonl` and `.jsonl.gz`, in a DynamoDB Export directory (`<dir>/<TableName>/data/`) or a flat directory of those files, alongside the `.json` and `.json.gz` parts it already accepted.
 
+### Fixed
+
+- An update no longer builds the path it writes through. A PartiQL `UPDATE ... SET zz.y = 1` on an item with no `zz` created the map and wrote the item; DynamoDB refuses it, and now so does Dynoxide, with `The document path provided in the update expression is invalid for update`. The same goes for `REMOVE`, `ADD` and `DELETE` through a parent that is missing or the wrong type, in PartiQL and in `UpdateItem` alike: `REMOVE zz.y` and `DELETE zz.y :v` were accepted, and `ADD zz.y :v` answered with an operand data-type error instead of the path error. A last step that is absent is still fine where its parent exists, so `REMOVE m.nope` stays a no-op. An `ADD` or `DELETE` whose operand does not fit what is stored is reported ahead of a bad path elsewhere in the same expression.
+
 ## [1.3.0] - 2026-10-10
 
 The crate moves to `dynoxide-rs` 3.0.0: the `expressions` and `partiql`
