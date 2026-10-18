@@ -7,8 +7,8 @@ use crate::errors::{DynoxideError, Result};
 use crate::expressions::condition::compare_values;
 use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
 use crate::partiql::parser::{
-    CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause,
-    WhereCondition,
+    CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetTerm, SetValue, Statement,
+    WhereClause, WhereCondition,
 };
 use crate::partiql::{PathSegment, names_attribute, split_path_segments};
 use crate::storage_backend::StorageBackend;
@@ -3623,84 +3623,105 @@ fn resolve_set_operand(
     match val {
         SetValue::SetCall { .. } => unreachable!("resolve_set_value handles a set call"),
         SetValue::Simple(pv) => resolve_value(pv, parameters),
-        SetValue::Add(attr, pv) => {
-            let current = resolve_nested_path(item, attr);
-            let operand = resolve_value(pv, parameters)?;
-            match (current, &operand) {
-                (Some(AttributeValue::N(cur)), AttributeValue::N(add)) => {
-                    use bigdecimal::BigDecimal;
-                    use std::str::FromStr;
-                    let a = BigDecimal::from_str(cur).map_err(|e| {
-                        DynoxideError::ValidationException(format!("Invalid number: {e}"))
-                    })?;
-                    let b = BigDecimal::from_str(add).map_err(|e| {
-                        DynoxideError::ValidationException(format!("Invalid number: {e}"))
-                    })?;
-                    let result = a + b;
-                    Ok(AttributeValue::N(format_bigdecimal(&result)))
-                }
-                // An attribute that is not there is not read as zero: DynamoDB
-                // refuses the arithmetic (eu-west-2, 18 October 2026).
-                (None, AttributeValue::N(_)) => Err(DynoxideError::ValidationException(
-                    crate::expressions::update::MISSING_ATTRIBUTE.to_string(),
-                )),
-                _ => Err(DynoxideError::ValidationException(
-                    crate::expressions::update::OPERAND_TYPE.to_string(),
-                )),
-            }
-        }
-        SetValue::Sub(attr, pv) => {
-            let current = resolve_nested_path(item, attr);
-            let operand = resolve_value(pv, parameters)?;
-            match (current, &operand) {
-                (Some(AttributeValue::N(cur)), AttributeValue::N(sub)) => {
-                    use bigdecimal::BigDecimal;
-                    use std::str::FromStr;
-                    let a = BigDecimal::from_str(cur).map_err(|e| {
-                        DynoxideError::ValidationException(format!("Invalid number: {e}"))
-                    })?;
-                    let b = BigDecimal::from_str(sub).map_err(|e| {
-                        DynoxideError::ValidationException(format!("Invalid number: {e}"))
-                    })?;
-                    let result = a - b;
-                    Ok(AttributeValue::N(format_bigdecimal(&result)))
-                }
-                (None, AttributeValue::N(_)) => Err(DynoxideError::ValidationException(
-                    crate::expressions::update::MISSING_ATTRIBUTE.to_string(),
-                )),
-                _ => Err(DynoxideError::ValidationException(
-                    crate::expressions::update::OPERAND_TYPE.to_string(),
-                )),
-            }
-        }
+        SetValue::Add(attr, term) => arithmetic(attr, term, item, parameters, "+"),
+        SetValue::Sub(attr, term) => arithmetic(attr, term, item, parameters, "-"),
         SetValue::ListAppend(first, second) => {
-            let a = resolve_value(first, parameters)?;
-            let b = resolve_value(second, parameters)?;
-            // At least one should be a list. If an attribute name was given,
-            // resolve it from the item.
-            let list_a = match &a {
-                AttributeValue::S(name) => resolve_nested_path(item, name)
-                    .cloned()
-                    .unwrap_or(AttributeValue::L(Vec::new())),
-                other => other.clone(),
-            };
-            let list_b = match &b {
-                AttributeValue::S(name) => resolve_nested_path(item, name)
-                    .cloned()
-                    .unwrap_or(AttributeValue::L(Vec::new())),
-                other => other.clone(),
-            };
+            // A literal or parameter of the wrong type is refused before the
+            // item is read, ahead of an attribute that is missing or mistyped.
+            let static_first = literal_of(first, parameters, "list_append", is_list)?;
+            let static_second = literal_of(second, parameters, "list_append", is_list)?;
+            let list_a = static_first.map_or_else(|| attribute_of(first, item, is_list), Ok)?;
+            let list_b = static_second.map_or_else(|| attribute_of(second, item, is_list), Ok)?;
             match (list_a, list_b) {
                 (AttributeValue::L(mut la), AttributeValue::L(lb)) => {
                     la.extend(lb);
                     Ok(AttributeValue::L(la))
                 }
-                _ => Err(DynoxideError::ValidationException(
-                    "list_append requires list operands".to_string(),
-                )),
+                _ => unreachable!("both operands were checked to be lists"),
             }
         }
     }
+}
+
+fn is_list(value: &AttributeValue) -> bool {
+    matches!(value, AttributeValue::L(_))
+}
+
+fn is_number(value: &AttributeValue) -> bool {
+    matches!(value, AttributeValue::N(_))
+}
+
+/// The value of a literal or parameter operand, `None` for an attribute. A
+/// value that `fits` is returned; one that does not is refused as DynamoDB
+/// refuses it, naming the operator and the operand's type.
+fn literal_of(
+    term: &SetTerm,
+    parameters: &[AttributeValue],
+    operator: &str,
+    fits: fn(&AttributeValue) -> bool,
+) -> Result<Option<AttributeValue>> {
+    let SetTerm::Value(value) = term else {
+        return Ok(None);
+    };
+    let value = resolve_value(value, parameters)?;
+    if fits(&value) {
+        return Ok(Some(value));
+    }
+    Err(DynoxideError::ValidationException(format!(
+        "Incorrect operand type for operator or function; operator or function: {operator}, \
+         operand type: {}",
+        value.type_name()
+    )))
+}
+
+/// The value of an attribute operand: refused when the item lacks it, and when
+/// it is not of the type the operator takes.
+fn attribute_of(
+    term: &SetTerm,
+    item: &Item,
+    fits: fn(&AttributeValue) -> bool,
+) -> Result<AttributeValue> {
+    let SetTerm::Path(path) = term else {
+        unreachable!("a value is read by literal_of");
+    };
+    match resolve_nested_path(item, path) {
+        None => Err(DynoxideError::ValidationException(
+            crate::expressions::update::MISSING_ATTRIBUTE.to_string(),
+        )),
+        Some(value) if fits(value) => Ok(value.clone()),
+        Some(_) => Err(DynoxideError::ValidationException(
+            crate::expressions::update::OPERAND_TYPE.to_string(),
+        )),
+    }
+}
+
+/// `attr + term` or `attr - term`, on numbers only.
+fn arithmetic(
+    attr: &str,
+    term: &SetTerm,
+    item: &Item,
+    parameters: &[AttributeValue],
+    operator: &str,
+) -> Result<AttributeValue> {
+    use bigdecimal::BigDecimal;
+    use std::str::FromStr;
+    let literal = literal_of(term, parameters, operator, is_number)?;
+    let left = attribute_of(&SetTerm::Path(attr.to_string()), item, is_number)?;
+    let right = literal.map_or_else(|| attribute_of(term, item, is_number), Ok)?;
+    let (AttributeValue::N(left), AttributeValue::N(right)) = (left, right) else {
+        unreachable!("both operands were checked to be numbers");
+    };
+    let number = |n: &str| {
+        BigDecimal::from_str(n)
+            .map_err(|e| DynoxideError::ValidationException(format!("Invalid number: {e}")))
+    };
+    let (left, right) = (number(&left)?, number(&right)?);
+    let result = if operator == "+" {
+        left + right
+    } else {
+        left - right
+    };
+    Ok(AttributeValue::N(format_bigdecimal(&result)))
 }
 
 /// The `ValidationException` DynamoDB raises for a document path that cannot be

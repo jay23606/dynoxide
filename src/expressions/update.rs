@@ -380,8 +380,8 @@ fn validate_add_type(val: &crate::types::AttributeValue) -> Result<(), String> {
         | AttributeValue::BS(_) => Ok(()),
         _ => Err(format!(
             "Invalid UpdateExpression: Incorrect operand type for operator or function; \
-             operator: ADD, operand type: {}",
-            dynamo_type_name(val)
+             operator: ADD, operand type: {}, typeSet: ALLOWED_FOR_ADD_OPERAND",
+            add_operand_type_name(val)
         )),
     }
 }
@@ -393,20 +393,22 @@ fn validate_delete_type(val: &crate::types::AttributeValue) -> Result<(), String
         AttributeValue::SS(_) | AttributeValue::NS(_) | AttributeValue::BS(_) => Ok(()),
         _ => Err(format!(
             "Invalid UpdateExpression: Incorrect operand type for operator or function; \
-             operator: DELETE, operand type: {}",
-            dynamo_type_name(val)
+             operator: DELETE, operand type: {}, typeSet: ALLOWED_FOR_ADD_OPERAND",
+            add_operand_type_name(val)
         )),
     }
 }
 
-/// Map an AttributeValue to its DynamoDB type name for error messages.
-fn dynamo_type_name(val: &crate::types::AttributeValue) -> &'static str {
+/// How ADD's and DELETE's refusals name an operand's type: spelled out, with
+/// binary as `Binary` (eu-west-2, 18 October 2026). The other operators use the
+/// short codes of `AttributeValue::type_name`.
+fn add_operand_type_name(val: &crate::types::AttributeValue) -> &'static str {
     use crate::types::AttributeValue;
     match val {
         AttributeValue::S(_) => "STRING",
         AttributeValue::N(_) => "NUMBER",
-        AttributeValue::B(_) => "BINARY",
-        AttributeValue::BOOL(_) => "BOOLEAN",
+        AttributeValue::B(_) => "Binary",
+        AttributeValue::BOOL(_) => "BOOL",
         AttributeValue::NULL(_) => "NULL",
         AttributeValue::SS(_) => "SS",
         AttributeValue::NS(_) => "NS",
@@ -448,7 +450,7 @@ fn validate_arithmetic_operand(
                 return Err(format!(
                     "Invalid UpdateExpression: Incorrect operand type for operator or function; \
                      operator or function: {op}, operand type: {}",
-                    dynamo_type_name(val)
+                    val.type_name()
                 ));
             }
             Ok(())
@@ -493,7 +495,7 @@ fn validate_list_append_operand(
             return Err(format!(
                 "Invalid UpdateExpression: Incorrect operand type for operator or function; \
                  operator or function: list_append, operand type: {}",
-                dynamo_type_name(val)
+                val.type_name()
             ));
         }
     }
@@ -823,7 +825,7 @@ fn evaluate_set_operand(
                     a.extend(b);
                     Ok(AttributeValue::L(a))
                 }
-                _ => Err("list_append requires two list operands".to_string()),
+                _ => Err(OPERAND_TYPE.to_string()),
             }
         }
         SetOperand::Group(inner) => evaluate_set_value(inner, item, tracker),

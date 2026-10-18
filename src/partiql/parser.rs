@@ -311,18 +311,27 @@ pub struct SetClause {
     pub value: SetValue,
 }
 
+/// One operand of a SET assignment's arithmetic or `list_append`: an attribute
+/// of the item, written bare, or a value. A quoted string is a value, never an
+/// attribute's name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetTerm {
+    Path(String),
+    Value(PartiqlValue),
+}
+
 /// A value on the right-hand side of a SET assignment.
 /// Supports simple values and binary arithmetic expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetValue {
     /// A simple value (literal or parameter).
     Simple(PartiqlValue),
-    /// `path + value`: add the value to the attribute at path.
-    Add(String, PartiqlValue),
-    /// `path - value`: subtract the value from the attribute at path.
-    Sub(String, PartiqlValue),
-    /// `list_append(path, value)` or `list_append(value, path)`.
-    ListAppend(PartiqlValue, PartiqlValue),
+    /// `path + term`: add the term to the attribute at path.
+    Add(String, SetTerm),
+    /// `path - term`: subtract the term from the attribute at path.
+    Sub(String, SetTerm),
+    /// `list_append(a, b)`, each a list literal, a parameter or an attribute.
+    ListAppend(SetTerm, SetTerm),
     /// `set_add(path, set)` or `set_delete(path, set)`: the set at `path`,
     /// which the call assigns back to, with the members added or removed.
     /// `refusal_at` is where DynamoDB points when the members turn out not to
@@ -1977,12 +1986,12 @@ fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> 
     {
         t.next_token()?; // consume list_append
         expect_char(t, "(")?;
-        let first = parse_value(t, 0)?;
+        let first = parse_set_term(t)?;
         let comma = t.next_token()?.ok_or("Expected ',' in list_append")?;
         if comma != "," {
             return Err(format!("Expected ',' but got '{comma}'"));
         }
-        let second = parse_value(t, 0)?;
+        let second = parse_set_term(t)?;
         expect_char(t, ")")?;
         return Ok(SetValue::ListAppend(first, second));
     }
@@ -1993,7 +2002,7 @@ fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> 
     match t.peek_token()? {
         Some(ref s) if s == "+" => {
             t.next_token()?; // consume +
-            let second = parse_value(t, 0)?;
+            let second = parse_set_term(t)?;
             // The first value should be a path reference (attribute name).
             // In PartiQL, `SET x = x + 1` means add 1 to the current value of x.
             let attr_path = match &first {
@@ -2012,7 +2021,7 @@ fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> 
         }
         Some(ref s) if s == "-" => {
             t.next_token()?; // consume -
-            let second = parse_value(t, 0)?;
+            let second = parse_set_term(t)?;
             let attr_path = match &first {
                 PartiqlValue::Literal(AttributeValue::S(s)) => s.clone(),
                 _ => {
@@ -2024,6 +2033,24 @@ fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> 
             Ok(SetValue::Sub(attr_path, second))
         }
         _ => Ok(SetValue::Simple(first)),
+    }
+}
+
+/// An operand of SET arithmetic or `list_append`. A bare name starts an
+/// attribute; anything else is a value, so `'abc'` is a string and not the
+/// attribute `abc`.
+fn parse_set_term(t: &mut Tokenizer) -> Result<SetTerm, String> {
+    let names_attribute = t.peek_token()?.is_some_and(|tok| {
+        tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && !["TRUE", "FALSE", "NULL"]
+                .iter()
+                .any(|word| tok.eq_ignore_ascii_case(word))
+    });
+    match parse_value(t, 0)? {
+        PartiqlValue::Literal(AttributeValue::S(path)) if names_attribute => {
+            Ok(SetTerm::Path(path))
+        }
+        value => Ok(SetTerm::Value(value)),
     }
 }
 
@@ -6107,7 +6134,9 @@ mod tests {
                         assert_eq!(attr, "count");
                         assert_eq!(
                             val,
-                            &PartiqlValue::Literal(AttributeValue::N("1".to_string()))
+                            &SetTerm::Value(PartiqlValue::Literal(AttributeValue::N(
+                                "1".to_string()
+                            )))
                         );
                     }
                     other => panic!("Expected Add, got {other:?}"),
