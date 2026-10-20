@@ -14,6 +14,36 @@ Dynoxide is an embeddable DynamoDB emulator backed by SQLite. It is designed for
 
 Conformance fixes ship as minor releases, so behaviour moves within a major line. This is the cumulative record: if something answers differently after an upgrade, look here first. `docs/versioning.md` explains the rule and how to pin if you would rather behaviour held still.
 
+### 1.4.0
+
+- **Results change without an error.**
+  - Every clause of an update reads the item as it was, in `UpdateItem` and
+    PartiQL alike: `REMOVE l[0], l[1]` takes out both original elements, a
+    PartiQL `SET s = n + 1` beside `SET n = 7` reads the old `n`, and an
+    `ADD`, `DELETE` or `REMOVE` at an index a list did not reach leaves an
+    element another clause appended alone.
+  - PartiQL `SET zz.y = 1` no longer creates the missing `zz`.
+  - A DELETE that empties a set held in a list element takes the element out at
+    its original index, and appends past the end of a list land in index order.
+  - A parallel `Scan` with `TotalSegments` above 4096 returns each item once,
+    and one that deletes each page as it goes sees its whole segment.
+- **Requests that used to be accepted are now rejected**, matching DynamoDB:
+  - an update through a missing or wrong-typed parent;
+  - PartiQL `REMOVE a, b` (one path per `REMOVE`) and overlapping PartiQL
+    paths;
+  - `Select` of `COUNT`, `ALL_ATTRIBUTES` or `ALL_PROJECTED_ATTRIBUTES` beside
+    `AttributesToGet`, on `Query` and `Scan`;
+  - a `Scan` `Segment` above 999999;
+  - a `Limit` of 0 on `Database::scan`, `Database::query` and the MCP tools.
+- **Requests that used to be refused are now accepted**: a `Limit`, `Segment` or
+  `TotalSegments` past what a 32-bit integer holds, or with a fraction, is read
+  as DynamoDB reads it, saturated and truncated.
+- **Messages move.** `Scan` answers its member checks, attribute values and
+  empty names as DynamoDB's newer validation layer does, which most regions run
+  as of October 2026 (`us-east-1` still runs the older one). `Query` puts its
+  `Select` and projection messages in the `1 validation error detected:`
+  envelope. `SET` arithmetic and `list_append` give DynamoDB's operand errors.
+
 ### 1.1.0
 
 - **`BatchGetItem` with an empty `RequestItems` map answers the standard validation envelope** (`Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1`) in place of a bespoke parameter-required sentence, following AWS. `BatchWriteItem` has not moved and still answers the bespoke sentence, so the two siblings differ.

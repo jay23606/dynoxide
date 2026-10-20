@@ -125,14 +125,12 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
             return Err(serde::de::Error::custom(message));
         }
 
-        // An empty name and a Limit of 0 are the newer validation layer's own
-        // checks, each reported on its own ahead of everything else. A name
-        // error and ReturnConsumedCapacity follow, together; Select waits
-        // until after the expression-mixing check in `execute` (captured
-        // 2026-10-09, six of seven regions).
-        // The two come back together, Limit first (captured 2026-10-09, six of
-        // seven regions). Scan words them the same way where the newer layer
-        // runs it (see `ScanMembers`).
+        // A Limit below 1 and an empty name are the newer validation layer's
+        // own checks, reported together, Limit first, ahead of everything
+        // else. A name error and ReturnConsumedCapacity follow, together;
+        // Select waits until after the expression-mixing check in `execute`
+        // (captured 2026-10-09, six of seven regions). Scan words them the same
+        // way where the newer layer runs it (see `ScanMembers`).
         //
         // With no TableName at all, the request goes to the older layer, which
         // reports every member error together: Select, ReturnConsumedCapacity,

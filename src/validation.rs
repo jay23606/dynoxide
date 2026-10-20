@@ -126,7 +126,7 @@ pub fn table_name_constraint_errors(
 /// 2026-10-09 in at least five of seven regions for each), and Scan since the
 /// newer layer reached most regions (20 of 33 on 2026-10-20). The older layer
 /// gives the `ReadWrite` form, which a Scan still gets when a missing table
-/// name or operator hands its request to that layer.
+/// name or operator, or a coerced integer, hands its request to that layer.
 pub(crate) const EMPTY_TABLE_NAME_REJECTION: &str = "Value at 'TableName' failed to satisfy \
      constraint: Member must have length greater than or equal to 1";
 
@@ -333,14 +333,7 @@ pub(crate) fn reject_bad_capacity_mode(mode: Option<&str>) -> Result<()> {
         None => Ok(()),
     }
 }
-/// The rejection for a `ReturnValues` outside the enum on PutItem, UpdateItem
-/// and DeleteItem: the validation framework's generic form, which names
-/// neither the value nor the member and lists the enum in DynamoDB's own
-/// order, its `UPDATE_NEW` typo included. Captured in eu-west-2, us-east-1 and
-/// two more regions on 2026-10-08; 31 of 33 regions answer this way, and
-/// eu-south-2 and me-central-1 still give the older per-value wording. Which
-/// values are accepted is unchanged: `UPDATED_NEW` is valid, `UPDATE_NEW` is
-/// only the message's spelling.
+
 /// The values `ReturnValues` accepts on a write.
 pub(crate) const RETURN_VALUES: [&str; 5] =
     ["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"];
@@ -349,6 +342,14 @@ pub(crate) const RETURN_VALUES: [&str; 5] =
 /// honour.
 pub(crate) const RETURN_VALUES_NOT_HONOURED: &str = "ReturnValues can only be ALL_OLD or NONE";
 
+/// The rejection for a `ReturnValues` outside the enum on PutItem, UpdateItem
+/// and DeleteItem: the validation framework's generic form, which names
+/// neither the value nor the member and lists the enum in DynamoDB's own
+/// order, its `UPDATE_NEW` typo included. Captured in eu-west-2, us-east-1 and
+/// two more regions on 2026-10-08; 31 of 33 regions answer this way, and
+/// eu-south-2 and me-central-1 still give the older per-value wording. Which
+/// values are accepted is unchanged: `UPDATED_NEW` is valid, `UPDATE_NEW` is
+/// only the message's spelling.
 pub(crate) const RETURN_VALUES_REJECTION: &str = "Failed to satisfy constraint: Member must \
      satisfy enum value set: [ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATE_NEW, NONE]";
 
@@ -365,7 +366,7 @@ pub(crate) fn return_values_value_rejection(value: &str) -> String {
 /// The rejection for a `ConditionalOperator` outside `[OR, AND]`, or `None`
 /// when the value is one DynamoDB accepts. Only the older validation layer
 /// checks it as an enum member, and a Scan reaches that layer only when a
-/// missing table name or operator hands it the request. The newer layer, which
+/// missing table name or operator, or a coerced integer, hands it the request. The newer layer, which
 /// every operation runs on in most regions, never reports the enum; see
 /// [`conditional_operator_misuse`].
 pub(crate) fn conditional_operator_rejection(operator: Option<&str>) -> Option<String> {

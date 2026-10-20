@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes
+
+- `Database::scan` and `Database::query` check a request built in Rust as the
+  HTTP path checks it, so they refuse requests they used to run: a `Limit` of
+  0 on either, and on `Database::scan` a `Select` or `ReturnConsumedCapacity`
+  outside its enum and a `Segment` above 999999. Scan's member errors now come
+  from `Database::scan` rather than from decoding the request, so a
+  `ScanRequest` with a `Select` of `BAD` decodes.
+- For a request built in Rust, an empty `UpdateExpression` comes back as
+  `DynoxideError::EnvelopedValidation` rather than `ValidationException`; the
+  message is unchanged.
+- `dynoxide mcp` refuses `--max-items 0` as it starts, and its `scan` and
+  `query` tools refuse a `limit` of 0, as DynamoDB refuses a `Limit` of 0.
+
 ### Added
 
 - **`server::serve_with_shutdown` stops an embedded HTTP server cleanly.** It
@@ -40,10 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member: it is joined after the other member errors and reported ahead of any
   expression error. UpdateItem puts an empty `UpdateExpression` in the
   `1 validation error detected:` envelope and reports an empty
-  `ConditionExpression` before it. For a request built in Rust, that empty
-  `UpdateExpression` now comes back as `DynoxideError::EnvelopedValidation`
-  rather than `ValidationException`; the message is unchanged.
-
+  `ConditionExpression` before it.
 - `UpdateItem` and PartiQL `UPDATE` refuse a `SET`, `REMOVE`, `ADD` or `DELETE` whose path has a missing or wrong-typed parent: `The document path provided in the update expression is invalid for update`. PartiQL `SET zz.y = 1` no longer creates `zz`.
 - Every clause of an update reads the item as it was before the update, in `UpdateItem` and PartiQL: `REMOVE l[0], l[1]` removes both elements, and `SET n = 7, s = n + 1` gives `s` the old `n` plus one.
 - PartiQL `UPDATE` refuses overlapping paths (`Two document paths overlap with each other`) and takes one path per `REMOVE` keyword, so `REMOVE a, b` is a syntax error.
@@ -54,9 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Scan` refuses `Select` of `COUNT`, `ALL_ATTRIBUTES` or `ALL_PROJECTED_ATTRIBUTES` beside `AttributesToGet`, and answers an empty attribute name in an `ExclusiveStartKey` or an expression value bare.
 - `Scan` words a bad number or a repeated set member in an attribute value as the newer layer does, with no `ExpressionAttributeValues contains invalid value` wrapper.
 - `Scan` reads `Limit`, `Segment` and `TotalSegments` as 32-bit integers that saturate and drop a fraction, so `Limit` 4294967296 is accepted and a negative `TotalSegments` is a validation error rather than a decoding one. It refuses a `Segment` above 999999, checks `Select` of `ALL_ATTRIBUTES` against a keys-only index ahead of the `ExclusiveStartKey`, and on a table with indexes reports an `ExclusiveStartKey` attribute of the wrong type as an index key mismatch.
-- For a `ScanRequest` built in Rust, the member errors now come from `Database::scan`, not from decoding the request, and `Select` of `BAD` decodes.
-- `Query` refuses `Select` of `COUNT`, `ALL_ATTRIBUTES` or `ALL_PROJECTED_ATTRIBUTES` beside `AttributesToGet`, puts its `Cannot specify ...` and `ALL_PROJECTED_ATTRIBUTES` messages in the `1 validation error detected:` envelope, reads `Limit` as `Scan` does, and answers an index key of the wrong type in an `ExclusiveStartKey` with `The provided starting key is invalid`. With no `TableName` it reports a bad `ReturnConsumedCapacity` beside the missing name, and a `QueryRequest` built in Rust with a `Limit` of 0 is refused, ahead of a bad table name as over HTTP.
-- `dynoxide mcp --max-items` refuses 0 as it starts. It used to make every query and scan fail with a `Limit` the agent never sent.
+- `Query` refuses `Select` of `COUNT`, `ALL_ATTRIBUTES` or `ALL_PROJECTED_ATTRIBUTES` beside `AttributesToGet`, puts its `Cannot specify ...` and `ALL_PROJECTED_ATTRIBUTES` messages in the `1 validation error detected:` envelope, reads `Limit` as `Scan` does, and answers an index key of the wrong type in an `ExclusiveStartKey` with `The provided starting key is invalid`. With no `TableName` it reports a bad `ReturnConsumedCapacity` beside the missing name.
 - A parallel `Scan` of a table with `TotalSegments` above 4096 returns each item once. The segments past the last hash bucket used to return almost every item.
 - A parallel `Scan` that deletes each page as it goes sees its whole segment. Once the item its `ExclusiveStartKey` named was deleted, the next page used to come back empty, with no `LastEvaluatedKey`.
 

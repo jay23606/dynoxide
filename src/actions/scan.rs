@@ -111,16 +111,17 @@ impl ScanMembers<'_> {
     /// errors come back together, and a later stage is not reached while an
     /// earlier one has any:
     ///
-    /// 1. A missing table name or a legacy condition with no
-    ///    `ComparisonOperator` hands the request to the older layer, which
-    ///    reports every member error it finds, in its wording and in this
-    ///    order: `Select`, `TotalSegments` (outside 1 to 1000000),
-    ///    `ReturnConsumedCapacity`, the table name (missing or empty),
-    ///    `ConditionalOperator`, the missing operators, `Segment` below 0,
-    ///    `Limit` below 1.
-    /// 2. `Limit`, `Segment`, `TotalSegments` (below 1 or above 1000000) and
-    ///    an empty table name, in the newer wording: the member's name
-    ///    capitalised and the value not echoed.
+    /// 1. A missing table name, a legacy condition with no
+    ///    `ComparisonOperator`, or a `Limit`, `Segment` or `TotalSegments` that
+    ///    saturated or lost a fraction as it was read hands the request to the
+    ///    older layer, which reports every member error it finds, in its
+    ///    wording and in this order: `Select`, `TotalSegments` (outside 1 to
+    ///    1000000), `ReturnConsumedCapacity`, the table name (missing or
+    ///    empty), `ConditionalOperator`, the missing operators, `Segment`
+    ///    (outside 0 to 999999), `Limit` below 1.
+    /// 2. `Limit` below 1, `Segment` outside 0 to 999999, `TotalSegments`
+    ///    outside 1 to 1000000 and an empty table name, in the newer wording:
+    ///    the member's name capitalised and the value not echoed.
     /// 3. The first table-name error beside a `ReturnConsumedCapacity` outside
     ///    its enum.
     ///

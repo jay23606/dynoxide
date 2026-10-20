@@ -2555,50 +2555,6 @@ fn validate_filter_attribute_value(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_rollback_that_found_no_transaction_is_told_apart() {
-        use crate::storage_backend::BackendError;
-        let found_none = |message: &str| {
-            super::rollback_found_no_transaction(&BackendError::Other(message.to_string()))
-        };
-        // As the native backend and the wasm one pass SQLite's message on.
-        assert!(found_none("cannot rollback - no transaction is active"));
-        assert!(found_none(
-            "sqlite-wasm: SQLITE_ERROR: sqlite3 result code 1: cannot rollback - no transaction is active"
-        ));
-        assert!(!found_none("disk I/O error"));
-        assert!(!super::rollback_found_no_transaction(&BackendError::Locked));
-    }
-
-    #[test]
-    fn size_estimate_range_is_whole_gigabytes_around_the_size() {
-        const GB: i64 = 1024 * 1024 * 1024;
-        assert_eq!(super::size_estimate_range_gb(0), vec![0.0, 1.0]);
-        assert_eq!(super::size_estimate_range_gb(1_000), vec![0.0, 1.0]);
-        assert_eq!(super::size_estimate_range_gb(GB - 1), vec![0.0, 1.0]);
-        assert_eq!(super::size_estimate_range_gb(GB), vec![1.0, 2.0]);
-        assert_eq!(super::size_estimate_range_gb(GB * 3 / 2), vec![1.0, 2.0]);
-        assert_eq!(super::size_estimate_range_gb(10 * GB), vec![10.0, 11.0]);
-    }
-
-    /// A legacy `Expected` that doesn't read as conditions is refused in
-    /// DynamoDB's words in every build, a library-only one included: the
-    /// classification no longer depends on the server features.
-    #[test]
-    fn an_unreadable_expected_is_refused_in_dynamodbs_words() {
-        let err = super::read_expected(&serde_json::json!({"guard": {"Value": {}}})).unwrap_err();
-        match err {
-            crate::DynoxideError::ValidationException(message) => assert_eq!(
-                message,
-                "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
-            ),
-            other => panic!("expected a ValidationException, got {other:?}"),
-        }
-    }
-}
-
 /// An integer member as DynamoDB reads it: a 32-bit signed integer that
 /// saturates at either end, truncating a fraction. A value that saturated or
 /// lost a fraction is flagged, because the member is then checked by the older
@@ -2678,4 +2634,48 @@ pub(crate) fn select_projection_rejection(
         (_, None) => return None,
     };
     Some(crate::validation::envelope_message(&msg))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_rollback_that_found_no_transaction_is_told_apart() {
+        use crate::storage_backend::BackendError;
+        let found_none = |message: &str| {
+            super::rollback_found_no_transaction(&BackendError::Other(message.to_string()))
+        };
+        // As the native backend and the wasm one pass SQLite's message on.
+        assert!(found_none("cannot rollback - no transaction is active"));
+        assert!(found_none(
+            "sqlite-wasm: SQLITE_ERROR: sqlite3 result code 1: cannot rollback - no transaction is active"
+        ));
+        assert!(!found_none("disk I/O error"));
+        assert!(!super::rollback_found_no_transaction(&BackendError::Locked));
+    }
+
+    #[test]
+    fn size_estimate_range_is_whole_gigabytes_around_the_size() {
+        const GB: i64 = 1024 * 1024 * 1024;
+        assert_eq!(super::size_estimate_range_gb(0), vec![0.0, 1.0]);
+        assert_eq!(super::size_estimate_range_gb(1_000), vec![0.0, 1.0]);
+        assert_eq!(super::size_estimate_range_gb(GB - 1), vec![0.0, 1.0]);
+        assert_eq!(super::size_estimate_range_gb(GB), vec![1.0, 2.0]);
+        assert_eq!(super::size_estimate_range_gb(GB * 3 / 2), vec![1.0, 2.0]);
+        assert_eq!(super::size_estimate_range_gb(10 * GB), vec![10.0, 11.0]);
+    }
+
+    /// A legacy `Expected` that doesn't read as conditions is refused in
+    /// DynamoDB's words in every build, a library-only one included: the
+    /// classification no longer depends on the server features.
+    #[test]
+    fn an_unreadable_expected_is_refused_in_dynamodbs_words() {
+        let err = super::read_expected(&serde_json::json!({"guard": {"Value": {}}})).unwrap_err();
+        match err {
+            crate::DynoxideError::ValidationException(message) => assert_eq!(
+                message,
+                "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
+            ),
+            other => panic!("expected a ValidationException, got {other:?}"),
+        }
+    }
 }

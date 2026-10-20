@@ -46,6 +46,42 @@ let req = serde_json::from_value(json!({
 let resp = db.query(req).unwrap();
 ```
 
+## Serving HTTP from your own program
+
+With the `http-server` feature (on by default), `server::serve_with_shutdown`
+serves the DynamoDB API on a listener you bind, until a future you supply
+resolves. It then stops accepting, closes idle keep-alive connections, lets
+running requests finish and returns, so the database is released when it does.
+
+```rust
+use dynoxide::Database;
+
+#[tokio::main]
+async fn main() -> Result<(), String> {
+    let db = Database::new("data.db").map_err(|e| e.to_string())?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8000")
+        .await
+        .map_err(|e| e.to_string())?;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+
+    // Hand `stop` to whatever decides when to shut down.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let _ = stop.send(());
+    });
+
+    dynoxide::server::serve_with_shutdown(listener, db, async {
+        let _ = stopped.await;
+    })
+    .await
+}
+```
+
+It installs no signal handler; `server::start` is the one that stops on Ctrl-C
+or SIGTERM. The rustdoc on `serve_with_shutdown` covers what to expect when a
+request never finishes and when a file-backed database's files are deleted
+straight after.
+
 ## Testing with Embedded Mode
 
 Each test gets a fully isolated database with no shared state:
