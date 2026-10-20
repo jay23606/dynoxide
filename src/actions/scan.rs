@@ -22,8 +22,12 @@ struct ScanRequestRaw {
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    #[serde(rename = "Limit", default, deserialize_with = "deserialize_int32")]
-    limit: Option<Int32>,
+    #[serde(
+        rename = "Limit",
+        default,
+        deserialize_with = "helpers::deserialize_int32"
+    )]
+    limit: Option<helpers::Int32>,
     #[serde(rename = "ExclusiveStartKey", default)]
     exclusive_start_key: Option<serde_json::Value>,
     #[serde(rename = "Select", default)]
@@ -36,14 +40,18 @@ struct ScanRequestRaw {
     consistent_read: Option<bool>,
     #[serde(rename = "IndexName", default)]
     index_name: Option<String>,
-    #[serde(rename = "Segment", default, deserialize_with = "deserialize_int32")]
-    segment: Option<Int32>,
+    #[serde(
+        rename = "Segment",
+        default,
+        deserialize_with = "helpers::deserialize_int32"
+    )]
+    segment: Option<helpers::Int32>,
     #[serde(
         rename = "TotalSegments",
         default,
-        deserialize_with = "deserialize_int32"
+        deserialize_with = "helpers::deserialize_int32"
     )]
-    total_segments: Option<Int32>,
+    total_segments: Option<helpers::Int32>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     return_consumed_capacity: Option<String>,
     #[serde(rename = "AttributesToGet", default)]
@@ -75,42 +83,6 @@ pub struct ScanRequest {
     /// Raw JSON for ExclusiveStartKey when deserialized from HTTP request.
     /// Parsed lazily in `execute()` after other validations run.
     pub exclusive_start_key_raw: Option<serde_json::Value>,
-}
-
-/// An integer member as DynamoDB reads it: a 32-bit signed integer that
-/// saturates at either end, truncating a fraction. A value that saturated or
-/// lost a fraction is flagged, because the member is then checked by the older
-/// layer, which reports the value as read (captured eu-west-2 and eu-central-1,
-/// 20 October 2026).
-#[derive(Debug, Clone, Copy)]
-struct Int32 {
-    value: i64,
-    coerced: bool,
-}
-
-fn deserialize_int32<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<Int32>, D::Error> {
-    let Some(number) = Option::<serde_json::Number>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-    let mut fraction = false;
-    let wide = if let Some(i) = number.as_i64() {
-        i128::from(i)
-    } else if let Some(u) = number.as_u64() {
-        i128::from(u)
-    } else {
-        // A fraction truncates toward zero; NaN and the infinities cannot
-        // appear in JSON.
-        let float = number.as_f64().unwrap_or(0.0);
-        fraction = float.fract() != 0.0;
-        float.trunc() as i128
-    };
-    let clamped = wide.clamp(i128::from(i32::MIN), i128::from(i32::MAX));
-    Ok(Some(Int32 {
-        value: clamped as i64,
-        coerced: fraction || clamped != wide,
-    }))
 }
 
 /// The members of a Scan that DynamoDB checks before it reads anything else
@@ -539,8 +511,8 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // Select outside its enum, then Select against the projection members,
-    // each in the envelope, then the parallel-scan members. The range of
+    // Select outside its enum, then Select against the projection members and
+    // the index, each in the envelope, then the parallel-scan members. The range of
     // TotalSegments was settled with the other members above.
     if let Some(msg) = request
         .select
@@ -551,48 +523,13 @@ pub async fn execute<S: StorageBackend>(
             crate::validation::envelope_message(&msg),
         ));
     }
-    if let Some(select) = request.select.as_deref() {
-        let projected = if request.attributes_to_get.is_some() {
-            Some("AttributesToGet")
-        } else if request.projection_expression.is_some() {
-            Some("ProjectionExpression")
-        } else {
-            None
-        };
-        match (select, projected) {
-            ("SPECIFIC_ATTRIBUTES", None) => {
-                return Err(DynoxideError::ValidationException(
-                    crate::validation::envelope_message(
-                        "Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES",
-                    ),
-                ));
-            }
-            ("SPECIFIC_ATTRIBUTES", Some(_)) | (_, None) => {}
-            (select, Some(member)) => {
-                // AWS phrases COUNT as "only the Count"; other values use the literal.
-                let target = if select == "COUNT" {
-                    "only the Count"
-                } else {
-                    select
-                };
-                return Err(DynoxideError::ValidationException(
-                    crate::validation::envelope_message(&format!(
-                        "Cannot specify the {member} when choosing to get {target}"
-                    )),
-                ));
-            }
-        }
-    }
-
-    // ALL_PROJECTED_ATTRIBUTES projects an index, so it requires an IndexName.
-    // AWS keeps the word "Querying" in this message even for Scan; preserve it verbatim.
-    if request.select.as_deref() == Some("ALL_PROJECTED_ATTRIBUTES") && request.index_name.is_none()
-    {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(
-                "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName",
-            ),
-        ));
+    if let Some(msg) = helpers::select_projection_rejection(
+        request.select.as_deref(),
+        request.attributes_to_get.is_some(),
+        request.projection_expression.is_some(),
+        request.index_name.is_some(),
+    ) {
+        return Err(DynoxideError::ValidationException(msg));
     }
 
     match (request.segment, request.total_segments) {

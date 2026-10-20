@@ -2598,3 +2598,84 @@ mod tests {
         }
     }
 }
+
+/// An integer member as DynamoDB reads it: a 32-bit signed integer that
+/// saturates at either end, truncating a fraction. A value that saturated or
+/// lost a fraction is flagged, because the member is then checked by the older
+/// layer, which reports the value as read (captured eu-west-2 and eu-central-1,
+/// 20 October 2026).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Int32 {
+    pub(crate) value: i64,
+    pub(crate) coerced: bool,
+}
+
+pub(crate) fn deserialize_int32<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Int32>, D::Error> {
+    let Some(number) =
+        <Option<serde_json::Number> as serde::Deserialize>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    let mut fraction = false;
+    let wide = if let Some(i) = number.as_i64() {
+        i128::from(i)
+    } else if let Some(u) = number.as_u64() {
+        i128::from(u)
+    } else {
+        // A fraction truncates toward zero; NaN and the infinities cannot
+        // appear in JSON.
+        let float = number.as_f64().unwrap_or(0.0);
+        fraction = float.fract() != 0.0;
+        float.trunc() as i128
+    };
+    let clamped = wide.clamp(i128::from(i32::MIN), i128::from(i32::MAX));
+    Ok(Some(Int32 {
+        value: clamped as i64,
+        coerced: fraction || clamped != wide,
+    }))
+}
+
+/// Select against the projection members and the index, as Query and Scan
+/// both check it on the newer validation layer, in the
+/// `1 validation error detected:` envelope: `SPECIFIC_ATTRIBUTES` needs
+/// `AttributesToGet` or `ProjectionExpression`, any other value refuses both,
+/// and `ALL_PROJECTED_ATTRIBUTES` needs an index (captured eu-west-2,
+/// eu-central-1 and us-east-1 for Query, eu-west-2 and eu-central-1 for Scan,
+/// 20 October 2026). The message keeps "Querying" on a Scan too.
+pub(crate) fn select_projection_rejection(
+    select: Option<&str>,
+    attributes_to_get: bool,
+    projection_expression: bool,
+    index: bool,
+) -> Option<String> {
+    let select = select?;
+    let projected = if attributes_to_get {
+        Some("AttributesToGet")
+    } else if projection_expression {
+        Some("ProjectionExpression")
+    } else {
+        None
+    };
+    let msg = match (select, projected) {
+        ("SPECIFIC_ATTRIBUTES", None) => "Must specify the AttributesToGet or \
+             ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"
+            .to_string(),
+        ("SPECIFIC_ATTRIBUTES", Some(_)) => return None,
+        (select, Some(member)) => {
+            // COUNT is phrased "only the Count"; other values use the literal.
+            let target = if select == "COUNT" {
+                "only the Count"
+            } else {
+                select
+            };
+            format!("Cannot specify the {member} when choosing to get {target}")
+        }
+        ("ALL_PROJECTED_ATTRIBUTES", None) if !index => {
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_string()
+        }
+        (_, None) => return None,
+    };
+    Some(crate::validation::envelope_message(&msg))
+}

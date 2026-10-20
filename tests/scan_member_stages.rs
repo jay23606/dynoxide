@@ -7,7 +7,7 @@
 //! on `gk`; `gsi2`, projecting everything, on `gk2`); eu-central-1 gave the same
 //! on every one.
 //! The layer reached 20 of the 33 observed regions by then, and the code
-//! follows the majority. The requests run in nine rounds, each looking at the
+//! follows the majority. The requests run in ten rounds, each looking at the
 //! order between two stages of the check, or at an edge of one, so the table
 //! is long on purpose. An empty expectation is a request DynamoDB accepts.
 //!
@@ -15,11 +15,11 @@
 //! layer moves again, capture the same requests afresh and replace the tables
 //! whole rather than editing single expectations.
 //!
-//! One request is left out on purpose: a `Limit` past what a 32-bit integer
-//! holds beside `Select` of `SPECIFIC_ATTRIBUTES` with no projection. DynamoDB
-//! puts the whole request on the older layer then, and answers without the
-//! `1 validation error detected:` envelope; Dynoxide applies the older layer to
-//! the member checks only, so it still envelopes the answer.
+//! Requests with a `Limit` that saturates or loses a fraction beside a check
+//! made after the members are left out on purpose. DynamoDB puts such a request
+//! on the older layer whole and answers every later check in its wording;
+//! Dynoxide applies the older layer to the member checks only, which the typed
+//! SDKs cannot reach. The same checks with an ordinary `Limit` are pinned.
 
 #![cfg(feature = "http-server")]
 
@@ -1077,6 +1077,131 @@ const CASES: &[(&str, &str, &str)] = &[
         r##"One or more parameter values were invalid: Type mismatch for Index Key gk Expected: S Actual: N IndexName: gsi"##,
     ),
     (
+        r##"r10 plain SPECIFIC_ATTRIBUTES, no projection"##,
+        r##"{"Select":"SPECIFIC_ATTRIBUTES"}"##,
+        r##"1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"##,
+    ),
+    (
+        r##"r10 plain Select COUNT + AttributesToGet"##,
+        r##"{"Select":"COUNT","AttributesToGet":["a"]}"##,
+        r##"1 validation error detected: Cannot specify the AttributesToGet when choosing to get only the Count"##,
+    ),
+    (
+        r##"r10 plain Select COUNT + ProjectionExpression"##,
+        r##"{"Select":"COUNT","ProjectionExpression":"a"}"##,
+        r##"1 validation error detected: Cannot specify the ProjectionExpression when choosing to get only the Count"##,
+    ),
+    (
+        r##"r10 plain ALL_PROJECTED_ATTRIBUTES, no index"##,
+        r##"{"Select":"ALL_PROJECTED_ATTRIBUTES"}"##,
+        r##"1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"##,
+    ),
+    (
+        r##"r10 plain Segment >= TotalSegments"##,
+        r##"{"Segment":5,"TotalSegments":5}"##,
+        r##"The Segment parameter is zero-based and must be less than parameter TotalSegments"##,
+    ),
+    (
+        r##"r10 plain Segment without TotalSegments"##,
+        r##"{"Segment":0}"##,
+        r##"The TotalSegments parameter is required but was not present in the request when Segment parameter is present"##,
+    ),
+    (
+        r##"r10 plain malformed ExclusiveStartKey"##,
+        r##"{"ExclusiveStartKey":{"bad":{"S":"p"}}}"##,
+        r##"The provided starting key is invalid"##,
+    ),
+    (
+        r##"r10 plain ExclusiveStartKey of the wrong type, indexed table"##,
+        r##"{"ExclusiveStartKey":{"pk":{"N":"1"}}}"##,
+        r##"One or more parameter values were invalid: Type mismatch for Index Key pk Expected: S Actual: N IndexName: gsi"##,
+    ),
+    (
+        r##"r10 plain gsi: index key of the wrong type"##,
+        r##"{"IndexName":"gsi","ExclusiveStartKey":{"pk":{"S":"a"},"gk":{"N":"1"}}}"##,
+        r##"One or more parameter values were invalid: Type mismatch for Index Key gk Expected: S Actual: N IndexName: gsi"##,
+    ),
+    (
+        r##"r10 plain gsi: ALL_ATTRIBUTES on a keys-only index + malformed ExclusiveStartKey"##,
+        r##"{"IndexName":"gsi","Select":"ALL_ATTRIBUTES","ExclusiveStartKey":{"bad":{"S":"p"}}}"##,
+        r##"One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not supported for global secondary index gsi because its projection type is not ALL"##,
+    ),
+    (
+        r##"r10 plain ConditionalOperator AND, no filter"##,
+        r##"{"ConditionalOperator":"AND"}"##,
+        r##"ConditionalOperator cannot be used without Filter or Expected"##,
+    ),
+    (
+        r##"r10 plain ConditionalOperator BOGUS, two-element ScanFilter"##,
+        r##"{"ConditionalOperator":"BOGUS","ScanFilter":{"a":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"x"}]},"b":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"y"}]}}}"##,
+        r##"Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]"##,
+    ),
+    (
+        r##"r10 plain ScanFilter operator BOGUS"##,
+        r##"{"ScanFilter":{"a":{"ComparisonOperator":"BOGUS","AttributeValueList":[{"S":"x"}]}}}"##,
+        r##"One or more parameter values were invalid: Invalid comparison operator"##,
+    ),
+    (
+        r##"r10 plain empty AttributesToGet name"##,
+        r##"{"AttributesToGet":[""]}"##,
+        r##"Empty attribute name"##,
+    ),
+    (
+        r##"r10 plain empty name in ExclusiveStartKey"##,
+        r##"{"ExclusiveStartKey":{"":{"S":"a"}}}"##,
+        r##"Empty attribute name"##,
+    ),
+    (
+        r##"r10 plain empty name in an expression value"##,
+        r##"{"FilterExpression":"a = :v","ExpressionAttributeValues":{":v":{"M":{"":{"S":"x"}}}}}"##,
+        r##"Empty attribute name"##,
+    ),
+    (
+        r##"r10 plain expression and non-expression mixed"##,
+        r##"{"ScanFilter":{"a":{"ComparisonOperator":"EQ","AttributeValueList":[{"S":"x"}]}},"FilterExpression":"a = :v","ExpressionAttributeValues":{":v":{"S":"x"}}}"##,
+        r##"Can not use both expression and non-expression parameters in the same request: Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}"##,
+    ),
+    (
+        r##"r10 plain empty number in an expression value"##,
+        r##"{"FilterExpression":"a = :v","ExpressionAttributeValues":{":v":{"N":""}}}"##,
+        r##"The parameter cannot be converted to a numeric value: "##,
+    ),
+    (
+        r##"r10 plain repeated string set member in an expression value"##,
+        r##"{"FilterExpression":"a = :v","ExpressionAttributeValues":{":v":{"SS":["a","a"]}}}"##,
+        r##"One or more parameter values were invalid: Input collection ["a", "a"] contains duplicates."##,
+    ),
+    (
+        r##"r10 plain ScanFilter empty number"##,
+        r##"{"ScanFilter":{"a":{"ComparisonOperator":"EQ","AttributeValueList":[{"N":""}]}}}"##,
+        r##"The parameter cannot be converted to a numeric value: "##,
+    ),
+    (
+        r##"r10 plain TableName ab"##,
+        r##"{"TableName":"ab"}"##,
+        r##"1 validation error detected: Value 'ab' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"##,
+    ),
+    (
+        r##"r10 plain ReturnConsumedCapacity BOGUS"##,
+        r##"{"ReturnConsumedCapacity":"BOGUS"}"##,
+        r##"1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"##,
+    ),
+    (
+        r##"r10 plain TableName ab + ReturnConsumedCapacity BOGUS"##,
+        r##"{"TableName":"ab","ReturnConsumedCapacity":"BOGUS"}"##,
+        r##"2 validation errors detected: Value 'ab' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3; Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"##,
+    ),
+    (
+        r##"r10 plain invalid FilterExpression syntax"##,
+        r##"{"FilterExpression":"a = = :v","ExpressionAttributeValues":{":v":{"S":"x"}}}"##,
+        r##"Invalid FilterExpression: Syntax error; token: "=", near: "= = :v""##,
+    ),
+    (
+        r##"r10 plain no such index"##,
+        r##"{"IndexName":"nope"}"##,
+        r##"The table does not have the specified index: nope"##,
+    ),
+    (
         r##"TotalSegments 0 with Segment 0"##,
         r##"{"Segment":0,"TotalSegments":0}"##,
         r##"1 validation error detected: Value at 'TotalSegments' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
@@ -1090,7 +1215,7 @@ const CASES: &[(&str, &str, &str)] = &[
 
 #[tokio::test]
 async fn each_request_is_answered_as_the_newer_layer_answers_it() {
-    assert_eq!(CASES.len(), 198, "a case was added or lost");
+    assert_eq!(CASES.len(), 223, "a case was added or lost");
     let url = start_server().await;
     let mut wrong = Vec::new();
     for (case, members, expected) in CASES {

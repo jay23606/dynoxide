@@ -54,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Scan` words a bad number or a repeated set member in an attribute value as the newer layer does, with no `ExpressionAttributeValues contains invalid value` wrapper.
 - `Scan` reads `Limit`, `Segment` and `TotalSegments` as 32-bit integers that saturate and drop a fraction, so `Limit` 4294967296 is accepted and a negative `TotalSegments` is a validation error rather than a decoding one. It refuses a `Segment` above 999999, checks `Select` of `ALL_ATTRIBUTES` against a keys-only index ahead of the `ExclusiveStartKey`, and on a table with indexes reports an `ExclusiveStartKey` attribute of the wrong type as an index key mismatch.
 - For a `ScanRequest` built in Rust, the member errors now come from `Database::scan`, not from decoding the request, and `Select` of `BAD` decodes.
+- `Query` refuses `Select` of `COUNT`, `ALL_ATTRIBUTES` or `ALL_PROJECTED_ATTRIBUTES` beside `AttributesToGet`, puts its `Cannot specify ...` and `ALL_PROJECTED_ATTRIBUTES` messages in the `1 validation error detected:` envelope, reads `Limit` as `Scan` does, and answers an index key of the wrong type in an `ExclusiveStartKey` with `The provided starting key is invalid`.
 
 ## [1.3.0] - 2026-10-10
 
