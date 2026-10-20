@@ -126,16 +126,14 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         // error and ReturnConsumedCapacity follow, together; Select waits
         // until after the expression-mixing check in `execute` (captured
         // 2026-10-09, six of seven regions).
-        // AWS DynamoDB's Query message diverges from Scan: Query omits the rejected
-        // value entirely and capitalises 'Limit', whereas Scan keeps the value and
-        // lowercases 'limit'. Do not collapse these into a shared helper. The two
-        // come back together, Limit first (captured 2026-10-09, six of seven
-        // regions).
+        // The two come back together, Limit first (captured 2026-10-09, six of
+        // seven regions). Scan words them the same way where the newer layer
+        // runs it (see `ScanMembers`).
         //
         // With no TableName at all, a Limit of 0 is joined with the missing
         // name's error, and with a Select outside the enum, which leads. This
-        // form echoes the value and spells the member 'limit' (captured
-        // eu-west-2 and us-east-1, 2026-10-09).
+        // form, which Scan gives too, echoes the value and spells the member
+        // 'limit' (captured eu-west-2 and us-east-1, 2026-10-09).
         if raw.table_name.is_none() && raw.limit == Some(0) {
             let mut errors = Vec::new();
             errors.extend(raw.select.as_deref().and_then(select_rejection));

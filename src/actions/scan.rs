@@ -100,14 +100,21 @@ impl ScanMembers<'_> {
     ///
     /// 1. A missing table name or a legacy condition with no
     ///    `ComparisonOperator` hands the request to the older layer, which
-    ///    reports every member error it finds, in its wording and its order.
-    /// 2. `Limit`, `Segment`, `TotalSegments` and an empty table name, in the
-    ///    newer wording: the member's name capitalised and the value not
-    ///    echoed.
+    ///    reports every member error it finds, in its wording and in this
+    ///    order: `Select`, `TotalSegments` (outside 1 to 1000000),
+    ///    `ReturnConsumedCapacity`, the table name (missing or empty),
+    ///    `ConditionalOperator`, the missing operators, `Segment` below 0,
+    ///    `Limit` below 1.
+    /// 2. `Limit`, `Segment`, `TotalSegments` (below 1 or above 1000000) and
+    ///    an empty table name, in the newer wording: the member's name
+    ///    capitalised and the value not echoed.
     /// 3. The first table-name error beside a `ReturnConsumedCapacity` outside
     ///    its enum.
     ///
-    /// Everything else about the request waits for `execute`.
+    /// Everything else about the request waits for `execute`. The wire path
+    /// asks here as the body is read and `execute` asks again, so a request
+    /// built in code gets the same answer; the one difference is that code
+    /// cannot leave the table name out.
     pub(crate) fn rejection(&self) -> Option<String> {
         use crate::validation::{
             EMPTY_TABLE_NAME_REJECTION, TableNameContext, conditional_operator_rejection,

@@ -5,9 +5,13 @@
 //! Each expectation is the answer eu-west-2 gave on 20 October 2026, a table
 //! with a string hash key named `pk`; eu-central-1 gave the same on every one.
 //! The layer reached 20 of the 33 observed regions by then, and the code
-//! follows the majority. The requests run in four rounds, each looking at the
+//! follows the majority. The requests run in five rounds, each looking at the
 //! order between two stages of the check, so the table is long on purpose.
 //! An empty expectation is a request DynamoDB accepts.
+//!
+//! The tables are data captured from DynamoDB, not written by hand. When the
+//! layer moves again, capture the same requests afresh and replace the tables
+//! whole rather than editing single expectations.
 
 #![cfg(feature = "http-server")]
 
@@ -507,7 +511,7 @@ const CASES: &[(&str, &str, &str)] = &[
         r##"One or more parameter values were invalid: Invalid comparison operator"##,
     ),
     (
-        r##"ReturnConsumedCapacity BOGUS + Select BOGUS + SPECIFIC? (Select BOGUS first)"##,
+        r##"ReturnConsumedCapacity BOGUS + Select BOGUS"##,
         r##"{"ReturnConsumedCapacity":"BOGUS","Select":"BOGUS"}"##,
         r##"1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"##,
     ),
@@ -662,7 +666,7 @@ const CASES: &[(&str, &str, &str)] = &[
         r##"1 validation error detected: Cannot specify the ProjectionExpression when choosing to get only the Count"##,
     ),
     (
-        r##"Select ALL_ATTRIBUTES + ProjectionExpression + Select-free Segment >= TotalSegments"##,
+        r##"ProjectionExpression + Segment >= TotalSegments"##,
         r##"{"ProjectionExpression":"a","Segment":5,"TotalSegments":5}"##,
         r##"The Segment parameter is zero-based and must be less than parameter TotalSegments"##,
     ),
@@ -805,6 +809,7 @@ const CASES: &[(&str, &str, &str)] = &[
 
 #[tokio::test]
 async fn each_request_is_answered_as_the_newer_layer_answers_it() {
+    assert_eq!(CASES.len(), 145, "a case was added or lost");
     let url = start_server().await;
     let mut wrong = Vec::new();
     for (case, members, expected) in CASES {
@@ -896,6 +901,7 @@ const VALUE_CASES: &[(&str, &str, &str)] = &[
 
 #[tokio::test]
 async fn attribute_values_are_read_as_the_newer_layer_reads_them() {
+    assert_eq!(VALUE_CASES.len(), 10, "a case was added or lost");
     let url = start_server().await;
     let mut wrong = Vec::new();
     for (case, members, expected) in VALUE_CASES {
