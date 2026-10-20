@@ -44,8 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UpdateExpression` now comes back as `DynoxideError::EnvelopedValidation`
   rather than `ValidationException`; the message is unchanged.
 
-### Fixed
-
 - `UpdateItem` and PartiQL `UPDATE` refuse a `SET`, `REMOVE`, `ADD` or `DELETE` whose path has a missing or wrong-typed parent: `The document path provided in the update expression is invalid for update`. PartiQL `SET zz.y = 1` no longer creates `zz`.
 - Every clause of an update reads the item as it was before the update, in `UpdateItem` and PartiQL: `REMOVE l[0], l[1]` removes both elements, and `SET n = 7, s = n + 1` gives `s` the old `n` plus one.
 - PartiQL `UPDATE` refuses overlapping paths (`Two document paths overlap with each other`) and takes one path per `REMOVE` keyword, so `REMOVE a, b` is a syntax error.
