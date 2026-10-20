@@ -521,7 +521,7 @@ async fn a_member_constraint_is_reported_ahead_of_a_deep_value() {
     assert_validation(
         status,
         &body,
-        "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1",
+        "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1",
     );
 }
 

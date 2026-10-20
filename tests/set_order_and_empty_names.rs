@@ -884,7 +884,7 @@ async fn reads_refuse_an_empty_name_bare() {
         &url,
         "Scan",
         json!({"TableName": "Tbl", "ExclusiveStartKey": {"pk": {"S": "a"}, "": {"S": "x"}}}),
-        "The provided starting key is invalid: Empty attribute name",
+        EMPTY,
     )
     .await;
     refused(
@@ -900,7 +900,7 @@ async fn reads_refuse_an_empty_name_bare() {
         "Scan",
         json!({"TableName": "Tbl", "FilterExpression": "m = :v",
         "ExpressionAttributeValues": {":v": e}}),
-        "ExpressionAttributeValues contains invalid value: Empty attribute name for key :v",
+        EMPTY,
     )
     .await;
 
@@ -1139,12 +1139,12 @@ async fn partiql_refuses_a_parameter_holding_an_empty_name() {
     assert_eq!(pks.len(), 2, "only a and b2 exist: {pks:?}");
 }
 
-// A Scan's ConditionalOperator outside its enum is a member check, reported
-// ahead of an empty attribute name. The wire path checks it as the request is
-// read; a request an embedded caller builds skips that, so `scan` checks it
-// before the empty name too.
+// A Scan's empty attribute name is reported ahead of a ConditionalOperator that
+// doesn't fit the request, as the wire path reports it (eu-west-2 and
+// eu-central-1, 2026-10-20), and a request an embedded caller builds gets the
+// same answer.
 #[test]
-fn an_embedded_scan_reports_a_bad_conditional_operator_ahead_of_an_empty_name() {
+fn an_embedded_scan_reports_an_empty_attribute_name_ahead_of_a_bad_conditional_operator() {
     let db = Database::memory().unwrap();
     db.create_table(
         serde_json::from_value(json!({
@@ -1165,8 +1165,5 @@ fn an_embedded_scan_reports_a_bad_conditional_operator_ahead_of_an_empty_name() 
         })
         .unwrap_err()
         .to_string();
-    assert_eq!(
-        err,
-        "1 validation error detected: Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]"
-    );
+    assert_eq!(err, "Empty attribute name");
 }

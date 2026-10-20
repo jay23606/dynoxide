@@ -100,7 +100,7 @@ fn test_total_segments_zero_rejected() {
     let err = db.scan(scan_req("Tbl", Some(0), Some(0))).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("totalSegments") && msg.contains("between 1 and 1000000"),
+        msg == "1 validation error detected: Value at 'TotalSegments' failed to satisfy constraint: Member must have value greater than or equal to 1",
         "unexpected error: {msg}"
     );
 }

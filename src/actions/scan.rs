@@ -20,11 +20,7 @@ struct ScanRequestRaw {
     projection_expression: Option<String>,
     #[serde(rename = "ExpressionAttributeNames", default)]
     expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(
-        rename = "ExpressionAttributeValues",
-        default,
-        deserialize_with = "crate::types::deserialize_older_expression_values"
-    )]
+    #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[serde(rename = "Limit", default)]
     limit: Option<usize>,
@@ -80,13 +76,140 @@ pub struct ScanRequest {
     pub exclusive_start_key_raw: Option<serde_json::Value>,
 }
 
+/// The members of a Scan that DynamoDB checks before it reads anything else
+/// about the request, and what it says when one fails. Captured in eu-west-2
+/// and eu-central-1 (20 October 2026), where the newer validation layer runs
+/// Scan, as it does in 20 of the 33 observed regions.
+pub(crate) struct ScanMembers<'a> {
+    pub table_name: Option<&'a str>,
+    pub select: Option<&'a str>,
+    pub return_consumed_capacity: Option<&'a str>,
+    pub conditional_operator: Option<&'a str>,
+    pub scan_filter: Option<&'a serde_json::Value>,
+    pub limit: Option<i64>,
+    pub segment: Option<i64>,
+    pub total_segments: Option<i64>,
+}
+
+const TOTAL_SEGMENTS_MAX: i64 = 1_000_000;
+
+impl ScanMembers<'_> {
+    /// The message for the first stage with an error, or `None`. A stage's
+    /// errors come back together, and a later stage is not reached while an
+    /// earlier one has any:
+    ///
+    /// 1. A missing table name or a legacy condition with no
+    ///    `ComparisonOperator` hands the request to the older layer, which
+    ///    reports every member error it finds, in its wording and its order.
+    /// 2. `Limit`, `Segment`, `TotalSegments` and an empty table name, in the
+    ///    newer wording: the member's name capitalised and the value not
+    ///    echoed.
+    /// 3. The first table-name error beside a `ReturnConsumedCapacity` outside
+    ///    its enum.
+    ///
+    /// Everything else about the request waits for `execute`.
+    pub(crate) fn rejection(&self) -> Option<String> {
+        use crate::validation::{
+            EMPTY_TABLE_NAME_REJECTION, TableNameContext, conditional_operator_rejection,
+            first_table_name_error, format_validation_errors, return_consumed_capacity_rejection,
+            table_name_constraint_errors,
+        };
+
+        let missing_operators =
+            helpers::missing_comparison_operators(self.scan_filter, "scanFilter");
+        if self.table_name.is_none() || !missing_operators.is_empty() {
+            let mut errors = Vec::new();
+            errors.extend(self.select.and_then(super::query::select_rejection));
+            if let Some(total) = self.total_segments {
+                if total < 1 {
+                    errors.push(format!(
+                        "Value '{total}' at 'totalSegments' failed to satisfy constraint: \
+                         Member must have value greater than or equal to 1"
+                    ));
+                } else if total > TOTAL_SEGMENTS_MAX {
+                    errors.push(format!(
+                        "Value '{total}' at 'totalSegments' failed to satisfy constraint: \
+                         Member must have value less than or equal to {TOTAL_SEGMENTS_MAX}"
+                    ));
+                }
+            }
+            errors.extend(return_consumed_capacity_rejection(
+                self.return_consumed_capacity,
+            ));
+            if matches!(self.table_name, None | Some("")) {
+                errors.extend(table_name_constraint_errors(
+                    self.table_name,
+                    TableNameContext::ReadWrite,
+                ));
+            }
+            errors.extend(conditional_operator_rejection(self.conditional_operator));
+            errors.extend(missing_operators);
+            if let Some(segment) = self.segment.filter(|s| *s < 0) {
+                errors.push(format!(
+                    "Value '{segment}' at 'segment' failed to satisfy constraint: \
+                     Member must have value greater than or equal to 0"
+                ));
+            }
+            if self.limit.is_some_and(|l| l < 1) {
+                errors.push(
+                    "Value '0' at 'limit' failed to satisfy constraint: \
+                     Member must have value greater than or equal to 1"
+                        .to_string(),
+                );
+            }
+            return format_validation_errors(&errors);
+        }
+
+        let mut errors = Vec::new();
+        if self.limit.is_some_and(|l| l < 1) {
+            errors.push(
+                "Value at 'Limit' failed to satisfy constraint: \
+                 Member must have value greater than or equal to 1"
+                    .to_string(),
+            );
+        }
+        if self.segment.is_some_and(|s| s < 0) {
+            errors.push(
+                "Value at 'Segment' failed to satisfy constraint: \
+                 Member must have value greater than or equal to 0"
+                    .to_string(),
+            );
+        }
+        if let Some(total) = self.total_segments {
+            if total < 1 {
+                errors.push(
+                    "Value at 'TotalSegments' failed to satisfy constraint: \
+                     Member must have value greater than or equal to 1"
+                        .to_string(),
+                );
+            } else if total > TOTAL_SEGMENTS_MAX {
+                errors.push(format!(
+                    "Value at 'TotalSegments' failed to satisfy constraint: \
+                     Member must have value less than or equal to {TOTAL_SEGMENTS_MAX}"
+                ));
+            }
+        }
+        if self.table_name == Some("") {
+            errors.push(EMPTY_TABLE_NAME_REJECTION.to_string());
+        }
+        if let Some(msg) = format_validation_errors(&errors) {
+            return Some(msg);
+        }
+
+        let mut errors = Vec::new();
+        errors.extend(self.table_name.and_then(first_table_name_error));
+        errors.extend(return_consumed_capacity_rejection(
+            self.return_consumed_capacity,
+        ));
+        format_validation_errors(&errors)
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for ScanRequest {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw = ScanRequestRaw::deserialize(deserializer)?;
-        use crate::validation::format_validation_errors;
-
         // A BOOL or NULL in a legacy condition, or its `Exists`, that doesn't
         // read as a boolean makes the whole request malformed, ahead of
         // everything else.
@@ -94,93 +217,19 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             return Err(serde::de::Error::custom(message));
         }
 
-        // Scan still runs on the older validation layer in most regions (six
-        // of seven, 2026-10-09). Its member errors come back together in the
-        // order Select, ReturnConsumedCapacity, ConditionalOperator, Limit,
-        // Segment, with a missing or empty table name last. Any other table
-        // name error is reported only when none of those fired.
-        let mut errors = Vec::new();
-
-        // Select enum
-        if let Some(ref sel) = raw.select
-            && ![
-                "ALL_ATTRIBUTES",
-                "ALL_PROJECTED_ATTRIBUTES",
-                "COUNT",
-                "SPECIFIC_ATTRIBUTES",
-            ]
-            .contains(&sel.as_str())
-        {
-            errors.push(format!(
-                "Value '{}' at 'select' failed to satisfy constraint: \
-                 Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]",
-                sel
-            ));
-        }
-
-        // ReturnConsumedCapacity enum
-        if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
-            raw.return_consumed_capacity.as_deref(),
-        ) {
-            errors.push(msg);
-        }
-
-        // ConditionalOperator enum, which only this layer checks.
-        if let Some(msg) =
-            crate::validation::conditional_operator_rejection(raw.conditional_operator.as_deref())
-        {
-            errors.push(msg);
-        }
-
-        // Limit must be >= 1.
-        // AWS DynamoDB's Scan message diverges from Query: Scan keeps the rejected
-        // value and lowercases 'limit', whereas Query omits the value and uses
-        // capital 'Limit'. Do not collapse these into a shared helper.
-        if let Some(limit) = raw.limit
-            && limit == 0
-        {
-            errors.push(
-                "Value '0' at 'limit' failed to satisfy constraint: \
-                     Member must have value greater than or equal to 1"
-                    .to_string(),
-            );
-        }
-
-        // Segment must be >= 0. (Segment vs TotalSegments and the TotalSegments
-        // range are checked in execute().)
-        if let Some(segment) = raw.segment
-            && segment < 0
-        {
-            errors.push(format!(
-                "Value '{}' at 'segment' failed to satisfy constraint: \
-                     Member must have value greater than or equal to 0",
-                segment
-            ));
-        }
-
-        // A ScanFilter condition with no ComparisonOperator. Captured alone
-        // in four regions (2026-10-10); its place among the other member
-        // errors is inferred.
-        errors.extend(helpers::missing_comparison_operators(
-            raw.scan_filter.as_ref(),
-            "scanFilter",
-        ));
-
-        match raw.table_name.as_deref() {
-            None | Some("") => errors.extend(crate::validation::table_name_constraint_errors(
-                raw.table_name.as_deref(),
-                crate::validation::TableNameContext::ReadWrite,
-            )),
-            Some(_) => {}
-        }
-
-        if let Some(msg) = format_validation_errors(&errors) {
-            return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
-        }
-
-        if let Some(name) = raw.table_name.as_deref()
-            && let Some(msg) =
-                format_validation_errors(&crate::validation::scan_table_name_errors(name))
+        // The members DynamoDB checks before it reads anything else, in
+        // the stages `ScanMembers::rejection` describes.
+        if let Some(msg) = (ScanMembers {
+            table_name: raw.table_name.as_deref(),
+            select: raw.select.as_deref(),
+            return_consumed_capacity: raw.return_consumed_capacity.as_deref(),
+            conditional_operator: raw.conditional_operator.as_deref(),
+            scan_filter: raw.scan_filter.as_ref(),
+            limit: raw.limit.and_then(|l| i64::try_from(l).ok()),
+            segment: raw.segment,
+            total_segments: raw.total_segments.map(i64::from),
+        })
+        .rejection()
         {
             return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
         }
@@ -232,52 +281,46 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     mut request: ScanRequest,
 ) -> Result<ScanResponse> {
-    // Validate table name format before checking existence (DynamoDB validates input first)
-    crate::validation::validate_scan_table_name(&request.table_name)?;
-
-    // ConditionalOperator outside its enum is a member check, reported ahead of
-    // the value checks. The wire path refuses it as the request is read; this
-    // covers a request an embedded caller builds (captured 2026-10-09, six of
-    // seven regions).
-    if let Some(msg) =
-        crate::validation::conditional_operator_rejection(request.conditional_operator.as_deref())
+    // The request's own members, as the wire path checks them when it reads the
+    // body: a request built in code gets the same answer.
+    if let Some(msg) = (ScanMembers {
+        table_name: Some(&request.table_name),
+        select: request.select.as_deref(),
+        return_consumed_capacity: request.return_consumed_capacity.as_deref(),
+        conditional_operator: request.conditional_operator.as_deref(),
+        scan_filter: request.scan_filter.as_ref(),
+        limit: request.limit.and_then(|l| i64::try_from(l).ok()),
+        segment: request.segment.map(i64::from),
+        total_segments: request.total_segments.map(i64::from),
+    })
+    .rejection()
     {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&msg),
-        ));
+        return Err(DynoxideError::ValidationException(msg));
     }
 
     // An empty attribute name is refused ahead of the table lookup and the
-    // expressions (captured in ten regions). AttributesToGet and a ScanFilter
-    // value answer bare; the ExclusiveStartKey and the expression values name
-    // what they are, as seven of the ten regions do (eu-west-2, eu-central-1 and
-    // ap-southeast-2 answer bare). An empty name in ScanFilter itself is accepted.
+    // expressions, bare whichever member holds it: 20 of 33 regions answer so
+    // for the ExclusiveStartKey and the expression values (2026-10-20); the
+    // other 13 name what they are. An empty name in ScanFilter itself is
+    // accepted.
     if crate::empty_names::names_include_empty(request.attributes_to_get.as_ref())
         || crate::empty_names::filter_values_have_empty_name(request.scan_filter.as_ref())
-    {
-        return Err(crate::empty_names::bare());
-    }
-    if request
-        .exclusive_start_key
-        .as_ref()
-        .is_some_and(crate::empty_names::map_has_empty_name)
+        || request
+            .exclusive_start_key
+            .as_ref()
+            .is_some_and(crate::empty_names::map_has_empty_name)
         || request
             .exclusive_start_key_raw
             .as_ref()
             .is_some_and(crate::empty_names::json_map_has_empty_name)
     {
-        return Err(DynoxideError::ValidationException(format!(
-            "The provided starting key is invalid: {}",
-            crate::empty_names::MESSAGE
-        )));
+        return Err(crate::empty_names::bare());
     }
     crate::empty_names::check_names(request.expression_attribute_names.as_ref())?;
-    if let Some(key) =
-        crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
+    if crate::empty_names::value_placeholder(request.expression_attribute_values.as_ref(), None)
+        .is_some()
     {
-        return Err(DynoxideError::ValidationException(
-            crate::empty_names::value_placeholder_message(key),
-        ));
+        return Err(crate::empty_names::bare());
     }
 
     // ---- Expression vs non-expression mixing validation ----
@@ -309,7 +352,7 @@ pub async fn execute<S: StorageBackend>(
             expression_attribute_names: &request.expression_attribute_names,
             expression_attribute_values: &request.expression_attribute_values,
             expression_attribute_values_raw: &no_raw_eav,
-            layer: crate::validation::ValueLayer::Older,
+            layer: crate::validation::ValueLayer::Current,
         };
         helpers::validate_expression_params(&ctx)?;
     }
@@ -330,7 +373,7 @@ pub async fn execute<S: StorageBackend>(
     helpers::validate_filter_conditions_raw(
         request.scan_filter.as_ref(),
         "ScanFilter",
-        crate::validation::ValueLayer::Older,
+        crate::validation::ValueLayer::Current,
     )?;
 
     // ---- Validate filter argument counts and type compatibility ----
@@ -345,7 +388,7 @@ pub async fn execute<S: StorageBackend>(
     let exclusive_start_key = if let Some(ref esk_val) = request.exclusive_start_key_raw {
         Some(helpers::parse_exclusive_start_key(
             esk_val,
-            crate::validation::ValueLayer::Older,
+            crate::validation::ValueLayer::Current,
         )?)
     } else {
         request.exclusive_start_key.clone()
@@ -356,7 +399,7 @@ pub async fn execute<S: StorageBackend>(
     let scan_filter: Option<HashMap<String, helpers::FilterCondition>> =
         match request.scan_filter.as_ref() {
             Some(sf_val) if request.filter_expression.is_none() && !sf_val.is_null() => Some(
-                helpers::read_legacy_conditions(sf_val, crate::validation::ValueLayer::Older)?,
+                helpers::read_legacy_conditions(sf_val, crate::validation::ValueLayer::Current)?,
             ),
             _ => None,
         };
@@ -376,35 +419,6 @@ pub async fn execute<S: StorageBackend>(
                 .get_or_insert_with(HashMap::new);
             expr_names.extend(converted.attribute_names);
         }
-    }
-
-    // Validate parallel scan parameters (before table existence check)
-    match (request.segment, request.total_segments) {
-        (Some(segment), Some(total)) => {
-            if !(1..=1_000_000).contains(&total) {
-                return Err(DynoxideError::ValidationException(
-                    "1 validation error detected: Value at 'totalSegments' failed to satisfy constraint: \
-                     Member must have value between 1 and 1000000".to_string(),
-                ));
-            }
-            if segment >= total {
-                return Err(DynoxideError::ValidationException(format!(
-                    "The Segment parameter is zero-based and must be less than parameter TotalSegments: Segment: {} is not less than TotalSegments: {}",
-                    segment, total
-                )));
-            }
-        }
-        (Some(_), None) => {
-            return Err(DynoxideError::ValidationException(
-                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present".to_string(),
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(DynoxideError::ValidationException(
-                "The Segment parameter is required but was not present in the request when parameter TotalSegments is present".to_string(),
-            ));
-        }
-        (None, None) => {}
     }
 
     // ---- Validate FilterExpression and ProjectionExpression BEFORE table existence ----
@@ -456,31 +470,49 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet
-    if request.select.as_deref() == Some("SPECIFIC_ATTRIBUTES")
-        && request.projection_expression.is_none()
-        && request.attributes_to_get.is_none()
+    // Select outside its enum, then Select against the projection members,
+    // each in the envelope, then the parallel-scan members. The range of
+    // TotalSegments was settled with the other members above.
+    if let Some(msg) = request
+        .select
+        .as_deref()
+        .and_then(super::query::select_rejection)
     {
         return Err(DynoxideError::ValidationException(
-            "Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"
-                .to_string(),
+            crate::validation::envelope_message(&msg),
         ));
     }
-
-    // A ProjectionExpression is only valid with Select = SPECIFIC_ATTRIBUTES.
-    if request.projection_expression.is_some()
-        && let Some(select) = request.select.as_deref()
-        && select != "SPECIFIC_ATTRIBUTES"
-    {
-        // AWS phrases COUNT as "only the Count"; other values use the literal.
-        let target = if select == "COUNT" {
-            "only the Count"
+    if let Some(select) = request.select.as_deref() {
+        let projected = if request.attributes_to_get.is_some() {
+            Some("AttributesToGet")
+        } else if request.projection_expression.is_some() {
+            Some("ProjectionExpression")
         } else {
-            select
+            None
         };
-        return Err(DynoxideError::ValidationException(format!(
-            "Cannot specify the ProjectionExpression when choosing to get {target}"
-        )));
+        match (select, projected) {
+            ("SPECIFIC_ATTRIBUTES", None) => {
+                return Err(DynoxideError::ValidationException(
+                    crate::validation::envelope_message(
+                        "Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES",
+                    ),
+                ));
+            }
+            ("SPECIFIC_ATTRIBUTES", Some(_)) | (_, None) => {}
+            (select, Some(member)) => {
+                // AWS phrases COUNT as "only the Count"; other values use the literal.
+                let target = if select == "COUNT" {
+                    "only the Count"
+                } else {
+                    select
+                };
+                return Err(DynoxideError::ValidationException(
+                    crate::validation::envelope_message(&format!(
+                        "Cannot specify the {member} when choosing to get {target}"
+                    )),
+                ));
+            }
+        }
     }
 
     // ALL_PROJECTED_ATTRIBUTES projects an index, so it requires an IndexName.
@@ -488,9 +520,30 @@ pub async fn execute<S: StorageBackend>(
     if request.select.as_deref() == Some("ALL_PROJECTED_ATTRIBUTES") && request.index_name.is_none()
     {
         return Err(DynoxideError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
-                .to_string(),
+            crate::validation::envelope_message(
+                "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName",
+            ),
         ));
+    }
+
+    match (request.segment, request.total_segments) {
+        (Some(segment), Some(total)) if segment >= total => {
+            return Err(DynoxideError::ValidationException(
+                "The Segment parameter is zero-based and must be less than parameter TotalSegments"
+                    .to_string(),
+            ));
+        }
+        (Some(_), None) => {
+            return Err(DynoxideError::ValidationException(
+                "The TotalSegments parameter is required but was not present in the request when Segment parameter is present".to_string(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(DynoxideError::ValidationException(
+                "The Segment parameter is required but was not present in the request when parameter TotalSegments is present".to_string(),
+            ));
+        }
+        _ => {}
     }
 
     let meta = helpers::require_table_for_item_op(storage, &request.table_name).await?;
@@ -553,11 +606,7 @@ pub async fn execute<S: StorageBackend>(
     // ---- Validate ExclusiveStartKey structure against key schema ----
     // Stage 1+2: count check + index key type check
     if let Some(ref esk) = exclusive_start_key {
-        let count_msg = if request.index_name.is_some() {
-            "The provided starting key is invalid"
-        } else {
-            "The provided starting key is invalid: The provided key element does not match the schema"
-        };
+        let count_msg = "The provided starting key is invalid";
         helpers::validate_esk_count_and_index_keys(
             esk,
             &meta,
@@ -588,7 +637,8 @@ pub async fn execute<S: StorageBackend>(
 
     // Stage 3: table key type check
     if let Some(ref esk) = exclusive_start_key {
-        helpers::validate_esk_table_keys(esk, &meta)?;
+        helpers::validate_esk_table_keys(esk, &meta)
+            .map_err(super::query::bare_start_key_mismatch)?;
     }
 
     // Extract ExclusiveStartKey pk/sk using effective key names

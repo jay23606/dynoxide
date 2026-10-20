@@ -123,8 +123,10 @@ pub fn table_name_constraint_errors(
 /// The newer validation layer's answer for an empty table name: no value echo,
 /// the member spelled `TableName`, reported on its own. PutItem, UpdateItem,
 /// DeleteItem, GetItem, Query and SearchVectors give it (captured on
-/// 2026-10-09 in at least five of seven regions for each); Scan, still on the
-/// older layer in most regions, gives the `ReadWrite` form instead.
+/// 2026-10-09 in at least five of seven regions for each), and Scan since the
+/// newer layer reached most regions (20 of 33 on 2026-10-20). The older layer
+/// gives the `ReadWrite` form, which a Scan still gets when a missing table
+/// name or operator hands its request to that layer.
 pub(crate) const EMPTY_TABLE_NAME_REJECTION: &str = "Value at 'TableName' failed to satisfy \
      constraint: Member must have length greater than or equal to 1";
 
@@ -211,35 +213,6 @@ pub(crate) fn update_item_table_name_errors(table_name: Option<&str>) -> Vec<Str
     errors
 }
 
-/// Scan's table-name errors in the older layer most regions still run it on:
-/// an empty name in the `ReadWrite` form, and otherwise every constraint the
-/// name breaks, the length before the pattern (captured 2026-10-09, six of
-/// seven regions).
-pub(crate) fn scan_table_name_errors(name: &str) -> Vec<String> {
-    if name.is_empty() {
-        return table_name_constraint_errors(Some(name), TableNameContext::ReadWrite);
-    }
-    let mut errors = Vec::new();
-    if name.len() < 3 {
-        errors.push(short_table_name_error(name));
-    } else if name.len() > 255 {
-        errors.push(long_table_name_error(name));
-    }
-    if !table_name_pattern_holds(name) {
-        errors.push(table_name_pattern_error(name));
-    }
-    errors
-}
-
-/// [`validate_table_name`] for Scan, so a request built in Rust gets the same
-/// answer as one decoded from a body.
-pub(crate) fn validate_scan_table_name(name: &str) -> Result<()> {
-    match format_validation_errors(&scan_table_name_errors(name)) {
-        Some(msg) => Err(DynoxideError::ValidationException(msg)),
-        None => Ok(()),
-    }
-}
-
 /// The rejection for a `ReturnValuesOnConditionCheckFailure` outside
 /// `[ALL_OLD, NONE]`, at `path`: `returnValuesOnConditionCheckFailure` on the
 /// single-item operations and `ExecuteStatement`, `transactItems.N.member.<action>.`
@@ -267,7 +240,8 @@ pub(crate) fn return_values_on_condition_check_failure_rejection(
 /// `Expected`, `QueryFilter` or `ScanFilter`. The newer layer checks nothing
 /// else about it, so an unknown value is refused here too (captured
 /// 2026-10-09: PutItem, UpdateItem, DeleteItem and Query in at least five of
-/// seven regions, Scan in all seven for a valid value).
+/// seven regions, Scan in all seven for a valid value and, since 2026-10-20, in
+/// the 20 of 33 regions on the newer layer for any value).
 pub(crate) fn conditional_operator_misuse(
     operator: Option<&str>,
     conditions: usize,
@@ -389,10 +363,11 @@ pub(crate) fn return_values_value_rejection(value: &str) -> String {
 }
 
 /// The rejection for a `ConditionalOperator` outside `[OR, AND]`, or `None`
-/// when the value is one DynamoDB accepts. Only Scan checks it as an enum
-/// member: it is still on the older validation layer in most regions (six of
-/// seven, 2026-10-09). The newer layer, which the other operations run on in
-/// most regions, never reports the enum; see [`conditional_operator_misuse`].
+/// when the value is one DynamoDB accepts. Only the older validation layer
+/// checks it as an enum member, and a Scan reaches that layer only when a
+/// missing table name or operator hands it the request. The newer layer, which
+/// every operation runs on in most regions, never reports the enum; see
+/// [`conditional_operator_misuse`].
 pub(crate) fn conditional_operator_rejection(operator: Option<&str>) -> Option<String> {
     let operator = operator?;
     if ["OR", "AND"].contains(&operator) {
@@ -1397,18 +1372,19 @@ fn validate_key_attr_value(
 /// Which of DynamoDB's two attribute-value validation layers an operation
 /// runs. They word a number they can't read, and a set with a repeated member,
 /// differently. Captured in eu-west-2, us-east-1, eu-west-1 and us-west-2,
-/// 2026-10-09; where the regions split (transactions and Scan, which eu-west-2
-/// already runs on the current layer), the majority's layer is used.
+/// 2026-10-09; where the regions split (the transactions, which eu-west-2
+/// already runs on the current layer, and Scan, which 19 of 33 regions read on
+/// it by 2026-10-20), the majority's layer is used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ValueLayer {
     /// PutItem, UpdateItem and DeleteItem (inside the envelope), and GetItem,
-    /// BatchGetItem and Query (bare). Numbers by the stored-number rule, an
+    /// BatchGetItem, Query and Scan (bare). Numbers by the stored-number rule, an
     /// empty one ending `: `; duplicates quoted, in the order described at
     /// [`duplicate_set_message`]; expression values with no
     /// `ExpressionAttributeValues contains invalid value` wrapper.
     Current,
-    /// BatchWriteItem, TransactWriteItems, TransactGetItems, Scan and the
-    /// PartiQL operations. Numbers as Java's `BigDecimal` reads them, an empty
+    /// BatchWriteItem, TransactWriteItems, TransactGetItems and the PartiQL
+    /// operations. Numbers as Java's `BigDecimal` reads them, an empty
     /// one with no colon; duplicates unquoted, as sent; expression values
     /// inside the wrapper.
     Older,
@@ -1423,7 +1399,6 @@ impl ValueLayer {
             "BatchWriteItem"
             | "TransactWriteItems"
             | "TransactGetItems"
-            | "Scan"
             | "ExecuteStatement"
             | "BatchExecuteStatement"
             | "ExecuteTransaction" => Self::Older,

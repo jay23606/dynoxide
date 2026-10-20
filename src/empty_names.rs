@@ -12,15 +12,15 @@
 //! is the wrapping. PutItem, UpdateItem and DeleteItem put it inside the
 //! validation envelope. An ExpressionAttributeNames entry is reported as
 //! "ExpressionAttributeNames contains invalid value: Empty attribute name for key
-//! #n". Scan and the condition values of a TransactWriteItems action name the
-//! ExpressionAttributeValues key, and Scan's ExclusiveStartKey carries the
-//! starting-key prefix.
+//! #n". The condition values of a TransactWriteItems action name the
+//! ExpressionAttributeValues key.
 //!
 //! Captured in eu-west-2 and us-east-1 on 9 October 2026, and in ten regions for
 //! the shapes the two disagreed on. Where they split, Dynoxide follows the
-//! majority: for Scan's ExpressionAttributeValues (7 of 10) and ExclusiveStartKey
-//! (7 of 10), and for a transaction's condition values (8 of 10). eu-west-2 is
-//! in the minority each time and answers the bare message.
+//! majority: for a transaction's condition values (8 of 10), where eu-west-2 is
+//! in the minority and answers the bare message. Scan's ExpressionAttributeValues
+//! and ExclusiveStartKey went the other way: 7 of 10 named them then, and 20 of
+//! 33 regions answered bare on 20 October 2026, so Scan answers bare.
 //!
 //! An empty name in a legacy QueryFilter or ScanFilter is accepted, as DynamoDB
 //! accepts it; only the values inside those filters are checked.
@@ -130,7 +130,7 @@ pub(crate) fn value_placeholder<'a>(
     found.first().copied()
 }
 
-/// The message Scan and a transaction's condition values use for an
+/// The message a transaction's condition values use for an
 /// ExpressionAttributeValues entry holding an empty name.
 pub(crate) fn value_placeholder_message(key: &str) -> String {
     format!("ExpressionAttributeValues contains invalid value: {MESSAGE} for key {key}")

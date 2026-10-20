@@ -7,8 +7,9 @@
 //! eu-west-2, us-east-1, eu-west-1, us-west-2, ap-northeast-1, eu-south-2 and
 //! me-central-1, and each test follows the majority of those seven for its
 //! operation: the newer layer for PutItem, UpdateItem, DeleteItem, GetItem,
-//! Query and SearchVectors, the older one for Scan (where only eu-west-2 had
-//! moved).
+//! Query and SearchVectors. Scan ran on the older layer in most regions then;
+//! by 20 October 2026 the newer one had reached 20 of 33, and its checks are
+//! pinned request by request in `scan_member_stages.rs`.
 
 #![cfg(feature = "http-server")]
 
@@ -77,7 +78,6 @@ fn with(mut base: serde_json::Value, extra: serde_json::Value) -> serde_json::Va
 
 const T: &str = "AbsentTable";
 const EMPTY_NAME: &str = "Value at 'TableName' failed to satisfy constraint: Member must have length greater than or equal to 1";
-const EMPTY_NAME_OLD: &str = "Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1";
 const RCC: &str = "Value 'INVALID' at 'returnConsumedCapacity' failed to satisfy constraint: \
                    Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
 const RICM: &str = "Value 'INVALID' at 'returnItemCollectionMetrics' failed to satisfy \
@@ -89,8 +89,6 @@ const RVOCCF: &str = "Value 'BOGUS' at 'returnValuesOnConditionCheckFailure' fai
 const SELECT: &str = "Value 'BOGUS' at 'select' failed to satisfy constraint: Member must \
                       satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, \
                       ALL_PROJECTED_ATTRIBUTES]";
-const XOR: &str = "Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member \
-                   must satisfy enum value set: [OR, AND]";
 const NO_FILTER: &str = "ConditionalOperator cannot be used without Filter or Expected";
 const ONE_FILTER: &str =
     "ConditionalOperator can only be used when Filter or Expected has two or more elements";
@@ -547,92 +545,6 @@ async fn query_member_errors() {
     }
 }
 
-/// Scan, in the older layer most regions still run: the member errors together
-/// in the order Select, ReturnConsumedCapacity, ConditionalOperator, Limit,
-/// Segment, then an empty name; any other name error only when nothing else is
-/// wrong, length before pattern.
-#[tokio::test]
-async fn scan_member_errors() {
-    let url = start_server().await;
-    let base = serde_json::json!({"TableName": T});
-    let limit = "Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
-    let segment = "Value '-1' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0";
-    let cases: Vec<(serde_json::Value, String)> = vec![
-        (serde_json::json!({"TableName": ""}), one(EMPTY_NAME_OLD)),
-        (
-            serde_json::json!({"TableName": "", "ReturnConsumedCapacity": "INVALID"}),
-            two(RCC, EMPTY_NAME_OLD),
-        ),
-        (
-            serde_json::json!({"TableName": "a!"}),
-            two(&short("a!"), &pattern("a!")),
-        ),
-        (
-            serde_json::json!({"TableName": "a!", "ReturnConsumedCapacity": "INVALID"}),
-            one(RCC),
-        ),
-        (
-            serde_json::json!({"TableName": "bad!name", "ReturnConsumedCapacity": "INVALID"}),
-            one(RCC),
-        ),
-        (
-            serde_json::json!({"TableName": "ab", "Limit": 0}),
-            one(limit),
-        ),
-        (
-            serde_json::json!({"TableName": "ab", "ConditionalOperator": "XOR"}),
-            one(XOR),
-        ),
-        (serde_json::json!({"ConditionalOperator": "XOR"}), one(XOR)),
-        (
-            serde_json::json!({"ConditionalOperator": "XOR", "ReturnConsumedCapacity": "INVALID"}),
-            two(RCC, XOR),
-        ),
-        (
-            serde_json::json!({"ConditionalOperator": "XOR", "Select": "BOGUS"}),
-            two(SELECT, XOR),
-        ),
-        (
-            serde_json::json!({"ReturnConsumedCapacity": "INVALID", "Select": "BOGUS"}),
-            two(SELECT, RCC),
-        ),
-        (
-            serde_json::json!({"ReturnConsumedCapacity": "INVALID", "Limit": 0}),
-            two(RCC, limit),
-        ),
-        (
-            serde_json::json!({"ConditionalOperator": "XOR", "Limit": 0}),
-            two(XOR, limit),
-        ),
-        (
-            serde_json::json!({"ConditionalOperator": "XOR", "ReturnConsumedCapacity": "INVALID",
-                "Select": "BOGUS", "Limit": 0}),
-            format!("4 validation errors detected: {SELECT}; {RCC}; {XOR}; {limit}"),
-        ),
-        (
-            serde_json::json!({"ConditionalOperator": "XOR", "Segment": -1, "TotalSegments": 2}),
-            two(XOR, segment),
-        ),
-        (
-            serde_json::json!({"ConditionalOperator": "XOR",
-                "ScanFilter": {"b": {"ComparisonOperator": "NULL"}}}),
-            one(XOR),
-        ),
-        (
-            serde_json::json!({"ConditionalOperator": "AND"}),
-            NO_FILTER.to_string(),
-        ),
-    ];
-    for (extra, expected) in cases {
-        let body = with(base.clone(), extra);
-        assert_eq!(
-            refused(&url, "Scan", body.clone()).await,
-            expected,
-            "{body}"
-        );
-    }
-}
-
 /// SearchVectors: a name error without the envelope, length before pattern and
 /// one error per name, ahead of ReturnConsumedCapacity; `TopK` below 1 and an
 /// empty name in the newer enveloped wording, `TopK` ahead of the name.
@@ -755,8 +667,9 @@ async fn query_reports_an_empty_name_and_a_zero_limit_together() {
 /// A `ConditionalOperator` that does join two or more legacy conditions but
 /// isn't `AND` or `OR` gets the newer layer's generic enum message, with
 /// DynamoDB's own `[ALL, OR]` list: enveloped on PutItem, UpdateItem and
-/// DeleteItem (five of seven regions), bare on Query (six of seven). Scan, on
-/// the older layer, still reports the enum. Captured 2026-10-09.
+/// DeleteItem (five of seven regions), bare on Query (six of seven) and, since
+/// Scan moved to the newer layer, on Scan. Captured 2026-10-09 and, for Scan,
+/// 2026-10-20.
 #[tokio::test]
 async fn an_unknown_conditional_operator_joining_two_legacy_conditions() {
     let url = start_server().await;
@@ -813,7 +726,7 @@ async fn an_unknown_conditional_operator_joining_two_legacy_conditions() {
                     "ScanFilter": {"b": {"ComparisonOperator": "NULL"}, "c": {"ComparisonOperator": "NULL"}}}),
                 xor.clone(),
             ),
-            one(XOR),
+            ALL_OR.to_string(),
         ),
         (
             "PutItem",

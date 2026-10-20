@@ -88,7 +88,7 @@ pub struct QueryRequest {
 
 /// The rejection for a `Select` outside the enum, or `None` when it is one
 /// DynamoDB accepts. The one copy of the set and the wording.
-fn select_rejection(select: &str) -> Option<String> {
+pub(crate) fn select_rejection(select: &str) -> Option<String> {
     if [
         "ALL_ATTRIBUTES",
         "ALL_PROJECTED_ATTRIBUTES",
@@ -1188,12 +1188,13 @@ fn key_condition_error(expr: &str, err: String) -> String {
 /// message alone, whatever the shape: a missing or extra attribute, a wrong
 /// type, a map or set, NULL, or an index query missing the table's or the
 /// index's keys. Captured in eu-west-2, us-east-1, us-west-2 and eu-central-1,
-/// 2026-10-09, where a Scan's answer varies by region.
+/// 2026-10-09. A Scan answers the same way where the newer validation layer
+/// runs it, which is most regions since October 2026.
 const START_KEY_INVALID: &str = "The provided starting key is invalid";
 
-/// The schema mismatch the shared starting-key check reports in a Scan's form,
-/// answered in a Query's.
-fn bare_start_key_mismatch(err: DynoxideError) -> DynoxideError {
+/// The schema mismatch the shared starting-key check reports with a reason
+/// appended, answered bare.
+pub(crate) fn bare_start_key_mismatch(err: DynoxideError) -> DynoxideError {
     match err {
         DynoxideError::ValidationException(msg)
             if msg
