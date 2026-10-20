@@ -263,19 +263,26 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     mut request: QueryRequest,
 ) -> Result<QueryResponse> {
-    // Validate table name format before checking existence (DynamoDB validates input first)
+    // A Limit of 0 and an empty table name come first and together, Limit
+    // first, then any other table-name error, as the wire path reports them
+    // when it reads the body; a request built in code gets the same answer.
+    let mut first_pass = Vec::new();
+    if request.limit == Some(0) {
+        first_pass.push(
+            "Value at 'Limit' failed to satisfy constraint: \
+             Member must have value greater than or equal to 1"
+                .to_string(),
+        );
+    }
+    if request.table_name.is_empty() {
+        first_pass.push(crate::validation::EMPTY_TABLE_NAME_REJECTION.to_string());
+    }
+    if let Some(msg) = crate::validation::format_validation_errors(&first_pass) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
     crate::validation::validate_item_table_name(&request.table_name)?;
 
-    // A Limit of 0 is refused as the wire path refuses it, and one past what a
-    // 32-bit integer holds is read as the largest one.
-    if request.limit == Some(0) {
-        return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(
-                "Value at 'Limit' failed to satisfy constraint: \
-                 Member must have value greater than or equal to 1",
-            ),
-        ));
-    }
+    // A Limit past what a 32-bit integer holds is read as the largest one.
     request.limit = request.limit.map(|l| l.min(i32::MAX as usize));
 
     // An empty attribute name is refused bare, ahead of the table lookup and the

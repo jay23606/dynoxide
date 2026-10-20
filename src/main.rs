@@ -226,8 +226,12 @@ struct McpArgs {
     #[arg(long)]
     read_only: bool,
 
-    /// Maximum items returned by query/scan (caps the limit parameter)
-    #[arg(long, value_name = "N")]
+    /// Maximum items returned by query/scan (caps the limit parameter; at least 1)
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
     max_items: Option<usize>,
 
     /// Maximum response size in bytes for query/scan
@@ -1357,6 +1361,15 @@ mod tests {
         #[test]
         fn top_level_args_are_rejected_alongside_mcp_subcommand() {
             assert!(Cli::try_parse_from(["dynoxide", "--db-path", "data.db", "mcp"]).is_err());
+        }
+
+        // A cap of 0 would refuse every query and scan an agent sent, as a Limit
+        // of 0 it never asked for, so it is refused as the server starts.
+        #[cfg(feature = "mcp-server")]
+        #[test]
+        fn mcp_max_items_must_be_at_least_one() {
+            assert!(Cli::try_parse_from(["dynoxide", "mcp", "--max-items", "0"]).is_err());
+            assert!(Cli::try_parse_from(["dynoxide", "mcp", "--max-items", "1"]).is_ok());
         }
 
         #[test]

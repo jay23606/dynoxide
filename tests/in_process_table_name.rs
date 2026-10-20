@@ -181,3 +181,38 @@ fn delete_item_refuses_return_values_it_does_not_honour_in_process() {
         );
     }
 }
+
+/// Query with a `Limit` of 0 beside a bad table name: the decoder reports the
+/// Limit first, joined with an empty name and alone beside any other name
+/// error. A request built in Rust gets the same answers.
+#[test]
+fn query_reports_a_zero_limit_beside_a_bad_name_as_the_wire_does() {
+    use dynoxide::actions::query::QueryRequest;
+    let db = Database::memory().unwrap();
+    for name in ["", "ab", "a!"] {
+        let body = json!({
+            "TableName": name,
+            "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "a"}},
+            "Limit": 0
+        });
+        let wire = wire_message::<QueryRequest>(body);
+        let mut values = std::collections::HashMap::new();
+        values.insert(
+            ":p".to_string(),
+            dynoxide::types::AttributeValue::S("a".to_string()),
+        );
+        let built = QueryRequest {
+            table_name: name.to_string(),
+            key_condition_expression: Some("pk = :p".to_string()),
+            expression_attribute_values: Some(values),
+            limit: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            in_process_message(db.query(built)),
+            wire,
+            "table name {name:?}"
+        );
+    }
+}
