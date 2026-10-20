@@ -92,7 +92,8 @@ async fn answer(url: &str, body: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// (case, request members, message). Any `TableName` replaces the table's.
+/// (case, request members, message). A `TableName` of `__absent__` leaves the
+/// member out; any other `TableName` replaces the table's.
 const CASES: &[(&str, &str, &str)] = &[
     (
         r##"Select COUNT + AttributesToGet"##,
@@ -274,11 +275,41 @@ const CASES: &[(&str, &str, &str)] = &[
         r##"{"KeyConditionExpression":"gk2 = :g","ExpressionAttributeValues":{":g":{"S":"a"}},"IndexName":"gsi2","ExclusiveStartKey":{"pk":{"N":"1"},"gk2":{"S":"a"}}}"##,
         r##"The provided starting key is invalid"##,
     ),
+    (
+        r##"absent TableName + ReturnConsumedCapacity BOGUS"##,
+        r##"{"KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"TableName":"__absent__","ReturnConsumedCapacity":"BOGUS"}"##,
+        r##"2 validation errors detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]; Value null at 'tableName' failed to satisfy constraint: Member must not be null"##,
+    ),
+    (
+        r##"absent TableName + Limit 0 + ReturnConsumedCapacity BOGUS"##,
+        r##"{"KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"TableName":"__absent__","Limit":0,"ReturnConsumedCapacity":"BOGUS"}"##,
+        r##"3 validation errors detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]; Value null at 'tableName' failed to satisfy constraint: Member must not be null; Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
+    (
+        r##"absent TableName + Limit 0 + Select BOGUS + ReturnConsumedCapacity BOGUS"##,
+        r##"{"KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"TableName":"__absent__","Limit":0,"Select":"BOGUS","ReturnConsumedCapacity":"BOGUS"}"##,
+        r##"4 validation errors detected: Value 'BOGUS' at 'select' failed to satisfy constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]; Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]; Value null at 'tableName' failed to satisfy constraint: Member must not be null; Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
+    (
+        r##"Limit 1.5 + ReturnConsumedCapacity BOGUS"##,
+        r##"{"KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"Limit":1.5,"ReturnConsumedCapacity":"BOGUS"}"##,
+        r##"1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"##,
+    ),
+    (
+        r##"Limit 0.5 + ReturnConsumedCapacity BOGUS"##,
+        r##"{"KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"Limit":0.5,"ReturnConsumedCapacity":"BOGUS"}"##,
+        r##"2 validation errors detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]; Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
+    (
+        r##"Limit 0.5 + Select BOGUS + ReturnConsumedCapacity BOGUS"##,
+        r##"{"KeyConditionExpression":"pk = :p","ExpressionAttributeValues":{":p":{"S":"a"}},"Limit":0.5,"Select":"BOGUS","ReturnConsumedCapacity":"BOGUS"}"##,
+        r##"3 validation errors detected: Value 'BOGUS' at 'select' failed to satisfy constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]; Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]; Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
 ];
 
 #[tokio::test]
 async fn each_request_is_answered_as_dynamodb_answers_it() {
-    assert_eq!(CASES.len(), 36, "a case was added or lost");
+    assert_eq!(CASES.len(), 42, "a case was added or lost");
     let url = start_server().await;
     let mut wrong = Vec::new();
     for (case, members, expected) in CASES {
@@ -288,7 +319,11 @@ async fn each_request_is_answered_as_dynamodb_answers_it() {
             .as_object()
             .unwrap()
         {
-            body[key] = value.clone();
+            if key == "TableName" && value == "__absent__" {
+                body.as_object_mut().unwrap().remove("TableName");
+            } else {
+                body[key] = value.clone();
+            }
         }
         let got = answer(&url, &body).await;
         if got != *expected {
@@ -346,6 +381,13 @@ fn a_request_built_in_code_is_answered_as_the_wire_request_is() {
         }
     };
     let cases: Vec<(&str, QueryRequest)> = vec![
+        (
+            "Limit 0",
+            kce(QueryRequest {
+                limit: Some(0),
+                ..Default::default()
+            }),
+        ),
         (
             "Select COUNT + AttributesToGet",
             QueryRequest {

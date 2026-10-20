@@ -154,3 +154,32 @@ fn test_paginated_parallel_scan() {
         "paginated parallel scan should return all 30 items"
     );
 }
+
+/// With more segments than the 4096 hash buckets, some segments hold no bucket
+/// and return nothing, so a full parallel scan still sees each item exactly
+/// once. It used to hand every item to the segments past the last bucket.
+#[test]
+fn more_segments_than_buckets_still_see_each_item_once() {
+    let db = make_db_with_items(7);
+    for total in [4097, 8192] {
+        let mut seen = Vec::new();
+        for segment in 0..total {
+            let resp = db
+                .scan(scan_req("Tbl", Some(segment), Some(total)))
+                .unwrap();
+            for item in resp.items.unwrap_or_default() {
+                if let Some(AttributeValue::S(pk)) = item.get("pk") {
+                    seen.push(pk.clone());
+                }
+            }
+        }
+        seen.sort();
+        let expected: Vec<String> = (0..7).map(|i| format!("item-{i:04}")).collect();
+        assert_eq!(seen, expected, "TotalSegments {total}");
+    }
+    // At the largest TotalSegments, the last segment holds no bucket.
+    let resp = db
+        .scan(scan_req("Tbl", Some(999_999), Some(1_000_000)))
+        .unwrap();
+    assert_eq!(resp.count, 0);
+}

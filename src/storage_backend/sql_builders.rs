@@ -1150,13 +1150,21 @@ pub fn scan_items<'a>(table_name: &str, params: &ScanParams<'a>) -> (String, Vec
     if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
         let start_bucket = ceiling_div(HASH_BUCKETS * seg, total);
         let end_bucket = ceiling_div(HASH_BUCKETS * (seg + 1), total) - 1;
-        where_clauses.push(format!(
-            "substr(hash_prefix, 1, 3) >= ?{} AND substr(hash_prefix, 1, 3) <= ?{}",
-            param_idx,
-            param_idx + 1
-        ));
-        out.push(SqlParam::text(format!("{start_bucket:03x}")));
-        out.push(SqlParam::text(format!("{end_bucket:03x}")));
+        if start_bucket > end_bucket {
+            // With more segments than buckets, some segments hold no bucket
+            // at all and must return nothing. Comparing their bounds as text
+            // would not do: the first bucket past the end prints as "1000",
+            // which sorts below "fff".
+            where_clauses.push("0".to_string());
+        } else {
+            where_clauses.push(format!(
+                "substr(hash_prefix, 1, 3) >= ?{} AND substr(hash_prefix, 1, 3) <= ?{}",
+                param_idx,
+                param_idx + 1
+            ));
+            out.push(SqlParam::text(format!("{start_bucket:03x}")));
+            out.push(SqlParam::text(format!("{end_bucket:03x}")));
+        }
     }
 
     if !where_clauses.is_empty() {

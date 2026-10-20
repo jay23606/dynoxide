@@ -134,10 +134,11 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         // seven regions). Scan words them the same way where the newer layer
         // runs it (see `ScanMembers`).
         //
-        // With no TableName at all, a Limit of 0 is joined with the missing
-        // name's error, and with a Select outside the enum, which leads. This
-        // form, which Scan gives too, echoes the value and spells the member
-        // 'limit' (captured eu-west-2 and us-east-1, 2026-10-09).
+        // With no TableName at all, the request goes to the older layer, which
+        // reports every member error together: Select, ReturnConsumedCapacity,
+        // the missing name, then a Limit below 1 with its value echoed and the
+        // member spelled 'limit', as Scan does (captured eu-west-2 and
+        // us-east-1, 2026-10-09 and 2026-10-20).
         //
         // A Limit that saturated or lost a fraction as it was read (see
         // `helpers::Int32`) is checked by the older layer the same way: the
@@ -146,15 +147,27 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
         let limit = raw.limit.map(|n| n.value);
         let coerced = raw.limit.is_some_and(|n| n.coerced);
         let limit_too_small = limit.filter(|l| *l < 1);
-        if (raw.table_name.is_none() && limit_too_small.is_some()) || coerced {
+        if raw.table_name.is_none() || coerced {
             let mut errors = Vec::new();
             errors.extend(raw.select.as_deref().and_then(select_rejection));
+            errors.extend(crate::validation::return_consumed_capacity_rejection(
+                raw.return_consumed_capacity.as_deref(),
+            ));
             if matches!(raw.table_name.as_deref(), None | Some("")) {
                 errors.extend(crate::validation::table_name_constraint_errors(
                     raw.table_name.as_deref(),
                     crate::validation::TableNameContext::ReadWrite,
                 ));
             }
+            // The missing operators' place is inferred from Scan's.
+            errors.extend(helpers::missing_comparison_operators(
+                raw.key_conditions.as_ref(),
+                "keyConditions",
+            ));
+            errors.extend(helpers::missing_comparison_operators(
+                raw.query_filter.as_ref(),
+                "queryFilter",
+            ));
             if let Some(limit) = limit_too_small {
                 errors.push(format!(
                     "Value '{limit}' at 'limit' failed to satisfy constraint: \
@@ -253,7 +266,16 @@ pub async fn execute<S: StorageBackend>(
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_item_table_name(&request.table_name)?;
 
-    // A Limit past what a 32-bit integer holds is read as the largest one.
+    // A Limit of 0 is refused as the wire path refuses it, and one past what a
+    // 32-bit integer holds is read as the largest one.
+    if request.limit == Some(0) {
+        return Err(DynoxideError::ValidationException(
+            crate::validation::envelope_message(
+                "Value at 'Limit' failed to satisfy constraint: \
+                 Member must have value greater than or equal to 1",
+            ),
+        ));
+    }
     request.limit = request.limit.map(|l| l.min(i32::MAX as usize));
 
     // An empty attribute name is refused bare, ahead of the table lookup and the
