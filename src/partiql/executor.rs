@@ -3042,26 +3042,42 @@ async fn execute_update<S: StorageBackend>(
 
     // Every SET value is worked out from the item as it was, so `SET a = 1, b = a
     // + 1` reads the old `a`, or finds none (eu-west-2, 18 October 2026).
+    // They are written in path order, as UpdateItem writes them, so two SETs
+    // past the end of a list append in the order of their indexes (eu-west-2
+    // and us-east-1, 20 October 2026). A SET that removes its path is taken out
+    // with the REMOVEs.
     let mut writes = Vec::with_capacity(set_clauses.len());
     for clause in set_clauses {
         writes.push((
+            element_path(&clause.path),
             &clause.path,
             resolve_set_value(&clause.value, &before_item, parameters)?,
         ));
     }
-    for (path, value) in writes {
+    writes.sort_by(|(a, _, _), (b, _, _)| crate::expressions::update::compare_paths(a, b));
+    let mut removals = Vec::with_capacity(remove_paths.len());
+    for (elements, path, value) in writes {
         match value {
             Some(val) => set_nested_value(&mut item, path, val)?,
-            None => remove_nested_value(&mut item, path)?,
+            None => removals.push((elements, path)),
         }
     }
 
     // REMOVE goes last, highest path first, so that taking out `l[0]` does not
-    // move the element that `l[1]` names.
-    let mut removals: Vec<_> = remove_paths
-        .iter()
-        .map(|path| (element_path(path), path))
-        .collect();
+    // move the element that `l[1]` names. A path the item did not have is left
+    // alone, even where a SET past the end has since put an element there; its
+    // parent must still be one the item had.
+    for path in remove_paths {
+        let elements = element_path(path);
+        if elements.is_empty()
+            || crate::expressions::resolve_path(&before_item, &elements).is_some()
+        {
+            removals.push((elements, path));
+        } else {
+            crate::expressions::check_update_parent(&before_item, &elements)
+                .map_err(DynoxideError::ValidationException)?;
+        }
+    }
     removals.sort_by(|(a, _), (b, _)| crate::expressions::update::compare_paths(b, a));
     for (_, path) in removals {
         remove_nested_value(&mut item, path)?;

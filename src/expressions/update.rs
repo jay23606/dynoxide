@@ -659,44 +659,71 @@ pub fn apply(
         }
     }
 
-    let mut writes = Vec::with_capacity(expr.set_actions.len());
+    // SET, ADD and DELETE write in path order, whichever clause they come
+    // from. Every index means what it meant in the item as it was: a SET or
+    // ADD past the end of a list appends, and the appends land in the order of
+    // their indexes, while an ADD or DELETE at an index the list did not reach
+    // never sees an element another clause appended (eu-west-2 and us-east-1,
+    // 9, 18 and 20 October 2026). Writing in path order gives exactly that,
+    // because an append only ever adds past the original end. Every SET value
+    // is already worked out from the snapshot and no two targets overlap, so
+    // the order changes nothing else.
+    enum Write<'v> {
+        Set(AttributeValue),
+        Add(&'v AttributeValue),
+        Delete(&'v AttributeValue),
+    }
+    let mut writes = Vec::with_capacity(
+        expr.set_actions.len() + expr.add_actions.len() + expr.delete_actions.len(),
+    );
     for action in &expr.set_actions {
         let resolved_path = resolve_path_elements(&action.path, tracker)?;
         let value = evaluate_set_value(&action.value, &snapshot, tracker)?;
-        writes.push((resolved_path, value));
+        writes.push((resolved_path, Write::Set(value)));
     }
-    // A SET past the end of a list appends, and two of them on the same list
-    // append in the order of their indexes rather than of their clauses
-    // (eu-west-2, 9 October 2026). Every value is already worked out from the
-    // snapshot and no two targets overlap, so writing in path order changes
-    // nothing else.
-    writes.sort_by(|(a, _), (b, _)| compare_paths(a, b));
-    for (path, value) in writes {
-        set_path(item, &path, value)?;
-    }
-
-    // Process ADD actions
     for action in &expr.add_actions {
         let resolved_path = resolve_path_elements(&action.path, tracker)?;
-        let add_val = tracker.resolve_value(&action.value_ref)?.clone();
-        apply_add(item, &resolved_path, &add_val).map_err(operand_or_path_error)?;
+        writes.push((
+            resolved_path,
+            Write::Add(tracker.resolve_value(&action.value_ref)?),
+        ));
     }
-
-    // Process DELETE actions
     for action in &expr.delete_actions {
         let resolved_path = resolve_path_elements(&action.path, tracker)?;
-        let del_val = tracker.resolve_value(&action.value_ref)?.clone();
-        apply_delete(item, &resolved_path, &del_val).map_err(operand_or_path_error)?;
+        writes.push((
+            resolved_path,
+            Write::Delete(tracker.resolve_value(&action.value_ref)?),
+        ));
+    }
+    writes.sort_by(|(a, _), (b, _)| compare_paths(a, b));
+
+    // A DELETE that empties a set takes the set out with the REMOVEs, so that
+    // an emptied element of a list does not move the elements after it.
+    let mut removals = Vec::with_capacity(expr.remove_actions.len());
+    for (path, write) in writes {
+        match write {
+            Write::Set(value) => set_path(item, &path, value)?,
+            Write::Add(value) => apply_add(item, &path, value).map_err(operand_or_path_error)?,
+            Write::Delete(value) => {
+                if apply_delete(item, &path, value).map_err(operand_or_path_error)? {
+                    removals.push(path);
+                }
+            }
+        }
     }
 
-    // REMOVE goes last, highest path first. Every path in an expression means
-    // what it meant in the item as it was, so taking out `l[0]` must not move
-    // the element that `l[1]` or `l[1].x` names, and an ADD or DELETE on
-    // either has already run against the original indexes (eu-west-2,
-    // 18 October 2026).
-    let mut removals = Vec::with_capacity(expr.remove_actions.len());
+    // REMOVE goes last, highest path first, so that taking out `l[0]` does not
+    // move the element that `l[1]` or `l[1].x` names. A path the item did not
+    // have is left alone, even where an append has since put an element there;
+    // its parent must still be one the item had (eu-west-2, 18 and 20 October
+    // 2026).
     for path in &expr.remove_actions {
-        removals.push(resolve_path_elements(path, tracker)?);
+        let path = resolve_path_elements(path, tracker)?;
+        if resolve_path(&snapshot, &path).is_some() {
+            removals.push(path);
+        } else {
+            check_update_parent(&snapshot, &path)?;
+        }
     }
     removals.sort_by(|a, b| compare_paths(b, a));
     for path in removals {
@@ -952,14 +979,19 @@ pub fn apply_delete_public(
     path: &[PathElement],
     del_val: &AttributeValue,
 ) -> Result<(), String> {
-    apply_delete(item, path, del_val).map_err(UpdateFailure::into_message)
+    if apply_delete(item, path, del_val).map_err(UpdateFailure::into_message)? {
+        remove_path(item, path)?;
+    }
+    Ok(())
 }
 
+/// Take `del_val`'s members out of the set at `path`. Returns whether the set
+/// is left empty, in which case the caller takes the attribute out.
 fn apply_delete(
     item: &mut HashMap<String, AttributeValue>,
     path: &[PathElement],
     del_val: &AttributeValue,
-) -> Result<(), UpdateFailure> {
+) -> Result<bool, UpdateFailure> {
     check_update_parent(item, path).map_err(UpdateFailure::Path)?;
     let existing = resolve_path(item, path);
 
@@ -970,10 +1002,10 @@ fn apply_delete(
                 .filter(|s| !del_set.contains(s))
                 .collect();
             if new_set.is_empty() {
-                remove_path(item, path).map_err(UpdateFailure::Path)
-            } else {
-                set_path(item, path, AttributeValue::SS(new_set)).map_err(UpdateFailure::Path)
+                return Ok(true);
             }
+            set_path(item, path, AttributeValue::SS(new_set)).map_err(UpdateFailure::Path)?;
+            Ok(false)
         }
         (Some(AttributeValue::NS(existing_set)), AttributeValue::NS(del_set)) => {
             let new_set: Vec<String> = existing_set
@@ -981,10 +1013,10 @@ fn apply_delete(
                 .filter(|n| !del_set.contains(n))
                 .collect();
             if new_set.is_empty() {
-                remove_path(item, path).map_err(UpdateFailure::Path)
-            } else {
-                set_path(item, path, AttributeValue::NS(new_set)).map_err(UpdateFailure::Path)
+                return Ok(true);
             }
+            set_path(item, path, AttributeValue::NS(new_set)).map_err(UpdateFailure::Path)?;
+            Ok(false)
         }
         (Some(AttributeValue::BS(existing_set)), AttributeValue::BS(del_set)) => {
             let new_set: Vec<Vec<u8>> = existing_set
@@ -992,12 +1024,12 @@ fn apply_delete(
                 .filter(|b| !del_set.contains(b))
                 .collect();
             if new_set.is_empty() {
-                remove_path(item, path).map_err(UpdateFailure::Path)
-            } else {
-                set_path(item, path, AttributeValue::BS(new_set)).map_err(UpdateFailure::Path)
+                return Ok(true);
             }
+            set_path(item, path, AttributeValue::BS(new_set)).map_err(UpdateFailure::Path)?;
+            Ok(false)
         }
-        (None, _) => Ok(()), // Nothing to delete from
+        (None, _) => Ok(false), // Nothing to delete from
         _ => Err(UpdateFailure::Operand(
             "Type mismatch for attribute to update".to_string(),
         )),
