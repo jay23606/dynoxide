@@ -7,8 +7,8 @@ use crate::errors::{DynoxideError, Result};
 use crate::expressions::condition::compare_values;
 use crate::expressions::key_condition::{ResolvedSortKeyCondition, sk_conditions_to_sql};
 use crate::partiql::parser::{
-    CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetValue, Statement, WhereClause,
-    WhereCondition,
+    CompOp, Operand, OrderByTerm, PartiqlValue, ReturningVariant, SetTerm, SetValue, Statement,
+    WhereClause, WhereCondition,
 };
 use crate::partiql::{PathSegment, names_attribute, split_path_segments};
 use crate::storage_backend::StorageBackend;
@@ -3007,6 +3007,10 @@ async fn execute_update<S: StorageBackend>(
         }
     }
 
+    // No two paths of one statement may overlap, the later clause being `path
+    // one`. Refused before the item is read, as UpdateItem refuses it.
+    reject_overlapping_paths(set_clauses, remove_paths)?;
+
     // Get existing item
     let existing_json = storage.get_item(table_name, &pk_str, &sk_str).await?;
     let mut item: Item = existing_json
@@ -3036,17 +3040,31 @@ async fn execute_update<S: StorageBackend>(
 
     let before_item = item.clone();
 
-    // Apply SET clauses with nested path support
+    // Every SET value is worked out from the item as it was, so `SET a = 1, b = a
+    // + 1` reads the old `a`, or finds none (eu-west-2, 18 October 2026).
+    let mut writes = Vec::with_capacity(set_clauses.len());
     for clause in set_clauses {
-        match resolve_set_value(&clause.value, &item, parameters)? {
-            Some(val) => set_nested_value(&mut item, &clause.path, val)?,
-            None => remove_nested_value(&mut item, &clause.path),
+        writes.push((
+            &clause.path,
+            resolve_set_value(&clause.value, &before_item, parameters)?,
+        ));
+    }
+    for (path, value) in writes {
+        match value {
+            Some(val) => set_nested_value(&mut item, path, val)?,
+            None => remove_nested_value(&mut item, path)?,
         }
     }
 
-    // Apply REMOVE clauses
-    for path in remove_paths {
-        remove_nested_value(&mut item, path);
+    // REMOVE goes last, highest path first, so that taking out `l[0]` does not
+    // move the element that `l[1]` names.
+    let mut removals: Vec<_> = remove_paths
+        .iter()
+        .map(|path| (element_path(path), path))
+        .collect();
+    removals.sort_by(|(a, _), (b, _)| crate::expressions::update::compare_paths(b, a));
+    for (_, path) in removals {
+        remove_nested_value(&mut item, path)?;
     }
 
     // Ensure keys are present
@@ -3617,105 +3635,150 @@ fn resolve_set_operand(
     match val {
         SetValue::SetCall { .. } => unreachable!("resolve_set_value handles a set call"),
         SetValue::Simple(pv) => resolve_value(pv, parameters),
-        SetValue::Add(attr, pv) => {
-            let current = resolve_nested_path(item, attr);
-            let operand = resolve_value(pv, parameters)?;
-            match (current, &operand) {
-                (Some(AttributeValue::N(cur)), AttributeValue::N(add)) => {
-                    use bigdecimal::BigDecimal;
-                    use std::str::FromStr;
-                    let a = BigDecimal::from_str(cur).map_err(|e| {
-                        DynoxideError::ValidationException(format!("Invalid number: {e}"))
-                    })?;
-                    let b = BigDecimal::from_str(add).map_err(|e| {
-                        DynoxideError::ValidationException(format!("Invalid number: {e}"))
-                    })?;
-                    let result = a + b;
-                    Ok(AttributeValue::N(format_bigdecimal(&result)))
-                }
-                (None, AttributeValue::N(_)) => {
-                    // Attribute doesn't exist yet: use the operand value
-                    Ok(operand)
-                }
-                _ => Err(DynoxideError::ValidationException(
-                    "SET expression add requires numeric attribute and operand".to_string(),
-                )),
-            }
-        }
-        SetValue::Sub(attr, pv) => {
-            let current = resolve_nested_path(item, attr);
-            let operand = resolve_value(pv, parameters)?;
-            match (current, &operand) {
-                (Some(AttributeValue::N(cur)), AttributeValue::N(sub)) => {
-                    use bigdecimal::BigDecimal;
-                    use std::str::FromStr;
-                    let a = BigDecimal::from_str(cur).map_err(|e| {
-                        DynoxideError::ValidationException(format!("Invalid number: {e}"))
-                    })?;
-                    let b = BigDecimal::from_str(sub).map_err(|e| {
-                        DynoxideError::ValidationException(format!("Invalid number: {e}"))
-                    })?;
-                    let result = a - b;
-                    Ok(AttributeValue::N(format_bigdecimal(&result)))
-                }
-                (None, AttributeValue::N(sub)) => {
-                    // Attribute doesn't exist yet: treat as 0 - operand
-                    use bigdecimal::BigDecimal;
-                    use std::str::FromStr;
-                    let b = BigDecimal::from_str(sub).map_err(|e| {
-                        DynoxideError::ValidationException(format!("Invalid number: {e}"))
-                    })?;
-                    let result = -b;
-                    Ok(AttributeValue::N(format_bigdecimal(&result)))
-                }
-                _ => Err(DynoxideError::ValidationException(
-                    "SET expression subtract requires numeric attribute and operand".to_string(),
-                )),
-            }
-        }
+        SetValue::Add(attr, term) => arithmetic(attr, term, item, parameters, "+"),
+        SetValue::Sub(attr, term) => arithmetic(attr, term, item, parameters, "-"),
         SetValue::ListAppend(first, second) => {
-            let a = resolve_value(first, parameters)?;
-            let b = resolve_value(second, parameters)?;
-            // At least one should be a list. If an attribute name was given,
-            // resolve it from the item.
-            let list_a = match &a {
-                AttributeValue::S(name) => resolve_nested_path(item, name)
-                    .cloned()
-                    .unwrap_or(AttributeValue::L(Vec::new())),
-                other => other.clone(),
-            };
-            let list_b = match &b {
-                AttributeValue::S(name) => resolve_nested_path(item, name)
-                    .cloned()
-                    .unwrap_or(AttributeValue::L(Vec::new())),
-                other => other.clone(),
-            };
+            // A literal or parameter of the wrong type is refused before the
+            // item is read, ahead of an attribute that is missing or mistyped.
+            let static_first = literal_of(first, parameters, "list_append", is_list)?;
+            let static_second = literal_of(second, parameters, "list_append", is_list)?;
+            let list_a = static_first.map_or_else(|| attribute_of(first, item, is_list), Ok)?;
+            let list_b = static_second.map_or_else(|| attribute_of(second, item, is_list), Ok)?;
             match (list_a, list_b) {
                 (AttributeValue::L(mut la), AttributeValue::L(lb)) => {
                     la.extend(lb);
                     Ok(AttributeValue::L(la))
                 }
-                _ => Err(DynoxideError::ValidationException(
-                    "list_append requires list operands".to_string(),
-                )),
+                _ => unreachable!("both operands were checked to be lists"),
             }
         }
     }
 }
 
+fn is_list(value: &AttributeValue) -> bool {
+    matches!(value, AttributeValue::L(_))
+}
+
+fn is_number(value: &AttributeValue) -> bool {
+    matches!(value, AttributeValue::N(_))
+}
+
+/// The value of a literal or parameter operand, `None` for an attribute. A
+/// value that `fits` is returned; one that does not is refused as DynamoDB
+/// refuses it, naming the operator and the operand's type.
+fn literal_of(
+    term: &SetTerm,
+    parameters: &[AttributeValue],
+    operator: &str,
+    fits: fn(&AttributeValue) -> bool,
+) -> Result<Option<AttributeValue>> {
+    let SetTerm::Value(value) = term else {
+        return Ok(None);
+    };
+    let value = resolve_value(value, parameters)?;
+    if fits(&value) {
+        return Ok(Some(value));
+    }
+    Err(DynoxideError::ValidationException(format!(
+        "Incorrect operand type for operator or function; operator or function: {operator}, \
+         operand type: {}",
+        value.type_name()
+    )))
+}
+
+/// The value of an attribute operand: refused when the item lacks it, and when
+/// it is not of the type the operator takes.
+fn attribute_of(
+    term: &SetTerm,
+    item: &Item,
+    fits: fn(&AttributeValue) -> bool,
+) -> Result<AttributeValue> {
+    let SetTerm::Path(path) = term else {
+        unreachable!("a value is read by literal_of");
+    };
+    match resolve_nested_path(item, path) {
+        None => Err(DynoxideError::ValidationException(
+            crate::expressions::MISSING_ATTRIBUTE.to_string(),
+        )),
+        Some(value) if fits(value) => Ok(value.clone()),
+        Some(_) => Err(DynoxideError::ValidationException(
+            crate::expressions::OPERAND_TYPE.to_string(),
+        )),
+    }
+}
+
+/// `attr + term` or `attr - term`, on numbers only.
+fn arithmetic(
+    attr: &str,
+    term: &SetTerm,
+    item: &Item,
+    parameters: &[AttributeValue],
+    operator: &str,
+) -> Result<AttributeValue> {
+    use bigdecimal::BigDecimal;
+    use std::str::FromStr;
+    let literal = literal_of(term, parameters, operator, is_number)?;
+    let left = attribute_of(&SetTerm::Path(attr.to_string()), item, is_number)?;
+    let right = literal.map_or_else(|| attribute_of(term, item, is_number), Ok)?;
+    let (AttributeValue::N(left), AttributeValue::N(right)) = (left, right) else {
+        unreachable!("both operands were checked to be numbers");
+    };
+    let number = |n: &str| {
+        BigDecimal::from_str(n)
+            .map_err(|e| DynoxideError::ValidationException(format!("Invalid number: {e}")))
+    };
+    let (left, right) = (number(&left)?, number(&right)?);
+    let result = if operator == "+" {
+        left + right
+    } else {
+        left - right
+    };
+    Ok(AttributeValue::N(format_bigdecimal(&result)))
+}
+
+/// A statement's path as the elements an UpdateItem path is made of, for the
+/// checks the two share. A path that does not split names nothing and yields
+/// no elements.
+fn element_path(path: &str) -> Vec<crate::expressions::PathElement> {
+    use crate::expressions::PathElement;
+    split_path_segments(path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|segment| match segment {
+            PathSegment::Key(key) => PathElement::Attribute(key.into_owned()),
+            PathSegment::Index(i) => PathElement::Index(i),
+        })
+        .collect()
+}
+
+/// Refuse a statement with two paths that overlap, DynamoDB's check on the
+/// paths a statement writes and removes. The later clause is `path one`;
+/// the SET clauses are taken as written before the REMOVE paths.
+fn reject_overlapping_paths(
+    set_clauses: &[crate::partiql::parser::SetClause],
+    remove_paths: &[String],
+) -> Result<()> {
+    let mut paths: Vec<_> = set_clauses
+        .iter()
+        .map(|clause| element_path(&clause.path))
+        .chain(remove_paths.iter().map(|path| element_path(path)))
+        .collect();
+    paths.reverse();
+    crate::expressions::update::check_path_overlaps(&paths)
+        .map_err(DynoxideError::ValidationException)
+}
+
 /// The `ValidationException` DynamoDB raises for a document path that cannot be
 /// applied by an update (e.g. indexing a scalar, or a missing intermediate).
 fn invalid_update_path() -> DynoxideError {
-    DynoxideError::ValidationException(
-        "The document path provided in the update expression is invalid for update".to_string(),
-    )
+    DynoxideError::ValidationException(crate::expressions::INVALID_UPDATE_PATH.to_string())
 }
 
 /// Set a value at a document path, navigating both map keys and list indices,
 /// so `SET tags[0] = :v` writes the real list element rather than a literal
 /// `tags[0]` key. A list index at or beyond the end appends, matching DynamoDB.
-/// Intermediate map keys are created if absent, preserving the prior behaviour
-/// for dotted map paths.
+/// Every parent on the way must already exist: a missing map is refused, not
+/// created, the same as in an UpdateItem (eu-west-2, 18 October 2026).
 fn set_nested_value(item: &mut Item, path: &str, val: AttributeValue) -> Result<()> {
     let segments = split_path_segments(path).ok_or_else(invalid_update_path)?;
     let (first, rest) = segments.split_first().ok_or_else(invalid_update_path)?;
@@ -3728,9 +3791,7 @@ fn set_nested_value(item: &mut Item, path: &str, val: AttributeValue) -> Result<
         item.insert(key, val);
         return Ok(());
     }
-    let entry = item
-        .entry(key)
-        .or_insert_with(|| AttributeValue::M(HashMap::new()));
+    let entry = item.get_mut(&key).ok_or_else(invalid_update_path)?;
     set_into_value(entry, rest, val)
 }
 
@@ -3766,12 +3827,10 @@ fn set_into_value(
     }
     match seg {
         PathSegment::Key(k) => match current {
-            AttributeValue::M(map) => {
-                let next = map
-                    .entry((*k).to_string())
-                    .or_insert_with(|| AttributeValue::M(HashMap::new()));
-                set_into_value(next, rest, val)
-            }
+            AttributeValue::M(map) => match map.get_mut(k.as_ref()) {
+                Some(next) => set_into_value(next, rest, val),
+                None => Err(invalid_update_path()),
+            },
             _ => Err(invalid_update_path()),
         },
         PathSegment::Index(i) => match current {
@@ -3786,63 +3845,48 @@ fn set_into_value(
 
 /// Remove the value at a document path, navigating both map keys and list
 /// indices, so `REMOVE tags[0]` deletes the list element (shifting the rest)
-/// rather than a literal `tags[0]` key.
-fn remove_nested_value(item: &mut Item, path: &str) {
-    let Some(segments) = split_path_segments(path) else {
-        return;
-    };
-    let Some((first, rest)) = segments.split_first() else {
-        return;
-    };
+/// rather than a literal `tags[0]` key. A last step that is not there is left
+/// alone; a parent that is missing, or of the wrong type for the step taken
+/// through it, is refused as it is for SET (eu-west-2, 18 October 2026).
+fn remove_nested_value(item: &mut Item, path: &str) -> Result<()> {
+    let segments = split_path_segments(path).ok_or_else(invalid_update_path)?;
+    let (first, rest) = segments.split_first().ok_or_else(invalid_update_path)?;
+    // The top-level item is a map; it cannot be indexed.
     let PathSegment::Key(key) = first else {
-        return; // the top-level item cannot be indexed
+        return Err(invalid_update_path());
     };
     if rest.is_empty() {
         item.remove(key.as_ref());
-        return;
+        return Ok(());
     }
-    if let Some(current) = item.get_mut(key.as_ref()) {
-        remove_from_value(current, rest);
-    }
+    let current = item.get_mut(key.as_ref()).ok_or_else(invalid_update_path)?;
+    remove_from_value(current, rest)
 }
 
-/// Recursive helper for [`remove_nested_value`]. A path that does not exist or
-/// whose type does not match is a no-op, mirroring DynamoDB's tolerant REMOVE.
-fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) {
+/// Recursive helper for [`remove_nested_value`].
+fn remove_from_value(current: &mut AttributeValue, segments: &[PathSegment]) -> Result<()> {
     let (seg, rest) = segments.split_first().expect("segments is non-empty");
     if rest.is_empty() {
-        match seg {
-            PathSegment::Key(k) => {
-                if let AttributeValue::M(map) = current {
-                    map.remove(k.as_ref());
-                }
+        return match (seg, current) {
+            (PathSegment::Key(k), AttributeValue::M(map)) => {
+                map.remove(k.as_ref());
+                Ok(())
             }
-            PathSegment::Index(i) => {
-                if let AttributeValue::L(list) = current
-                    && *i < list.len()
-                {
+            (PathSegment::Index(i), AttributeValue::L(list)) => {
+                if *i < list.len() {
                     list.remove(*i);
                 }
+                Ok(())
             }
-        }
-        return;
+            _ => Err(invalid_update_path()),
+        };
     }
-    match seg {
-        PathSegment::Key(k) => {
-            if let AttributeValue::M(map) = current
-                && let Some(next) = map.get_mut(k.as_ref())
-            {
-                remove_from_value(next, rest);
-            }
-        }
-        PathSegment::Index(i) => {
-            if let AttributeValue::L(list) = current
-                && let Some(next) = list.get_mut(*i)
-            {
-                remove_from_value(next, rest);
-            }
-        }
-    }
+    let next = match (seg, current) {
+        (PathSegment::Key(k), AttributeValue::M(map)) => map.get_mut(k.as_ref()),
+        (PathSegment::Index(i), AttributeValue::L(list)) => list.get_mut(*i),
+        _ => None,
+    };
+    remove_from_value(next.ok_or_else(invalid_update_path)?, rest)
 }
 
 /// Check if an item matches a WHERE clause (with OR-group support).

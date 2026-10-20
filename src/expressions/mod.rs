@@ -352,41 +352,95 @@ pub fn evaluate_without_tracking(
     condition::evaluate(expr, item, &tracker)
 }
 
+/// The `ValidationException` text DynamoDB gives for a document path an update
+/// cannot apply: a parent that is missing, or of the wrong type for the step
+/// taken through it.
+pub(crate) const INVALID_UPDATE_PATH: &str =
+    "The document path provided in the update expression is invalid for update";
+
+/// What an arithmetic SET or `list_append` says of an operand that names an
+/// attribute the item does not have.
+pub(crate) const MISSING_ATTRIBUTE: &str =
+    "The provided expression refers to an attribute that does not exist in the item";
+
+/// What an update says of an operand whose type does not fit the operation: a
+/// stored value of the wrong type for `+`, `-` or `list_append`, or an ADD or
+/// DELETE operand that does not fit the stored value.
+pub(crate) const OPERAND_TYPE: &str =
+    "An operand in the update expression has an incorrect data type";
+
 /// Navigate a document path into an item, returning the attribute value at that path.
 pub fn resolve_path(
     item: &HashMap<String, AttributeValue>,
     path: &[PathElement],
 ) -> Option<AttributeValue> {
-    if path.is_empty() {
-        return None;
-    }
+    resolve_path_ref(item, path).cloned()
+}
 
-    let first = match &path[0] {
+/// [`resolve_path`] without the copy.
+fn resolve_path_ref<'a>(
+    item: &'a HashMap<String, AttributeValue>,
+    path: &[PathElement],
+) -> Option<&'a AttributeValue> {
+    let (first, rest) = path.split_first()?;
+    let mut current = match first {
         PathElement::Attribute(name) => item.get(name)?,
         PathElement::Index(_) => return None,
     };
-
-    let mut current = first.clone();
-    for element in &path[1..] {
-        match element {
-            PathElement::Attribute(name) => {
-                if let AttributeValue::M(map) = &current {
-                    current = map.get(name)?.clone();
-                } else {
-                    return None;
-                }
-            }
-            PathElement::Index(i) => {
-                if let AttributeValue::L(list) = &current {
-                    current = list.get(*i)?.clone();
-                } else {
-                    return None;
-                }
-            }
-        }
+    for element in rest {
+        current = match (element, current) {
+            (PathElement::Attribute(name), AttributeValue::M(map)) => map.get(name)?,
+            (PathElement::Index(i), AttributeValue::L(list)) => list.get(*i)?,
+            _ => return None,
+        };
     }
-
     Some(current)
+}
+
+/// The value at `path` for writing, or `None` where [`resolve_path`] would.
+fn resolve_path_mut<'a>(
+    item: &'a mut HashMap<String, AttributeValue>,
+    path: &[PathElement],
+) -> Option<&'a mut AttributeValue> {
+    let (first, rest) = path.split_first()?;
+    let mut current = match first {
+        PathElement::Attribute(name) => item.get_mut(name)?,
+        PathElement::Index(_) => return None,
+    };
+    for element in rest {
+        current = match (element, current) {
+            (PathElement::Attribute(name), AttributeValue::M(map)) => map.get_mut(name)?,
+            (PathElement::Index(i), AttributeValue::L(list)) => list.get_mut(*i)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// Whether the step into `path`'s last element can be taken: every parent
+/// exists, and the one directly above the last element is a map where the last
+/// element names a key, a list where it is an index. The last element itself
+/// need not exist. An update refuses the others with [`INVALID_UPDATE_PATH`],
+/// whether it sets, removes, adds to or deletes from the path (eu-west-2,
+/// 18 October 2026).
+pub(crate) fn check_update_parent(
+    item: &HashMap<String, AttributeValue>,
+    path: &[PathElement],
+) -> Result<(), String> {
+    let Some((last, parents)) = path.split_last() else {
+        return Err("Empty path".to_string());
+    };
+    if parents.is_empty() {
+        return match last {
+            PathElement::Attribute(_) => Ok(()),
+            PathElement::Index(_) => Err("Cannot index into top-level item".to_string()),
+        };
+    }
+    match (resolve_path_ref(item, parents), last) {
+        (Some(AttributeValue::M(_)), PathElement::Attribute(_))
+        | (Some(AttributeValue::L(_)), PathElement::Index(_)) => Ok(()),
+        _ => Err(INVALID_UPDATE_PATH.to_string()),
+    }
 }
 
 /// Set a value at a document path. Intermediate maps and lists must already
@@ -420,10 +474,7 @@ pub fn set_path(
         let entry = match item.get_mut(&first_name) {
             Some(e) => e,
             None => {
-                return Err(
-                    "The document path provided in the update expression is invalid for update"
-                        .to_string(),
-                );
+                return Err(INVALID_UPDATE_PATH.to_string());
             }
         };
 
@@ -447,10 +498,7 @@ fn set_nested(
                     map.insert(name.clone(), value);
                     Ok(())
                 } else {
-                    Err(
-                        "The document path provided in the update expression is invalid for update"
-                            .to_string(),
-                    )
+                    Err(INVALID_UPDATE_PATH.to_string())
                 }
             }
             PathElement::Index(i) => {
@@ -463,10 +511,7 @@ fn set_nested(
                     }
                     Ok(())
                 } else {
-                    Err(
-                        "The document path provided in the update expression is invalid for update"
-                            .to_string(),
-                    )
+                    Err(INVALID_UPDATE_PATH.to_string())
                 }
             }
         }
@@ -478,16 +523,10 @@ fn set_nested(
                     // The key must already exist to navigate deeper.
                     match map.get_mut(name) {
                         Some(entry) => set_nested(entry, &path[1..], value),
-                        None => Err(
-                            "The document path provided in the update expression is invalid for update"
-                                .to_string(),
-                        ),
+                        None => Err(INVALID_UPDATE_PATH.to_string()),
                     }
                 } else {
-                    Err(
-                        "The document path provided in the update expression is invalid for update"
-                            .to_string(),
-                    )
+                    Err(INVALID_UPDATE_PATH.to_string())
                 }
             }
             PathElement::Index(i) => {
@@ -498,99 +537,38 @@ fn set_nested(
                 {
                     set_nested(next, &path[1..], value)
                 } else {
-                    Err(
-                        "The document path provided in the update expression is invalid for update"
-                            .to_string(),
-                    )
+                    Err(INVALID_UPDATE_PATH.to_string())
                 }
             }
         }
     }
 }
 
-/// Remove a value at a document path.
+/// Remove a value at a document path. A last element that is not there is
+/// left alone; a parent that is missing or the wrong type is refused, the same
+/// as for [`set_path`].
 pub fn remove_path(
     item: &mut HashMap<String, AttributeValue>,
     path: &[PathElement],
 ) -> Result<(), String> {
-    if path.is_empty() {
-        return Err("Empty path".to_string());
-    }
-
-    if path.len() == 1 {
-        match &path[0] {
-            PathElement::Attribute(name) => {
-                item.remove(name);
-                Ok(())
-            }
-            PathElement::Index(_) => Err("Cannot index into top-level item".to_string()),
+    check_update_parent(item, path)?;
+    let (last, parents) = path.split_last().expect("checked non-empty");
+    if parents.is_empty() {
+        if let PathElement::Attribute(name) = last {
+            item.remove(name);
         }
-    } else {
-        let first_name = match &path[0] {
-            PathElement::Attribute(name) => name.clone(),
-            PathElement::Index(_) => return Err("Cannot index into top-level item".to_string()),
-        };
-
-        if let Some(entry) = item.get_mut(&first_name) {
-            remove_nested(entry, &path[1..])
-        } else {
-            Ok(()) // Path doesn't exist, nothing to remove
-        }
+        return Ok(());
     }
-}
-
-fn remove_nested(current: &mut AttributeValue, path: &[PathElement]) -> Result<(), String> {
-    if path.is_empty() {
-        return Err("Empty remaining path".to_string());
-    }
-
-    if path.len() == 1 {
-        match &path[0] {
-            PathElement::Attribute(name) => {
-                if let AttributeValue::M(map) = current {
-                    map.remove(name);
-                    Ok(())
-                } else {
-                    Ok(()) // Not a map, nothing to remove
-                }
-            }
-            PathElement::Index(i) => {
-                if let AttributeValue::L(list) = current {
-                    if *i < list.len() {
-                        list.remove(*i);
-                    }
-                    Ok(())
-                } else {
-                    Ok(()) // Not a list, nothing to remove
-                }
-            }
+    match (resolve_path_mut(item, parents), last) {
+        (Some(AttributeValue::M(map)), PathElement::Attribute(name)) => {
+            map.remove(name);
         }
-    } else {
-        match &path[0] {
-            PathElement::Attribute(name) => {
-                if let AttributeValue::M(map) = current {
-                    if let Some(entry) = map.get_mut(name) {
-                        remove_nested(entry, &path[1..])
-                    } else {
-                        Ok(())
-                    }
-                } else {
-                    Ok(())
-                }
-            }
-            PathElement::Index(i) => {
-                if let AttributeValue::L(list) = current {
-                    if let Some(entry) = list.get_mut(*i) {
-                        remove_nested(entry, &path[1..])
-                    } else {
-                        Ok(())
-                    }
-                } else {
-                    Ok(())
-                }
-            }
+        (Some(AttributeValue::L(list)), PathElement::Index(i)) if *i < list.len() => {
+            list.remove(*i);
         }
+        _ => {}
     }
+    Ok(())
 }
 
 /// Element in a document path (e.g., `a.b[0].c`).
