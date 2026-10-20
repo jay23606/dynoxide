@@ -22,8 +22,8 @@ struct ScanRequestRaw {
     expression_attribute_names: Option<HashMap<String, String>>,
     #[serde(rename = "ExpressionAttributeValues", default)]
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    #[serde(rename = "Limit", default)]
-    limit: Option<usize>,
+    #[serde(rename = "Limit", default, deserialize_with = "deserialize_int32")]
+    limit: Option<Int32>,
     #[serde(rename = "ExclusiveStartKey", default)]
     exclusive_start_key: Option<serde_json::Value>,
     #[serde(rename = "Select", default)]
@@ -36,13 +36,14 @@ struct ScanRequestRaw {
     consistent_read: Option<bool>,
     #[serde(rename = "IndexName", default)]
     index_name: Option<String>,
-    // Signed so a negative Segment deserialises and can be rejected with the
-    // DynamoDB ValidationException rather than a serde error. Cast to u32 after
-    // the >= 0 check below.
-    #[serde(rename = "Segment", default)]
-    segment: Option<i64>,
-    #[serde(rename = "TotalSegments", default)]
-    total_segments: Option<u32>,
+    #[serde(rename = "Segment", default, deserialize_with = "deserialize_int32")]
+    segment: Option<Int32>,
+    #[serde(
+        rename = "TotalSegments",
+        default,
+        deserialize_with = "deserialize_int32"
+    )]
+    total_segments: Option<Int32>,
     #[serde(rename = "ReturnConsumedCapacity", default)]
     return_consumed_capacity: Option<String>,
     #[serde(rename = "AttributesToGet", default)]
@@ -76,6 +77,42 @@ pub struct ScanRequest {
     pub exclusive_start_key_raw: Option<serde_json::Value>,
 }
 
+/// An integer member as DynamoDB reads it: a 32-bit signed integer that
+/// saturates at either end, truncating a fraction. A value that saturated or
+/// lost a fraction is flagged, because the member is then checked by the older
+/// layer, which reports the value as read (captured eu-west-2 and eu-central-1,
+/// 20 October 2026).
+#[derive(Debug, Clone, Copy)]
+struct Int32 {
+    value: i64,
+    coerced: bool,
+}
+
+fn deserialize_int32<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Int32>, D::Error> {
+    let Some(number) = Option::<serde_json::Number>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let mut fraction = false;
+    let wide = if let Some(i) = number.as_i64() {
+        i128::from(i)
+    } else if let Some(u) = number.as_u64() {
+        i128::from(u)
+    } else {
+        // A fraction truncates toward zero; NaN and the infinities cannot
+        // appear in JSON.
+        let float = number.as_f64().unwrap_or(0.0);
+        fraction = float.fract() != 0.0;
+        float.trunc() as i128
+    };
+    let clamped = wide.clamp(i128::from(i32::MIN), i128::from(i32::MAX));
+    Ok(Some(Int32 {
+        value: clamped as i64,
+        coerced: fraction || clamped != wide,
+    }))
+}
+
 /// The members of a Scan that DynamoDB checks before it reads anything else
 /// about the request, and what it says when one fails. Captured in eu-west-2
 /// and eu-central-1 (20 October 2026), where the newer validation layer runs
@@ -89,9 +126,13 @@ pub(crate) struct ScanMembers<'a> {
     pub limit: Option<i64>,
     pub segment: Option<i64>,
     pub total_segments: Option<i64>,
+    /// Whether `Limit`, `Segment` or `TotalSegments` saturated or lost a
+    /// fraction as it was read.
+    pub coerced: bool,
 }
 
 const TOTAL_SEGMENTS_MAX: i64 = 1_000_000;
+const SEGMENT_MAX: i64 = 999_999;
 
 impl ScanMembers<'_> {
     /// The message for the first stage with an error, or `None`. A stage's
@@ -124,7 +165,7 @@ impl ScanMembers<'_> {
 
         let missing_operators =
             helpers::missing_comparison_operators(self.scan_filter, "scanFilter");
-        if self.table_name.is_none() || !missing_operators.is_empty() {
+        if self.table_name.is_none() || !missing_operators.is_empty() || self.coerced {
             let mut errors = Vec::new();
             errors.extend(self.select.and_then(super::query::select_rejection));
             if let Some(total) = self.total_segments {
@@ -151,18 +192,24 @@ impl ScanMembers<'_> {
             }
             errors.extend(conditional_operator_rejection(self.conditional_operator));
             errors.extend(missing_operators);
-            if let Some(segment) = self.segment.filter(|s| *s < 0) {
-                errors.push(format!(
-                    "Value '{segment}' at 'segment' failed to satisfy constraint: \
-                     Member must have value greater than or equal to 0"
-                ));
+            if let Some(segment) = self.segment {
+                if segment < 0 {
+                    errors.push(format!(
+                        "Value '{segment}' at 'segment' failed to satisfy constraint: \
+                         Member must have value greater than or equal to 0"
+                    ));
+                } else if segment > SEGMENT_MAX {
+                    errors.push(format!(
+                        "Value '{segment}' at 'segment' failed to satisfy constraint: \
+                         Member must have value less than or equal to {SEGMENT_MAX}"
+                    ));
+                }
             }
-            if self.limit.is_some_and(|l| l < 1) {
-                errors.push(
-                    "Value '0' at 'limit' failed to satisfy constraint: \
+            if let Some(limit) = self.limit.filter(|l| *l < 1) {
+                errors.push(format!(
+                    "Value '{limit}' at 'limit' failed to satisfy constraint: \
                      Member must have value greater than or equal to 1"
-                        .to_string(),
-                );
+                ));
             }
             return format_validation_errors(&errors);
         }
@@ -175,12 +222,19 @@ impl ScanMembers<'_> {
                     .to_string(),
             );
         }
-        if self.segment.is_some_and(|s| s < 0) {
-            errors.push(
-                "Value at 'Segment' failed to satisfy constraint: \
-                 Member must have value greater than or equal to 0"
-                    .to_string(),
-            );
+        if let Some(segment) = self.segment {
+            if segment < 0 {
+                errors.push(
+                    "Value at 'Segment' failed to satisfy constraint: \
+                     Member must have value greater than or equal to 0"
+                        .to_string(),
+                );
+            } else if segment > SEGMENT_MAX {
+                errors.push(format!(
+                    "Value at 'Segment' failed to satisfy constraint: \
+                     Member must have value less than or equal to {SEGMENT_MAX}"
+                ));
+            }
         }
         if let Some(total) = self.total_segments {
             if total < 1 {
@@ -232,9 +286,13 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             return_consumed_capacity: raw.return_consumed_capacity.as_deref(),
             conditional_operator: raw.conditional_operator.as_deref(),
             scan_filter: raw.scan_filter.as_ref(),
-            limit: raw.limit.and_then(|l| i64::try_from(l).ok()),
-            segment: raw.segment,
-            total_segments: raw.total_segments.map(i64::from),
+            limit: raw.limit.map(|n| n.value),
+            segment: raw.segment.map(|n| n.value),
+            total_segments: raw.total_segments.map(|n| n.value),
+            coerced: [raw.limit, raw.segment, raw.total_segments]
+                .iter()
+                .flatten()
+                .any(|n| n.coerced),
         })
         .rejection()
         {
@@ -248,13 +306,13 @@ impl<'de> serde::Deserialize<'de> for ScanRequest {
             projection_expression: raw.projection_expression,
             expression_attribute_names: raw.expression_attribute_names,
             expression_attribute_values: raw.expression_attribute_values,
-            limit: raw.limit,
+            limit: raw.limit.map(|n| n.value as usize),
             exclusive_start_key: None,
             select: raw.select,
             consistent_read: raw.consistent_read,
             index_name: raw.index_name,
-            segment: raw.segment.map(|s| s as u32),
-            total_segments: raw.total_segments,
+            segment: raw.segment.map(|n| n.value as u32),
+            total_segments: raw.total_segments.map(|n| n.value as u32),
             return_consumed_capacity: raw.return_consumed_capacity,
             attributes_to_get: raw.attributes_to_get,
             scan_filter: raw.scan_filter,
@@ -296,14 +354,18 @@ pub async fn execute<S: StorageBackend>(
         return_consumed_capacity: request.return_consumed_capacity.as_deref(),
         conditional_operator: request.conditional_operator.as_deref(),
         scan_filter: request.scan_filter.as_ref(),
-        limit: request.limit.and_then(|l| i64::try_from(l).ok()),
+        limit: request.limit.map(|l| i64::try_from(l).unwrap_or(i64::MAX)),
         segment: request.segment.map(i64::from),
         total_segments: request.total_segments.map(i64::from),
+        coerced: false,
     })
     .rejection()
     {
         return Err(DynoxideError::ValidationException(msg));
     }
+
+    // A Limit past what a 32-bit integer holds is read as the largest one.
+    request.limit = request.limit.map(|l| l.min(i32::MAX as usize));
 
     // An empty attribute name is refused ahead of the table lookup and the
     // expressions, bare whichever member holds it: 20 of 33 regions answer so
@@ -610,25 +672,14 @@ pub async fn execute<S: StorageBackend>(
         ),
     };
 
-    // ---- Validate ExclusiveStartKey structure against key schema ----
-    // Stage 1+2: count check + index key type check
-    if let Some(ref esk) = exclusive_start_key {
-        let count_msg = "The provided starting key is invalid";
-        helpers::validate_esk_count_and_index_keys(
-            esk,
-            &meta,
-            request.index_name.as_deref(),
-            count_msg,
-        )?;
-    }
-
-    // Check ALL_ATTRIBUTES on global index (between index key check and table key check)
+    // Select ALL_ATTRIBUTES on a global index that doesn't project everything is
+    // refused ahead of the starting key's checks (captured eu-west-2 and
+    // eu-central-1, 20 October 2026).
     if let Some(ref index_name) = request.index_name
         && !is_lsi
         && let Some(ref select) = request.select
         && select == "ALL_ATTRIBUTES"
     {
-        // Check if index projection is ALL
         let gsi_defs = super::gsi::parse_gsi_defs(&meta)?;
         if let Some(gsi) = gsi_defs.iter().find(|g| g.index_name == *index_name)
             && gsi.projection_type != crate::types::ProjectionType::ALL
@@ -640,6 +691,18 @@ pub async fn execute<S: StorageBackend>(
                 index_name
             )));
         }
+    }
+
+    // ---- Validate ExclusiveStartKey structure against key schema ----
+    // Stage 1+2: count check + index key type check
+    if let Some(ref esk) = exclusive_start_key {
+        helpers::validate_esk_count_and_index_keys(
+            esk,
+            &meta,
+            request.index_name.as_deref(),
+            "The provided starting key is invalid",
+            true,
+        )?;
     }
 
     // Stage 3: table key type check

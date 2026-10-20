@@ -2072,6 +2072,7 @@ pub fn validate_esk_count_and_index_keys(
     meta: &TableMetadata,
     index_name: Option<&str>,
     count_mismatch_msg: &str,
+    name_index_on_type_mismatch: bool,
 ) -> Result<()> {
     let table_key_schema: Vec<KeySchemaElement> = serde_json::from_str(&meta.key_schema)
         .map_err(|e| DynoxideError::InternalServerError(format!("Bad key schema JSON: {e}")))?;
@@ -2095,6 +2096,38 @@ pub fn validate_esk_count_and_index_keys(
     for k in &index_key_schema {
         if !expected_names.contains(&k.attribute_name) {
             expected_names.push(k.attribute_name.clone());
+        }
+    }
+
+    // A Scan on the newer validation layer checks every starting key attribute
+    // against the attribute definitions ahead of the count, and on a table
+    // with indexes reports a mismatch as an index key's, naming the index
+    // asked for or else the first the table has (captured eu-west-2 and
+    // eu-central-1, 20 October 2026). A table with no index answers in the
+    // short form from the table key check.
+    if name_index_on_type_mismatch {
+        let index = match index_name {
+            Some(index) => Some(index.to_string()),
+            None => super::gsi::parse_gsi_defs(meta)?
+                .into_iter()
+                .chain(super::lsi::parse_lsi_defs(meta)?)
+                .next()
+                .map(|def| def.index_name),
+        };
+        if let Some(index) = index {
+            for def in &attr_defs {
+                if let Some(val) = esk.get(&def.attribute_name)
+                    && !attr_value_matches_scalar_type(val, &def.attribute_type)
+                {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "One or more parameter values were invalid: Type mismatch for Index \
+                         Key {} Expected: {:?} Actual: {} IndexName: {index}",
+                        def.attribute_name,
+                        def.attribute_type,
+                        val.type_name()
+                    )));
+                }
+            }
         }
     }
 

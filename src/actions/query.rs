@@ -621,6 +621,7 @@ pub async fn execute<S: StorageBackend>(
             &meta,
             request.index_name.as_deref(),
             "The provided starting key is invalid",
+            false,
         )?;
         // Stage 3: table key type check
         helpers::validate_esk_table_keys(esk, &meta).map_err(bare_start_key_mismatch)?;

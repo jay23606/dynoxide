@@ -2,16 +2,24 @@
 //! in the newer validation layer: which error is reported, in which wording,
 //! and which errors come back together.
 //!
-//! Each expectation is the answer eu-west-2 gave on 20 October 2026, a table
-//! with a string hash key named `pk`; eu-central-1 gave the same on every one.
+//! Each expectation is the answer eu-west-2 gave on 20 October 2026, for a table
+//! with a string hash key named `pk` and two global indexes (`gsi`, keys only,
+//! on `gk`; `gsi2`, projecting everything, on `gk2`); eu-central-1 gave the same
+//! on every one.
 //! The layer reached 20 of the 33 observed regions by then, and the code
-//! follows the majority. The requests run in five rounds, each looking at the
-//! order between two stages of the check, so the table is long on purpose.
-//! An empty expectation is a request DynamoDB accepts.
+//! follows the majority. The requests run in nine rounds, each looking at the
+//! order between two stages of the check, or at an edge of one, so the table
+//! is long on purpose. An empty expectation is a request DynamoDB accepts.
 //!
 //! The tables are data captured from DynamoDB, not written by hand. When the
 //! layer moves again, capture the same requests afresh and replace the tables
 //! whole rather than editing single expectations.
+//!
+//! One request is left out on purpose: a `Limit` past what a 32-bit integer
+//! holds beside `Select` of `SPECIFIC_ATTRIBUTES` with no projection. DynamoDB
+//! puts the whole request on the older layer then, and answers without the
+//! `1 validation error detected:` envelope; Dynoxide applies the older layer to
+//! the member checks only, so it still envelopes the answer.
 
 #![cfg(feature = "http-server")]
 
@@ -28,7 +36,17 @@ async fn start_server() -> String {
         serde_json::from_value::<CreateTableRequest>(serde_json::json!({
             "TableName": TABLE,
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
-            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "gk", "AttributeType": "S"},
+                {"AttributeName": "gk2", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [
+                {"IndexName": "gsi", "KeySchema": [{"AttributeName": "gk", "KeyType": "HASH"}],
+                 "Projection": {"ProjectionType": "KEYS_ONLY"}},
+                {"IndexName": "gsi2", "KeySchema": [{"AttributeName": "gk2", "KeyType": "HASH"}],
+                 "Projection": {"ProjectionType": "ALL"}}
+            ],
             "BillingMode": "PAY_PER_REQUEST"
         }))
         .unwrap(),
@@ -41,7 +59,7 @@ async fn start_server() -> String {
     url
 }
 
-/// The ValidationException message a Scan is refused with, or an empty string
+/// The ValidationException (or SerializationException) message a Scan is refused with, or an empty string
 /// when it is accepted.
 async fn answer(url: &str, body: &serde_json::Value) -> String {
     let resp = reqwest::Client::new()
@@ -67,14 +85,16 @@ async fn answer(url: &str, body: &serde_json::Value) -> String {
         "internal marker or serde position leaked: {text}"
     );
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let kind = parsed["__type"].as_str().unwrap();
     assert!(
-        parsed["__type"]
-            .as_str()
-            .unwrap()
-            .ends_with("#ValidationException"),
+        kind.ends_with("#ValidationException") || kind.ends_with("#SerializationException"),
         "unexpected __type for {body}: {parsed}"
     );
-    parsed["message"].as_str().unwrap().to_string()
+    parsed["message"]
+        .as_str()
+        .or_else(|| parsed["Message"].as_str())
+        .unwrap()
+        .to_string()
 }
 
 /// (case, request members, message). A `TableName` of `__absent__` leaves the
@@ -183,7 +203,7 @@ const CASES: &[(&str, &str, &str)] = &[
     (
         r##"ExclusiveStartKey right name, wrong type"##,
         r##"{"ExclusiveStartKey":{"pk":{"N":"1"}}}"##,
-        r##"The provided starting key is invalid"##,
+        r##"One or more parameter values were invalid: Type mismatch for Index Key pk Expected: S Actual: N IndexName: gsi"##,
     ),
     (
         r##"ExclusiveStartKey empty map"##,
@@ -796,6 +816,267 @@ const CASES: &[(&str, &str, &str)] = &[
         r##"1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"##,
     ),
     (
+        r##"TotalSegments 1, accepted"##,
+        r##"{"Segment":0,"TotalSegments":1}"##,
+        r##""##,
+    ),
+    (
+        r##"TotalSegments 1000000, accepted"##,
+        r##"{"Segment":0,"TotalSegments":1000000}"##,
+        r##""##,
+    ),
+    (
+        r##"absent TableName + TotalSegments 1000001"##,
+        r##"{"TableName":"__absent__","Segment":0,"TotalSegments":1000001}"##,
+        r##"2 validation errors detected: Value '1000001' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000; Value null at 'tableName' failed to satisfy constraint: Member must not be null"##,
+    ),
+    (
+        r##"SPECIFIC_ATTRIBUTES with AttributesToGet, accepted"##,
+        r##"{"Select":"SPECIFIC_ATTRIBUTES","AttributesToGet":["a"]}"##,
+        r##""##,
+    ),
+    (
+        r##"SPECIFIC_ATTRIBUTES with ProjectionExpression, accepted"##,
+        r##"{"Select":"SPECIFIC_ATTRIBUTES","ProjectionExpression":"a"}"##,
+        r##""##,
+    ),
+    (
+        r##"Select COUNT, accepted"##,
+        r##"{"Select":"COUNT"}"##,
+        r##""##,
+    ),
+    (
+        r##"index: no such index"##,
+        r##"{"IndexName":"nope"}"##,
+        r##"The table does not have the specified index: nope"##,
+    ),
+    (
+        r##"index: ALL_PROJECTED_ATTRIBUTES, accepted"##,
+        r##"{"IndexName":"gsi","Select":"ALL_PROJECTED_ATTRIBUTES"}"##,
+        r##""##,
+    ),
+    (
+        r##"index: ALL_PROJECTED_ATTRIBUTES + AttributesToGet"##,
+        r##"{"IndexName":"gsi","Select":"ALL_PROJECTED_ATTRIBUTES","AttributesToGet":["a"]}"##,
+        r##"1 validation error detected: Cannot specify the AttributesToGet when choosing to get ALL_PROJECTED_ATTRIBUTES"##,
+    ),
+    (
+        r##"index: ALL_PROJECTED_ATTRIBUTES + ProjectionExpression"##,
+        r##"{"IndexName":"gsi","Select":"ALL_PROJECTED_ATTRIBUTES","ProjectionExpression":"a"}"##,
+        r##"1 validation error detected: Cannot specify the ProjectionExpression when choosing to get ALL_PROJECTED_ATTRIBUTES"##,
+    ),
+    (
+        r##"index: ALL_ATTRIBUTES on a keys-only index"##,
+        r##"{"IndexName":"gsi","Select":"ALL_ATTRIBUTES"}"##,
+        r##"One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not supported for global secondary index gsi because its projection type is not ALL"##,
+    ),
+    (
+        r##"index: ALL_ATTRIBUTES on a keys-only index + malformed ExclusiveStartKey"##,
+        r##"{"IndexName":"gsi","Select":"ALL_ATTRIBUTES","ExclusiveStartKey":{"bad":{"S":"p"}}}"##,
+        r##"One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not supported for global secondary index gsi because its projection type is not ALL"##,
+    ),
+    (
+        r##"index: SPECIFIC_ATTRIBUTES, no projection"##,
+        r##"{"IndexName":"gsi","Select":"SPECIFIC_ATTRIBUTES"}"##,
+        r##"1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"##,
+    ),
+    (
+        r##"index: Segment >= TotalSegments"##,
+        r##"{"IndexName":"gsi","Segment":5,"TotalSegments":5}"##,
+        r##"The Segment parameter is zero-based and must be less than parameter TotalSegments"##,
+    ),
+    (
+        r##"index: malformed ExclusiveStartKey"##,
+        r##"{"IndexName":"gsi","ExclusiveStartKey":{"bad":{"S":"p"}}}"##,
+        r##"The provided starting key is invalid"##,
+    ),
+    (
+        r##"index: ExclusiveStartKey with the table key only"##,
+        r##"{"IndexName":"gsi","ExclusiveStartKey":{"pk":{"S":"a"}}}"##,
+        r##"The provided starting key is invalid"##,
+    ),
+    (
+        r##"index: ExclusiveStartKey with the index key only"##,
+        r##"{"IndexName":"gsi","ExclusiveStartKey":{"gk":{"S":"a"}}}"##,
+        r##"The provided starting key is invalid"##,
+    ),
+    (
+        r##"index: ExclusiveStartKey with a wrong-typed index key"##,
+        r##"{"IndexName":"gsi","ExclusiveStartKey":{"pk":{"S":"a"},"gk":{"N":"1"}}}"##,
+        r##"One or more parameter values were invalid: Type mismatch for Index Key gk Expected: S Actual: N IndexName: gsi"##,
+    ),
+    (
+        r##"index: ExclusiveStartKey with an extra attribute"##,
+        r##"{"IndexName":"gsi","ExclusiveStartKey":{"pk":{"S":"a"},"gk":{"S":"b"},"extra":{"S":"c"}}}"##,
+        r##"The provided starting key is invalid"##,
+    ),
+    (
+        r##"Segment 4294967296 of 1"##,
+        r##"{"Segment":4294967296,"TotalSegments":1}"##,
+        r##"1 validation error detected: Value '2147483647' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"##,
+    ),
+    (
+        r##"Segment 2147483648 of 5"##,
+        r##"{"Segment":2147483648,"TotalSegments":5}"##,
+        r##"1 validation error detected: Value '2147483647' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999"##,
+    ),
+    (
+        r##"Segment 2147483647 of 5"##,
+        r##"{"Segment":2147483647,"TotalSegments":5}"##,
+        r##"1 validation error detected: Value at 'Segment' failed to satisfy constraint: Member must have value less than or equal to 999999"##,
+    ),
+    (
+        r##"Segment -2147483649 of 5"##,
+        r##"{"Segment":-2147483649,"TotalSegments":5}"##,
+        r##"1 validation error detected: Value '-2147483648' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"##,
+    ),
+    (
+        r##"Segment 1.5 of 5"##,
+        r##"{"Segment":1.5,"TotalSegments":5}"##,
+        r##""##,
+    ),
+    (
+        r##"TotalSegments 4294967296"##,
+        r##"{"Segment":0,"TotalSegments":4294967296}"##,
+        r##"1 validation error detected: Value '2147483647' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"##,
+    ),
+    (
+        r##"TotalSegments 2147483648"##,
+        r##"{"Segment":0,"TotalSegments":2147483648}"##,
+        r##"1 validation error detected: Value '2147483647' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"##,
+    ),
+    (
+        r##"TotalSegments -1"##,
+        r##"{"Segment":0,"TotalSegments":-1}"##,
+        r##"1 validation error detected: Value at 'TotalSegments' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
+    (
+        r##"TotalSegments 1.5"##,
+        r##"{"Segment":0,"TotalSegments":1.5}"##,
+        r##""##,
+    ),
+    (
+        r##"TotalSegments 4294967296 without Segment"##,
+        r##"{"TotalSegments":4294967296}"##,
+        r##"1 validation error detected: Value '2147483647' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000"##,
+    ),
+    (
+        r##"Limit 9223372036854775808"##,
+        r##"{"Limit":9223372036854776000}"##,
+        r##""##,
+    ),
+    (
+        r##"Limit 4294967296"##,
+        r##"{"Limit":4294967296}"##,
+        r##""##,
+    ),
+    (
+        r##"Limit 2147483648"##,
+        r##"{"Limit":2147483648}"##,
+        r##""##,
+    ),
+    (
+        r##"Limit 2147483647, accepted"##,
+        r##"{"Limit":2147483647}"##,
+        r##""##,
+    ),
+    (
+        r##"Limit -1"##,
+        r##"{"Limit":-1}"##,
+        r##"1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
+    (r##"Limit 1.5"##, r##"{"Limit":1.5}"##, r##""##),
+    (
+        r##"Limit as a string"##,
+        r##"{"Limit":"5"}"##,
+        r##"STRING_VALUE cannot be converted to Integer"##,
+    ),
+    (
+        r##"Limit -1 + TotalSegments 4294967296"##,
+        r##"{"Limit":-1,"Segment":0,"TotalSegments":4294967296}"##,
+        r##"2 validation errors detected: Value '2147483647' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000; Value '-1' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
+    (
+        r##"Limit 4294967296 + negative Segment"##,
+        r##"{"Limit":4294967296,"Segment":-1,"TotalSegments":4}"##,
+        r##"1 validation error detected: Value '-1' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0"##,
+    ),
+    (
+        r##"Limit 4294967296 + Select BOGUS"##,
+        r##"{"Limit":4294967296,"Select":"BOGUS"}"##,
+        r##"1 validation error detected: Value 'BOGUS' at 'select' failed to satisfy constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]"##,
+    ),
+    (
+        r##"Limit 4294967296 + empty TableName"##,
+        r##"{"Limit":4294967296,"TableName":""}"##,
+        r##"1 validation error detected: Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1"##,
+    ),
+    (
+        r##"Segment 999999 of 1000000, accepted"##,
+        r##"{"Segment":999999,"TotalSegments":1000000}"##,
+        r##""##,
+    ),
+    (
+        r##"Segment 1000000 of 1000000"##,
+        r##"{"Segment":1000000,"TotalSegments":1000000}"##,
+        r##"1 validation error detected: Value at 'Segment' failed to satisfy constraint: Member must have value less than or equal to 999999"##,
+    ),
+    (
+        r##"Limit 0.5"##,
+        r##"{"Limit":0.5}"##,
+        r##"1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
+    (
+        r##"Segment -0.5 of 5, accepted"##,
+        r##"{"Segment":-0.5,"TotalSegments":5}"##,
+        r##""##,
+    ),
+    (
+        r##"Limit 0 + TotalSegments 2147483648"##,
+        r##"{"Limit":0,"Segment":0,"TotalSegments":2147483648}"##,
+        r##"2 validation errors detected: Value '2147483647' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000; Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
+    (
+        r##"TotalSegments 4294967296 + empty TableName"##,
+        r##"{"Segment":0,"TotalSegments":4294967296,"TableName":""}"##,
+        r##"2 validation errors detected: Value '2147483647' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000; Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1"##,
+    ),
+    (
+        r##"Limit -2147483649"##,
+        r##"{"Limit":-2147483649}"##,
+        r##"1 validation error detected: Value '-2147483648' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
+    ),
+    (
+        r##"table key of the wrong type, no IndexName, two indexes"##,
+        r##"{"ExclusiveStartKey":{"pk":{"N":"1"}}}"##,
+        r##"One or more parameter values were invalid: Type mismatch for Index Key pk Expected: S Actual: N IndexName: gsi"##,
+    ),
+    (
+        r##"gsi: table key of the wrong type"##,
+        r##"{"IndexName":"gsi","ExclusiveStartKey":{"pk":{"N":"1"},"gk":{"S":"a"}}}"##,
+        r##"One or more parameter values were invalid: Type mismatch for Index Key pk Expected: S Actual: N IndexName: gsi"##,
+    ),
+    (
+        r##"gsi2: table key of the wrong type"##,
+        r##"{"IndexName":"gsi2","ExclusiveStartKey":{"pk":{"N":"1"},"gk2":{"S":"a"}}}"##,
+        r##"One or more parameter values were invalid: Type mismatch for Index Key pk Expected: S Actual: N IndexName: gsi2"##,
+    ),
+    (
+        r##"gsi2: index key of the wrong type"##,
+        r##"{"IndexName":"gsi2","ExclusiveStartKey":{"pk":{"S":"a"},"gk2":{"N":"1"}}}"##,
+        r##"One or more parameter values were invalid: Type mismatch for Index Key gk2 Expected: S Actual: N IndexName: gsi2"##,
+    ),
+    (
+        r##"table key of the wrong type and an index key present, no IndexName"##,
+        r##"{"ExclusiveStartKey":{"pk":{"N":"1"},"gk":{"S":"a"}}}"##,
+        r##"One or more parameter values were invalid: Type mismatch for Index Key pk Expected: S Actual: N IndexName: gsi"##,
+    ),
+    (
+        r##"a non-key attribute of the wrong type, no IndexName"##,
+        r##"{"ExclusiveStartKey":{"gk":{"N":"1"}}}"##,
+        r##"One or more parameter values were invalid: Type mismatch for Index Key gk Expected: S Actual: N IndexName: gsi"##,
+    ),
+    (
         r##"TotalSegments 0 with Segment 0"##,
         r##"{"Segment":0,"TotalSegments":0}"##,
         r##"1 validation error detected: Value at 'TotalSegments' failed to satisfy constraint: Member must have value greater than or equal to 1"##,
@@ -809,7 +1090,7 @@ const CASES: &[(&str, &str, &str)] = &[
 
 #[tokio::test]
 async fn each_request_is_answered_as_the_newer_layer_answers_it() {
-    assert_eq!(CASES.len(), 145, "a case was added or lost");
+    assert_eq!(CASES.len(), 198, "a case was added or lost");
     let url = start_server().await;
     let mut wrong = Vec::new();
     for (case, members, expected) in CASES {
@@ -916,6 +1197,155 @@ async fn attribute_values_are_read_as_the_newer_layer_reads_them() {
         let got = answer(&url, &body).await;
         if got != *expected {
             wrong.push(format!("{case}\n  want: {expected}\n  got:  {got}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The wire table's answer for `case`.
+fn wire_answer(case: &str) -> &'static str {
+    CASES
+        .iter()
+        .find(|(name, _, _)| *name == case)
+        .unwrap_or_else(|| panic!("no case called {case}"))
+        .2
+}
+
+/// A request built in code skips the body reader, so `scan` has to give the
+/// answers the wire path gives: the same message for the same mistake.
+#[test]
+fn a_request_built_in_code_is_answered_as_the_wire_request_is() {
+    use dynoxide::actions::scan::ScanRequest;
+
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+            "TableName": TABLE,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let on = |request: ScanRequest| ScanRequest {
+        table_name: TABLE.to_string(),
+        ..request
+    };
+    let cases: Vec<(&str, ScanRequest)> = vec![
+        (
+            "Limit 0",
+            on(ScanRequest {
+                limit: Some(0),
+                ..Default::default()
+            }),
+        ),
+        (
+            "TotalSegments 0 with Segment 0",
+            on(ScanRequest {
+                segment: Some(0),
+                total_segments: Some(0),
+                ..Default::default()
+            }),
+        ),
+        (
+            "TotalSegments 1000001 with Segment 0",
+            on(ScanRequest {
+                segment: Some(0),
+                total_segments: Some(1_000_001),
+                ..Default::default()
+            }),
+        ),
+        (
+            "Segment 1000000 of 1000000",
+            on(ScanRequest {
+                segment: Some(1_000_000),
+                total_segments: Some(1_000_000),
+                ..Default::default()
+            }),
+        ),
+        (
+            "Segment >= TotalSegments",
+            on(ScanRequest {
+                segment: Some(5),
+                total_segments: Some(5),
+                ..Default::default()
+            }),
+        ),
+        (
+            "Segment 0 without TotalSegments + Select BOGUS",
+            on(ScanRequest {
+                segment: Some(0),
+                select: Some("BOGUS".into()),
+                ..Default::default()
+            }),
+        ),
+        (
+            "empty TableName",
+            ScanRequest {
+                table_name: String::new(),
+                ..Default::default()
+            },
+        ),
+        (
+            "TableName with a bad character, a!",
+            ScanRequest {
+                table_name: "a!".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            "TableName too short, ab",
+            ScanRequest {
+                table_name: "ab".into(),
+                ..Default::default()
+            },
+        ),
+        (
+            "Select BOGUS",
+            on(ScanRequest {
+                select: Some("BOGUS".into()),
+                ..Default::default()
+            }),
+        ),
+        (
+            "ReturnConsumedCapacity BOGUS",
+            on(ScanRequest {
+                return_consumed_capacity: Some("BOGUS".into()),
+                ..Default::default()
+            }),
+        ),
+        (
+            "SPECIFIC_ATTRIBUTES, no projection",
+            on(ScanRequest {
+                select: Some("SPECIFIC_ATTRIBUTES".into()),
+                ..Default::default()
+            }),
+        ),
+        (
+            "Select COUNT + AttributesToGet",
+            on(ScanRequest {
+                select: Some("COUNT".into()),
+                attributes_to_get: Some(vec!["a".into()]),
+                ..Default::default()
+            }),
+        ),
+        (
+            "ConditionalOperator AND, no filter",
+            on(ScanRequest {
+                conditional_operator: Some("AND".into()),
+                ..Default::default()
+            }),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, request) in cases {
+        let got = db.scan(request).unwrap_err().to_string();
+        if got != wire_answer(case) {
+            wrong.push(format!(
+                "{case}\n  want: {}\n  got:  {got}",
+                wire_answer(case)
+            ));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
