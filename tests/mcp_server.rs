@@ -2905,33 +2905,19 @@ fn test_http_transport() {
 
     let binary = env!("CARGO_BIN_EXE_dynoxide");
 
-    // Find a free port
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
-    // Start the MCP server in HTTP mode. A fixed token via env keeps the test
-    // deterministic and avoids writing to the real per-user config dir.
-    let mut child = Command::new(binary)
-        .args(["mcp", "--http", "--port", &port.to_string()])
-        .env("DYNOXIDE_MCP_AUTH_TOKEN", "test-transport-token")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn dynoxide mcp --http");
-
-    // Wait for the server to be ready by polling the endpoint
-    let _url = format!("http://127.0.0.1:{port}/mcp");
-    let mut ready = false;
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "MCP HTTP server did not start within 5 seconds");
+    // Start the MCP server in HTTP mode, again on another port if it loses the
+    // race for the first. A fixed token via env keeps the test deterministic and
+    // avoids writing to the real per-user config dir.
+    let (port, mut child) = spawn_on_free_port("127.0.0.1", |port| {
+        let mut command = Command::new(binary);
+        command
+            .args(["mcp", "--http", "--port", &port.to_string()])
+            .env("DYNOXIDE_MCP_AUTH_TOKEN", "test-transport-token")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    });
 
     // Send an initialize request via HTTP POST
     let init_body = serde_json::json!({
@@ -3004,32 +2990,21 @@ fn test_http_transport_dns_rebinding_defences() {
 
     let binary = env!("CARGO_BIN_EXE_dynoxide");
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
-    let child = Command::new(binary)
-        .args(["mcp", "--http", "--port", &port.to_string()])
-        // Auth now wraps the transport. Use a fixed token and send it on every
-        // request so these assertions still exercise rmcp's Host/Origin checks
-        // (which sit behind auth) rather than the 401 from the auth layer.
-        .env("DYNOXIDE_MCP_AUTH_TOKEN", "dns-rebind-token")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn dynoxide mcp --http");
+    let (port, child) = spawn_on_free_port("127.0.0.1", |port| {
+        let mut command = Command::new(binary);
+        command
+            .args(["mcp", "--http", "--port", &port.to_string()])
+            // Auth now wraps the transport. Use a fixed token and send it on
+            // every request so these assertions still exercise rmcp's
+            // Host/Origin checks (which sit behind auth) rather than the 401
+            // from the auth layer.
+            .env("DYNOXIDE_MCP_AUTH_TOKEN", "dns-rebind-token")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    });
     let _kill_on_drop = ChildKiller(child);
-
-    let mut ready = false;
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "MCP HTTP server did not start within 5 seconds");
 
     let init_body = serde_json::json!({
         "jsonrpc": "2.0",

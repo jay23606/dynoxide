@@ -304,16 +304,23 @@ where
     }
 }
 
-/// Resolves once `state` reports the container has exited. Reads it first
-/// after `grace`, then every `interval`.
+/// Resolves once `state` reports a container that can no longer become ready:
+/// exited, dead, or gone on two reads in a row (one read can miss a container
+/// that is there, if Docker briefly fails to answer). Reads it first after
+/// `grace`, then every `interval`.
 async fn watch_for_exit<F>(grace: Duration, interval: Duration, state: F)
 where
     F: Fn() -> ContainerState + Clone + Send + 'static,
 {
     tokio::time::sleep(grace).await;
+    let mut gone_before = false;
     loop {
-        if let Ok(ContainerState::Exited(_)) = tokio::task::spawn_blocking(state.clone()).await {
-            return;
+        match tokio::task::spawn_blocking(state.clone()).await {
+            Ok(ContainerState::Exited(_)) => return,
+            Ok(ContainerState::Other(status)) if status == "dead" => return,
+            Ok(ContainerState::Gone) if gone_before => return,
+            Ok(ContainerState::Gone) => gone_before = true,
+            _ => gone_before = false,
         }
         tokio::time::sleep(interval).await;
     }
@@ -650,6 +657,55 @@ mod tests {
             "gave up after {:?}, nowhere near the 300s timeout",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn a_dead_or_vanished_container_ends_the_wait_early() {
+        for state in [ContainerState::Other("dead".into()), ContainerState::Gone] {
+            let started = Instant::now();
+            let ready = wait_for_list_tables_unless_exited(
+                &refused_endpoint(),
+                Duration::from_secs(300),
+                Duration::ZERO,
+                Duration::from_millis(10),
+                move || state.clone(),
+            )
+            .await;
+            assert!(!ready);
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "gave up after {:?}, nowhere near the 300s timeout",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_read_that_misses_the_container_does_not_end_the_wait() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Gone once, then running: the wait carries on to its timeout.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let started = Instant::now();
+        let ready = wait_for_list_tables_unless_exited(
+            &refused_endpoint(),
+            Duration::from_millis(400),
+            Duration::ZERO,
+            Duration::from_millis(10),
+            move || {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ContainerState::Gone
+                } else {
+                    ContainerState::Running
+                }
+            },
+        )
+        .await;
+        assert!(!ready);
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        assert!(reads.load(Ordering::SeqCst) > 2);
     }
 
     #[tokio::test]
