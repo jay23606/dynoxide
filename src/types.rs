@@ -1295,6 +1295,62 @@ fn complement_mantissa(digits: &[u8], width: usize) -> String {
     s
 }
 
+/// The key attribute a stored key string (see [`AttributeValue::to_key_string`])
+/// came from, or `None` for a string that is not one. A number comes back in a
+/// form that has the same value, which is all its hash depends on; the
+/// sortable encoding keeps 40 digits, more than DynamoDB's 38.
+pub(crate) fn key_value_from_key_string(key: &str) -> Option<AttributeValue> {
+    let (kind, body) = key.split_once(':')?;
+    match kind {
+        "S" => Some(AttributeValue::S(body.to_string())),
+        "B" => hex_decode(body).map(AttributeValue::B),
+        "N" => number_from_sortable(body).map(AttributeValue::N),
+        _ => None,
+    }
+}
+
+/// Undo [`normalize_number_for_sort`]: a sign digit, a four-digit exponent
+/// offset by 5000 and a 40-digit mantissa, both complemented for a negative.
+fn number_from_sortable(body: &str) -> Option<String> {
+    if body.len() != 45 || !body.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (sign, rest) = body.split_at(1);
+    let (exponent, mantissa) = rest.split_at(4);
+    let exponent: i32 = exponent.parse().ok()?;
+    let (negative, exponent, mantissa): (bool, i32, String) = match sign {
+        "1" => return Some("0".to_string()),
+        "2" => (false, exponent - 5000, mantissa.to_string()),
+        "0" => (
+            true,
+            (9999 - exponent) - 5000,
+            mantissa
+                .bytes()
+                .map(|b| (b'0' + (9 - (b - b'0'))) as char)
+                .collect(),
+        ),
+        _ => return None,
+    };
+    let digits = mantissa.trim_end_matches('0');
+    if digits.is_empty() {
+        return Some("0".to_string());
+    }
+    Some(format!(
+        "{}0.{digits}E{exponent}",
+        if negative { "-" } else { "" }
+    ))
+}
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 /// Hex-encode bytes (lowercase) for binary key storage.
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);

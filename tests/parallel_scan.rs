@@ -5,6 +5,7 @@
 
 use dynoxide::Database;
 use dynoxide::actions::create_table::CreateTableRequest;
+use dynoxide::actions::delete_item::DeleteItemRequest;
 use dynoxide::actions::put_item::PutItemRequest;
 use dynoxide::actions::scan::ScanRequest;
 use dynoxide::types::*;
@@ -182,4 +183,44 @@ fn more_segments_than_buckets_still_see_each_item_once() {
         .scan(scan_req("Tbl", Some(999_999), Some(1_000_000)))
         .unwrap();
     assert_eq!(resp.count, 0);
+}
+
+/// A worker that deletes each page as it scans its segment must still see the
+/// whole segment: the next page starts from the deleted item's place. It used
+/// to start from nowhere and return nothing more.
+#[test]
+fn a_segment_scanned_while_its_pages_are_deleted_is_seen_whole() {
+    let db = make_db_with_items(100);
+    let total = 2;
+    let mut seen = Vec::new();
+    for segment in 0..total {
+        let mut start = None;
+        loop {
+            let resp = db
+                .scan(ScanRequest {
+                    exclusive_start_key: start.take(),
+                    limit: Some(10),
+                    ..scan_req("Tbl", Some(segment), Some(total))
+                })
+                .unwrap();
+            for item in resp.items.unwrap_or_default() {
+                db.delete_item(DeleteItemRequest {
+                    table_name: "Tbl".to_string(),
+                    key: HashMap::from([("pk".to_string(), item["pk"].clone())]),
+                    ..Default::default()
+                })
+                .unwrap();
+                if let Some(AttributeValue::S(pk)) = item.get("pk") {
+                    seen.push(pk.clone());
+                }
+            }
+            match resp.last_evaluated_key {
+                Some(key) => start = Some(key),
+                None => break,
+            }
+        }
+    }
+    seen.sort();
+    let expected: Vec<String> = (0..100).map(|i| format!("item-{i:04}")).collect();
+    assert_eq!(seen, expected);
 }

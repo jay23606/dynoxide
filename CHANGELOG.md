@@ -57,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - For a `ScanRequest` built in Rust, the member errors now come from `Database::scan`, not from decoding the request, and `Select` of `BAD` decodes.
 - `Query` refuses `Select` of `COUNT`, `ALL_ATTRIBUTES` or `ALL_PROJECTED_ATTRIBUTES` beside `AttributesToGet`, puts its `Cannot specify ...` and `ALL_PROJECTED_ATTRIBUTES` messages in the `1 validation error detected:` envelope, reads `Limit` as `Scan` does, and answers an index key of the wrong type in an `ExclusiveStartKey` with `The provided starting key is invalid`. With no `TableName` it reports a bad `ReturnConsumedCapacity` beside the missing name, and a `QueryRequest` built in Rust with a `Limit` of 0 is refused.
 - A parallel `Scan` of a table with `TotalSegments` above 4096 returns each item once. The segments past the last hash bucket used to return almost every item.
+- A parallel `Scan` that deletes each page as it goes sees its whole segment. Once the item its `ExclusiveStartKey` named was deleted, the next page used to come back empty, with no `LastEvaluatedKey`.
 
 ## [1.3.0] - 2026-10-10
 

@@ -4203,6 +4203,41 @@ mod tests {
     }
 
     #[test]
+    fn a_key_string_read_back_hashes_as_the_key_did() {
+        let mut keys: Vec<AttributeValue> = [
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "12300",
+            "1.23e4",
+            "0.000123",
+            "-0.5",
+            "123.4560",
+            "99999999999999999999999999999999999999",
+            "-1E-130",
+            "9.9E125",
+        ]
+        .iter()
+        .map(|n| AttributeValue::N((*n).to_string()))
+        .collect();
+        keys.extend(["", "a", "item-0042", "ü:é"].map(|s| AttributeValue::S(s.into())));
+        keys.extend([vec![], vec![0u8], vec![0xff, 0x00, 0x10]].map(AttributeValue::B));
+        for key in keys {
+            let stored = key.to_key_string().unwrap();
+            let read_back = crate::types::key_value_from_key_string(&stored)
+                .unwrap_or_else(|| panic!("{stored} did not read back"));
+            assert_eq!(
+                compute_hash_prefix(&read_back),
+                compute_hash_prefix(&key),
+                "{key:?} via {stored}"
+            );
+        }
+        assert!(crate::types::key_value_from_key_string("X:1").is_none());
+        assert!(crate::types::key_value_from_key_string("N:12").is_none());
+    }
+
+    #[test]
     fn test_hash_prefix_number_keys() {
         // Verify number key hash prefixes from scan tests.
         // "251" must be in segment 1 (bucket 1) with TotalSegments=4096
