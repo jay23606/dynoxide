@@ -63,6 +63,7 @@ pub(crate) fn parse_sequence_number(public: &str) -> Option<i64> {
 
 /// The floor for a new stored sequence number: microseconds since the epoch,
 /// so a fresh in-memory database never reissues an earlier session's numbers.
+#[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub(crate) fn sequence_number_floor(clock: &dyn Clock) -> i64 {
     (clock.now_unix_secs_f64() * 1_000_000.0) as i64
 }
