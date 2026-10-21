@@ -21,7 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read the stream from its start.
 - **Downgrading replays the stream.** A `SequenceNumber` saved under this
   release does not resolve on an earlier release, so a consumer that resumes
-  from one after a downgrade reads the stream again from its start.
+  from one after a downgrade reads the stream again from its start. Records
+  written under this release also report a different eventID on an earlier
+  release, so a consumer that de-duplicates by eventID processes them again.
 
 ### Fixed
 

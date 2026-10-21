@@ -49,13 +49,13 @@ const SEQUENCE_NUMBER_OFFSET: u128 = 100_000_000_000_000_000_000;
 
 /// The public form of a stored sequence number: 21 digits, as DynamoDB's are
 /// (21 to 40). Fixed width, so string and numeric order agree.
-pub fn format_sequence_number(stored: i64) -> String {
+pub(crate) fn format_sequence_number(stored: i64) -> String {
     (SEQUENCE_NUMBER_OFFSET + stored.max(0) as u128).to_string()
 }
 
 /// The stored sequence number a public one names. A short number reads as
 /// stored, so a value a client kept from an earlier build still resolves.
-pub fn parse_sequence_number(public: &str) -> Option<i64> {
+pub(crate) fn parse_sequence_number(public: &str) -> Option<i64> {
     let value: u128 = public.parse().ok()?;
     let stored = value.checked_sub(SEQUENCE_NUMBER_OFFSET).unwrap_or(value);
     i64::try_from(stored).ok()
@@ -63,7 +63,7 @@ pub fn parse_sequence_number(public: &str) -> Option<i64> {
 
 /// The floor for a new stored sequence number: microseconds since the epoch,
 /// so a fresh in-memory database never reissues an earlier session's numbers.
-pub fn sequence_number_floor(clock: &dyn Clock) -> i64 {
+pub(crate) fn sequence_number_floor(clock: &dyn Clock) -> i64 {
     (clock.now_unix_secs_f64() * 1_000_000.0) as i64
 }
 
