@@ -14,6 +14,15 @@ Everything else a user installs carries 1.4.0. Most of the release brings
 answers in line with DynamoDB, so some requests answer differently: see
 Behaviour changes and `docs/compatibility-summary.md`.
 
+### Security
+
+- **`rustls-webpki` moves to 0.103.16** for RUSTSEC-2026-0382. Earlier
+  versions could accept a certificate chain through one of the distrusted
+  emSign intermediates, whose private keys are now public. `rustls` moves to
+  0.23.46 alongside it for RUSTSEC-2026-0346 to RUSTSEC-2026-0349. Both reach
+  the tree through dev-dependencies only and never shipped in a released
+  artefact.
+
 ### Behaviour changes
 
 - `Database::scan` and `Database::query` check a request built in Rust as the
