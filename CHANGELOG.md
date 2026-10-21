@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-21
+
+The crate moves to `dynoxide-rs` 3.1.0 for the new `server::serve_with_shutdown`.
+Everything else a user installs carries 1.4.0. Most of the release brings
+answers in line with DynamoDB, so some requests answer differently: see
+Behaviour changes and `docs/compatibility-summary.md`.
+
 ### Behaviour changes
 
 - `Database::scan` and `Database::query` check a request built in Rust as the
@@ -1868,7 +1875,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/nubo-db/dynoxide/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/nubo-db/dynoxide/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/nubo-db/dynoxide/compare/v1.1.0...v1.2.0
