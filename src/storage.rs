@@ -533,13 +533,19 @@ impl Storage {
         let _ = self
             .conn
             .execute_batch("ALTER TABLE _stream_records ADD COLUMN user_identity TEXT");
-        // Likewise the event id, and records written before it existed get
-        // one now, stored so every later read returns the same id.
-        let _ = self
-            .conn
-            .execute_batch("ALTER TABLE _stream_records ADD COLUMN event_id TEXT");
-        self.conn
-            .execute_batch(sql_builders::BACKFILL_STREAM_EVENT_IDS)?;
+        // Likewise the event id; records written before it existed keep the
+        // id they always reported.
+        let has_event_id: bool =
+            self.conn
+                .query_row(sql_builders::STREAM_RECORDS_HAVE_EVENT_ID, [], |row| {
+                    row.get(0)
+                })?;
+        if !has_event_id {
+            self.conn
+                .execute_batch(sql_builders::ADD_STREAM_EVENT_ID_COLUMN)?;
+            self.conn
+                .execute_batch(sql_builders::BACKFILL_STREAM_EVENT_IDS)?;
+        }
         if new_database {
             let (sql, params) = sql_builders::init_schema_version(SCHEMA_VERSION);
             self.conn
@@ -1999,6 +2005,23 @@ impl Storage {
         after_sequence: i64,
         limit: usize,
     ) -> Result<Vec<StreamRecord>> {
+        Ok(self
+            .stream_records_with_event_ids(table_name, shard_id, after_sequence, limit)?
+            .into_iter()
+            .map(|(record, _)| record)
+            .collect())
+    }
+
+    /// As [`Self::get_stream_records`], with each record's stored event id.
+    /// The id is `None` only on a row an older build wrote to the file since
+    /// this one opened it.
+    pub(crate) fn stream_records_with_event_ids(
+        &self,
+        table_name: &str,
+        shard_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<(StreamRecord, Option<String>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_name, keys_json, new_image, old_image, sequence_number, created_at, user_identity, event_id
              FROM _stream_records
@@ -2010,7 +2033,7 @@ impl Storage {
             .query_map(
                 params![table_name, shard_id, after_sequence, limit as i64],
                 |row| {
-                    Ok(StreamRecord {
+                    let record = StreamRecord {
                         event_name: row.get(0)?,
                         keys_json: row.get(1)?,
                         new_image: row.get(2)?,
@@ -2018,8 +2041,8 @@ impl Storage {
                         sequence_number: row.get(4)?,
                         created_at: row.get(5)?,
                         user_identity: row.get(6)?,
-                        event_id: row.get(7)?,
-                    })
+                    };
+                    Ok((record, row.get(7)?))
                 },
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2146,9 +2169,6 @@ pub struct StreamRecord {
     pub sequence_number: String,
     pub created_at: i64,
     pub user_identity: Option<String>,
-    /// Assigned when the record is written. `None` only on a row an older
-    /// build wrote to the file since this one opened it.
-    pub event_id: Option<String>,
 }
 
 /// Per-table statistics returned by `Storage::table_stats()`.
@@ -2616,44 +2636,70 @@ mod tests {
         assert_eq!(meta2.table_id.as_deref(), Some(id.as_str()));
     }
 
-    /// A stream record table from before records carried an event id gains the
-    /// column on open, and each old record gets an id that later opens keep.
-    #[test]
-    fn stream_records_without_an_event_id_get_a_stable_one_on_open() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap().to_string();
-        {
-            let storage = Storage::new(&path).unwrap();
-            for seq in ["1", "2"] {
-                storage
-                    .insert_stream_record("T", "INSERT", "{}", None, None, seq, "s", 0)
-                    .unwrap();
-            }
+    /// Write a database at `path` whose stream record table predates the
+    /// `event_id` column, holding records at sequence numbers 1 and 2.
+    fn write_pre_event_id_database(path: &str) {
+        let storage = Storage::new(path).unwrap();
+        for seq in ["1", "2"] {
             storage
-                .conn()
-                .execute_batch("ALTER TABLE _stream_records DROP COLUMN event_id")
+                .insert_stream_record("T", "INSERT", "{}", None, None, seq, "s", 0)
                 .unwrap();
         }
+        storage
+            .conn()
+            .execute_batch("ALTER TABLE _stream_records DROP COLUMN event_id")
+            .unwrap();
+    }
 
-        let ids = |storage: &Storage| -> Vec<String> {
-            storage
-                .get_stream_records("T", "s", 0, 10)
-                .unwrap()
-                .into_iter()
-                .map(|r| r.event_id.expect("backfilled on open"))
-                .collect()
-        };
-        let first = ids(&Storage::new(&path).unwrap());
-        assert_eq!(first.len(), 2);
-        for id in &first {
-            assert_eq!(id.len(), 32, "{id}");
-            assert!(
-                id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
-                "{id}"
-            );
-        }
-        assert_ne!(first[0], first[1]);
-        assert_eq!(ids(&Storage::new(&path).unwrap()), first);
+    fn stored_event_ids(storage: &Storage) -> Vec<Option<String>> {
+        storage
+            .stream_records_with_event_ids("T", "s", 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, event_id)| event_id)
+            .collect()
+    }
+
+    /// Opening a database from before the `event_id` column adds it, and each
+    /// old record keeps the id it always reported: its sequence number.
+    #[test]
+    fn stream_records_without_an_event_id_keep_their_sequence_number_on_open() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        write_pre_event_id_database(&path);
+
+        let expected = vec![Some("1".to_string()), Some("2".to_string())];
+        let storage = Storage::new(&path).unwrap();
+        assert_eq!(stored_event_ids(&storage), expected);
+
+        // Once the column exists the backfill does not run again: a row an
+        // older build writes without an id stays as written.
+        storage
+            .conn()
+            .execute_batch("UPDATE _stream_records SET event_id = NULL WHERE sequence_number = '2'")
+            .unwrap();
+        drop(storage);
+        let storage = Storage::new(&path).unwrap();
+        assert_eq!(
+            stored_event_ids(&storage),
+            vec![Some("1".to_string()), None]
+        );
+    }
+
+    /// A restored snapshot from before the `event_id` column is backfilled
+    /// the same way.
+    #[test]
+    fn a_restored_snapshot_without_an_event_id_column_is_backfilled() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        write_pre_event_id_database(&path);
+
+        let mut storage = Storage::memory().unwrap();
+        storage.restore_from(&path).unwrap();
+        assert_eq!(
+            stored_event_ids(&storage),
+            vec![Some("1".to_string()), Some("2".to_string())]
+        );
     }
 
     /// The v8 -> v9 migration adds the `vector_index_definitions` column, so a

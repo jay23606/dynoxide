@@ -78,24 +78,15 @@ pub async fn execute<S: StorageBackend>(
     let position = match request.shard_iterator_type.as_str() {
         "TRIM_HORIZON" => 0,
         "LATEST" => {
-            // Position at the last record written, so only later ones return.
-            let sid = crate::streams::shard_id(&table_name);
-            let (_, last) = storage.get_shard_sequence_range(&table_name, &sid).await?;
+            // Position at the shard's last record, so only later ones return.
+            let (_, last) = storage
+                .get_shard_sequence_range(&table_name, &request.shard_id)
+                .await?;
             last.and_then(|seq| seq.parse().ok()).unwrap_or(0)
         }
-        "AT_SEQUENCE_NUMBER" => {
-            let seq = request
-                .sequence_number
-                .as_deref()
-                .and_then(crate::streams::parse_sequence_number)
-                .unwrap_or(0);
-            seq - 1 // AT means include this record, so position before it
-        }
-        "AFTER_SEQUENCE_NUMBER" => request
-            .sequence_number
-            .as_deref()
-            .and_then(crate::streams::parse_sequence_number)
-            .unwrap_or(0),
+        // AT includes the named record, so position just before it.
+        "AT_SEQUENCE_NUMBER" => requested_sequence_number(&request)? - 1,
+        "AFTER_SEQUENCE_NUMBER" => requested_sequence_number(&request)?,
         other => {
             return Err(DynoxideError::ValidationException(format!(
                 "Invalid ShardIteratorType: {other}"
@@ -107,6 +98,19 @@ pub async fn execute<S: StorageBackend>(
 
     Ok(GetShardIteratorResponse {
         shard_iterator: Some(iterator),
+    })
+}
+
+/// The stored sequence number an AT_ or AFTER_SEQUENCE_NUMBER request names.
+fn requested_sequence_number(request: &GetShardIteratorRequest) -> Result<i64> {
+    let kind = &request.shard_iterator_type;
+    let value = request.sequence_number.as_deref().ok_or_else(|| {
+        DynoxideError::ValidationException(format!(
+            "SequenceNumber is required for ShardIteratorType {kind}"
+        ))
+    })?;
+    crate::streams::parse_sequence_number(value).ok_or_else(|| {
+        DynoxideError::ValidationException(format!("Invalid SequenceNumber: {value}"))
     })
 }
 

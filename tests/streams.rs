@@ -458,6 +458,20 @@ fn test_transact_write_generates_stream_records() {
     assert_eq!(resp.records[0].event_name, "INSERT"); // initial put
     assert_eq!(resp.records[1].event_name, "INSERT"); // transact put
     assert_eq!(resp.records[2].event_name, "REMOVE"); // transact delete
+
+    // Each transact record carries its own eventID, shaped as DynamoDB's.
+    for record in &resp.records[1..] {
+        assert_aws_event_id(&record.event_id);
+    }
+    assert_ne!(resp.records[1].event_id, resp.records[2].event_id);
+}
+
+fn assert_aws_event_id(id: &str) {
+    assert_eq!(id.len(), 32, "eventID {id} should be 32 hex digits");
+    assert!(
+        id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "eventID {id} should be lowercase hex"
+    );
 }
 
 #[test]
@@ -732,4 +746,147 @@ fn sequence_numbers_are_aws_shaped_and_drive_every_iterator_type() {
     let seqs = sequence_numbers(&db, "Evt");
     assert_eq!(range.starting_sequence_number.as_ref(), seqs.first());
     assert_eq!(range.ending_sequence_number.as_ref(), seqs.last());
+}
+
+fn record_keys(resp: &dynoxide::actions::get_records::GetRecordsResponse) -> Vec<String> {
+    resp.records
+        .iter()
+        .map(|r| match r.dynamodb.keys.get("pk") {
+            Some(AttributeValue::S(s)) => s.clone(),
+            other => panic!("unexpected key {other:?}"),
+        })
+        .collect()
+}
+
+/// A database file whose two stream records carry the short sequence numbers
+/// 1 and 2 and predate the `event_id` column, as an earlier build wrote them.
+fn write_legacy_stream_file(path: &str) {
+    {
+        let db = Database::new(path).unwrap();
+        create_stream_table(&db, "Evt", "NEW_IMAGE");
+        put_item(&db, "Evt", "k0", "v");
+        put_item(&db, "Evt", "k1", "v");
+    }
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "UPDATE _stream_records SET sequence_number = CASE
+             WHEN json_extract(keys_json, '$.pk.S') = 'k0' THEN '1' ELSE '2' END;
+         ALTER TABLE _stream_records DROP COLUMN event_id;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn records_from_an_earlier_build_keep_their_ids_and_order_beside_new_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    let path = path.to_str().unwrap();
+    write_legacy_stream_file(path);
+
+    let db = Database::new(path).unwrap();
+    put_item(&db, "Evt", "k2", "v");
+    put_item(&db, "Evt", "k3", "v");
+
+    // Old records keep the eventID they always reported; new ones are random.
+    let records = all_records(&db, "Evt");
+    let ids: Vec<&str> = records.iter().map(|r| r.event_id.as_str()).collect();
+    assert_eq!(&ids[..2], ["1", "2"]);
+    for id in &ids[2..] {
+        assert_aws_event_id(id);
+    }
+
+    // Write order holds across both kinds, as numbers and as strings.
+    let horizon = get_records(&db, &shard_iterator(&db, "Evt", "TRIM_HORIZON", None));
+    assert_eq!(record_keys(&horizon), ["k0", "k1", "k2", "k3"]);
+    let seqs = sequence_numbers(&db, "Evt");
+    assert_eq!(
+        &seqs[..2],
+        ["100000000000000000001", "100000000000000000002"]
+    );
+    let mut sorted = seqs.clone();
+    sorted.sort();
+    assert_eq!(sorted, seqs);
+
+    let arn = get_stream_arn(&db, "Evt");
+    let desc = db
+        .describe_stream(serde_json::from_value(json!({"StreamArn": &arn})).unwrap())
+        .unwrap();
+    let range = &desc.stream_description.shards[0].sequence_number_range;
+    assert_eq!(
+        range.starting_sequence_number.as_deref(),
+        Some("100000000000000000001")
+    );
+    assert_eq!(range.ending_sequence_number.as_ref(), seqs.last());
+
+    // A short number a client kept from the earlier build still resolves.
+    let at = shard_iterator(&db, "Evt", "AT_SEQUENCE_NUMBER", Some("2"));
+    assert_eq!(record_keys(&get_records(&db, &at)), ["k1", "k2", "k3"]);
+    let after = shard_iterator(&db, "Evt", "AFTER_SEQUENCE_NUMBER", Some("1"));
+    assert_eq!(record_keys(&get_records(&db, &after)), ["k1", "k2", "k3"]);
+    let after = shard_iterator(&db, "Evt", "AFTER_SEQUENCE_NUMBER", Some(&seqs[1]));
+    assert_eq!(record_keys(&get_records(&db, &after)), ["k2", "k3"]);
+
+    let latest = get_records(&db, &shard_iterator(&db, "Evt", "LATEST", None));
+    assert!(latest.records.is_empty());
+    put_item(&db, "Evt", "k4", "v");
+    let next = latest.next_shard_iterator.unwrap();
+    assert_eq!(record_keys(&get_records(&db, &next)), ["k4"]);
+
+    // Reopening leaves every eventID as it was.
+    drop(db);
+    let db = Database::new(path).unwrap();
+    let reread: Vec<String> = all_records(&db, "Evt")
+        .into_iter()
+        .map(|r| r.event_id)
+        .collect();
+    assert_eq!(&reread[..4], ids);
+
+    // A record an earlier build writes to the file later, with no eventID,
+    // reports its stored sequence number, as the backfill would have stored.
+    drop(db);
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch("UPDATE _stream_records SET event_id = NULL WHERE sequence_number = '2'")
+        .unwrap();
+    let db = Database::new(path).unwrap();
+    assert_eq!(all_records(&db, "Evt")[1].event_id, "2");
+}
+
+#[test]
+fn a_missing_or_invalid_sequence_number_is_a_validation_error() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    put_item(&db, "Evt", "k0", "v");
+    let arn = get_stream_arn(&db, "Evt");
+
+    for kind in ["AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER"] {
+        let cases = [
+            None,
+            Some(""),
+            Some("abc"),
+            Some("-5"),
+            Some("1.5"),
+            // Past i64 once the offset is removed, and past any stored number.
+            Some("99999999999999999999"),
+            Some("9999999999999999999999999999999999999999"),
+            Some("99999999999999999999999999999999999999999"),
+        ];
+        for seq in cases {
+            let mut req = json!({
+                "StreamArn": &arn,
+                "ShardId": "shardId-00000001-Evt",
+                "ShardIteratorType": kind
+            });
+            if let Some(seq) = seq {
+                req["SequenceNumber"] = json!(seq);
+            }
+            let err = db
+                .get_shard_iterator(serde_json::from_value(req).unwrap())
+                .expect_err(&format!("{kind} with {seq:?} should be refused"));
+            assert!(
+                matches!(err, dynoxide::DynoxideError::ValidationException(_)),
+                "{kind} with {seq:?}: {err:?}"
+            );
+        }
+    }
 }

@@ -10,21 +10,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Behaviour changes
 
 - **A stream record's `SequenceNumber` is 21 digits**, within DynamoDB's 21 to
-  40, and a new database starts its numbers from the clock, so an in-memory
-  server no longer reissues the numbers an earlier run gave out. Numbers keep
-  their order as strings and as numbers. `GetShardIterator` still accepts the
-  short numbers earlier builds returned. `storage::StreamRecord` gains an
-  `event_id` field.
+  40, and records already in a database file are shown in the same 21-digit
+  form. Every table's next number is at least the current time in
+  microseconds, so an in-memory server no longer reissues the numbers an
+  earlier run gave out. Numbers keep their order as strings and as numbers.
+  `GetShardIterator` still accepts the short numbers earlier builds returned.
+- `GetShardIterator` refuses an `AT_SEQUENCE_NUMBER` or
+  `AFTER_SEQUENCE_NUMBER` request whose `SequenceNumber` is missing, is not a
+  whole number or is out of range, with a `ValidationException`. It used to
+  read the stream from its start.
+- **Downgrading replays the stream.** A `SequenceNumber` saved under this
+  release does not resolve on an earlier release, so a consumer that resumes
+  from one after a downgrade reads the stream again from its start.
 
 ### Fixed
 
 - **A stream record's `eventID` is globally unique.** It was the record's
   sequence number, so an in-memory server issued `1`, `2`, `3` again after
   every restart, and a consumer that skips eventIDs it has already processed
-  silently dropped new events. Each record now gets a random 32-character
+  silently dropped new events. Each new record gets a random 32-character
   hex id when it is written, stored with it so every read returns the same
-  one. Records in an existing database file get theirs when it is next
-  opened.
+  one. Records already in a database file keep the eventIDs they reported
+  before.
 
 ## [1.4.0] - 2026-10-21
 

@@ -860,6 +860,16 @@ pub trait StorageBackend: private::Sealed {
         limit: usize,
     ) -> Result<Vec<StreamRecord>, BackendError>;
 
+    /// As `get_stream_records`, with each record's stored event id. The id is
+    /// `None` only on a row an older build wrote since this one opened the file.
+    async fn get_stream_records_with_event_ids(
+        &self,
+        table_name: &str,
+        shard_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<(StreamRecord, Option<String>)>, BackendError>;
+
     async fn list_stream_enabled_tables(&self) -> Result<Vec<TableMetadata>, BackendError>;
 
     // -----------------------------------------------------------------------
