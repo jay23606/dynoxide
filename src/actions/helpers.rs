@@ -2072,6 +2072,7 @@ pub fn validate_esk_count_and_index_keys(
     meta: &TableMetadata,
     index_name: Option<&str>,
     count_mismatch_msg: &str,
+    name_index_on_type_mismatch: bool,
 ) -> Result<()> {
     let table_key_schema: Vec<KeySchemaElement> = serde_json::from_str(&meta.key_schema)
         .map_err(|e| DynoxideError::InternalServerError(format!("Bad key schema JSON: {e}")))?;
@@ -2095,6 +2096,38 @@ pub fn validate_esk_count_and_index_keys(
     for k in &index_key_schema {
         if !expected_names.contains(&k.attribute_name) {
             expected_names.push(k.attribute_name.clone());
+        }
+    }
+
+    // A Scan on the newer validation layer checks every starting key attribute
+    // against the attribute definitions ahead of the count, and on a table
+    // with indexes reports a mismatch as an index key's, naming the index
+    // asked for or else the first the table has (captured eu-west-2 and
+    // eu-central-1, 20 October 2026). A table with no index answers in the
+    // short form from the table key check.
+    if name_index_on_type_mismatch {
+        let index = match index_name {
+            Some(index) => Some(index.to_string()),
+            None => super::gsi::parse_gsi_defs(meta)?
+                .into_iter()
+                .chain(super::lsi::parse_lsi_defs(meta)?)
+                .next()
+                .map(|def| def.index_name),
+        };
+        if let Some(index) = index {
+            for def in &attr_defs {
+                if let Some(val) = esk.get(&def.attribute_name)
+                    && !attr_value_matches_scalar_type(val, &def.attribute_type)
+                {
+                    return Err(DynoxideError::ValidationException(format!(
+                        "One or more parameter values were invalid: Type mismatch for Index \
+                         Key {} Expected: {:?} Actual: {} IndexName: {index}",
+                        def.attribute_name,
+                        def.attribute_type,
+                        val.type_name()
+                    )));
+                }
+            }
         }
     }
 
@@ -2520,6 +2553,87 @@ fn validate_filter_attribute_value(
         }
         _ => Ok(()),
     }
+}
+
+/// An integer member as DynamoDB reads it: a 32-bit signed integer that
+/// saturates at either end, truncating a fraction. A value that saturated or
+/// lost a fraction is flagged, because the member is then checked by the older
+/// layer, which reports the value as read (captured eu-west-2 and eu-central-1,
+/// 20 October 2026).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Int32 {
+    pub(crate) value: i64,
+    pub(crate) coerced: bool,
+}
+
+pub(crate) fn deserialize_int32<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Int32>, D::Error> {
+    let Some(number) =
+        <Option<serde_json::Number> as serde::Deserialize>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    let mut fraction = false;
+    let wide = if let Some(i) = number.as_i64() {
+        i128::from(i)
+    } else if let Some(u) = number.as_u64() {
+        i128::from(u)
+    } else {
+        // A fraction truncates toward zero; NaN and the infinities cannot
+        // appear in JSON.
+        let float = number.as_f64().unwrap_or(0.0);
+        fraction = float.fract() != 0.0;
+        float.trunc() as i128
+    };
+    let clamped = wide.clamp(i128::from(i32::MIN), i128::from(i32::MAX));
+    Ok(Some(Int32 {
+        value: clamped as i64,
+        coerced: fraction || clamped != wide,
+    }))
+}
+
+/// Select against the projection members and the index, as Query and Scan
+/// both check it on the newer validation layer, in the
+/// `1 validation error detected:` envelope: `SPECIFIC_ATTRIBUTES` needs
+/// `AttributesToGet` or `ProjectionExpression`, any other value refuses both,
+/// and `ALL_PROJECTED_ATTRIBUTES` needs an index (captured eu-west-2,
+/// eu-central-1 and us-east-1 for Query, eu-west-2 and eu-central-1 for Scan,
+/// 20 October 2026). The message keeps "Querying" on a Scan too.
+pub(crate) fn select_projection_rejection(
+    select: Option<&str>,
+    attributes_to_get: bool,
+    projection_expression: bool,
+    index: bool,
+) -> Option<String> {
+    let select = select?;
+    let projected = if attributes_to_get {
+        Some("AttributesToGet")
+    } else if projection_expression {
+        Some("ProjectionExpression")
+    } else {
+        None
+    };
+    let msg = match (select, projected) {
+        ("SPECIFIC_ATTRIBUTES", None) => "Must specify the AttributesToGet or \
+             ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"
+            .to_string(),
+        ("SPECIFIC_ATTRIBUTES", Some(_)) => return None,
+        (select, Some(member)) => {
+            // COUNT is phrased "only the Count"; other values use the literal.
+            let target = if select == "COUNT" {
+                "only the Count"
+            } else {
+                select
+            };
+            format!("Cannot specify the {member} when choosing to get {target}")
+        }
+        ("ALL_PROJECTED_ATTRIBUTES", None) if !index => {
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_string()
+        }
+        (_, None) => return None,
+    };
+    Some(crate::validation::envelope_message(&msg))
 }
 
 #[cfg(test)]

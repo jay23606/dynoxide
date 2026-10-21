@@ -46,6 +46,42 @@ let req = serde_json::from_value(json!({
 let resp = db.query(req).unwrap();
 ```
 
+## Serving HTTP from your own program
+
+With the `http-server` feature (on by default), `server::serve_with_shutdown`
+serves the DynamoDB API on a listener you bind, until a future you supply
+resolves. It then stops accepting, closes idle keep-alive connections, lets
+running requests finish and returns, so the database is released when it does.
+
+```rust
+use dynoxide::Database;
+
+#[tokio::main]
+async fn main() -> Result<(), String> {
+    let db = Database::new("data.db").map_err(|e| e.to_string())?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8000")
+        .await
+        .map_err(|e| e.to_string())?;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+
+    // Hand `stop` to whatever decides when to shut down.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let _ = stop.send(());
+    });
+
+    dynoxide::server::serve_with_shutdown(listener, db, async {
+        let _ = stopped.await;
+    })
+    .await
+}
+```
+
+It installs no signal handler; `server::start` is the one that stops on Ctrl-C
+or SIGTERM. The rustdoc on `serve_with_shutdown` covers what to expect when a
+request never finishes and when a file-backed database's files are deleted
+straight after.
+
 ## Testing with Embedded Mode
 
 Each test gets a fully isolated database with no shared state:
@@ -89,7 +125,7 @@ No Docker. No port conflicts. No table name prefixes. Tests run in parallel with
 `native-sqlite`, `encryption` and `wasm-sqlite` are **mutually exclusive** - they select different SQLite backends. `wasm-sqlite` additionally excludes the CLI, server and MCP features, which are native-only. Cargo adds the default features to whatever you list, so naming one of these on its own is not enough: `features = ["wasm-sqlite"]` still enables `native-sqlite` and the CLI from the defaults, and the build stops on a `compile_error!` saying so. Always pair a non-default backend with `default-features = false`. To use encryption:
 
 ```toml
-dynoxide-rs = { version = "3.0", default-features = false, features = ["encryption"] }
+dynoxide-rs = { version = "3.1", default-features = false, features = ["encryption"] }
 ```
 
 **Workspace note:** Cargo unifies features across a workspace. If any crate depends on `dynoxide-rs` with default features (getting `native-sqlite`) and another uses `encryption`, both activate and the build fails. Use `default-features = false` on all `dynoxide-rs` dependencies in the workspace.

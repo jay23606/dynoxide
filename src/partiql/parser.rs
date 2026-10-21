@@ -3,7 +3,7 @@
 //! Parses a subset of PartiQL relevant to DynamoDB:
 //! - `SELECT [projections] FROM "table" [WHERE conditions]`
 //! - INSERT INTO "table" VALUE { ... } [IF NOT EXISTS]
-//! - UPDATE "table" SET path = value [REMOVE attr1, attr2] [WHERE conditions]
+//! - UPDATE "table" SET path = value [REMOVE attr1] [REMOVE attr2] [WHERE conditions]
 //! - DELETE FROM "table" [WHERE conditions]
 
 use crate::types::AttributeValue;
@@ -55,15 +55,8 @@ impl From<&str> for ParseError {
 }
 
 /// A parsed PartiQL statement.
-///
-/// Every variant is `#[non_exhaustive]`: they carry a growing set of clauses (a
-/// `RETURNING` variant was added in 0.12.0, an index qualifier after that), so
-/// downstream code must match them with `..` and cannot build them by struct
-/// literal. This keeps later clause additions non-breaking, matching the
-/// precedent set by `DynoxideError`.
 #[derive(Debug, Clone)]
 pub enum Statement {
-    #[non_exhaustive]
     Select {
         table_name: String,
         /// The index named by a `"table"."index"` qualifier, if any.
@@ -74,13 +67,11 @@ pub enum Statement {
         /// clause.
         order_by: Vec<OrderByTerm>,
     },
-    #[non_exhaustive]
     Insert {
         table_name: String,
         item: HashMap<String, PartiqlValue>,
         if_not_exists: bool,
     },
-    #[non_exhaustive]
     Update {
         table_name: String,
         /// The index named by a `"table"."index"` qualifier, if any. DynamoDB
@@ -94,7 +85,6 @@ pub enum Statement {
         /// clause. All four variants are valid on `UPDATE`. `None` when absent.
         returning: Option<ReturningVariant>,
     },
-    #[non_exhaustive]
     Delete {
         table_name: String,
         /// The index named by a `"table"."index"` qualifier, if any. Carried
@@ -110,7 +100,6 @@ pub enum Statement {
 
 /// One term of a SELECT's `ORDER BY` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct OrderByTerm {
     /// The attribute path the term names, unquoted.
     pub path: String,
@@ -311,18 +300,27 @@ pub struct SetClause {
     pub value: SetValue,
 }
 
+/// One operand of a SET assignment's arithmetic or `list_append`: an attribute
+/// of the item, written bare, or a value. A quoted string is a value, never an
+/// attribute's name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetTerm {
+    Path(String),
+    Value(PartiqlValue),
+}
+
 /// A value on the right-hand side of a SET assignment.
 /// Supports simple values and binary arithmetic expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetValue {
     /// A simple value (literal or parameter).
     Simple(PartiqlValue),
-    /// `path + value`: add the value to the attribute at path.
-    Add(String, PartiqlValue),
-    /// `path - value`: subtract the value from the attribute at path.
-    Sub(String, PartiqlValue),
-    /// `list_append(path, value)` or `list_append(value, path)`.
-    ListAppend(PartiqlValue, PartiqlValue),
+    /// `path + term`: add the term to the attribute at path.
+    Add(String, SetTerm),
+    /// `path - term`: subtract the term from the attribute at path.
+    Sub(String, SetTerm),
+    /// `list_append(a, b)`, each a list literal, a parameter or an attribute.
+    ListAppend(SetTerm, SetTerm),
     /// `set_add(path, set)` or `set_delete(path, set)`: the set at `path`,
     /// which the call assigns back to, with the members added or removed.
     /// `refusal_at` is where DynamoDB points when the members turn out not to
@@ -340,7 +338,6 @@ pub enum SetValue {
 /// Groups are OR-joined; conditions within each group are AND-joined.
 /// `WHERE a = 1 AND b = 2 OR c = 3` parses as `[[a=1, b=2], [c=3]]`.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct WhereClause {
     /// OR-groups: outer = OR, inner = AND.
     ///
@@ -360,7 +357,7 @@ pub struct WhereClause {
     /// conditions, before it is flattened into `groups`. The overlap check
     /// reads it, because DynamoDB splits a read only on an OR with a key
     /// condition under it (captured eu-west-2 and us-east-1, 2026-10-09).
-    pub(crate) tree: Option<ConditionTree>,
+    pub(crate) tree: ConditionTree,
 }
 
 /// A WHERE clause as written, with every `NOT` pushed down to a condition.
@@ -405,12 +402,7 @@ impl ConditionTree {
 }
 
 /// A single condition in a WHERE clause: either a comparison or a function call.
-///
-/// Non-exhaustive, like `WhereClause` and `Statement`. The parser gains variants
-/// as it learns predicates, and each one it gained used to break every
-/// downstream `match` on it.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
 pub enum WhereCondition {
     Comparison(Condition),
     /// `NOT` of a comparison, in the same shape as `NotBeginsWith` and
@@ -458,7 +450,6 @@ pub enum WhereCondition {
 
 /// One side of a comparison that isn't `path op value`.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
 pub enum Operand {
     Path(String),
     Value(PartiqlValue),
@@ -475,7 +466,6 @@ pub enum Operand {
 /// other than MISSING, which has its own condition (captured eu-west-2 and
 /// us-east-1, 2026-10-09).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum TypeTest {
     Null,
     Boolean,
@@ -1916,8 +1906,10 @@ fn parse_update_clauses(t: &mut Tokenizer) -> Result<(Vec<SetClause>, Vec<String
                 let value = parse_set_value(t, &path)?;
                 set_clauses.push(SetClause { path, value });
             }
+            // SET takes a list of assignments; REMOVE takes one path, and a
+            // comma after it is a token left over (eu-west-2, 18 October 2026).
             match t.peek_token()? {
-                Some(ref s) if s == "," => {
+                Some(ref s) if s == "," && !remove => {
                     t.next_token()?;
                 }
                 _ => break,
@@ -1977,12 +1969,12 @@ fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> 
     {
         t.next_token()?; // consume list_append
         expect_char(t, "(")?;
-        let first = parse_value(t, 0)?;
+        let first = parse_set_term(t)?;
         let comma = t.next_token()?.ok_or("Expected ',' in list_append")?;
         if comma != "," {
             return Err(format!("Expected ',' but got '{comma}'"));
         }
-        let second = parse_value(t, 0)?;
+        let second = parse_set_term(t)?;
         expect_char(t, ")")?;
         return Ok(SetValue::ListAppend(first, second));
     }
@@ -1993,7 +1985,7 @@ fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> 
     match t.peek_token()? {
         Some(ref s) if s == "+" => {
             t.next_token()?; // consume +
-            let second = parse_value(t, 0)?;
+            let second = parse_set_term(t)?;
             // The first value should be a path reference (attribute name).
             // In PartiQL, `SET x = x + 1` means add 1 to the current value of x.
             let attr_path = match &first {
@@ -2012,7 +2004,7 @@ fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> 
         }
         Some(ref s) if s == "-" => {
             t.next_token()?; // consume -
-            let second = parse_value(t, 0)?;
+            let second = parse_set_term(t)?;
             let attr_path = match &first {
                 PartiqlValue::Literal(AttributeValue::S(s)) => s.clone(),
                 _ => {
@@ -2024,6 +2016,24 @@ fn parse_set_value(t: &mut Tokenizer, target: &str) -> Result<SetValue, String> 
             Ok(SetValue::Sub(attr_path, second))
         }
         _ => Ok(SetValue::Simple(first)),
+    }
+}
+
+/// An operand of SET arithmetic or `list_append`. A bare name starts an
+/// attribute; anything else is a value, so `'abc'` is a string and not the
+/// attribute `abc`.
+fn parse_set_term(t: &mut Tokenizer) -> Result<SetTerm, String> {
+    let names_attribute = t.peek_token()?.is_some_and(|tok| {
+        tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && !["TRUE", "FALSE", "NULL"]
+                .iter()
+                .any(|word| tok.eq_ignore_ascii_case(word))
+    });
+    match parse_value(t, 0)? {
+        PartiqlValue::Literal(AttributeValue::S(path)) if names_attribute => {
+            Ok(SetTerm::Path(path))
+        }
+        value => Ok(SetTerm::Value(value)),
     }
 }
 
@@ -2304,7 +2314,7 @@ fn parse_optional_where(t: &mut Tokenizer) -> Result<Option<WhereClause>, String
             Ok(Some(WhereClause {
                 groups: parsed.groups,
                 top_level_equalities: parsed.top_level_equalities,
-                tree: Some(parsed.tree),
+                tree: parsed.tree,
             }))
         }
         _ => Ok(None),
@@ -5588,7 +5598,7 @@ mod tests {
             panic!("expected a SELECT with WHERE");
         };
         let per_copy: usize = wc.groups.iter().flatten().map(|c| condition_bytes(c)).sum();
-        let held = wc.tree.as_ref().unwrap().bytes();
+        let held = wc.tree.bytes();
         assert!(per_copy > 1024 * 1024, "{per_copy}");
         assert!(held < 8_192, "{held}");
 
@@ -6064,7 +6074,7 @@ mod tests {
     #[test]
     fn test_parse_update_with_remove() {
         let stmt =
-            parse("UPDATE \"T\" SET name = 'Bob' REMOVE age, email WHERE pk = 'k1'").unwrap();
+            parse("UPDATE \"T\" SET name = 'Bob' REMOVE age REMOVE email WHERE pk = 'k1'").unwrap();
         match stmt {
             Statement::Update {
                 set_clauses,
@@ -6107,7 +6117,9 @@ mod tests {
                         assert_eq!(attr, "count");
                         assert_eq!(
                             val,
-                            &PartiqlValue::Literal(AttributeValue::N("1".to_string()))
+                            &SetTerm::Value(PartiqlValue::Literal(AttributeValue::N(
+                                "1".to_string()
+                            )))
                         );
                     }
                     other => panic!("Expected Add, got {other:?}"),

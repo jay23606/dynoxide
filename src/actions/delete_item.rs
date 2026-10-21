@@ -49,6 +49,19 @@ pub struct DeleteItemRequest {
     pub expression_attribute_values_raw: Option<serde_json::Value>,
 }
 
+use crate::validation::RETURN_VALUES_NOT_HONOURED;
+
+/// Whether `return_values` is one DeleteItem refuses, for a request built in
+/// Rust: anything but NONE and ALL_OLD, compared without regard to case, as
+/// the check always was. A decoded request has had a value outside the enum
+/// reported by the enum check already.
+fn return_values_not_honoured(return_values: Option<&str>) -> bool {
+    return_values.is_some_and(|rv| {
+        let rv = rv.to_uppercase();
+        rv != "NONE" && rv != "ALL_OLD"
+    })
+}
+
 impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -93,7 +106,7 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
 
         // ReturnValues enum
         if let Some(ref rv) = raw.return_values
-            && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv.as_str())
+            && !crate::validation::RETURN_VALUES.contains(&rv.as_str())
         {
             errors.push(crate::validation::RETURN_VALUES_REJECTION.to_string());
         }
@@ -116,6 +129,20 @@ impl<'de> serde::Deserialize<'de> for DeleteItemRequest {
             "returnValuesOnConditionCheckFailure",
         ) {
             errors.push(msg);
+        }
+
+        // DeleteItem honours only NONE and ALL_OLD. Another value the enum
+        // allows is a member error too, joined after the others, and, with a
+        // key to go with it, ahead of every expression check (captured
+        // eu-west-2 and us-east-1, 2026-10-09; a missing key is reported
+        // alone).
+        if raw.key.is_some()
+            && raw
+                .return_values
+                .as_deref()
+                .is_some_and(|rv| ["ALL_NEW", "UPDATED_OLD", "UPDATED_NEW"].contains(&rv))
+        {
+            errors.push(RETURN_VALUES_NOT_HONOURED.to_string());
         }
 
         if let Some(msg) = format_validation_errors(&errors) {
@@ -175,6 +202,14 @@ async fn execute_inner<S: StorageBackend>(
 ) -> Result<DeleteItemResponse> {
     // Validate table name format before checking existence (DynamoDB validates input first)
     crate::validation::validate_item_table_name(&request.table_name)?;
+
+    // A ReturnValues DeleteItem does not honour is a request member error, so
+    // it is refused ahead of the expressions, as a decoded request is.
+    if return_values_not_honoured(request.return_values.as_deref()) {
+        return Err(DynoxideError::EnvelopedValidation(
+            RETURN_VALUES_NOT_HONOURED.to_string(),
+        ));
+    }
 
     // An empty attribute name is refused as the request is read, ahead of every
     // other value check, the condition and the table lookup (captured in ten
@@ -332,19 +367,6 @@ async fn execute_inner<S: StorageBackend>(
                     .get_or_insert_with(HashMap::new);
                 expr_names.extend(converted.attribute_names);
             }
-        }
-    }
-
-    // DeleteItem honours only NONE and ALL_OLD. Another value the enum allows
-    // is refused in the envelope, before the table is looked up, as PutItem
-    // refuses it (eu-west-2 and us-east-1, 2026-10-09, for ALL_NEW,
-    // UPDATED_NEW and UPDATED_OLD, and for ALL_NEW on a missing table).
-    if let Some(ref rv) = request.return_values {
-        let rv_upper = rv.to_uppercase();
-        if rv_upper != "NONE" && rv_upper != "ALL_OLD" {
-            return Err(DynoxideError::EnvelopedValidation(
-                "ReturnValues can only be ALL_OLD or NONE".to_string(),
-            ));
         }
     }
 

@@ -250,3 +250,180 @@ fn a_key_attribute_whose_name_holds_a_dot_is_named_by_quoting_it() {
         vec!["1"]
     );
 }
+
+/// A table with a dotted or bracketed name on its sort key, on a GSI's keys
+/// and on an LSI's sort key.
+fn indexed() -> Database {
+    let db = Database::memory().unwrap();
+    db.create_table(
+        serde_json::from_value::<CreateTableRequest>(json!({
+            "TableName": "Idx",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "s.k", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "s.k", "AttributeType": "N"},
+                {"AttributeName": "g.k", "AttributeType": "S"},
+                {"AttributeName": "t[0]", "AttributeType": "N"},
+                {"AttributeName": "l.s", "AttributeType": "N"}
+            ],
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "Gidx",
+                "KeySchema": [
+                    {"AttributeName": "g.k", "KeyType": "HASH"},
+                    {"AttributeName": "t[0]", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "Lidx",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "l.s", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for (sk, g, t, l) in [("1", "x", "1", "9"), ("2", "x", "2", "8")] {
+        db.put_item(
+            serde_json::from_value::<PutItemRequest>(json!({
+                "TableName": "Idx",
+                "Item": {
+                    "pk": {"S": "p"}, "s.k": {"N": sk}, "g.k": {"S": g},
+                    "t[0]": {"N": t}, "l.s": {"N": l},
+                    "m": {"M": {"a.b": {"N": "0"}}}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    db
+}
+
+/// One attribute of each item a statement returns, in the order returned.
+fn column(db: &Database, statement: &str, name: &str) -> Vec<String> {
+    run(db, statement)
+        .unwrap_or_else(|e| panic!("{statement}: {e}"))
+        .iter()
+        .map(|item| item[name]["N"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A quoted name holding a dot or a bracket works as a GSI's hash and sort
+/// key and as an LSI's sort key: the index is read by it and ordered by it,
+/// and a write that changes a GSI's hash key moves the item between its
+/// partitions. No capture backs these rows; they pin what is written and
+/// believed right.
+#[test]
+fn a_quoted_name_with_a_dot_or_a_bracket_names_an_index_key() {
+    let db = indexed();
+    assert_eq!(
+        column(
+            &db,
+            r#"SELECT "t[0]" FROM "Idx"."Gidx" WHERE "g.k" = 'x' ORDER BY "t[0]" DESC"#,
+            "t[0]"
+        ),
+        vec!["2", "1"]
+    );
+    assert_eq!(
+        column(
+            &db,
+            r#"SELECT "t[0]" FROM "Idx"."Gidx" WHERE "g.k" = 'x' AND "t[0]" > 1"#,
+            "t[0]"
+        ),
+        vec!["2"]
+    );
+    assert_eq!(
+        column(
+            &db,
+            r#"SELECT "s.k" FROM "Idx"."Lidx" WHERE pk = 'p' ORDER BY "l.s""#,
+            "s.k"
+        ),
+        vec!["2", "1"]
+    );
+    assert_eq!(
+        column(
+            &db,
+            r#"SELECT "s.k" FROM "Idx"."Lidx" WHERE pk = 'p' AND "l.s" < 9"#,
+            "s.k"
+        ),
+        vec!["2"]
+    );
+    // Changing the GSI's hash key moves the item between its partitions.
+    assert_eq!(
+        run(
+            &db,
+            r#"UPDATE "Idx" SET "g.k" = 'z' WHERE pk = 'p' AND "s.k" = 2"#
+        ),
+        Ok(vec![])
+    );
+    assert_eq!(
+        column(
+            &db,
+            r#"SELECT "s.k" FROM "Idx"."Gidx" WHERE "g.k" = 'z'"#,
+            "s.k"
+        ),
+        vec!["2"]
+    );
+    assert_eq!(
+        column(
+            &db,
+            r#"SELECT "s.k" FROM "Idx"."Gidx" WHERE "g.k" = 'x'"#,
+            "s.k"
+        ),
+        vec!["1"]
+    );
+}
+
+/// RETURNING hands back the attribute a quoted name set under that name, not
+/// split at its dot, and a path through a map reaches the key inside it.
+#[test]
+fn a_quoted_name_is_one_attribute_in_a_returning_clause_and_a_nested_set() {
+    let db = indexed();
+    assert_eq!(
+        run(
+            &db,
+            r#"UPDATE "Idx" SET "n.m" = 5 WHERE pk = 'p' AND "s.k" = 1 RETURNING MODIFIED NEW *"#
+        ),
+        Ok(vec![json!({"n.m": {"N": "5"}})])
+    );
+    assert_eq!(
+        run(
+            &db,
+            r#"UPDATE "Idx" SET "n.m" = 6 WHERE pk = 'p' AND "s.k" = 1 RETURNING MODIFIED OLD *"#
+        ),
+        Ok(vec![json!({"n.m": {"N": "5"}})])
+    );
+    // A quoted step inside a path is a key of the map, dot and bracket
+    // included, and the map keeps the key it already held.
+    assert_eq!(
+        run(
+            &db,
+            r#"UPDATE "Idx" SET m."a.b" = 5, m."c[0]" = 1 WHERE pk = 'p' AND "s.k" = 1 RETURNING MODIFIED NEW *"#
+        ),
+        Ok(vec![
+            json!({"m": {"M": {"a.b": {"N": "5"}, "c[0]": {"N": "1"}}}})
+        ])
+    );
+    assert_eq!(
+        run(
+            &db,
+            r#"UPDATE "Idx" SET m."a.b" = 6 WHERE pk = 'p' AND "s.k" = 1 RETURNING MODIFIED OLD *"#
+        ),
+        Ok(vec![json!({"m": {"M": {"a.b": {"N": "5"}}}})])
+    );
+    let after = run(
+        &db,
+        r#"UPDATE "Idx" REMOVE m."a.b" WHERE pk = 'p' AND "s.k" = 1 RETURNING ALL NEW *"#,
+    )
+    .unwrap();
+    assert_eq!(after[0]["m"], json!({"M": {"c[0]": {"N": "1"}}}));
+    assert_eq!(after[0]["n.m"], json!({"N": "6"}));
+}

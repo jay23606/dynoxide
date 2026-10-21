@@ -5,6 +5,7 @@
 
 use dynoxide::Database;
 use dynoxide::actions::create_table::CreateTableRequest;
+use dynoxide::actions::delete_item::DeleteItemRequest;
 use dynoxide::actions::put_item::PutItemRequest;
 use dynoxide::actions::scan::ScanRequest;
 use dynoxide::types::*;
@@ -100,7 +101,7 @@ fn test_total_segments_zero_rejected() {
     let err = db.scan(scan_req("Tbl", Some(0), Some(0))).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("totalSegments") && msg.contains("between 1 and 1000000"),
+        msg == "1 validation error detected: Value at 'TotalSegments' failed to satisfy constraint: Member must have value greater than or equal to 1",
         "unexpected error: {msg}"
     );
 }
@@ -153,4 +154,73 @@ fn test_paginated_parallel_scan() {
         30,
         "paginated parallel scan should return all 30 items"
     );
+}
+
+/// With more segments than the 4096 hash buckets, some segments hold no bucket
+/// and return nothing, so a full parallel scan still sees each item exactly
+/// once. It used to hand every item to the segments past the last bucket.
+#[test]
+fn more_segments_than_buckets_still_see_each_item_once() {
+    let db = make_db_with_items(7);
+    for total in [4097, 8192] {
+        let mut seen = Vec::new();
+        for segment in 0..total {
+            let resp = db
+                .scan(scan_req("Tbl", Some(segment), Some(total)))
+                .unwrap();
+            for item in resp.items.unwrap_or_default() {
+                if let Some(AttributeValue::S(pk)) = item.get("pk") {
+                    seen.push(pk.clone());
+                }
+            }
+        }
+        seen.sort();
+        let expected: Vec<String> = (0..7).map(|i| format!("item-{i:04}")).collect();
+        assert_eq!(seen, expected, "TotalSegments {total}");
+    }
+    // At the largest TotalSegments, the last segment holds no bucket.
+    let resp = db
+        .scan(scan_req("Tbl", Some(999_999), Some(1_000_000)))
+        .unwrap();
+    assert_eq!(resp.count, 0);
+}
+
+/// A worker that deletes each page as it scans its segment must still see the
+/// whole segment: the next page starts from the deleted item's place. It used
+/// to start from nowhere and return nothing more.
+#[test]
+fn a_segment_scanned_while_its_pages_are_deleted_is_seen_whole() {
+    let db = make_db_with_items(100);
+    let total = 2;
+    let mut seen = Vec::new();
+    for segment in 0..total {
+        let mut start = None;
+        loop {
+            let resp = db
+                .scan(ScanRequest {
+                    exclusive_start_key: start.take(),
+                    limit: Some(10),
+                    ..scan_req("Tbl", Some(segment), Some(total))
+                })
+                .unwrap();
+            for item in resp.items.unwrap_or_default() {
+                db.delete_item(DeleteItemRequest {
+                    table_name: "Tbl".to_string(),
+                    key: HashMap::from([("pk".to_string(), item["pk"].clone())]),
+                    ..Default::default()
+                })
+                .unwrap();
+                if let Some(AttributeValue::S(pk)) = item.get("pk") {
+                    seen.push(pk.clone());
+                }
+            }
+            match resp.last_evaluated_key {
+                Some(key) => start = Some(key),
+                None => break,
+            }
+        }
+    }
+    seen.sort();
+    let expected: Vec<String> = (0..100).map(|i| format!("item-{i:04}")).collect();
+    assert_eq!(seen, expected);
 }

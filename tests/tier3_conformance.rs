@@ -242,13 +242,18 @@ fn query_rejects_invalid_select_value() {
 
 #[test]
 fn scan_rejects_invalid_select_value() {
-    let result = serde_json::from_value::<ScanRequest>(serde_json::json!({
+    // The newer validation layer checks Select once the request is read, so
+    // the request decodes and `scan` refuses it, in the envelope.
+    let request = serde_json::from_value::<ScanRequest>(serde_json::json!({
         "TableName": "TestTable",
         "Select": "BAD"
-    }));
-    let err = result.unwrap_err().to_string();
+    }))
+    .unwrap();
+    let err = make_db().scan(request).unwrap_err().to_string();
     assert!(
-        err.contains("at 'select' failed to satisfy constraint"),
+        err.starts_with(
+            "1 validation error detected: Value 'BAD' at 'select' failed to satisfy constraint"
+        ),
         "Expected select enum validation error, got: {err}"
     );
 }
@@ -279,10 +284,11 @@ fn scan_rejects_limit_zero() {
         "Limit": 0
     }));
     let err = result.unwrap_err().to_string();
-    // AWS DynamoDB lowercases 'limit' for Scan (Query keeps capital 'Limit').
+    // In the newer validation layer Scan words it as Query does: capital 'Limit',
+    // and the value is not echoed.
     assert!(
-        err.contains("at 'limit' failed to satisfy constraint"),
-        "Expected scan limit validation error with lowercase 'limit', got: {err}"
+        err.contains("Value at 'Limit' failed to satisfy constraint"),
+        "Expected scan limit validation error, got: {err}"
     );
     assert!(
         err.contains("greater than or equal to 1"),

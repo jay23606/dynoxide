@@ -1131,7 +1131,23 @@ pub fn scan_items<'a>(table_name: &str, params: &ScanParams<'a>) -> (String, Vec
 
     if let (Some(start_pk), Some(start_sk)) = (params.exclusive_start_pk, params.exclusive_start_sk)
     {
-        if is_parallel {
+        // A parallel scan resumes from the starting key's hash. It is worked
+        // out from the key itself, so it holds after the item the key names is
+        // deleted: a scan that deletes as it goes still sees the rest of its
+        // segment. The lookup by key is only for a key string that cannot be
+        // read back.
+        let cursor_hash = is_parallel
+            .then(|| crate::types::key_value_from_key_string(start_pk))
+            .flatten()
+            .map(|key| crate::storage::compute_hash_prefix(&key));
+        if cursor_hash.is_some() {
+            where_clauses.push(format!(
+                "(hash_prefix, pk, sk) > (?{}, ?{}, ?{})",
+                param_idx + 2,
+                param_idx,
+                param_idx + 1
+            ));
+        } else if is_parallel {
             where_clauses.push(format!(
                 "(hash_prefix, pk, sk) > ((SELECT hash_prefix FROM \"{escaped}\" WHERE pk = ?{} AND sk = ?{} LIMIT 1), ?{}, ?{})",
                 param_idx,
@@ -1145,18 +1161,30 @@ pub fn scan_items<'a>(table_name: &str, params: &ScanParams<'a>) -> (String, Vec
         out.push(SqlParam::text(start_pk));
         out.push(SqlParam::text(start_sk));
         param_idx += 2;
+        if let Some(hash) = cursor_hash {
+            out.push(SqlParam::text(hash));
+            param_idx += 1;
+        }
     }
 
     if let (Some(seg), Some(total)) = (params.segment, params.total_segments) {
         let start_bucket = ceiling_div(HASH_BUCKETS * seg, total);
         let end_bucket = ceiling_div(HASH_BUCKETS * (seg + 1), total) - 1;
-        where_clauses.push(format!(
-            "substr(hash_prefix, 1, 3) >= ?{} AND substr(hash_prefix, 1, 3) <= ?{}",
-            param_idx,
-            param_idx + 1
-        ));
-        out.push(SqlParam::text(format!("{start_bucket:03x}")));
-        out.push(SqlParam::text(format!("{end_bucket:03x}")));
+        if start_bucket > end_bucket {
+            // With more segments than buckets, some segments hold no bucket
+            // at all and must return nothing. Comparing their bounds as text
+            // would not do: the first bucket past the end prints as "1000",
+            // which sorts below "fff".
+            where_clauses.push("0".to_string());
+        } else {
+            where_clauses.push(format!(
+                "substr(hash_prefix, 1, 3) >= ?{} AND substr(hash_prefix, 1, 3) <= ?{}",
+                param_idx,
+                param_idx + 1
+            ));
+            out.push(SqlParam::text(format!("{start_bucket:03x}")));
+            out.push(SqlParam::text(format!("{end_bucket:03x}")));
+        }
     }
 
     if !where_clauses.is_empty() {
@@ -1535,6 +1563,59 @@ mod tests {
                 SqlParam::text(format!("{end:03x}")),
             ]
         );
+    }
+
+    #[test]
+    fn scan_items_parallel_with_cursor_binds_the_cursors_own_hash() {
+        let params = ScanParams {
+            exclusive_start_pk: Some("S:a"),
+            exclusive_start_sk: Some(""),
+            segment: Some(0),
+            total_segments: Some(2),
+            ..Default::default()
+        };
+        let (sql, out) = scan_items("T", &params);
+        assert_eq!(
+            sql,
+            "SELECT pk, sk, item_json FROM \"T\" WHERE (hash_prefix, pk, sk) > (?3, ?1, ?2) AND substr(hash_prefix, 1, 3) >= ?4 AND substr(hash_prefix, 1, 3) <= ?5 ORDER BY hash_prefix ASC, pk ASC, sk ASC"
+        );
+        let hash =
+            crate::storage::compute_hash_prefix(&crate::types::AttributeValue::S("a".into()));
+        assert_eq!(
+            out,
+            vec![
+                SqlParam::text("S:a"),
+                SqlParam::text(""),
+                SqlParam::text(hash),
+                SqlParam::text("000"),
+                SqlParam::text("7ff"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_items_segment_past_the_last_bucket_matches_nothing() {
+        // Segment 1 of 8192 and the last of 1000000 own no bucket.
+        for (start, segment, total) in [
+            (None, 1, 8192),
+            (Some("S:a"), 1, 8192),
+            (None, 999_999, 1_000_000),
+        ] {
+            let params = ScanParams {
+                exclusive_start_pk: start,
+                exclusive_start_sk: start.map(|_| ""),
+                segment: Some(segment),
+                total_segments: Some(total),
+                ..Default::default()
+            };
+            let (sql, out) = scan_items("T", &params);
+            assert!(
+                sql.contains(" 0 ") || sql.contains("WHERE 0") || sql.contains("AND 0"),
+                "{sql}"
+            );
+            assert!(!sql.contains("substr(hash_prefix"), "{sql}");
+            assert_eq!(out.len(), if start.is_some() { 3 } else { 0 });
+        }
     }
 
     #[test]

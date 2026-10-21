@@ -34,8 +34,12 @@ struct QueryRequestRaw {
         deserialize_with = "crate::types::deserialize_lenient_flag"
     )]
     scan_index_forward: Option<bool>,
-    #[serde(rename = "Limit", default)]
-    limit: Option<usize>,
+    #[serde(
+        rename = "Limit",
+        default,
+        deserialize_with = "helpers::deserialize_int32"
+    )]
+    limit: Option<helpers::Int32>,
     #[serde(rename = "ExclusiveStartKey", default)]
     exclusive_start_key: Option<serde_json::Value>,
     #[serde(rename = "Select", default)]
@@ -86,6 +90,25 @@ pub struct QueryRequest {
     pub exclusive_start_key_raw: Option<serde_json::Value>,
 }
 
+/// The rejection for a `Select` outside the enum, or `None` when it is one
+/// DynamoDB accepts. The one copy of the set and the wording.
+pub(crate) fn select_rejection(select: &str) -> Option<String> {
+    if [
+        "ALL_ATTRIBUTES",
+        "ALL_PROJECTED_ATTRIBUTES",
+        "COUNT",
+        "SPECIFIC_ATTRIBUTES",
+    ]
+    .contains(&select)
+    {
+        return None;
+    }
+    Some(format!(
+        "Value '{select}' at 'select' failed to satisfy constraint: Member must satisfy \
+         enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]"
+    ))
+}
+
 impl<'de> serde::Deserialize<'de> for QueryRequest {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -102,18 +125,59 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
             return Err(serde::de::Error::custom(message));
         }
 
-        // An empty name and a Limit of 0 are the newer validation layer's own
-        // checks, each reported on its own ahead of everything else. A name
-        // error and ReturnConsumedCapacity follow, together; Select waits
-        // until after the expression-mixing check in `execute` (captured
-        // 2026-10-09, six of seven regions).
-        // AWS DynamoDB's Query message diverges from Scan: Query omits the rejected
-        // value entirely and capitalises 'Limit', whereas Scan keeps the value and
-        // lowercases 'limit'. Do not collapse these into a shared helper. The two
-        // come back together, Limit first (captured 2026-10-09, six of seven
-        // regions).
+        // A Limit below 1 and an empty name are the newer validation layer's
+        // own checks, reported together, Limit first, ahead of everything
+        // else. A name error and ReturnConsumedCapacity follow, together;
+        // Select waits until after the expression-mixing check in `execute`
+        // (captured 2026-10-09, six of seven regions). Scan words them the same
+        // way where the newer layer runs it (see `ScanMembers`).
+        //
+        // With no TableName at all, the request goes to the older layer, which
+        // reports every member error together: Select, ReturnConsumedCapacity,
+        // the missing name, then a Limit below 1 with its value echoed and the
+        // member spelled 'limit', as Scan does (captured eu-west-2 and
+        // us-east-1, 2026-10-09 and 2026-10-20).
+        //
+        // A Limit that saturated or lost a fraction as it was read (see
+        // `helpers::Int32`) is checked by the older layer the same way: the
+        // value as read, and an empty name in the older wording (captured
+        // eu-west-2, eu-central-1 and us-east-1, 2026-10-20).
+        let limit = raw.limit.map(|n| n.value);
+        let coerced = raw.limit.is_some_and(|n| n.coerced);
+        let limit_too_small = limit.filter(|l| *l < 1);
+        if raw.table_name.is_none() || coerced {
+            let mut errors = Vec::new();
+            errors.extend(raw.select.as_deref().and_then(select_rejection));
+            errors.extend(crate::validation::return_consumed_capacity_rejection(
+                raw.return_consumed_capacity.as_deref(),
+            ));
+            if matches!(raw.table_name.as_deref(), None | Some("")) {
+                errors.extend(crate::validation::table_name_constraint_errors(
+                    raw.table_name.as_deref(),
+                    crate::validation::TableNameContext::ReadWrite,
+                ));
+            }
+            // The missing operators' place is inferred from Scan's.
+            errors.extend(helpers::missing_comparison_operators(
+                raw.key_conditions.as_ref(),
+                "keyConditions",
+            ));
+            errors.extend(helpers::missing_comparison_operators(
+                raw.query_filter.as_ref(),
+                "queryFilter",
+            ));
+            if let Some(limit) = limit_too_small {
+                errors.push(format!(
+                    "Value '{limit}' at 'limit' failed to satisfy constraint: \
+                     Member must have value greater than or equal to 1"
+                ));
+            }
+            if let Some(msg) = format_validation_errors(&errors) {
+                return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+            }
+        }
         let mut first_pass = Vec::new();
-        if raw.limit == Some(0) {
+        if limit_too_small.is_some() {
             first_pass.push(
                 "Value at 'Limit' failed to satisfy constraint: \
                  Member must have value greater than or equal to 1"
@@ -162,7 +226,7 @@ impl<'de> serde::Deserialize<'de> for QueryRequest {
             // Left out or null, a Query reads forward (captured eu-west-2 and
             // us-east-1, 2026-10-10).
             scan_index_forward: raw.scan_index_forward.unwrap_or(true),
-            limit: raw.limit,
+            limit: limit.map(|l| l as usize),
             exclusive_start_key: None,
             select: raw.select,
             consistent_read: raw.consistent_read,
@@ -197,8 +261,27 @@ pub async fn execute<S: StorageBackend>(
     storage: &S,
     mut request: QueryRequest,
 ) -> Result<QueryResponse> {
-    // Validate table name format before checking existence (DynamoDB validates input first)
+    // A Limit of 0 and an empty table name come first and together, Limit
+    // first, then any other table-name error, as the wire path reports them
+    // when it reads the body; a request built in code gets the same answer.
+    let mut first_pass = Vec::new();
+    if request.limit == Some(0) {
+        first_pass.push(
+            "Value at 'Limit' failed to satisfy constraint: \
+             Member must have value greater than or equal to 1"
+                .to_string(),
+        );
+    }
+    if request.table_name.is_empty() {
+        first_pass.push(crate::validation::EMPTY_TABLE_NAME_REJECTION.to_string());
+    }
+    if let Some(msg) = crate::validation::format_validation_errors(&first_pass) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
     crate::validation::validate_item_table_name(&request.table_name)?;
+
+    // A Limit past what a 32-bit integer holds is read as the largest one.
+    request.limit = request.limit.map(|l| l.min(i32::MAX as usize));
 
     // An empty attribute name is refused bare, ahead of the table lookup and the
     // expressions, wherever the request carries one: AttributesToGet, a
@@ -271,21 +354,9 @@ pub async fn execute<S: StorageBackend>(
     }
 
     // ---- Select, after the mixing check (captured 2026-10-09) ----
-    if let Some(ref sel) = request.select
-        && ![
-            "ALL_ATTRIBUTES",
-            "ALL_PROJECTED_ATTRIBUTES",
-            "COUNT",
-            "SPECIFIC_ATTRIBUTES",
-        ]
-        .contains(&sel.as_str())
-    {
+    if let Some(msg) = request.select.as_deref().and_then(select_rejection) {
         return Err(DynoxideError::ValidationException(
-            crate::validation::envelope_message(&format!(
-                "Value '{sel}' at 'select' failed to satisfy constraint: Member must satisfy \
-                 enum value set: [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, \
-                 ALL_PROJECTED_ATTRIBUTES]"
-            )),
+            crate::validation::envelope_message(&msg),
         ));
     }
 
@@ -384,42 +455,14 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    // SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet.
-    // Query wraps the phrase in the "1 validation error detected:" envelope;
-    // Scan returns it bare. This asymmetry matches real DynamoDB.
-    if request.select.as_deref() == Some("SPECIFIC_ATTRIBUTES")
-        && request.projection_expression.is_none()
-        && request.attributes_to_get.is_none()
-    {
-        return Err(DynoxideError::ValidationException(
-            "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"
-                .to_string(),
-        ));
-    }
-
-    // A ProjectionExpression is only valid with Select = SPECIFIC_ATTRIBUTES.
-    if request.projection_expression.is_some()
-        && let Some(select) = request.select.as_deref()
-        && select != "SPECIFIC_ATTRIBUTES"
-    {
-        // AWS phrases COUNT as "only the Count"; other values use the literal.
-        let target = if select == "COUNT" {
-            "only the Count"
-        } else {
-            select
-        };
-        return Err(DynoxideError::ValidationException(format!(
-            "Cannot specify the ProjectionExpression when choosing to get {target}"
-        )));
-    }
-
-    // ALL_PROJECTED_ATTRIBUTES projects an index, so it requires an IndexName.
-    if request.select.as_deref() == Some("ALL_PROJECTED_ATTRIBUTES") && request.index_name.is_none()
-    {
-        return Err(DynoxideError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
-                .to_string(),
-        ));
+    // Select against the projection members and the index, in the envelope.
+    if let Some(msg) = helpers::select_projection_rejection(
+        request.select.as_deref(),
+        request.attributes_to_get.is_some(),
+        request.projection_expression.is_some(),
+        request.index_name.is_some(),
+    ) {
+        return Err(DynoxideError::ValidationException(msg));
     }
 
     // For KeyConditionExpression, validate syntax early too
@@ -599,7 +642,9 @@ pub async fn execute<S: StorageBackend>(
             &meta,
             request.index_name.as_deref(),
             "The provided starting key is invalid",
-        )?;
+            false,
+        )
+        .map_err(bare_start_key_mismatch)?;
         // Stage 3: table key type check
         helpers::validate_esk_table_keys(esk, &meta).map_err(bare_start_key_mismatch)?;
         // Stage 4: an empty string or binary key value has its own message.
@@ -1164,17 +1209,21 @@ fn key_condition_error(expr: &str, err: String) -> String {
 /// message alone, whatever the shape: a missing or extra attribute, a wrong
 /// type, a map or set, NULL, or an index query missing the table's or the
 /// index's keys. Captured in eu-west-2, us-east-1, us-west-2 and eu-central-1,
-/// 2026-10-09, where a Scan's answer varies by region.
+/// 2026-10-09. A Scan answers the same way where the newer validation layer
+/// runs it, which is most regions since October 2026.
 const START_KEY_INVALID: &str = "The provided starting key is invalid";
 
-/// The schema mismatch the shared starting-key check reports in a Scan's form,
-/// answered in a Query's.
-fn bare_start_key_mismatch(err: DynoxideError) -> DynoxideError {
+/// The schema mismatch the shared starting-key checks report, with or without
+/// the starting-key prefix, answered as [`START_KEY_INVALID`] alone. An index
+/// key of the wrong type answers so too (captured eu-west-2, eu-central-1 and
+/// us-east-1, 2026-10-20).
+pub(crate) fn bare_start_key_mismatch(err: DynoxideError) -> DynoxideError {
     match err {
         DynoxideError::ValidationException(msg)
             if msg
                 == "The provided starting key is invalid: \
-                    The provided key element does not match the schema" =>
+                    The provided key element does not match the schema"
+                || msg == "The provided key element does not match the schema" =>
         {
             DynoxideError::ValidationException(START_KEY_INVALID.to_string())
         }

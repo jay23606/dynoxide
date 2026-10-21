@@ -113,7 +113,7 @@ fn test_update_remove_clause() {
     // Remove age and email attributes
     exec(
         &db,
-        "UPDATE \"Tbl\" SET name = 'Alicia' REMOVE age, email WHERE pk = 'k1'",
+        "UPDATE \"Tbl\" SET name = 'Alicia' REMOVE age REMOVE email WHERE pk = 'k1'",
     );
 
     let sel = exec(&db, "SELECT * FROM \"Tbl\" WHERE pk = 'k1'");

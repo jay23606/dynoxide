@@ -531,6 +531,145 @@ fn top_k_zero_rejects_at_the_request_model_layer_enveloped() {
     );
 }
 
+/// A request built in Rust must meet the same IndexName and SearchVector
+/// checks as one decoded from a body, and say the same thing about them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_request_built_in_rust_meets_the_index_name_and_search_vector_checks() {
+    let storage = Storage::memory().unwrap();
+    let one = [dynoxide::types::AttributeValue::N("1".to_string())];
+
+    // (IndexName, SearchVector length, the member errors the wire gives).
+    let short = "Value at 'IndexName' failed to satisfy constraint: \
+                 Member must have length greater than or equal to 3";
+    let empty = "Value at 'SearchVector' failed to satisfy constraint: \
+                 Member must have length greater than or equal to 1";
+    let cases: [(&str, usize, String); 4] = [
+        ("", 1, format!("1 validation error detected: {short}")),
+        ("ab", 1, format!("1 validation error detected: {short}")),
+        ("vix", 0, format!("1 validation error detected: {empty}")),
+        (
+            "ab",
+            0,
+            format!("2 validation errors detected: {short}; {empty}"),
+        ),
+    ];
+
+    for (index_name, vector_len, expected) in cases {
+        let request = SearchVectorsRequest {
+            table_name: "AnyTable".to_string(),
+            index_name: index_name.to_string(),
+            search_vector: one.iter().take(vector_len).cloned().collect(),
+            top_k: 1,
+            ..Default::default()
+        };
+        let in_process = dynoxide::actions::search_vectors::execute(
+            &storage,
+            request,
+            &VectorIndexLifecycle::new(),
+        )
+        .await
+        .expect_err("a member that breaks its constraint is refused")
+        .to_string();
+
+        // The same request decoded from a body gives the same text.
+        let wire = request_model_error(serde_json::from_value(json!({
+            "TableName": "AnyTable", "IndexName": index_name,
+            "SearchVector": one.iter().take(vector_len).map(|_| json!({"N": "1"})).collect::<Vec<_>>(),
+            "TopK": 1
+        })));
+
+        assert_eq!(
+            wire, expected,
+            "wire answer for {index_name:?}/{vector_len}"
+        );
+        assert_eq!(
+            in_process, expected,
+            "in-process answer for {index_name:?}/{vector_len}"
+        );
+    }
+}
+
+/// Every combination of the members that can break a constraint, with and
+/// without a malformed table name: the request decoded from a body and the
+/// same request built in Rust give the same text, the same errors in the same
+/// order.
+#[tokio::test(flavor = "current_thread")]
+async fn in_process_and_wire_requests_agree_on_every_member_combination() {
+    use dynoxide::types::AttributeValue;
+    let storage = Storage::memory().unwrap();
+    let tables = ["AnyTable", "a"];
+    let index_names = ["", "ab", "vix", &"i".repeat(256)];
+    let mut compared = 0;
+    for table in tables {
+        for index_name in index_names {
+            for vector_len in [0usize, 1] {
+                for top_k in [0i64, 1] {
+                    let vector_json: Vec<_> = (0..vector_len).map(|_| json!({"N": "1"})).collect();
+                    let wire = serde_json::from_value::<SearchVectorsRequest>(json!({
+                        "TableName": table, "IndexName": index_name,
+                        "SearchVector": vector_json, "TopK": top_k
+                    }));
+                    // The one clean combination reaches the index lookup in
+                    // both paths; there is nothing to compare.
+                    let Err(wire) = wire else { continue };
+                    let wire = wire.to_string();
+                    let wire = wire.strip_prefix("VALIDATION:").unwrap();
+
+                    let request = SearchVectorsRequest {
+                        table_name: table.to_string(),
+                        index_name: index_name.to_string(),
+                        search_vector: (0..vector_len)
+                            .map(|_| AttributeValue::N("1".to_string()))
+                            .collect(),
+                        top_k,
+                        ..Default::default()
+                    };
+                    let in_process = dynoxide::actions::search_vectors::execute(
+                        &storage,
+                        request,
+                        &VectorIndexLifecycle::new(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+
+                    assert_eq!(
+                        in_process,
+                        wire,
+                        "{table:?} / {} chars / vector of {vector_len} / TopK {top_k}",
+                        index_name.len()
+                    );
+                    compared += 1;
+                }
+            }
+        }
+    }
+    // 2 tables x 4 index names x 2 vector lengths x 2 TopK values, less the
+    // one clean request.
+    assert_eq!(compared, 31, "every refused combination was compared");
+}
+
+/// Member errors win over a malformed table name, as they do on the wire
+/// (the table name is only looked at once the members are clean).
+#[tokio::test(flavor = "current_thread")]
+async fn member_errors_come_before_a_malformed_table_name_in_process() {
+    let storage = Storage::memory().unwrap();
+    let request = SearchVectorsRequest {
+        table_name: "a".to_string(),
+        index_name: "ab".to_string(),
+        search_vector: vec![dynoxide::types::AttributeValue::N("1".to_string())],
+        top_k: 1,
+        ..Default::default()
+    };
+    let err =
+        dynoxide::actions::search_vectors::execute(&storage, request, &VectorIndexLifecycle::new())
+            .await
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("'IndexName'"), "{err}");
+    assert!(!err.contains("tableName"), "{err}");
+}
+
 #[test]
 fn unrecognised_return_consumed_capacity_rejects_at_the_request_model_layer() {
     // SearchVectors asks the shared enum helper rather than carrying its own

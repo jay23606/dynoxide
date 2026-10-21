@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-21
+
+The crate moves to `dynoxide-rs` 3.1.0 for the new `server::serve_with_shutdown`.
+Everything else a user installs carries 1.4.0. Most of the release brings
+answers in line with DynamoDB, so some requests answer differently: see
+Behaviour changes and `docs/compatibility-summary.md`.
+
+### Security
+
+- **`rustls-webpki` moves to 0.103.16** for RUSTSEC-2026-0382. Earlier
+  versions could accept a certificate chain through one of the distrusted
+  emSign intermediates, whose private keys are now public. `rustls` moves to
+  0.23.46 alongside it for RUSTSEC-2026-0346 to RUSTSEC-2026-0349. Both reach
+  the tree through dev-dependencies only and never shipped in a released
+  artefact.
+
+### Behaviour changes
+
+- `Database::scan` and `Database::query` check a request built in Rust as the
+  HTTP path checks it, so they refuse requests they used to run: a `Limit` of
+  0 on either, and on `Database::scan` a `Select` or `ReturnConsumedCapacity`
+  outside its enum and a `Segment` above 999999. Scan's member errors now come
+  from `Database::scan` rather than from decoding the request, so a
+  `ScanRequest` with a `Select` of `BAD` decodes.
+- For a request built in Rust, an empty `UpdateExpression` comes back as
+  `DynoxideError::EnvelopedValidation` rather than `ValidationException`; the
+  message is unchanged.
+- `dynoxide mcp` refuses `--max-items 0` as it starts, and its `scan` and
+  `query` tools refuse a `limit` of 0, as DynamoDB refuses a `Limit` of 0.
+
 ### Added
 
 - **`server::serve_with_shutdown` stops an embedded HTTP server cleanly.** It
@@ -17,7 +47,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a file-backed database's files stayed open (and could not be deleted on
   Windows). `start` now runs on it too, with its Ctrl-C and SIGTERM handling
   unchanged.
-- `dynoxide import` reads JSON Lines files named `.jsonl` and `.jsonl.gz`, in a DynamoDB Export directory (`<dir>/<TableName>/data/`) or a flat directory of those files, alongside the `.json` and `.json.gz` parts it already accepted.
+- `dynoxide import` reads JSON Lines files named `.jsonl` and `.jsonl.gz`, in a DynamoDB Export directory (`<dir>/<TableName>/data/`) or a flat directory of those files, alongside the `.json` and `.json.gz` parts it already accepted ([#250](https://github.com/nubo-db/dynoxide/pull/250), thanks [@samchungy](https://github.com/samchungy)).
+
+### Fixed
+
+- **A `SearchVectorsRequest` built in Rust now meets the `IndexName`,
+  `SearchVector` and `TopK` checks.** An `IndexName` shorter than three
+  characters, an empty `SearchVector` or a `TopK` below 1 used to get past
+  `Database::search_vectors` and fail later with whatever came next. They now
+  get the same validation message as the same request sent over HTTP, in the
+  same order. A `TopK` below 1 now gets the `1 validation error detected:`
+  form it has over HTTP rather than the bare out-of-range message; `TopK` above
+  100 keeps the bare message.
+- **Five request-validation messages now match DynamoDB when more than one
+  thing is wrong.** UpdateItem with no `TableName` keeps that error beside a
+  bad `ReturnValues`, and, when the key is missing too, beside a bad
+  `ReturnConsumedCapacity` or `ReturnItemCollectionMetrics`, in the order
+  DynamoDB lists them. Query with
+  no `TableName` and a `Limit` of 0 reports both, with a bad `Select` first.
+  BatchGetItem reports a malformed table name ahead of the total key count.
+  DeleteItem treats a `ReturnValues` of `ALL_NEW` or `UPDATED_NEW` as a request
+  member: it is joined after the other member errors and reported ahead of any
+  expression error. UpdateItem puts an empty `UpdateExpression` in the
+  `1 validation error detected:` envelope and reports an empty
+  `ConditionExpression` before it.
+- `UpdateItem` and PartiQL `UPDATE` refuse a `SET`, `REMOVE`, `ADD` or `DELETE` whose path has a missing or wrong-typed parent: `The document path provided in the update expression is invalid for update`. PartiQL `SET zz.y = 1` no longer creates `zz`.
+- Every clause of an update reads the item as it was before the update, in `UpdateItem` and PartiQL: `REMOVE l[0], l[1]` removes both elements, and `SET n = 7, s = n + 1` gives `s` the old `n` plus one.
+- PartiQL `UPDATE` refuses overlapping paths (`Two document paths overlap with each other`) and takes one path per `REMOVE` keyword, so `REMOVE a, b` is a syntax error.
+- `SET` arithmetic and `list_append` return DynamoDB's errors for a missing attribute, a stored value of the wrong type and a value of the wrong type. A PartiQL `SET n = zz + 1` on a missing `zz` is refused, not read as zero. `ADD` and `DELETE` name the operand type in full with a `typeSet`; the others use the short code (`S`, `N`, `L`).
+- PartiQL `+`, `-` and `list_append` take an attribute on either side, and a quoted string is a string.
+- An update that appends past the end of a list reads every other index on that list as the list was: an `ADD`, `DELETE` or `REMOVE` at an index the list did not reach leaves the appended element alone, and the appends land in index order, PartiQL's included. A `DELETE` that empties a set held in a list element takes the element out at its original index.
+- `Scan` checks its request members as the newer validation layer does, which 20 of 33 regions now run: `Limit`, `Segment`, `TotalSegments` and an empty `TableName` come first in the newer wording, then the table-name format and `ReturnConsumedCapacity`, then `Select`, with an `ExclusiveStartKey` mismatch answered as `The provided starting key is invalid` ([#254](https://github.com/nubo-db/dynoxide/issues/254)).
+- `Scan` refuses `Select` of `COUNT`, `ALL_ATTRIBUTES` or `ALL_PROJECTED_ATTRIBUTES` beside `AttributesToGet`, and answers an empty attribute name in an `ExclusiveStartKey` or an expression value bare.
+- `Scan` words a bad number or a repeated set member in an attribute value as the newer layer does, with no `ExpressionAttributeValues contains invalid value` wrapper.
+- `Scan` reads `Limit`, `Segment` and `TotalSegments` as 32-bit integers that saturate and drop a fraction, so `Limit` 4294967296 is accepted and a negative `TotalSegments` is a validation error rather than a decoding one. It refuses a `Segment` above 999999, checks `Select` of `ALL_ATTRIBUTES` against a keys-only index ahead of the `ExclusiveStartKey`, and on a table with indexes reports an `ExclusiveStartKey` attribute of the wrong type as an index key mismatch.
+- `Query` refuses `Select` of `COUNT`, `ALL_ATTRIBUTES` or `ALL_PROJECTED_ATTRIBUTES` beside `AttributesToGet`, puts its `Cannot specify ...` and `ALL_PROJECTED_ATTRIBUTES` messages in the `1 validation error detected:` envelope, reads `Limit` as `Scan` does, and answers an index key of the wrong type in an `ExclusiveStartKey` with `The provided starting key is invalid`. With no `TableName` it reports a bad `ReturnConsumedCapacity` beside the missing name.
+- A parallel `Scan` of a table with `TotalSegments` above 4096 returns each item once. The segments past the last hash bucket used to return almost every item.
+- A parallel `Scan` that deletes each page as it goes sees its whole segment. Once the item its `ExclusiveStartKey` named was deleted, the next page used to come back empty, with no `LastEvaluatedKey`.
 
 ## [1.3.0] - 2026-10-10
 
@@ -1818,7 +1884,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/nubo-db/dynoxide/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/nubo-db/dynoxide/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/nubo-db/dynoxide/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/nubo-db/dynoxide/compare/v1.1.0...v1.2.0

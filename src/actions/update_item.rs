@@ -83,7 +83,7 @@ fn first_invalid_member_enum(
     return_consumed_capacity: Option<&str>,
 ) -> Option<(String, bool)> {
     if let Some(rv) = return_values
-        && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv)
+        && !crate::validation::RETURN_VALUES.contains(&rv)
     {
         return Some((crate::validation::RETURN_VALUES_REJECTION.to_string(), true));
     }
@@ -123,9 +123,12 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
         // Without its key, UpdateItem falls back to the older layer in all seven
         // regions captured on 2026-10-09: every enum error in the older
         // per-value wording, then the key, and no table name error beside
-        // them. The enums' order is the older layer's (ReturnConsumedCapacity,
-        // ReturnValues, ReturnValuesOnConditionCheckFailure,
-        // ReturnItemCollectionMetrics). An empty name is still checked first.
+        // them unless the name is missing altogether. The enums' order is the
+        // older layer's (ReturnConsumedCapacity, ReturnValues,
+        // ReturnValuesOnConditionCheckFailure, ReturnItemCollectionMetrics),
+        // with a missing name's error right after ReturnConsumedCapacity's
+        // (captured eu-west-2 and us-east-1, 2026-10-09). An empty name is
+        // still checked first.
         if raw.key.is_none() && raw.table_name.as_deref() != Some("") {
             let mut errors: Vec<String> = Vec::new();
             if let Some(msg) = crate::validation::return_consumed_capacity_rejection(
@@ -133,8 +136,11 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
             ) {
                 errors.push(msg);
             }
+            if raw.table_name.is_none() {
+                errors.extend(crate::validation::update_item_table_name_errors(None));
+            }
             if let Some(rv) = raw.return_values.as_deref()
-                && !["ALL_NEW", "UPDATED_OLD", "ALL_OLD", "NONE", "UPDATED_NEW"].contains(&rv)
+                && !crate::validation::RETURN_VALUES.contains(&rv)
             {
                 errors.push(crate::validation::return_values_value_rejection(rv));
             }
@@ -153,6 +159,20 @@ impl<'de> serde::Deserialize<'de> for UpdateItemRequest {
                 "Value null at 'key' failed to satisfy constraint: Member must not be null"
                     .to_string(),
             );
+            if let Some(msg) = format_validation_errors(&errors) {
+                return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
+            }
+        }
+
+        // A missing table name is joined with an invalid ReturnValues, the
+        // name's error first (captured eu-west-2 and us-east-1, 2026-10-09).
+        // The other enums beside a missing name are uncaptured.
+        if raw.table_name.is_none()
+            && let Some(rv) = raw.return_values.as_deref()
+            && !crate::validation::RETURN_VALUES.contains(&rv)
+        {
+            let mut errors = crate::validation::update_item_table_name_errors(None);
+            errors.push(crate::validation::return_values_value_rejection(rv));
             if let Some(msg) = format_validation_errors(&errors) {
                 return Err(serde::de::Error::custom(format!("VALIDATION:{}", msg)));
             }
@@ -488,22 +508,23 @@ async fn execute_inner<S: StorageBackend>(
             .map_err(crate::validation::tag_for_envelope)?;
     }
 
-    // Validate empty UpdateExpression
-    if let Some(ref ue) = request.update_expression
-        && ue.is_empty()
-    {
-        return Err(DynoxideError::ValidationException(
-            "Invalid UpdateExpression: The expression can not be empty;".to_string(),
-        ));
-    }
-
     // Validate empty ConditionExpression, inside the envelope (eu-west-2 and
-    // us-east-1, 2026-10-09).
+    // us-east-1, 2026-10-09). It is reported ahead of an empty
+    // UpdateExpression (eu-west-2 and us-east-1, 2026-10-09).
     if let Some(ref ce) = request.condition_expression
         && ce.is_empty()
     {
         return Err(DynoxideError::EnvelopedValidation(
             "Invalid ConditionExpression: The expression can not be empty;".to_string(),
+        ));
+    }
+
+    // Validate empty UpdateExpression, inside the envelope too (same capture).
+    if let Some(ref ue) = request.update_expression
+        && ue.is_empty()
+    {
+        return Err(DynoxideError::EnvelopedValidation(
+            "Invalid UpdateExpression: The expression can not be empty;".to_string(),
         ));
     }
 

@@ -84,6 +84,58 @@ pub struct SearchVectorsRequest {
     pub return_consumed_capacity: Option<String>,
 }
 
+/// The IndexName, SearchVector and TopK member constraints, in the order they
+/// are reported.
+///
+/// The one copy, asked by the request decoder and by `execute`, so a request
+/// built in Rust meets the same checks and gets the same words as one decoded
+/// from a body.
+///
+/// The short-name rejection carries no value echo and spells the member path
+/// 'IndexName' (captured from real DynamoDB, eu-west-2 and us-east-1,
+/// 2026-08-13). The upper bound mirrors the 255 the CreateTable family
+/// enforces; its wording for this operation is uncaptured beyond the no-echo
+/// form the captured lower bound establishes. An empty vector rejects in the
+/// same no-echo, 'SearchVector' member-path form (captured from real
+/// DynamoDB, eu-west-2 and us-east-1, 2026-08-13).
+///
+/// TopK below 1 rejects at the request-model layer, in the newer layer's
+/// wording with no value echo (captured 2026-10-09, six of six regions). Only
+/// the lower bound lives here: 101 rejects bare at the operation layer with
+/// its own captured message, and non-integer values never reach this point
+/// (the i32 field rejects them inside serde).
+fn member_constraint_errors(index_name: &str, search_vector_len: usize, top_k: i64) -> Vec<String> {
+    let mut errors = Vec::new();
+    if index_name.len() < 3 {
+        errors.push(
+            "Value at 'IndexName' failed to satisfy constraint: \
+             Member must have length greater than or equal to 3"
+                .to_string(),
+        );
+    } else if index_name.len() > 255 {
+        errors.push(
+            "Value at 'IndexName' failed to satisfy constraint: \
+             Member must have length less than or equal to 255"
+                .to_string(),
+        );
+    }
+    if search_vector_len == 0 {
+        errors.push(
+            "Value at 'SearchVector' failed to satisfy constraint: \
+             Member must have length greater than or equal to 1"
+                .to_string(),
+        );
+    }
+    if top_k < 1 {
+        errors.push(
+            "Value at 'TopK' failed to satisfy constraint: \
+             Member must have value greater than or equal to 1"
+                .to_string(),
+        );
+    }
+    errors
+}
+
 impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -111,48 +163,11 @@ impl<'de> serde::Deserialize<'de> for SearchVectorsRequest {
             ));
         }
 
-        // The short-name rejection carries no value echo and spells the
-        // member path 'IndexName' (captured from real DynamoDB, eu-west-2 and
-        // us-east-1, 2026-08-13). The upper bound mirrors the 255 the
-        // CreateTable family enforces; its wording for this operation is
-        // uncaptured beyond the no-echo form the captured lower bound
-        // establishes.
-        if raw.index_name.len() < 3 {
-            errors.push(
-                "Value at 'IndexName' failed to satisfy constraint: \
-                 Member must have length greater than or equal to 3"
-                    .to_string(),
-            );
-        } else if raw.index_name.len() > 255 {
-            errors.push(
-                "Value at 'IndexName' failed to satisfy constraint: \
-                 Member must have length less than or equal to 255"
-                    .to_string(),
-            );
-        }
-        // An empty vector rejects in the same no-echo, 'SearchVector'
-        // member-path form as the IndexName constraint (captured from real
-        // DynamoDB, eu-west-2 and us-east-1, 2026-08-13).
-        if raw.search_vector.is_empty() {
-            errors.push(
-                "Value at 'SearchVector' failed to satisfy constraint: \
-                 Member must have length greater than or equal to 1"
-                    .to_string(),
-            );
-        }
-        // TopK below 1 rejects at the request-model layer, in the newer
-        // layer's wording with no value echo (captured 2026-10-09, six of six
-        // regions). Only the lower bound lives here: 101 rejects bare at the
-        // operation layer with its own captured message, and non-integer
-        // values never reach this point (the i32 field rejects them inside
-        // serde).
-        if raw.top_k < 1 {
-            errors.push(
-                "Value at 'TopK' failed to satisfy constraint: \
-                 Member must have value greater than or equal to 1"
-                    .to_string(),
-            );
-        }
+        errors.extend(member_constraint_errors(
+            &raw.index_name,
+            raw.search_vector.len(),
+            i64::from(raw.top_k),
+        ));
 
         // A table name that breaks its constraints comes after those members
         // and ahead of ReturnConsumedCapacity, without the envelope, one error
@@ -446,17 +461,25 @@ pub async fn execute<S: StorageBackend>(
             crate::validation::envelope_message(crate::validation::EMPTY_TABLE_NAME_REJECTION),
         ));
     }
+    // The member constraints, as the decoder reports them: ahead of a
+    // malformed table name, which is only looked at once the members are
+    // clean.
+    if let Some(msg) = crate::validation::format_validation_errors(&member_constraint_errors(
+        &request.index_name,
+        request.search_vector.len(),
+        request.top_k,
+    )) {
+        return Err(DynoxideError::ValidationException(msg));
+    }
     if let Some(msg) = crate::validation::first_table_name_error(&request.table_name) {
         return Err(DynoxideError::ValidationException(msg));
     }
 
-    // TopK beyond the request-model lower bound rejects bare with the value
-    // interpolated (captured 2026-08-11: 101). Checked before the table
-    // lookup, mirroring the Query family's input-first posture (the relative
-    // order against table existence is uncaptured). The lower arm is
-    // unreachable through the wire (the request model rejects it first,
-    // enveloped) and guards direct in-process construction.
-    if !(1..=100).contains(&request.top_k) {
+    // TopK beyond the upper bound rejects bare with the value interpolated
+    // (captured 2026-08-11: 101). Checked before the table lookup, mirroring
+    // the Query family's input-first posture (the relative order against table
+    // existence is uncaptured). The lower bound is a member constraint, above.
+    if request.top_k > 100 {
         return Err(DynoxideError::ValidationException(format!(
             "Provided TopK value '{}' is out of valid range. The value must be between 1 and \
              100 inclusive",

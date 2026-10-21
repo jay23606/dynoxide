@@ -3,15 +3,16 @@
 //! repeated member, is worded.
 //!
 //! The current layer (PutItem, UpdateItem and DeleteItem inside the
-//! `1 validation error detected: ` envelope; GetItem, BatchGetItem and Query
-//! bare) reads numbers by the stored-number rule, ends an empty one with
+//! `1 validation error detected: ` envelope; GetItem, BatchGetItem, Query and
+//! Scan bare) reads numbers by the stored-number rule, ends an empty one with
 //! `: `, quotes duplicated members in a particular order and never wraps an
-//! expression value. The older layer (BatchWriteItem, the transactions, Scan
-//! and PartiQL) reads numbers as Java's `BigDecimal` does, prints members as
-//! sent and wraps expression values naming the key. Captured in eu-west-2,
+//! expression value. The older layer (BatchWriteItem, the transactions and
+//! PartiQL) reads numbers as Java's `BigDecimal` does, prints members as sent
+//! and wraps expression values naming the key. Captured in eu-west-2,
 //! us-east-1, eu-west-1 and us-west-2, 2026-10-09; where the regions split
-//! (eu-west-2 runs the current layer on transactions and Scan), Dynoxide
-//! follows the majority.
+//! (eu-west-2 runs the current layer on the transactions), Dynoxide follows
+//! the majority. Scan was one of those until 20 October 2026, when 19 of 33
+//! regions read its values on the current layer.
 
 #![cfg(feature = "http-server")]
 
@@ -150,6 +151,14 @@ async fn reads_on_the_current_layer_refuse_numbers_bare() {
     )
     .await;
     assert_eq!(query, message);
+    let scan = refusal(
+        &url,
+        "Scan",
+        json!({"TableName": "Vlt", "FilterExpression": "n = :v",
+            "ExpressionAttributeValues": {":v": n("")}}),
+    )
+    .await;
+    assert_eq!(scan, message);
 }
 
 #[tokio::test]
@@ -170,17 +179,6 @@ async fn the_older_layer_reads_numbers_as_big_decimal_and_names_expression_value
     )
     .await;
     assert_eq!(transaction, for_key(UNDERFLOW, ":v"));
-    let scan = refusal(
-        &url,
-        "Scan",
-        json!({"TableName": "Vlt", "FilterExpression": "n = :v",
-            "ExpressionAttributeValues": {":v": n("")}}),
-    )
-    .await;
-    assert_eq!(
-        scan,
-        for_key("The parameter cannot be converted to a numeric value", ":v")
-    );
 }
 
 #[tokio::test]
@@ -259,21 +257,18 @@ async fn query_start_keys_and_legacy_filters_use_the_current_words() {
 }
 
 #[tokio::test]
-async fn scan_values_keep_the_older_words_inside_the_wrapper() {
+async fn scan_values_use_the_current_words_with_no_wrapper() {
     let url = start().await;
     let got = refusal(
         &url,
         "Scan",
         json!({"TableName": "Vlt", "FilterExpression": "s = :t",
-            "ExpressionAttributeValues": {":t": {"SS": ["b", "a", "b"]}}}),
+            "ExpressionAttributeValues": {":t": {"SS": ["a", "a"]}}}),
     )
     .await;
     assert_eq!(
         got,
-        for_key(
-            &format!("{INVALID}Input collection [b, a, b] contains duplicates."),
-            ":t"
-        )
+        format!(r#"{INVALID}Input collection ["a", "a"] contains duplicates."#)
     );
 }
 

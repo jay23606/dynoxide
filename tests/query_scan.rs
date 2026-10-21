@@ -704,7 +704,7 @@ fn test_scan_specific_attributes_without_projection_rejected() {
     let err = db.scan(req).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES",
+        "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES",
         "expected DynamoDB's exact message, got: {err}"
     );
 }

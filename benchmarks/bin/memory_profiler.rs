@@ -7,7 +7,7 @@ use dynoxide::actions::update_item::UpdateItemRequest;
 use dynoxide::types::AttributeValue;
 use dynoxide_benchmarks::containers::{
     self, ContainerState, ContainerTarget, container_state, docker_available, image_available,
-    remove_container, report_not_ready, report_stopped, wait_for_list_tables,
+    remove_container, report_not_ready, report_stopped, wait_for_container_list_tables,
 };
 use dynoxide_benchmarks::memory_measurement::{current_rss_bytes, disk_usage_bytes, format_bytes};
 use dynoxide_benchmarks::stats;
@@ -402,8 +402,9 @@ fn measure_container_idle_rss(
     target.run(&container_name)?;
 
     // The same readiness check as the startup benchmark.
-    if !runtime.block_on(wait_for_list_tables(
+    if !runtime.block_on(wait_for_container_list_tables(
         &target.endpoint(),
+        &container_name,
         CONTAINER_READY_TIMEOUT,
     )) {
         let reason = report_not_ready(target, &container_name, CONTAINER_READY_TIMEOUT);
