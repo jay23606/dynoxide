@@ -52,10 +52,10 @@ cargo install dynoxide-rs --no-default-features --features encrypted-full
 ```toml
 [dependencies]
 # Minimal - just the embedded database, no server or CLI dependencies
-dynoxide-rs = { version = "3.0", default-features = false, features = ["native-sqlite"] }
+dynoxide-rs = { version = "3.1", default-features = false, features = ["native-sqlite"] }
 
 # Or with encryption:
-# dynoxide-rs = { version = "3.0", default-features = false, features = ["encryption"] }
+# dynoxide-rs = { version = "3.1", default-features = false, features = ["encryption"] }
 ```
 
 ## Upgrading to 1.3.0
