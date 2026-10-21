@@ -533,6 +533,13 @@ impl Storage {
         let _ = self
             .conn
             .execute_batch("ALTER TABLE _stream_records ADD COLUMN user_identity TEXT");
+        // Likewise the event id, and records written before it existed get
+        // one now, stored so every later read returns the same id.
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE _stream_records ADD COLUMN event_id TEXT");
+        self.conn
+            .execute_batch(sql_builders::BACKFILL_STREAM_EVENT_IDS)?;
         if new_database {
             let (sql, params) = sql_builders::init_schema_version(SCHEMA_VERSION);
             self.conn
@@ -1962,25 +1969,26 @@ impl Storage {
         created_at: i64,
         user_identity: Option<&str>,
     ) -> Result<()> {
+        // Globally unique, as DynamoDB's eventID is: 32 lowercase hex digits.
+        let event_id = uuid::Uuid::new_v4().simple().to_string();
         self.conn.execute(
-            "INSERT INTO _stream_records (table_name, event_name, keys_json, new_image, old_image, sequence_number, shard_id, created_at, user_identity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![table_name, event_name, keys_json, new_image, old_image, sequence_number, shard_id, created_at, user_identity],
+            "INSERT INTO _stream_records (table_name, event_name, keys_json, new_image, old_image, sequence_number, shard_id, created_at, user_identity, event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![table_name, event_name, keys_json, new_image, old_image, sequence_number, shard_id, created_at, user_identity, event_id],
         )?;
         Ok(())
     }
 
-    /// Get the next sequence number for a table's stream.
+    /// Get the next sequence number for a table's stream: one past the last,
+    /// and never below the clock's floor.
     pub fn next_stream_sequence_number(&self, table_name: &str) -> Result<i64> {
         let result: std::result::Result<i64, _> = self.conn.query_row(
             "SELECT COALESCE(MAX(CAST(sequence_number AS INTEGER)), 0) + 1 FROM _stream_records WHERE table_name = ?1",
             params![table_name],
             |row| row.get(0),
         );
-        match result {
-            Ok(n) => Ok(n),
-            Err(_) => Ok(1),
-        }
+        let next = result.unwrap_or(1);
+        Ok(next.max(crate::streams::sequence_number_floor(self.clock())))
     }
 
     /// Get stream records for a shard starting after a given sequence number.
@@ -1992,7 +2000,7 @@ impl Storage {
         limit: usize,
     ) -> Result<Vec<StreamRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT event_name, keys_json, new_image, old_image, sequence_number, created_at, user_identity
+            "SELECT event_name, keys_json, new_image, old_image, sequence_number, created_at, user_identity, event_id
              FROM _stream_records
              WHERE table_name = ?1 AND shard_id = ?2 AND CAST(sequence_number AS INTEGER) > ?3
              ORDER BY CAST(sequence_number AS INTEGER) ASC
@@ -2010,6 +2018,7 @@ impl Storage {
                         sequence_number: row.get(4)?,
                         created_at: row.get(5)?,
                         user_identity: row.get(6)?,
+                        event_id: row.get(7)?,
                     })
                 },
             )?
@@ -2068,10 +2077,15 @@ impl Storage {
         table_name: &str,
         shard_id: &str,
     ) -> Result<(Option<String>, Option<String>)> {
+        // Compared as numbers: as text, "10" sorts before "9".
         let result: std::result::Result<(Option<String>, Option<String>), _> = self.conn.query_row(
-            "SELECT MIN(sequence_number), MAX(sequence_number) FROM _stream_records WHERE table_name = ?1 AND shard_id = ?2",
+            "SELECT MIN(CAST(sequence_number AS INTEGER)), MAX(CAST(sequence_number AS INTEGER)) FROM _stream_records WHERE table_name = ?1 AND shard_id = ?2",
             params![table_name, shard_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                let min: Option<i64> = row.get(0)?;
+                let max: Option<i64> = row.get(1)?;
+                Ok((min.map(|n| n.to_string()), max.map(|n| n.to_string())))
+            },
         );
         match result {
             Ok(range) => Ok(range),
@@ -2132,6 +2146,9 @@ pub struct StreamRecord {
     pub sequence_number: String,
     pub created_at: i64,
     pub user_identity: Option<String>,
+    /// Assigned when the record is written. `None` only on a row an older
+    /// build wrote to the file since this one opened it.
+    pub event_id: Option<String>,
 }
 
 /// Per-table statistics returned by `Storage::table_stats()`.
@@ -2597,6 +2614,46 @@ mod tests {
         let storage2 = Storage::new(&path).unwrap();
         let meta2 = storage2.get_table_metadata("LegacyTable").unwrap().unwrap();
         assert_eq!(meta2.table_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// A stream record table from before records carried an event id gains the
+    /// column on open, and each old record gets an id that later opens keep.
+    #[test]
+    fn stream_records_without_an_event_id_get_a_stable_one_on_open() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        {
+            let storage = Storage::new(&path).unwrap();
+            for seq in ["1", "2"] {
+                storage
+                    .insert_stream_record("T", "INSERT", "{}", None, None, seq, "s", 0)
+                    .unwrap();
+            }
+            storage
+                .conn()
+                .execute_batch("ALTER TABLE _stream_records DROP COLUMN event_id")
+                .unwrap();
+        }
+
+        let ids = |storage: &Storage| -> Vec<String> {
+            storage
+                .get_stream_records("T", "s", 0, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.event_id.expect("backfilled on open"))
+                .collect()
+        };
+        let first = ids(&Storage::new(&path).unwrap());
+        assert_eq!(first.len(), 2);
+        for id in &first {
+            assert_eq!(id.len(), 32, "{id}");
+            assert!(
+                id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "{id}"
+            );
+        }
+        assert_ne!(first[0], first[1]);
+        assert_eq!(ids(&Storage::new(&path).unwrap()), first);
     }
 
     /// The v8 -> v9 migration adds the `vector_index_definitions` column, so a

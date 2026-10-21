@@ -208,8 +208,14 @@ pub const INIT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS _config (
                 sequence_number TEXT NOT NULL,
                 shard_id TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                user_identity TEXT
+                user_identity TEXT,
+                event_id TEXT
             );";
+
+/// Give every stream record without an event id one: 32 random lowercase hex
+/// digits, the shape a new record gets.
+pub const BACKFILL_STREAM_EVENT_IDS: &str =
+    "UPDATE _stream_records SET event_id = lower(hex(randomblob(16))) WHERE event_id IS NULL";
 
 // --- Transaction control (constant SQL) ---------------------------------
 

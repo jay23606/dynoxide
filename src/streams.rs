@@ -44,6 +44,29 @@ pub fn shard_id(table_name: &str) -> String {
     format!("shardId-00000001-{table_name}")
 }
 
+/// Offset that turns a stored sequence number into its 21-digit public form.
+const SEQUENCE_NUMBER_OFFSET: u128 = 100_000_000_000_000_000_000;
+
+/// The public form of a stored sequence number: 21 digits, as DynamoDB's are
+/// (21 to 40). Fixed width, so string and numeric order agree.
+pub fn format_sequence_number(stored: i64) -> String {
+    (SEQUENCE_NUMBER_OFFSET + stored.max(0) as u128).to_string()
+}
+
+/// The stored sequence number a public one names. A short number reads as
+/// stored, so a value a client kept from an earlier build still resolves.
+pub fn parse_sequence_number(public: &str) -> Option<i64> {
+    let value: u128 = public.parse().ok()?;
+    let stored = value.checked_sub(SEQUENCE_NUMBER_OFFSET).unwrap_or(value);
+    i64::try_from(stored).ok()
+}
+
+/// The floor for a new stored sequence number: microseconds since the epoch,
+/// so a fresh in-memory database never reissues an earlier session's numbers.
+pub fn sequence_number_floor(clock: &dyn Clock) -> i64 {
+    (clock.now_unix_secs_f64() * 1_000_000.0) as i64
+}
+
 /// Generate a stream label from the current timestamp.
 ///
 /// The label format preserves the historical `<secs>.<nanos>` shape. The
@@ -161,4 +184,26 @@ pub async fn record_stream_event<S: StorageBackend>(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sequence_number_round_trips_through_its_public_form() {
+        for stored in [0, 1, 1_761_000_000_000_000, i64::MAX] {
+            let public = format_sequence_number(stored);
+            assert_eq!(public.len(), 21, "{public}");
+            assert_eq!(parse_sequence_number(&public), Some(stored));
+        }
+        assert!(format_sequence_number(9) < format_sequence_number(10));
+    }
+
+    #[test]
+    fn a_short_sequence_number_reads_as_stored() {
+        assert_eq!(parse_sequence_number("5"), Some(5));
+        assert_eq!(parse_sequence_number("abc"), None);
+        assert_eq!(parse_sequence_number("999999999999999999999999"), None);
+    }
 }

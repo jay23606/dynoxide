@@ -78,28 +78,24 @@ pub async fn execute<S: StorageBackend>(
     let position = match request.shard_iterator_type.as_str() {
         "TRIM_HORIZON" => 0,
         "LATEST" => {
-            // Position at the latest record
-            let seq = storage.next_stream_sequence_number(&table_name).await?;
-            seq - 1 // Will return records after this position
+            // Position at the last record written, so only later ones return.
+            let sid = crate::streams::shard_id(&table_name);
+            let (_, last) = storage.get_shard_sequence_range(&table_name, &sid).await?;
+            last.and_then(|seq| seq.parse().ok()).unwrap_or(0)
         }
         "AT_SEQUENCE_NUMBER" => {
-            let seq: i64 = request
+            let seq = request
                 .sequence_number
                 .as_deref()
-                .unwrap_or("0")
-                .parse()
+                .and_then(crate::streams::parse_sequence_number)
                 .unwrap_or(0);
             seq - 1 // AT means include this record, so position before it
         }
-        "AFTER_SEQUENCE_NUMBER" => {
-            let seq: i64 = request
-                .sequence_number
-                .as_deref()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-            seq
-        }
+        "AFTER_SEQUENCE_NUMBER" => request
+            .sequence_number
+            .as_deref()
+            .and_then(crate::streams::parse_sequence_number)
+            .unwrap_or(0),
         other => {
             return Err(DynoxideError::ValidationException(format!(
                 "Invalid ShardIteratorType: {other}"

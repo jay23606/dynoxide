@@ -138,8 +138,13 @@ pub async fn execute<S: StorageBackend>(
                 })
         });
 
+        let sequence_number = crate::streams::format_sequence_number(seq_num);
         records.push(Record {
-            event_id: raw.sequence_number.clone(),
+            // A row with no id gets one when the database next opens.
+            event_id: raw
+                .event_id
+                .clone()
+                .unwrap_or_else(|| sequence_number.clone()),
             event_name: raw.event_name.clone(),
             event_version: "1.1".to_string(),
             event_source: "aws:dynamodb".to_string(),
@@ -148,7 +153,7 @@ pub async fn execute<S: StorageBackend>(
                 keys,
                 new_image,
                 old_image,
-                sequence_number: raw.sequence_number.clone(),
+                sequence_number,
                 size_bytes: size as i64,
                 stream_view_type: view_type.clone(),
                 approximate_creation_date_time: raw.created_at as f64,

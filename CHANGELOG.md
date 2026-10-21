@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes
+
+- **A stream record's `SequenceNumber` is 21 digits**, within DynamoDB's 21 to
+  40, and a new database starts its numbers from the clock, so an in-memory
+  server no longer reissues the numbers an earlier run gave out. Numbers keep
+  their order as strings and as numbers. `GetShardIterator` still accepts the
+  short numbers earlier builds returned. `storage::StreamRecord` gains an
+  `event_id` field.
+
+### Fixed
+
+- **A stream record's `eventID` is globally unique.** It was the record's
+  sequence number, so an in-memory server issued `1`, `2`, `3` again after
+  every restart, and a consumer that skips eventIDs it has already processed
+  silently dropped new events. Each record now gets a random 32-character
+  hex id when it is written, stored with it so every read returns the same
+  one. Records in an existing database file get theirs when it is next
+  opened.
+
 ## [1.4.0] - 2026-10-21
 
 The crate moves to `dynoxide-rs` 3.1.0 for the new `server::serve_with_shutdown`.

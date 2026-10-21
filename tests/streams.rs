@@ -494,9 +494,9 @@ fn test_records_ordered_by_sequence_number() {
     assert_eq!(resp.records.len(), 10);
 
     // Verify monotonically increasing sequence numbers
-    let mut prev_seq: i64 = 0;
+    let mut prev_seq: u128 = 0;
     for record in &resp.records {
-        let seq: i64 = record.dynamodb.sequence_number.parse().unwrap();
+        let seq: u128 = record.dynamodb.sequence_number.parse().unwrap();
         assert!(
             seq > prev_seq,
             "sequence numbers should be monotonically increasing"
@@ -543,4 +543,193 @@ fn describe_table_omits_stream_specification_when_disabled() {
         table.get("StreamSpecification").is_none() || table["StreamSpecification"].is_null(),
         "StreamSpecification should be absent for a non-stream table"
     );
+}
+
+// ------------------------------------------------------------------
+// eventID and SequenceNumber identity
+// ------------------------------------------------------------------
+
+fn shard_iterator(db: &Database, table: &str, kind: &str, seq: Option<&str>) -> String {
+    let arn = get_stream_arn(db, table);
+    let mut req = json!({
+        "StreamArn": &arn,
+        "ShardId": format!("shardId-00000001-{table}"),
+        "ShardIteratorType": kind
+    });
+    if let Some(seq) = seq {
+        req["SequenceNumber"] = json!(seq);
+    }
+    let iter_req = serde_json::from_value(req).unwrap();
+    db.get_shard_iterator(iter_req)
+        .unwrap()
+        .shard_iterator
+        .unwrap()
+}
+
+fn all_records(db: &Database, table: &str) -> Vec<dynoxide::actions::get_records::Record> {
+    get_records(db, &shard_iterator(db, table, "TRIM_HORIZON", None)).records
+}
+
+fn event_ids(db: &Database, table: &str) -> Vec<String> {
+    all_records(db, table)
+        .into_iter()
+        .map(|r| r.event_id)
+        .collect()
+}
+
+fn sequence_numbers(db: &Database, table: &str) -> Vec<String> {
+    all_records(db, table)
+        .into_iter()
+        .map(|r| r.dynamodb.sequence_number)
+        .collect()
+}
+
+fn delete_item(db: &Database, table: &str, pk: &str) {
+    let req = json!({"TableName": table, "Key": {"pk": {"S": pk}}});
+    db.delete_item(serde_json::from_value(req).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn event_ids_are_unique_and_aws_shaped() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_AND_OLD_IMAGES");
+    for i in 0..10 {
+        put_item(&db, "Evt", &format!("k{i}"), "a");
+        put_item(&db, "Evt", &format!("k{i}"), "b");
+        delete_item(&db, "Evt", &format!("k{i}"));
+    }
+
+    let ids = event_ids(&db, "Evt");
+    assert_eq!(ids.len(), 30);
+    for id in &ids {
+        assert_eq!(id.len(), 32, "eventID {id} should be 32 hex digits");
+        assert!(
+            id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "eventID {id} should be lowercase hex"
+        );
+    }
+    let distinct: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(distinct.len(), ids.len(), "eventIDs should be unique");
+}
+
+#[test]
+fn rereading_a_record_returns_the_same_event_id() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    for i in 0..3 {
+        put_item(&db, "Evt", &format!("k{i}"), "v");
+    }
+    let first = event_ids(&db, "Evt");
+    assert_eq!(first.len(), 3);
+    assert_eq!(event_ids(&db, "Evt"), first);
+
+    // A record read at its own sequence number carries the same id.
+    let seq = sequence_numbers(&db, "Evt")[1].clone();
+    let at = get_records(
+        &db,
+        &shard_iterator(&db, "Evt", "AT_SEQUENCE_NUMBER", Some(&seq)),
+    );
+    assert_eq!(at.records[0].event_id, first[1]);
+}
+
+#[test]
+fn a_reopened_database_returns_the_same_event_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streams.db");
+    let path = path.to_str().unwrap();
+    let (ids, seqs) = {
+        let db = Database::new(path).unwrap();
+        create_stream_table(&db, "Evt", "NEW_IMAGE");
+        put_item(&db, "Evt", "a", "1");
+        put_item(&db, "Evt", "b", "2");
+        (event_ids(&db, "Evt"), sequence_numbers(&db, "Evt"))
+    };
+    let db = Database::new(path).unwrap();
+    assert_eq!(event_ids(&db, "Evt"), ids);
+    assert_eq!(sequence_numbers(&db, "Evt"), seqs);
+}
+
+#[test]
+fn a_fresh_database_reuses_no_event_id_or_sequence_number() {
+    let session = || {
+        let db = Database::memory().unwrap();
+        create_stream_table(&db, "Evt", "NEW_IMAGE");
+        for i in 0..3 {
+            put_item(&db, "Evt", &format!("k{i}"), "v");
+        }
+        (event_ids(&db, "Evt"), sequence_numbers(&db, "Evt"))
+    };
+    let (ids1, seqs1) = session();
+    let (ids2, seqs2) = session();
+
+    assert!(
+        ids2.iter().all(|id| !ids1.contains(id)),
+        "a new session reissued an eventID: {ids1:?} then {ids2:?}"
+    );
+    let last1: u128 = seqs1.last().unwrap().parse().unwrap();
+    let first2: u128 = seqs2.first().unwrap().parse().unwrap();
+    assert!(
+        first2 > last1,
+        "a new session's sequence numbers should follow the last one's: {seqs1:?} then {seqs2:?}"
+    );
+}
+
+#[test]
+fn sequence_numbers_are_aws_shaped_and_drive_every_iterator_type() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    for i in 0..5 {
+        put_item(&db, "Evt", &format!("k{i}"), "v");
+    }
+
+    let seqs = sequence_numbers(&db, "Evt");
+    assert_eq!(seqs.len(), 5);
+    for seq in &seqs {
+        assert!(
+            seq.len() >= 21 && seq.len() <= 40 && seq.chars().all(|c| c.is_ascii_digit()),
+            "SequenceNumber {seq} should be 21 to 40 digits"
+        );
+    }
+    let mut sorted = seqs.clone();
+    sorted.sort();
+    assert_eq!(sorted, seqs, "string order should match write order");
+
+    let keys = |resp: dynoxide::actions::get_records::GetRecordsResponse| -> Vec<String> {
+        resp.records
+            .iter()
+            .map(|r| match r.dynamodb.keys.get("pk") {
+                Some(AttributeValue::S(s)) => s.clone(),
+                other => panic!("unexpected key {other:?}"),
+            })
+            .collect()
+    };
+    let at = shard_iterator(&db, "Evt", "AT_SEQUENCE_NUMBER", Some(&seqs[2]));
+    assert_eq!(keys(get_records(&db, &at)), ["k2", "k3", "k4"]);
+    let after = shard_iterator(&db, "Evt", "AFTER_SEQUENCE_NUMBER", Some(&seqs[2]));
+    assert_eq!(keys(get_records(&db, &after)), ["k3", "k4"]);
+    let horizon = shard_iterator(&db, "Evt", "TRIM_HORIZON", None);
+    assert_eq!(keys(get_records(&db, &horizon)).len(), 5);
+
+    let latest = shard_iterator(&db, "Evt", "LATEST", None);
+    let resp = get_records(&db, &latest);
+    assert!(resp.records.is_empty());
+    put_item(&db, "Evt", "k5", "v");
+    let next = resp.next_shard_iterator.unwrap();
+    assert_eq!(keys(get_records(&db, &next)), ["k5"]);
+
+    // A NextShardIterator resumes after the page it ends.
+    let paged = get_records(&db, &after);
+    let resume = paged.next_shard_iterator.clone().unwrap();
+    assert_eq!(keys(paged), ["k3", "k4", "k5"]);
+    assert!(get_records(&db, &resume).records.is_empty());
+
+    let arn = get_stream_arn(&db, "Evt");
+    let desc = db
+        .describe_stream(serde_json::from_value(json!({"StreamArn": &arn})).unwrap())
+        .unwrap();
+    let range = &desc.stream_description.shards[0].sequence_number_range;
+    let seqs = sequence_numbers(&db, "Evt");
+    assert_eq!(range.starting_sequence_number.as_ref(), seqs.first());
+    assert_eq!(range.ending_sequence_number.as_ref(), seqs.last());
 }
