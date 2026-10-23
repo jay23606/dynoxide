@@ -818,11 +818,12 @@ fn records_from_an_earlier_build_keep_their_ids_and_order_beside_new_ones() {
     );
     assert_eq!(range.ending_sequence_number.as_ref(), seqs.last());
 
-    // A short number a client kept from the earlier build still resolves.
-    let at = shard_iterator(&db, "Evt", "AT_SEQUENCE_NUMBER", Some("2"));
+    let at = shard_iterator(&db, "Evt", "AT_SEQUENCE_NUMBER", Some(&seqs[1]));
     assert_eq!(record_keys(&get_records(&db, &at)), ["k1", "k2", "k3"]);
-    let after = shard_iterator(&db, "Evt", "AFTER_SEQUENCE_NUMBER", Some("1"));
+    let after = shard_iterator(&db, "Evt", "AFTER_SEQUENCE_NUMBER", Some(&seqs[0]));
     assert_eq!(record_keys(&get_records(&db, &after)), ["k1", "k2", "k3"]);
+    // A short number a client kept from the earlier build is refused on length.
+    assert!(shard_iterator_error(&db, "AT_SEQUENCE_NUMBER", Some("2")).contains("length"));
     let after = shard_iterator(&db, "Evt", "AFTER_SEQUENCE_NUMBER", Some(&seqs[1]));
     assert_eq!(record_keys(&get_records(&db, &after)), ["k2", "k3"]);
 
@@ -852,41 +853,75 @@ fn records_from_an_earlier_build_keep_their_ids_and_order_beside_new_ones() {
     assert_eq!(all_records(&db, "Evt")[1].event_id, "2");
 }
 
+fn shard_iterator_error(db: &Database, kind: &str, seq: Option<&str>) -> String {
+    let mut req = json!({
+        "StreamArn": get_stream_arn(db, "Evt"),
+        "ShardId": "shardId-00000001-Evt",
+        "ShardIteratorType": kind
+    });
+    if let Some(seq) = seq {
+        req["SequenceNumber"] = json!(seq);
+    }
+    match db.get_shard_iterator(serde_json::from_value(req).unwrap()) {
+        Err(dynoxide::DynoxideError::ValidationException(msg)) => msg,
+        other => panic!("{kind} with {seq:?}: {other:?}"),
+    }
+}
+
 #[test]
-fn a_missing_or_invalid_sequence_number_is_a_validation_error() {
+fn a_missing_or_invalid_sequence_number_is_refused_as_dynamodb_does() {
     let db = Database::memory().unwrap();
     create_stream_table(&db, "Evt", "NEW_IMAGE");
     put_item(&db, "Evt", "k0", "v");
-    let arn = get_stream_arn(&db, "Evt");
 
+    let too_short = "1 validation error detected: Value at 'sequenceNumber' failed to \
+                     satisfy constraint: Member must have length greater than or equal to 21";
+    let too_long = "1 validation error detected: Value at 'sequenceNumber' failed to \
+                    satisfy constraint: Member must have length less than or equal to 40";
+    let unusable = "Invalid SequenceNumber for the shard";
+    let forty_nines = "9".repeat(40);
     for kind in ["AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER"] {
         let cases = [
-            None,
-            Some(""),
-            Some("abc"),
-            Some("-5"),
-            Some("1.5"),
-            // Past i64 once the offset is removed, and past any stored number.
-            Some("99999999999999999999"),
-            Some("9999999999999999999999999999999999999999"),
-            Some("99999999999999999999999999999999999999999"),
+            (
+                None,
+                "One or more parameter values were invalid: SequenceNumber cannot be null",
+            ),
+            (Some(""), too_short),
+            (Some("5"), too_short),
+            (Some("12345678901234567890"), too_short),
+            (Some("99999999999999999999999999999999999999999"), too_long),
+            (Some("abcdefghijklmnopqrstu"), unusable),
+            (Some("-100000000000000000001"), unusable),
+            (Some("000000000000000000000"), unusable),
+            (Some(forty_nines.as_str()), unusable),
         ];
-        for seq in cases {
-            let mut req = json!({
-                "StreamArn": &arn,
-                "ShardId": "shardId-00000001-Evt",
-                "ShardIteratorType": kind
-            });
-            if let Some(seq) = seq {
-                req["SequenceNumber"] = json!(seq);
-            }
-            let err = db
-                .get_shard_iterator(serde_json::from_value(req).unwrap())
-                .expect_err(&format!("{kind} with {seq:?} should be refused"));
-            assert!(
-                matches!(err, dynoxide::DynoxideError::ValidationException(_)),
-                "{kind} with {seq:?}: {err:?}"
+        for (seq, expected) in cases {
+            assert_eq!(
+                shard_iterator_error(&db, kind, seq),
+                expected,
+                "{kind} {seq:?}"
             );
         }
+    }
+
+    // A leading `+` on an otherwise valid number is accepted.
+    let first = format!("+{}", sequence_numbers(&db, "Evt")[0]);
+    let at = shard_iterator(&db, "Evt", "AT_SEQUENCE_NUMBER", Some(&first));
+    assert_eq!(record_keys(&get_records(&db, &at)), ["k0"]);
+}
+
+#[test]
+fn a_sequence_number_on_trim_horizon_or_latest_is_refused() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    put_item(&db, "Evt", "k0", "v");
+    let seq = sequence_numbers(&db, "Evt")[0].clone();
+
+    for kind in ["TRIM_HORIZON", "LATEST"] {
+        assert_eq!(
+            shard_iterator_error(&db, kind, Some(&seq)),
+            "One or more parameter values were invalid: \
+             SequenceNumber should not be passed for this iterator type"
+        );
     }
 }

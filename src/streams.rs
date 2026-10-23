@@ -53,16 +53,17 @@ pub(crate) fn format_sequence_number(stored: i64) -> String {
     (SEQUENCE_NUMBER_OFFSET + stored.max(0) as u128).to_string()
 }
 
-/// The stored sequence number a public one names. A short number reads as
-/// stored, so a value a client kept from an earlier build still resolves.
+/// The stored sequence number a public one names, or `None` when it could
+/// not have been issued.
 pub(crate) fn parse_sequence_number(public: &str) -> Option<i64> {
     let value: u128 = public.parse().ok()?;
-    let stored = value.checked_sub(SEQUENCE_NUMBER_OFFSET).unwrap_or(value);
-    i64::try_from(stored).ok()
+    let stored = i64::try_from(value.checked_sub(SEQUENCE_NUMBER_OFFSET)?).ok()?;
+    (stored > 0).then_some(stored)
 }
 
 /// The floor for a new stored sequence number: microseconds since the epoch,
-/// so a fresh in-memory database never reissues an earlier session's numbers.
+/// so a fresh in-memory database doesn't normally reissue an earlier session's
+/// numbers.
 #[cfg(any(feature = "native-sqlite", feature = "_has-encryption"))]
 pub(crate) fn sequence_number_floor(clock: &dyn Clock) -> i64 {
     (clock.now_unix_secs_f64() * 1_000_000.0) as i64
@@ -193,7 +194,7 @@ mod tests {
 
     #[test]
     fn a_sequence_number_round_trips_through_its_public_form() {
-        for stored in [0, 1, 1_761_000_000_000_000, i64::MAX] {
+        for stored in [1, 1_761_000_000_000_000, i64::MAX] {
             let public = format_sequence_number(stored);
             assert_eq!(public.len(), 21, "{public}");
             assert_eq!(parse_sequence_number(&public), Some(stored));
@@ -202,9 +203,16 @@ mod tests {
     }
 
     #[test]
-    fn a_short_sequence_number_reads_as_stored() {
-        assert_eq!(parse_sequence_number("5"), Some(5));
-        assert_eq!(parse_sequence_number("abc"), None);
-        assert_eq!(parse_sequence_number("999999999999999999999999"), None);
+    fn a_number_that_was_never_issued_names_nothing() {
+        for public in [
+            "5",
+            "abc",
+            "000000000000000000000",
+            "100000000000000000000",
+            "999999999999999999999999999999999999999",
+        ] {
+            assert_eq!(parse_sequence_number(public), None, "{public}");
+        }
+        assert_eq!(parse_sequence_number("+100000000000000000005"), Some(5));
     }
 }
