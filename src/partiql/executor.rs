@@ -1881,12 +1881,18 @@ async fn evaluate_window<S: StorageBackend>(
                 return Err(refusal);
             }
             if let (Some(sk_name), Some(wc)) = (read_sk, where_clause) {
-                let sk_conditions =
-                    translate_sk_conditions(&wc.groups[0], sk_name, parameters).unwrap_or_default();
-                for sk_value in sk_conditions.iter().flat_map(|c| c.values()) {
-                    if let Some(refusal) = crate::actions::helpers::key_size_refusal(sk_value, true)
-                    {
-                        return Err(refusal);
+                // With multiple OR groups, the read uses the shared partition
+                // and evaluates the full condition as a filter. Sort-key
+                // values in one group are not key conditions for that read.
+                if wc.groups.len() == 1 {
+                    let sk_conditions = translate_sk_conditions(&wc.groups[0], sk_name, parameters)
+                        .unwrap_or_default();
+                    for sk_value in sk_conditions.iter().flat_map(|c| c.values()) {
+                        if let Some(refusal) =
+                            crate::actions::helpers::key_size_refusal(sk_value, true)
+                        {
+                            return Err(refusal);
+                        }
                     }
                 }
             }
