@@ -1865,7 +1865,8 @@ async fn evaluate_window<S: StorageBackend>(
     // A keyed read needs an equality on the partition key. An index whose key
     // has more than one attribute never gets here: its reads are refused first
     // (see `reject_multi_attribute_index`).
-    let pk_condition = where_clause.and_then(|wc| find_pk_condition(wc, read_pk));
+    let pk_condition = where_clause
+        .and_then(|wc| find_pk_condition(wc, read_pk).or_else(|| pk_in_every_group(wc, read_pk)));
     // A partition key value no key can have only gets this far when the clause
     // isn't read by key (see `check_read_key_types`), and it matches no row.
     let pk_key = match pk_condition {
@@ -1892,13 +1893,9 @@ async fn evaluate_window<S: StorageBackend>(
             Some(value.to_key_string())
         }
         None => {
-            // An OR beside the key condition leaves the key in every group the
-            // clause expands to, so the statement still reads one partition
-            // and an oversized key is refused as it is without the OR
-            // (captured eu-west-2 and us-east-1, 2026-10-10:
-            // `pk = <2,049 bytes> AND (x = 1 OR x = 2)` on a table; an index's
-            // key is inferred to follow suit, as its key reads do). The read
-            // itself stays a scan here.
+            // Keep the oversized-key check for a key that appears in every
+            // expanded OR group, even when the groups pin different values and
+            // the read therefore remains a scan.
             if let Some(value) = where_clause.and_then(|wc| pk_in_every_group(wc, read_pk)) {
                 let value = resolve_value(value, parameters)?;
                 if let Some(refusal) = crate::actions::helpers::key_size_refusal(&value, false) {
@@ -1925,13 +1922,13 @@ async fn evaluate_window<S: StorageBackend>(
     } else if let Some(None) = pk_key {
         Vec::new()
     } else if let Some(Some(pk_str)) = pk_key {
-        // Sort-key conditions that a key condition can express are pushed into
-        // the SQL, so `limit` counts rows within the key-condition range rather
-        // than rows in the whole partition, which is how DynamoDB paces a
-        // key-bound read. find_pk_condition only fires on a single-OR-group
-        // WHERE, so the group holding the sort-key conditions is unambiguous.
+        // Sort-key conditions from a single OR group can be pushed into the
+        // SQL, so `limit` counts rows within the key-condition range. With
+        // multiple groups, read the shared partition and apply the whole WHERE
+        // clause as a filter instead; no one group's sort-key conditions apply
+        // to every row in the partition.
         let sk_conditions = match (read_sk, where_clause) {
-            (Some(sk_name), Some(wc)) => {
+            (Some(sk_name), Some(wc)) if wc.groups.len() == 1 => {
                 translate_sk_conditions(&wc.groups[0], sk_name, parameters)
             }
             _ => None,
