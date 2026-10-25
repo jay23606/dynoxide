@@ -3866,8 +3866,9 @@ fn select_with_common_partition_key_across_or_groups_reads_only_that_partition()
     let table_keyed = read("SELECT * FROM \"SharedPartition\" WHERE pk = 'k'");
     let table_or = read("SELECT * FROM \"SharedPartition\" WHERE pk = 'k' AND (x = 1 OR x = 2)");
     assert_eq!(table_or.items.as_ref().unwrap().len(), 2);
+    let table_or_capacity = table_or.consumed_capacity.as_ref().unwrap().capacity_units;
     assert_eq!(
-        table_or.consumed_capacity.unwrap().capacity_units,
+        table_or_capacity,
         table_keyed.consumed_capacity.unwrap().capacity_units,
         "an OR whose branches all pin the same table partition should read only that partition"
     );
@@ -3901,6 +3902,7 @@ fn select_with_common_partition_key_across_or_groups_reads_only_that_partition()
             statement: "SELECT * FROM \"SharedPartition\" WHERE pk = 'k' AND (x = 1 OR x = 2)"
                 .to_string(),
             limit: Some(1),
+            return_consumed_capacity: Some("TOTAL".to_string()),
             next_token,
             ..Default::default()
         })
@@ -3908,8 +3910,10 @@ fn select_with_common_partition_key_across_or_groups_reads_only_that_partition()
     };
     let mut next_token = None;
     let mut values = Vec::new();
+    let mut paginated_capacity = 0.0;
     loop {
         let response = page(next_token);
+        paginated_capacity += response.consumed_capacity.as_ref().unwrap().capacity_units;
         values.extend(
             response
                 .items
@@ -3930,6 +3934,10 @@ fn select_with_common_partition_key_across_or_groups_reads_only_that_partition()
         values,
         [1, 2],
         "pagination should walk only the shared partition"
+    );
+    assert!(
+        paginated_capacity < full_scan.consumed_capacity.as_ref().unwrap().capacity_units,
+        "pagination should charge less than a table scan"
     );
 }
 
